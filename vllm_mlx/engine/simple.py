@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import mlx.core as mx
@@ -21,6 +22,7 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
+    EngineBusy,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
@@ -174,6 +176,20 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
+        self._generation_lock_admission = (
+            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
+            .strip()
+            .lower()
+        )
+        if self._generation_lock_admission not in {"fail_fast", "wait"}:
+            logger.warning(
+                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
+                self._generation_lock_admission,
+            )
+            self._generation_lock_admission = "fail_fast"
+        self._generation_waiters = 0
+        self._generation_busy_rejections = 0
+        self._active_requests: dict[str, dict[str, Any]] = {}
 
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
@@ -204,6 +220,54 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             return getattr(self._model, "processor", None)
         return self._model.tokenizer
+
+    def _generation_lock_holder_summary(self) -> str:
+        if not self._active_requests:
+            return "none"
+
+        holders = []
+        now = time.time()
+        for request_id, info in self._active_requests.items():
+            elapsed_s = info.get("elapsed_s")
+            started_at = info.get("started_at")
+            if started_at is not None:
+                elapsed_s = round(now - started_at, 1)
+            kind = info.get("kind", "unknown")
+            status = info.get("status", "unknown")
+            holders.append(
+                f"{request_id}:{status}:{kind}:"
+                f"prompt={info.get('prompt_tokens', 0)}:"
+                f"completion={info.get('completion_tokens', 0)}:"
+                f"elapsed_s={elapsed_s if elapsed_s is not None else 'unknown'}"
+            )
+        return ",".join(holders)
+
+    @asynccontextmanager
+    async def _acquire_generation_slot(self, request_id: str):
+        """Admission control for SimpleEngine's serialized MLX route."""
+        if (
+            self._generation_lock_admission == "fail_fast"
+            and self._generation_lock.locked()
+        ):
+            self._generation_busy_rejections += 1
+            raise EngineBusy(
+                "SimpleEngine serialized route is busy; "
+                f"request_id={request_id}; "
+                f"active={self._generation_lock_holder_summary()}; "
+                f"waiters={self._generation_waiters}; "
+                "retry later"
+            )
+
+        self._generation_waiters += 1
+        acquired = False
+        try:
+            async with self._generation_lock:
+                acquired = True
+                self._generation_waiters -= 1
+                yield
+        finally:
+            if not acquired and self._generation_waiters > 0:
+                self._generation_waiters -= 1
 
     def prepare_for_start(self) -> None:
         """Load the backing model off the serving event loop."""
@@ -386,14 +450,33 @@ class SimpleEngine(BaseEngine):
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
-    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
+    async def _run_blocking_serialized(
+        self,
+        func,
+        /,
+        *args,
+        request_id: str | None = None,
+        on_cancel=None,
+        **kwargs,
+    ):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
         finishes, or a follow-up request can enter MLX/Metal concurrently and
         corrupt the command-buffer state.
         """
-        async with self._generation_lock:
+        request_id = request_id or f"simple-{id(func):x}"
+        async with self._acquire_generation_slot(request_id):
+            started_at = time.time()
+            self._active_requests[request_id] = {
+                "request_id": request_id,
+                "status": "running",
+                "kind": "blocking_serialized",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "elapsed_s": 0.0,
+                "started_at": started_at,
+            }
 
             def run_bound():
                 _bind_worker_generation_streams()
@@ -416,6 +499,8 @@ class SimpleEngine(BaseEngine):
                 except BaseException:
                     pass
                 raise
+            finally:
+                self._active_requests.pop(request_id, None)
 
     async def generate(
         self,
@@ -510,6 +595,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+        request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -557,64 +643,94 @@ class SimpleEngine(BaseEngine):
                         yield output
                     return
 
-        async with self._generation_lock:
+        async with self._acquire_generation_slot(request_id):
+            started_at = time.time()
+            self._active_requests[request_id] = {
+                "request_id": request_id,
+                "status": "running",
+                "kind": "stream_generate",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "elapsed_s": 0.0,
+                "started_at": started_at,
+            }
             # Non-stream chat runs in a worker thread and rebinds generation
             # streams there. Rebind again on the current thread before
             # stream_generate so nonstream->stream mode switches remain valid.
             _bind_worker_generation_streams()
 
-            accumulated_text = ""
-            prompt_tokens = 0
-            completion_tokens = 0
-            finished = False
+            try:
+                accumulated_text = ""
+                prompt_tokens = 0
+                completion_tokens = 0
+                finished = False
 
-            for chunk in self._model.stream_generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
-            ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                    else prompt_tokens
-                )
-                completion_tokens += 1
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                accumulated_text += new_text
+                for chunk in self._model.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    **kwargs,
+                ):
+                    prompt_tokens = (
+                        chunk.prompt_tokens
+                        if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                        else prompt_tokens
+                    )
+                    completion_tokens += 1
+                    if request_id in self._active_requests:
+                        self._active_requests[request_id].update(
+                            {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "elapsed_s": round(time.time() - started_at, 1),
+                            }
+                        )
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated_text += new_text
 
-                finished = (
-                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-                )
-                finish_reason = None
-                if finished:
-                    finish_reason = getattr(chunk, "finish_reason", "stop")
+                    finished = (
+                        getattr(chunk, "finished", False)
+                        or completion_tokens >= max_tokens
+                    )
+                    finish_reason = None
+                    if finished:
+                        finish_reason = getattr(chunk, "finish_reason", "stop")
 
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text=new_text,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=finished,
-                    finish_reason=finish_reason,
-                )
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
 
-                if finished:
-                    break
+                    if finished:
+                        break
 
-            if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text="",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=True,
-                    finish_reason=None,
-                )
+                if not finished:
+                    if prompt_tokens == 0:
+                        prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                    if request_id in self._active_requests:
+                        self._active_requests[request_id].update(
+                            {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "elapsed_s": round(time.time() - started_at, 1),
+                            }
+                        )
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text="",
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        finished=True,
+                        finish_reason=None,
+                    )
+            finally:
+                self._active_requests.pop(request_id, None)
 
     async def chat(
         self,
@@ -2174,6 +2290,15 @@ class SimpleEngine(BaseEngine):
             "uptime_seconds": time.time() - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
+            "running": bool(self._active_requests),
+            "num_running": len(self._active_requests),
+            "num_waiting": self._generation_waiters,
+            "requests": list(self._active_requests.values()),
+            "generation_lock": {
+                "locked": self._generation_lock.locked(),
+                "admission": self._generation_lock_admission,
+                "busy_rejections": self._generation_busy_rejections,
+            },
         }
 
         # SpecPrefill stats

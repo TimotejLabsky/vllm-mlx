@@ -32,6 +32,12 @@ class GenerationOutput:
     finished: bool = True
 
 
+class EngineBusy(RuntimeError):
+    """Raised when a serialized engine route is already serving a request."""
+
+    code = "text_generation_busy"
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""
