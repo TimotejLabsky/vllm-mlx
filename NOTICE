@@ -15,8 +15,8 @@ This fork carries a series of local patches on top of upstream commit
 git commit on the `main` branch with the prefix `patch:`. The branch
 is periodically rebased on waybarrios/main to pick up upstream changes.
 
-Patch series (as of fork creation, 2026-05-19). Full rationale,
-measurements, and upstreaming notes for each patch are in PATCHES.md.
+Patch series (last updated 2026-05-19). Full rationale, measurements,
+and upstreaming notes for each patch are in PATCHES.md.
 
   1.  patch: bugfixes                    - load_model_with_fallback fix + model-name validation
   2.  patch: reasoning-effort            - OpenAI reasoning_effort field, maps "none" → no thinking
@@ -28,6 +28,8 @@ measurements, and upstreaming notes for each patch are in PATCHES.md.
   8.  patch: incoming-reasoning-content  - preserve reasoning_content on incoming messages
   9.  patch: cache-extended-prefix       - extend cache to full conversation history + grow-on-HIT
   10. patch: status-system-kv            - /v1/status includes system_kv_cache
+  11. patch: mx-compile                  - --compile flag wrapping mx.compile(shapeless=True)
+                                           around the forward pass (ported from upstream PR #270)
 
 Modifications are marked in source files with `EXTENDED_PREFIX_MARKER`
 comments where appropriate. The full change history is in `git log`.
