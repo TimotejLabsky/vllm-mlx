@@ -16,7 +16,6 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -34,7 +33,6 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
-    EngineBusy,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
@@ -139,7 +137,6 @@ class SimpleEngine(BaseEngine):
         specprefill_enabled: bool = False,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
-        specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
         mllm_draft_model: str | None = None,
@@ -160,8 +157,6 @@ class SimpleEngine(BaseEngine):
             specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
-            specprefill_backbone_pct: Fraction of chunks to reserve for evenly
-                spaced coverage (default: 0.0)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
@@ -194,7 +189,6 @@ class SimpleEngine(BaseEngine):
         self._specprefill_enabled = specprefill_enabled
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
-        self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
@@ -348,54 +342,6 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             return getattr(self._model, "processor", None)
         return self._model.tokenizer
-
-    def _generation_lock_holder_summary(self) -> str:
-        if not self._active_requests:
-            return "none"
-
-        holders = []
-        now = time.time()
-        for request_id, info in self._active_requests.items():
-            elapsed_s = info.get("elapsed_s")
-            started_at = info.get("started_at")
-            if started_at is not None:
-                elapsed_s = round(now - started_at, 1)
-            kind = info.get("kind", "unknown")
-            status = info.get("status", "unknown")
-            holders.append(
-                f"{request_id}:{status}:{kind}:"
-                f"prompt={info.get('prompt_tokens', 0)}:"
-                f"completion={info.get('completion_tokens', 0)}:"
-                f"elapsed_s={elapsed_s if elapsed_s is not None else 'unknown'}"
-            )
-        return ",".join(holders)
-
-    @asynccontextmanager
-    async def _acquire_generation_slot(self, request_id: str):
-        """Admission control for SimpleEngine's serialized MLX route."""
-        if (
-            self._generation_lock_admission == "fail_fast"
-            and self._generation_lock.locked()
-        ):
-            self._generation_busy_rejections += 1
-            raise EngineBusy(
-                "SimpleEngine serialized route is busy; "
-                f"request_id={request_id}; "
-                f"active={self._generation_lock_holder_summary()}; "
-                f"waiters={self._generation_waiters}; "
-                "retry later"
-            )
-
-        self._generation_waiters += 1
-        acquired = False
-        try:
-            async with self._generation_lock:
-                acquired = True
-                self._generation_waiters -= 1
-                yield
-        finally:
-            if not acquired and self._generation_waiters > 0:
-                self._generation_waiters -= 1
 
     def prepare_for_start(self) -> None:
         """Load the backing model off the serving event loop."""
@@ -613,33 +559,14 @@ class SimpleEngine(BaseEngine):
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
-    async def _run_blocking_serialized(
-        self,
-        func,
-        /,
-        *args,
-        request_id: str | None = None,
-        on_cancel=None,
-        **kwargs,
-    ):
+    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
         finishes, or a follow-up request can enter MLX/Metal concurrently and
         corrupt the command-buffer state.
         """
-        request_id = request_id or f"simple-{id(func):x}"
-        async with self._acquire_generation_slot(request_id):
-            started_at = time.time()
-            self._active_requests[request_id] = {
-                "request_id": request_id,
-                "status": "running",
-                "kind": "blocking_serialized",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "elapsed_s": 0.0,
-                "started_at": started_at,
-            }
+        async with self._generation_lock:
 
             def run_bound():
                 _bind_worker_generation_streams()
@@ -662,8 +589,6 @@ class SimpleEngine(BaseEngine):
                 except BaseException:
                     pass
                 raise
-            finally:
-                self._active_requests.pop(request_id, None)
 
     async def generate(
         self,
@@ -868,8 +793,6 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
-        specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
-        request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -912,100 +835,72 @@ class SimpleEngine(BaseEngine):
                         top_p,
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
-                        specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
                     ):
                         yield output
                     return
 
-        async with self._acquire_generation_slot(request_id):
-            started_at = time.time()
-            self._active_requests[request_id] = {
-                "request_id": request_id,
-                "status": "running",
-                "kind": "stream_generate",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "elapsed_s": 0.0,
-                "started_at": started_at,
-            }
+        async with self._generation_lock:
             # Non-stream chat runs in a worker thread and rebinds generation
             # streams there. Rebind again on the current thread before
             # stream_generate so nonstream->stream mode switches remain valid.
             _bind_worker_generation_streams()
 
-            try:
-                accumulated_text = ""
-                prompt_tokens = 0
-                completion_tokens = 0
-                finished = False
+            accumulated_text = ""
+            prompt_tokens = 0
+            completion_tokens = 0
+            finished = False
 
-                for chunk in self._model.stream_generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    **kwargs,
-                ):
-                    prompt_tokens = (
-                        chunk.prompt_tokens
-                        if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                        else prompt_tokens
-                    )
-                    completion_tokens += 1
-                    if request_id in self._active_requests:
-                        self._active_requests[request_id].update(
-                            {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "elapsed_s": round(time.time() - started_at, 1),
-                            }
-                        )
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    accumulated_text += new_text
+            for chunk in self._model.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                prompt_tokens = (
+                    chunk.prompt_tokens
+                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                    else prompt_tokens
+                )
+                completion_tokens += 1
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                accumulated_text += new_text
 
-                    finished = (
-                        getattr(chunk, "finished", False)
-                        or completion_tokens >= max_tokens
-                    )
-                    finish_reason = None
-                    if finished:
-                        finish_reason = getattr(chunk, "finish_reason", "stop")
+                finished = (
+                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
+                )
+                finish_reason = None
+                if finished:
+                    finish_reason = getattr(chunk, "finish_reason", "stop")
 
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                    )
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
 
-                    if finished:
-                        break
+                if finished:
+                    break
 
-                if not finished:
-                    if prompt_tokens == 0:
-                        prompt_tokens = len(self._model.tokenizer.encode(prompt))
-                    if request_id in self._active_requests:
-                        self._active_requests[request_id].update(
-                            {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "elapsed_s": round(time.time() - started_at, 1),
-                            }
-                        )
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text="",
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        finished=True,
-                        finish_reason=None,
-                    )
-            finally:
-                self._active_requests.pop(request_id, None)
+            if not finished:
+                if prompt_tokens == 0:
+                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text="",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finished=True,
+                    # Patched: was None — OpenAI streaming clients (AI SDK,
+                    # opencode) discard responses where the final chunk lacks
+                    # a non-null finish_reason. Natural EOS is "stop".
+                    finish_reason="stop",
+                )
 
     async def chat(
         self,
@@ -1792,7 +1687,6 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         specprefill_keep_pct: float | None = None,
-        specprefill_backbone_pct: float | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -1856,16 +1750,7 @@ class SimpleEngine(BaseEngine):
                 # Phase 2: Select important chunks
                 _cancel_check()
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                effective_backbone = (
-                    specprefill_backbone_pct
-                    if specprefill_backbone_pct is not None
-                    else self._specprefill_backbone_pct
-                )
-                selected = select_chunks(
-                    importance,
-                    keep_pct=effective_keep,
-                    backbone_pct=effective_backbone,
-                )
+                selected = select_chunks(importance, keep_pct=effective_keep)
                 n_selected = selected.shape[0]
 
                 # Phase 3: Sparse prefill on target model
@@ -2019,7 +1904,6 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
-        specprefill_backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
@@ -2506,16 +2390,7 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                effective_backbone = (
-                    specprefill_backbone_pct
-                    if specprefill_backbone_pct is not None
-                    else self._specprefill_backbone_pct
-                )
-                selected = select_chunks(
-                    importance,
-                    keep_pct=effective_keep,
-                    backbone_pct=effective_backbone,
-                )
+                selected = select_chunks(importance, keep_pct=effective_keep)
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
 
@@ -2748,7 +2623,7 @@ class SimpleEngine(BaseEngine):
             "loaded": self._loaded,
             "running": self._loaded,
             "num_running": self._num_running,
-            "num_waiting": self._generation_waiters,
+            "num_waiting": 0,
             "num_requests_processed": self._total_requests_processed,
             "total_prompt_tokens": self._total_prompt_tokens,
             "total_completion_tokens": self._total_completion_tokens,
@@ -2757,11 +2632,6 @@ class SimpleEngine(BaseEngine):
                 "prompt_tps": 0.0,
             },
             "requests": requests_snapshot,
-            "generation_lock": {
-                "locked": self._generation_lock.locked(),
-                "admission": self._generation_lock_admission,
-                "busy_rejections": self._generation_busy_rejections,
-            },
         }
 
         # MLLM prefix cache stats, remapped to the shape BatchedEngine emits
@@ -2799,7 +2669,6 @@ class SimpleEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
-                "backbone_pct": self._specprefill_backbone_pct,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
