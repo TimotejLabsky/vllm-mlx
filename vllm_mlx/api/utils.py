@@ -666,6 +666,13 @@ def extract_multimodal_content(
                 msg_dict = {"role": role, "content": _content_to_text(content)}
                 if tool_calls_list:
                     msg_dict["tool_calls"] = tool_calls_list
+                _rc = (
+                    msg.get("reasoning_content")
+                    if isinstance(msg, dict)
+                    else getattr(msg, "reasoning_content", None)
+                )
+                if _rc:
+                    msg_dict["reasoning_content"] = _rc
                 processed_messages.append(msg_dict)
             else:
                 # Convert tool calls to text for models without native support
@@ -691,7 +698,15 @@ def extract_multimodal_content(
 
         if isinstance(content, str):
             # Simple text message
-            processed_messages.append({"role": role, "content": content})
+            _msg_dict = {"role": role, "content": content}
+            _rc = (
+                msg.get("reasoning_content")
+                if isinstance(msg, dict)
+                else getattr(msg, "reasoning_content", None)
+            )
+            if _rc:
+                _msg_dict["reasoning_content"] = _rc
+            processed_messages.append(_msg_dict)
         elif isinstance(content, list):
             # Multimodal message - extract text and media
             text_parts = []

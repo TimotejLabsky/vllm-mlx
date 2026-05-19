@@ -82,6 +82,15 @@ class Message(BaseModel):
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
     tool_call_id: str | None = None
+    # For assistant messages with prior <think> traces — survives request
+    # parsing so extract_multimodal_content can attach it to processed
+    # messages and the chat template (Qwen3.6 et al.) can render it when
+    # chat_template_kwargs.preserve_thinking=true. Without this, Pydantic
+    # silently drops the field at request parsing time.
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
 
 
 # =============================================================================
