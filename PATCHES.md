@@ -1,6 +1,6 @@
 # Local patches in this fork
 
-This fork carries 11 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries 12 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
 For Apache 2.0 attribution see [`NOTICE`](NOTICE). For the consumer side of these changes (how they're wired into the homelab) see [`TimotejLabsky/personal-infratructure`](https://github.com/TimotejLabsky/personal-infratructure) — particularly `mac-studio/README.md`, `mac-studio/llama-swap-config.yaml`, and the historical patch scripts in `mac-studio/patches/`.
 
@@ -214,6 +214,33 @@ Patch is left in the fork because it's non-destructive when off, the +33 % on sm
 **How to use:** add `--compile` to a llama-swap entry's `cmd:`. Verify it engaged by grepping the model's stdout/log for `Model forward pass compiled with mx.compile(shapeless=True)`.
 
 **Upstreaming:** the underlying PR is the upstream candidate; our copy is just a port to keep us moving while #270 sits open. The `2a27820` inner-model traversal fix would also need to go upstream as part of the same PR (the original PR's wiring assumed `_engine._model` was already an `nn.Module`).
+
+---
+
+## 12. `5bdc0cb` — `patch: hybrid-probe-denylist`
+
+**Files:** `vllm_mlx/engine/simple.py`
+
+Reframes the SimpleEngine LLM-path system-KV probe from an **allowlist** (every cache entry must be a plain `KVCache`) to a **denylist** (no entry may be a `RotatingKVCache`).
+
+**The bug:** patch #6 (`system-kv-hybrid-aliasing`) already made `ArraysCache` snapshot-safe by shallow-copying lists at capture and restore. But the start-of-engine probe was still using the old allowlist logic — any model that mixed `KVCache + ArraysCache` (Qwen3.6-27B-4bit, Qwen3.5-27B, every Gated DeltaNet hybrid) tripped the allowlist and got the entire snapshot path disabled. Result: opencode workloads on the 27B dense model were doing full uncached prefill on **every turn**, ~30 s of wasted prefill the cache should have saved.
+
+**The fix:** new probe explicitly checks `isinstance(c, RotatingKVCache)` and only disables for those. `RotatingKVCache` (sliding-window — gemma3_text, olmo3, recurrent_gemma) is genuinely unsafe because `.state` aliases in-place-mutated ring buffers, so the snapshot/restore can't capture it without drift. Pure `KVCache` and `ArraysCache` are both safe under patch #6's shallow-copy semantics.
+
+Also added an explicit `snapshot enabled` log line on the success path so a future regression surfaces as a missing log line, not a silent fallback.
+
+**Verified on Qwen3.6-27B-4bit (2026-05-19), 4-turn multi-turn test, 4.2K-token system prompt:**
+
+| Turn | Latency | Cache event | Cached tokens before | Prefilled new tokens |
+|------|---------|-------------|---------------------|----------------------|
+| T1 (cold) | **25.19 s** | MISS → store 4223-token snapshot | — | 4208 sys + 22 user |
+| T2 (+50 tok history) | **1.92 s** | HIT + GROW 4223→4273 | 4223 | 57 |
+| T3 (+50 tok history) | **1.91 s** | HIT + GROW 4273→4325 | 4273 | 59 |
+| T4 (+60 tok history) | **1.94 s** | HIT + GROW 4325→… | 4325 | 66 |
+
+**13× speedup on warm turns (25 s → 1.9 s).** Patch #9's grow-on-HIT semantics are now alive on the 27B dense: every turn after the first reuses the full conversation cache and only prefills the previous assistant reply + new user message + gen-prompt tail (~60 tokens vs ~4200 cold). This is the model behind opencode for us, so this is the highest-impact patch in the fork for daily use.
+
+**Upstreaming:** strong candidate. The original allowlist was over-conservative; the denylist is the correct semantics once aliasing in `ArraysCache` is fixed (which the underlying patch in PR #523 / upstream HEAD does NOT do — that's patch #6's contribution, also a PR candidate).
 
 ---
 
