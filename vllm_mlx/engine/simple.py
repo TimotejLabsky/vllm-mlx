@@ -1692,7 +1692,15 @@ class SimpleEngine(BaseEngine):
                                 text_model, max_kv_size=_max_kv_size or None
                             )
                             for i, saved_state in enumerate(system_kv_snapshot):
-                                backbone_cache[i].state = saved_state
+                                # Shallow-copy lists (ArraysCache layers) to prevent
+                                # this request's generation from mutating the snapshot
+                                # for future replays. KVCache state is a tuple — passes
+                                # through unchanged.
+                                backbone_cache[i].state = (
+                                    list(saved_state)
+                                    if isinstance(saved_state, list)
+                                    else saved_state
+                                )
 
                             prompt_to_send = mx.array(suffix_tokens)
                             return backbone_cache, prompt_to_send
@@ -1876,7 +1884,7 @@ class SimpleEngine(BaseEngine):
                     mx.eval([c.state for c in mc])
 
                 # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
-                snapshot = [c.state for c in mc]
+                snapshot = [list(c.state) if isinstance(c.state, list) else c.state for c in mc]
                 mx.eval([s for pair in snapshot for s in pair])
 
                 if self._is_system_kv_safe():
