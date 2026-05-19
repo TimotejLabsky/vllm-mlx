@@ -186,11 +186,8 @@ def _load_model_with_fallback(
         return _load_strict_false(model_name, tokenizer_config)
 
     try:
-        # return_config defaults to False, so mlx-lm returns exactly two values.
-        model, tokenizer = cast(
-            "tuple[Module, TokenizerWrapper]",
-            load(model_name, tokenizer_config=tokenizer_config),
-        )
+        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
+        return model, tokenizer
     except ValueError as e:
         # Fallback for models with non-standard tokenizers
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
