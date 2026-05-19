@@ -3481,16 +3481,28 @@ def load_model(
             asyncio.set_event_loop(loop)
             loop.run_until_complete(_engine.start())
             if compile:
-                from .compile import apply_compile
+                from .compile import apply_compile, is_compiled
 
-                inner_model = getattr(_engine, "_model", None) or getattr(
-                    _engine, "_text_model", None
-                )
+                # Walk the wrapper chain to reach the actual nn.Module:
+                # - LLM:  SimpleEngine._model = MLXLanguageModel,  inner at  .model
+                # - MLLM: SimpleEngine._model = MLXMultimodalLM,    inner at  .model
+                # - MLLM text head route (Qwen3-VL etc.) uses ._text_model
+                #   directly, which already IS the nn.Module.
+                outer = getattr(_engine, "_model", None)
+                inner_model = getattr(outer, "model", outer)
+                if inner_model is None:
+                    inner_model = getattr(_engine, "_text_model", None)
                 if inner_model is not None:
                     apply_compile(inner_model)
-                    logger.info(
-                        "Compile: forward pass compiled (simple mode)"
-                    )
+                    if is_compiled(inner_model):
+                        logger.info(
+                            "Compile: forward pass compiled (simple mode)"
+                        )
+                    else:
+                        logger.warning(
+                            "Compile requested but apply_compile() did not "
+                            "wrap the model — see preceding warning"
+                        )
                 else:
                     logger.warning(
                         "Compile requested but SimpleEngine exposed no model "
