@@ -175,10 +175,13 @@ Adds the `--compile` flag wiring `mx.compile(shapeless=True)` around the model f
 
 **Follow-up commit `2a27820`** fixes the inner-model traversal in the SimpleEngine path. The original wiring grabbed `_engine._model`, which on `SimpleEngine` is the `MLXMultimodalLM` / `MLXLanguageModel` *wrapper*, not the MLX `nn.Module`. `mx.compile` threw `'MLXMultimodalLM' object has no attribute '__call__'`; `apply_compile`'s try/except swallowed it and the server logged `compiled` when nothing was actually compiled. The fix walks down to `_engine._model.model`, falls through to bare `._model`, then `._text_model`, and re-checks `is_compiled()` so the success log only fires when the wrap took.
 
-**Verified on mac-studio with Qwen3.5-4B-4bit (2026-05-19):**
+**Verified on mac-studio (2026-05-19):**
 
 - Boot with `--compile`: server starts, `Model forward pass compiled with mx.compile(shapeless=True)` log line confirms wrap.
-- 3 warm requests, 2347-token prompt, 32-token completion, T=0.0 deterministic:
+
+Two A/B runs on different models, same harness (warmup + 3 timed cold-prefill requests at T=0.0, max_tokens=30):
+
+**Qwen3.5-4B-4bit, 2347-token prompt:**
 
 | Run | --compile off | --compile on |
 |-----|---------------|--------------|
@@ -187,7 +190,26 @@ Adds the `--compile` flag wiring `mx.compile(shapeless=True)` around the model f
 | 3   | 2.464 s       | 2.471 s |
 | avg | 2.51 s        | 2.46 s |
 
-Result on this workload: within noise. Expected — Qwen3.5-4B-4bit at 32 completion tokens is decode-dominated (~60 ms/tok × 32 ≈ 2 s of the 2.5 s total), so the prefill speedup is invisible. To see the published +33 % needs a prompt:completion ratio that's prefill-heavy (large prompt, short answer), and ideally a model where the attention kernel-launch overhead is a larger fraction of forward-pass time. Recommended next A/B: Qwen3.6-27B-4bit with a 16K-token prompt and 16-token completion.
+Decode-dominated workload (≈30 × 60 ms = 1.8 s of decode in a 2.5 s total). Within noise.
+
+**Qwen3.6-27B-4bit (our opencode dense model), 4K-token prompt — prefill-heavy:**
+
+| Run    | --compile off | --compile on |
+|--------|---------------|--------------|
+| warmup | 31.39 s       | 31.36 s |
+| 1      | 30.893 s      | 30.898 s |
+| 2      | 30.901 s      | 30.891 s |
+| 3      | 30.886 s      | 30.888 s |
+| **avg of 3** | **30.893 s** | **30.892 s** |
+
+**Δ = 1 ms (0.003 %)**. Decode in this run is ≈ 30 tok × ~70 tok/s ≈ 0.43 s, so ~99 % of every request is prefill — yet the compile wrap provides **no measurable speedup**. System-KV snapshot was also disabled by the probe on this run (`model returned non-KVCache entries (['ArraysCache', 'KVCache'])`) so every request did full uncached prefill, isolating compile from cache effects.
+
+**Conclusion:** PR #270's published +33 % prefill on Qwen3-8B-4bit does **not transfer** to Qwen3.6-27B-4bit. Likely reasons:
+
+- At 4-bit on a 27B dense model, the elementwise kernel-launch overhead is no longer the bottleneck — Metal command-buffer dispatch is small relative to the per-layer matmul + dequant work.
+- The hybrid attention layout (Gated DeltaNet + standard) means a chunk of forward-pass time is in op shapes that don't fuse via `mx.compile(shapeless=True)`.
+
+Patch is left in the fork because it's non-destructive when off, the +33 % on smaller models is real per upstream, and it's the cleanest entry point for future MLX compile improvements. **Don't add `--compile` to llama-swap config for Qwen3.6-27B-4bit (or the 35B MoE without first re-measuring) — there's nothing to gain.**
 
 **How to use:** add `--compile` to a llama-swap entry's `cmd:`. Verify it engaged by grepping the model's stdout/log for `Model forward pass compiled with mx.compile(shapeless=True)`.
 
