@@ -205,6 +205,7 @@ class ChatCompletionRequest(BaseModel):
     # Text-only requests also use this flag to leave the default TextModel route
     # and run through the MLLM path where the drafter can participate.
     mllm_draft: bool | None = None
+    reasoning_effort: str | None = None  # OpenAI-compatible: low/medium/high/none
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
