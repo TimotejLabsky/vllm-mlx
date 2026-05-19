@@ -273,6 +273,14 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        # --compile: wrap forward pass with mx.compile for fused Metal kernels.
+        # See vllm_mlx/compile.py (ported from upstream PR #270).
+        if getattr(self, "_compile_on_start", False):
+            from ..compile import apply_compile
+
+            self._model = apply_compile(self._model)
+            logger.info("Compile: forward pass compiled (batched MLLM)")
+
         # Set Metal memory limits (same as LLM path)
         try:
             import mlx.core as mx
@@ -456,6 +464,14 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             tokenizer_config=tokenizer_config,
         )
+
+        # --compile: wrap forward pass with mx.compile for fused Metal kernels.
+        # See vllm_mlx/compile.py (ported from upstream PR #270).
+        if getattr(self, "_compile_on_start", False):
+            from ..compile import apply_compile
+
+            self._model = apply_compile(self._model)
+            logger.info("Compile: forward pass compiled (batched LLM)")
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
