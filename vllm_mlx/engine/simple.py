@@ -225,31 +225,15 @@ class SimpleEngine(BaseEngine):
         self._generation_waiters = 0
         self._generation_busy_rejections = 0
 
-        # System prompt KV cache (reduces repeated prefill across requests).
-        # OrderedDict acts as an LRU keyed by system-prefix hash so that the
-        # main agent and any sub-agents with different toolsets can coexist
-        # without thrashing a single snapshot slot.
-        # Value is (snapshot_list, system_token_count).
-        self._system_kv_capacity = max(
-            1, int(os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4"))
-        )
-        self._system_kv_cache: "OrderedDict[str, tuple[list, int]]" = OrderedDict()
-        # Cache-effectiveness counters. Incremented only from inside the
-        # serialized worker (single writer) so plain ``+=`` is safe; reads
-        # from ``get_stats`` may be slightly stale, which is fine for
-        # metrics.
-        self._system_kv_cache_stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
-        # True only when the model's prompt cache can be snapshotted and
-        # restored for the manual system-prefix cache branch. Plain KV caches
-        # and hybrid ``ArraysCache`` entries are safe when their state
-        # containers are copied at snapshot/restore boundaries. Sliding-window
-        # cache classes such as ``RotatingKVCache`` remain disabled because
-        # their extra cursor metadata is not captured by ``.state`` alone.
+        # System prompt KV cache (reduces repeated prefill across requests)
+        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
+        self._system_kv_hash = None  # Hash of system prefix text
+        self._system_kv_token_count = 0  # Tokens in cached prefix
+        # True only when the model's prompt cache is composed entirely of
+        # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
+        # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
+        # aliases buffers ``update_and_fetch`` mutates in place — snapshot
+        # restore would silently desynchronize. Probed once in ``start()``.
         self._supports_system_kv_cache: bool = False
 
     @staticmethod
@@ -440,46 +424,6 @@ class SimpleEngine(BaseEngine):
                                 self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                             )
 
-                        # Probe the derived TextModel's prompt cache for snapshot-safety
-                        # (same gate stream_chat uses for the pure-LLM path).
-                        # _stream_generate_text only enters the system-KV cache branch
-                        # when this flag is True, so sliding-window text models won't
-                        # desynchronize on restore.
-                        #
-                        # Probe args must match the runtime constructor in
-                        # _stream_generate_text (max_kv_size=self._max_kv_size or None).
-                        # Under bounded-KV serving (max_kv_size > 0) make_prompt_cache
-                        # returns RotatingKVCache for models without a custom
-                        # make_cache; probing with default args would mis-classify that
-                        # path as snapshot-safe.
-                        try:
-                            from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-                            probe_cache = make_prompt_cache(
-                                self._text_model, max_kv_size=self._max_kv_size or None
-                            )
-                            self._supports_system_kv_cache = bool(probe_cache) and all(
-                                isinstance(c, KVCache) for c in probe_cache
-                            )
-                            if not self._supports_system_kv_cache:
-                                cache_types = sorted(
-                                    {type(c).__name__ for c in probe_cache}
-                                )
-                                logger.info(
-                                    "System KV cache snapshot disabled for MLLM "
-                                    "text routing: TextModel returned non-KVCache "
-                                    "entries (%s); _stream_generate_text will use "
-                                    "the uncached path",
-                                    cache_types,
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                "MLLM TextModel KV cache support probe failed "
-                                "(%s); disabling snapshot path",
-                                e,
-                            )
-                            self._supports_system_kv_cache = False
-
                         has_mtp = (
                             hasattr(self._text_model, "mtp")
                             and self._text_model.mtp is not None
@@ -549,9 +493,9 @@ class SimpleEngine(BaseEngine):
         self._text_tokenizer = None
         self._draft_model = None
         self._loaded = False
-        self._system_kv_cache.clear()
-        for k in self._system_kv_cache_stats:
-            self._system_kv_cache_stats[k] = 0
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
@@ -985,10 +929,12 @@ class SimpleEngine(BaseEngine):
         if kwargs.get("logits_processors") and not self._is_mllm:
             return await aggregate_stream_chat()
 
-        # Text-only requests on MLLM models should always aggregate the
-        # streaming path for non-streaming chat. This keeps one execution seam
-        # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
-        if self._is_mllm and not has_media_content(messages):
+        # Text-only requests (MLLM-text or pure LLM mode) aggregate the
+        # streaming path so they go through _stream_generate_text and reuse
+        # the system-prefix KV cache. MLLM-with-media falls through to
+        # mlx_vlm. LLM-mode resolves the text model via
+        # _text_route_resources() inside _stream_generate_text.
+        if not has_media_content(messages):
             return await aggregate_stream_chat()
 
         # Convert tools for template if provided
@@ -1110,14 +1056,27 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Per-request routing: text-only through mlx_lm TextModel
+        # Per-request routing: text-only goes through mlx_lm TextModel.
+        # MLLM mode: use the parallel TextModel built by build_text_model.
+        # LLM mode: use the mlx_lm model directly (resolved by
+        # _text_route_resources). Either way, _stream_generate_text reuses
+        # the system-prompt KV cache across requests.
         if (
-            self._is_mllm
-            and self._text_model is not None
-            and self._should_route_text_through_text_model(
-                mllm_draft_requested=mllm_draft_requested
+            # patch #4 (llm-mode-kv-cache): route text-only requests through
+            # _stream_generate_text so they reuse the system-prompt KV cache.
+            # Pure-LLM models (not self._is_mllm) use _text_route_resources()'s
+            # fallback to self._model; MLLM models still honour upstream's
+            # drafter-routing gate.
+            not has_media_content(messages)
+            and (
+                not self._is_mllm
+                or (
+                    self._text_model is not None
+                    and self._should_route_text_through_text_model(
+                        mllm_draft_requested=mllm_draft_requested
+                    )
+                )
             )
-            and not has_media_content(messages)
         ):
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
@@ -1302,9 +1261,9 @@ class SimpleEngine(BaseEngine):
         system_hash = None
         kv_cache_eligible = False
         # Snapshot reference captured at gate time so a concurrent MISS that
-        # mutates ``self._system_kv_cache`` between the gate and the restore
-        # (which runs later inside ``_run_blocking_serialized``) can't
-        # desynchronize the restored KV from the hash that decided HIT.
+        # reassigns ``self._system_kv_snapshot`` between the gate and the
+        # restore (which runs later inside ``_run_blocking_serialized``)
+        # can't desynchronize the restored KV from the hash that decided HIT.
         hit_snapshot: Any = None
 
         # Decode-control gate.
@@ -1471,16 +1430,19 @@ class SimpleEngine(BaseEngine):
                         suffix_tokens = full_tokens_list[system_token_count:]
                         kv_cache_eligible = True
                         # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the dict
-                        # lookup just returned. A later concurrent MISS that
-                        # mutates ``self._system_kv_cache`` before our
-                        # serialized worker restores it cannot alias what we
-                        # captured here — dict.get is atomic under the GIL
-                        # and returns a reference to an immutable tuple.
-                        candidate = self._system_kv_cache.get(system_hash)
-                        if candidate is not None and system_token_count == candidate[1]:
+                        # HIT, ``hit_snapshot`` is the exact list the hash
+                        # check just validated against. A later concurrent
+                        # MISS that reassigns ``self._system_kv_snapshot``
+                        # before our serialized worker restores it cannot
+                        # alias what we captured here.
+                        candidate_snapshot = self._system_kv_snapshot
+                        if (
+                            system_hash == self._system_kv_hash
+                            and candidate_snapshot is not None
+                            and system_token_count == self._system_kv_token_count
+                        ):
                             cache_hit = True
-                            hit_snapshot = candidate[0]
+                            hit_snapshot = candidate_snapshot
                             logger.info(
                                 "System KV cache HIT (stream_chat): reusing %d "
                                 "tokens, prefilling %d new (hash=%s)",
@@ -1528,17 +1490,12 @@ class SimpleEngine(BaseEngine):
                 if cache_hit:
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
-                    # gate, never from ``self._system_kv_cache`` directly:
-                    # a concurrent MISS could have evicted the entry between
-                    # the gate check and this point. Restore clones mutable
-                    # state containers so decode cannot mutate the saved LRU
-                    # snapshot by reference.
-                    self._restore_prompt_cache(bc, hit_snapshot)
-                    # Bump LRU position. Safe to mutate here because the
-                    # worker is serialized under ``_generation_lock``.
-                    if system_hash in self._system_kv_cache:
-                        self._system_kv_cache.move_to_end(system_hash)
-                    self._system_kv_cache_stats["hits"] += 1
+                    # gate, never from ``self._system_kv_snapshot`` directly:
+                    # a concurrent MISS could have replaced the instance
+                    # attribute with a snapshot for a different system prefix
+                    # between the gate check and this point.
+                    for i, saved_state in enumerate(hit_snapshot):
+                        bc[i].state = saved_state
                 else:
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
@@ -1559,28 +1516,11 @@ class SimpleEngine(BaseEngine):
                     # the KV state, not residual activations from prefill.
                     mx.clear_cache()
 
-                    snapshot = self._snapshot_prompt_cache(bc)
-                    self._eval_cache_snapshot(snapshot)
-                    self._system_kv_cache[system_hash] = (snapshot, system_token_count)
-                    self._system_kv_cache.move_to_end(system_hash)
-                    evicted_count = 0
-                    while len(self._system_kv_cache) > self._system_kv_capacity:
-                        evicted_hash, _ = self._system_kv_cache.popitem(last=False)
-                        self._system_kv_cache_stats["evictions"] += 1
-                        evicted_count += 1
-                        logger.info(
-                            "System KV cache EVICTED (stream_chat): hash=%s "
-                            "(capacity=%d)",
-                            evicted_hash,
-                            self._system_kv_capacity,
-                        )
-                    if evicted_count:
-                        # Eviction dropped MLX array refs; reclaim Metal heap.
-                        # Skip on the common non-eviction path to avoid
-                        # flushing the Metal allocator's reuse pool.
-                        mx.clear_cache()
-                    self._system_kv_cache_stats["misses"] += 1
-                    self._system_kv_cache_stats["stores"] += 1
+                    snapshot = [c.state for c in bc]
+                    mx.eval([s for pair in snapshot for s in pair])
+                    self._system_kv_snapshot = snapshot
+                    self._system_kv_hash = system_hash
+                    self._system_kv_token_count = system_token_count
                     try:
                         cache_mb = sum(c.nbytes for c in bc) / 1e6
                     except Exception:
@@ -1893,6 +1833,20 @@ class SimpleEngine(BaseEngine):
                 finish_reason="length",
             )
 
+    def _text_route_resources(self):
+        """Return (text_model, text_tokenizer) for the text-only generation path.
+
+        MLLM models build a parallel mlx_lm TextModel via ``build_text_model``
+        for fast text-only routing; LLM models load the mlx_lm model directly
+        as ``self._model.model``. Either way the caller wants the same shape:
+        an mlx_lm Model and its tokenizer.
+        """
+        if self._text_model is not None and self._text_tokenizer is not None:
+            return self._text_model, self._text_tokenizer
+        if self._model is not None:
+            return self._model.model, self._model.tokenizer
+        return None, None
+
     async def _stream_generate_text(
         self,
         messages: list[dict[str, Any]],
@@ -1919,6 +1873,14 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.models import cache as cache_module
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        # Resolve the text-only model + tokenizer (works for both MLLM
+        # text routing and LLM mode where self._model is the mlx_lm model).
+        text_model, text_tokenizer = self._text_route_resources()
+        if text_model is None or text_tokenizer is None:
+            raise RuntimeError(
+                "_stream_generate_text called without an available text model"
+            )
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -1950,14 +1912,17 @@ class SimpleEngine(BaseEngine):
         safe_messages = normalize_messages_for_chat_template(messages)
 
         try:
-            full_prompt = self._text_tokenizer.apply_chat_template(
+            # patch #4: use the route-resolved tokenizer (local text_tokenizer),
+            # not self._text_tokenizer — the latter is None in pure-LLM mode.
+            # Keep upstream's safe_messages normalization (#494 dangling-think fix).
+            full_prompt = text_tokenizer.apply_chat_template(
                 safe_messages, **template_kwargs
             )
         except TypeError:
             # Template doesn't accept tools= or enable_thinking=
             template_kwargs.pop("tools", None)
             template_kwargs.pop("enable_thinking", None)
-            full_prompt = self._text_tokenizer.apply_chat_template(
+            full_prompt = text_tokenizer.apply_chat_template(
                 safe_messages, **template_kwargs
             )
 
@@ -2001,7 +1966,7 @@ class SimpleEngine(BaseEngine):
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        if has_system and self._text_model is not None and not cache_blocking_controls:
+        if has_system and text_model is not None:
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
@@ -2019,7 +1984,7 @@ class SimpleEngine(BaseEngine):
                 ]
 
                 # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
+                tokenizer = text_tokenizer
                 add_special = tokenizer.bos_token is None or not full_prompt.startswith(
                     tokenizer.bos_token
                 )
@@ -2043,10 +2008,10 @@ class SimpleEngine(BaseEngine):
                     system_tokens = system_tokens_list
                     suffix_tokens = full_tokens_list[system_token_count:]
 
-                    hit_candidate = self._system_kv_cache.get(system_hash)
                     if (
-                        hit_candidate is not None
-                        and system_token_count == hit_candidate[1]
+                        system_hash == self._system_kv_hash
+                        and self._system_kv_snapshot is not None
+                        and system_token_count == self._system_kv_token_count
                     ):
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
@@ -2071,14 +2036,10 @@ class SimpleEngine(BaseEngine):
                         backbone_cache, prompt_to_send = (
                             await self._run_blocking_serialized(
                                 make_cache_with_snapshot,
-                                self._text_model,
-                                hit_candidate[0],
+                                text_model,
+                                self._system_kv_snapshot,
                             )
                         )
-                        # Bump LRU position now that we know we'll use it.
-                        if system_hash in self._system_kv_cache:
-                            self._system_kv_cache.move_to_end(system_hash)
-                        self._system_kv_cache_stats["hits"] += 1
                         cache_hit = True
 
                         logger.info(
@@ -2116,7 +2077,7 @@ class SimpleEngine(BaseEngine):
 
         # For specprefill, ensure we have token IDs (not just prompt text)
         if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
+            tokenizer = text_tokenizer
             add_special = tokenizer.bos_token is None or not full_prompt.startswith(
                 tokenizer.bos_token
             )
@@ -2179,7 +2140,7 @@ class SimpleEngine(BaseEngine):
                 cache_module.trim_prompt_cache(prompt_cache, 1)
                 return mx.array([last_tok], dtype=mx.uint32)
             return mx.array(
-                self._text_tokenizer.encode(getattr(last_resp, "text", "")),
+                text_tokenizer.encode(getattr(last_resp, "text", "")),
                 dtype=mx.uint32,
             )
 
@@ -2203,7 +2164,7 @@ class SimpleEngine(BaseEngine):
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             for resp in mlx_stream_generate(
                 model,
-                self._text_tokenizer,
+                text_tokenizer,
                 prompt=prompt,
                 **resume_kwargs,
             ):
@@ -2216,7 +2177,7 @@ class SimpleEngine(BaseEngine):
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
 
-            model = self._text_model
+            model = text_model
             can_retire_processors = _processors_can_retire(all_processors)
             use_mtp = (
                 self._mtp
@@ -2256,25 +2217,9 @@ class SimpleEngine(BaseEngine):
                 snapshot = self._snapshot_prompt_cache(mc)
                 self._eval_cache_snapshot(snapshot)
 
-                self._system_kv_cache[system_hash] = (snapshot, system_token_count)
-                self._system_kv_cache.move_to_end(system_hash)
-                evicted_count = 0
-                while len(self._system_kv_cache) > self._system_kv_capacity:
-                    evicted_hash, _ = self._system_kv_cache.popitem(last=False)
-                    self._system_kv_cache_stats["evictions"] += 1
-                    evicted_count += 1
-                    logger.info(
-                        "System KV cache EVICTED: hash=%s (capacity=%d)",
-                        evicted_hash,
-                        self._system_kv_capacity,
-                    )
-                if evicted_count:
-                    # Eviction dropped MLX array refs; reclaim Metal heap.
-                    # Skip on the common non-eviction path to avoid flushing
-                    # the Metal allocator's reuse pool.
-                    mx.clear_cache()
-                self._system_kv_cache_stats["misses"] += 1
-                self._system_kv_cache_stats["stores"] += 1
+                self._system_kv_snapshot = snapshot
+                self._system_kv_hash = system_hash
+                self._system_kv_token_count = system_token_count
 
                 backbone_cache = mc
                 prompt_to_send = mx.array(suffix_tokens)
@@ -2334,7 +2279,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -2368,7 +2313,7 @@ class SimpleEngine(BaseEngine):
             else:
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -2442,7 +2387,7 @@ class SimpleEngine(BaseEngine):
                 # Phase 4: Sample the first token from the prefilled logits, then
                 # continue through mlx_lm's normal decode path so MTP and request-
                 # local logits processors remain active after sparse prefill.
-                eos_id = self._text_tokenizer.eos_token_id
+                eos_id = text_tokenizer.eos_token_id
                 seed_tokens = (
                     mx.array(full_tokens_list, dtype=mx.uint32)
                     if full_tokens_list is not None
@@ -2463,7 +2408,7 @@ class SimpleEngine(BaseEngine):
                 tok_id = y.item()
                 generated_ids.append(tok_id)
 
-                decoded = self._text_tokenizer.decode(generated_ids)
+                decoded = text_tokenizer.decode(generated_ids)
                 new_text = decoded[len(prev_decoded) :]
                 prev_decoded = decoded
 
@@ -2508,7 +2453,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=continuation_prompt,
                     max_tokens=max_tokens - token_count,
                     sampler=sampler,
@@ -2690,36 +2635,18 @@ class SimpleEngine(BaseEngine):
                 "keep_pct": self._specprefill_keep_pct,
             }
 
-        # System KV cache stats (LRU over multiple system prefixes)
-        if self._system_kv_cache:
-            slots = []
-            total_bytes = 0
-            for slot_hash, (snapshot, tokens) in self._system_kv_cache.items():
-                slot_bytes = 0
-                for entry in snapshot:
-                    if isinstance(entry, tuple) and len(entry) == 2:
-                        slot_bytes += entry[0].nbytes + entry[1].nbytes
-                    elif isinstance(entry, list):
-                        slot_bytes += sum(a.nbytes for a in entry if a is not None)
-                total_bytes += slot_bytes
-                slots.append(
-                    {
-                        "hash": slot_hash,
-                        "tokens": tokens,
-                        "memory_mb": round(slot_bytes / 1e6, 1),
-                    }
-                )
-            counters = dict(self._system_kv_cache_stats)
-            denom = counters["hits"] + counters["misses"]
-            counters["hit_ratio"] = (
-                round(counters["hits"] / denom, 3) if denom > 0 else None
-            )
+        # System KV cache stats
+        if self._system_kv_snapshot is not None:
+            cache_bytes = 0
+            for entry in self._system_kv_snapshot:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    cache_bytes += entry[0].nbytes + entry[1].nbytes
+                elif isinstance(entry, list):
+                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
             stats["system_kv_cache"] = {
-                "capacity": self._system_kv_capacity,
-                "in_use": len(self._system_kv_cache),
-                "total_memory_mb": round(total_bytes / 1e6, 1),
-                "slots": slots,
-                "counters": counters,
+                "tokens": self._system_kv_token_count,
+                "hash": self._system_kv_hash,
+                "memory_mb": round(cache_bytes / 1e6, 1),
             }
 
         # Include Metal memory stats
@@ -2736,55 +2663,14 @@ class SimpleEngine(BaseEngine):
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        """Get cache statistics for the system-prompt KV LRU plus, when the
-        model is multimodal, the MLLM's own cache stats.
-        """
-        result: dict[str, Any] = {}
-        if self._supports_system_kv_cache:
-            counters = dict(self._system_kv_cache_stats)
-            denom = counters["hits"] + counters["misses"]
-            counters["hit_ratio"] = (
-                round(counters["hits"] / denom, 3) if denom > 0 else None
-            )
-            result["system_kv_cache"] = {
-                "capacity": self._system_kv_capacity,
-                "in_use": len(self._system_kv_cache),
-                "counters": counters,
-            }
+        """Get cache statistics (for MLLM models)."""
         if self._is_mllm and self._model is not None:
-            result["mllm_cache"] = self._model.get_cache_stats()
-        return result or None
+            return self._model.get_cache_stats()
+        return None
 
     def clear_runtime_caches(self) -> dict[str, Any] | None:
-        """Clear engine-managed runtime caches.
-
-        Includes the multi-slot system-prompt KV LRU — each retained snapshot
-        is multi-GB on the Metal heap, so DELETE /v1/cache must drop them or
-        the operator's reset is silently incomplete. Counters reset alongside
-        so /v1/cache/stats reflects the cleared state immediately.
-
-        OrderedDict ops are atomic under the GIL: a concurrent worker that has
-        already captured a tuple reference from .get() finishes safely against
-        its own copy; any new request after this call hits MISS and repopulates
-        from scratch. No need to acquire _generation_lock for the clear itself.
-        """
-        result: dict[str, Any] = {}
-
-        dropped = len(self._system_kv_cache)
-        if dropped or any(self._system_kv_cache_stats.values()):
-            self._system_kv_cache.clear()
-            for k in self._system_kv_cache_stats:
-                self._system_kv_cache_stats[k] = 0
-            try:
-                import mlx.core as mx
-
-                mx.clear_cache()
-            except Exception:
-                pass
-            result["system_kv_cache"] = {"dropped_entries": dropped}
-
+        """Clear engine-managed runtime caches."""
         if self._is_mllm and self._model is not None:
             self._model.clear_cache()
-            result["model_cache"] = True
-
-        return result or None
+            return {"model_cache": True}
+        return None
