@@ -399,13 +399,13 @@ class MetricsCollector:
 
         cache_type = "none"
         cache_stats = None
-        for candidate in ("memory_aware_cache", "paged_cache", "prefix_cache"):
+        for candidate in ("memory_aware_cache", "paged_cache", "prefix_cache", "system_kv_cache"):
             if candidate in stats:
                 cache_type = candidate
                 cache_stats = stats[candidate]
                 break
 
-        for candidate in ("none", "prefix_cache", "memory_aware_cache", "paged_cache"):
+        for candidate in ("none", "prefix_cache", "memory_aware_cache", "paged_cache", "system_kv_cache"):
             self._prom["cache_type"].labels(cache_type=candidate).set(
                 1 if cache_type == candidate else 0
             )
