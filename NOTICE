@@ -30,6 +30,10 @@ and upstreaming notes for each patch are in PATCHES.md.
   10. patch: status-system-kv            - /v1/status includes system_kv_cache
   11. patch: mx-compile                  - --compile flag wrapping mx.compile(shapeless=True)
                                            around the forward pass (ported from upstream PR #270)
+  12. patch: hybrid-probe-denylist       - SimpleEngine LLM-path snapshot probe: reject only
+                                           RotatingKVCache instead of allowlisting KVCache; lets
+                                           hybrid models (Qwen3.6-27B, Qwen3.5-27B, etc.) keep
+                                           the system-KV cache enabled
 
 Modifications are marked in source files with `EXTENDED_PREFIX_MARKER`
 comments where appropriate. The full change history is in `git log`.
