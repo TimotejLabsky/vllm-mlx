@@ -1814,6 +1814,33 @@ class SimpleEngine(BaseEngine):
                 finish_reason="length",
             )
 
+    def _is_system_kv_safe(self):
+        """Return True if the system-KV snapshot is enabled for this engine.
+
+        Reads ``VLLM_MLX_DISABLE_SYSTEM_KV`` env var once and caches the
+        result. Set the var to ``1``/``true``/``yes`` (typically per-model
+        in the llama-swap launch config) to disable the snapshot path on
+        models known to produce drifted/looping output on cache replay
+        (hybrid Qwen3.5/3.6/Qwen3-Next family — see mlx-lm#1162).
+        """
+        cached = getattr(self, "_system_kv_safe_cached", None)
+        if cached is not None:
+            return cached
+
+        import os
+
+        disabled = os.environ.get("VLLM_MLX_DISABLE_SYSTEM_KV", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if disabled:
+            logger.info(
+                "system-KV snapshot disabled by VLLM_MLX_DISABLE_SYSTEM_KV env var"
+            )
+        self._system_kv_safe_cached = not disabled
+        return self._system_kv_safe_cached
+
     def _text_route_resources(self):
         """Return (text_model, text_tokenizer) for the text-only generation path.
 
@@ -1993,6 +2020,7 @@ class SimpleEngine(BaseEngine):
                         system_hash == self._system_kv_hash
                         and self._system_kv_snapshot is not None
                         and system_token_count == self._system_kv_token_count
+                        and self._is_system_kv_safe()
                     ):
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
@@ -2198,9 +2226,10 @@ class SimpleEngine(BaseEngine):
                 snapshot = self._snapshot_prompt_cache(mc)
                 self._eval_cache_snapshot(snapshot)
 
-                self._system_kv_snapshot = snapshot
-                self._system_kv_hash = system_hash
-                self._system_kv_token_count = system_token_count
+                if self._is_system_kv_safe():
+                    self._system_kv_snapshot = snapshot
+                    self._system_kv_hash = system_hash
+                    self._system_kv_token_count = system_token_count
 
                 backbone_cache = mc
                 prompt_to_send = mx.array(suffix_tokens)
