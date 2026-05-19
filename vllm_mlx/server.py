@@ -4030,6 +4030,7 @@ def load_model(
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
     model_path: str | None = None,
+    compile: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -4203,8 +4204,11 @@ def load_model(
             specprefill_draft_model=specprefill_draft_model,
             model_path=model_path,
         )
-        # BatchedEngine will be started in lifespan (uvicorn's event loop)
-        # Just log for now
+        # BatchedEngine starts in lifespan (uvicorn's event loop).
+        # Flag so the deferred start() can apply_compile after the model
+        # weights load. See vllm_mlx/engine/batched.py.
+        if compile:
+            _engine._compile_on_start = True
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         simple_engine_cls = SimpleEngine
@@ -4247,6 +4251,22 @@ def load_model(
         try:
             asyncio.set_event_loop(loop)
             loop.run_until_complete(_engine.start())
+            if compile:
+                from .compile import apply_compile
+
+                inner_model = getattr(_engine, "_model", None) or getattr(
+                    _engine, "_text_model", None
+                )
+                if inner_model is not None:
+                    apply_compile(inner_model)
+                    logger.info(
+                        "Compile: forward pass compiled (simple mode)"
+                    )
+                else:
+                    logger.warning(
+                        "Compile requested but SimpleEngine exposed no model "
+                        "attribute; skipping mx.compile wrap"
+                    )
         finally:
             with suppress(Exception):
                 loop.run_until_complete(loop.shutdown_default_executor())
