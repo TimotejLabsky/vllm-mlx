@@ -279,25 +279,48 @@ class SimpleEngine(BaseEngine):
                 )
 
             # Probe whether this model's prompt cache is snapshot-safe for the
-            # stream_chat system-prefix cache branch. Sliding-window models
-            # (gemma3_text, olmo3, recurrent_gemma) return RotatingKVCache
-            # entries whose ``.state`` aliases in-place-mutated buffers.
-            # Only relevant for the LLM path; MLLM never enters the cache
-            # branch.
+            # stream_chat system-prefix cache branch. We use a denylist rather
+            # than an allowlist:
+            #
+            # - KVCache:        safe (tuple state, immutable on capture).
+            # - ArraysCache:    safe AFTER patch #6 (system-kv-hybrid-aliasing)
+            #                   shallow-copies the list at capture and restore.
+            #                   Used by hybrid attention layers (Gated DeltaNet
+            #                   in Qwen3.6, etc.) interleaved with KVCache.
+            # - RotatingKVCache: UNSAFE. Sliding-window models (gemma3_text,
+            #                    olmo3, recurrent_gemma) expose ``.state`` as
+            #                    an alias of in-place-mutated ring buffers,
+            #                    which the snapshot mechanism cannot capture
+            #                    without restore drift. Disable for these.
+            #
+            # Only relevant for the LLM path; MLLM gates via _is_system_kv_safe.
             if not self._is_mllm and self._model is not None:
                 try:
-                    from mlx_lm.models.cache import KVCache, make_prompt_cache
+                    from mlx_lm.models.cache import (
+                        RotatingKVCache,
+                        make_prompt_cache,
+                    )
 
                     probe_cache = make_prompt_cache(self._model.model)
-                    self._supports_system_kv_cache = bool(probe_cache) and all(
-                        isinstance(c, KVCache) for c in probe_cache
+                    has_rotating = any(
+                        isinstance(c, RotatingKVCache) for c in probe_cache
                     )
+                    self._supports_system_kv_cache = bool(probe_cache) and not has_rotating
                     if not self._supports_system_kv_cache:
                         cache_types = sorted({type(c).__name__ for c in probe_cache})
                         logger.info(
                             "System KV cache snapshot disabled: model returned "
-                            "non-KVCache entries (%s); stream_chat will use the "
-                            "uncached path",
+                            "RotatingKVCache entries (%s); stream_chat will use "
+                            "the uncached path. Set "
+                            "VLLM_MLX_DISABLE_SYSTEM_KV=1 to also bypass on "
+                            "models that pass the probe.",
+                            cache_types,
+                        )
+                    else:
+                        cache_types = sorted({type(c).__name__ for c in probe_cache})
+                        logger.info(
+                            "System KV cache snapshot enabled (probe cache "
+                            "types: %s)",
                             cache_types,
                         )
                 except Exception as e:
