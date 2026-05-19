@@ -15,7 +15,8 @@ This fork carries a series of local patches on top of upstream commit
 git commit on the `main` branch with the prefix `patch:`. The branch
 is periodically rebased on waybarrios/main to pick up upstream changes.
 
-Patch series (as of fork creation, 2026-05-19):
+Patch series (as of fork creation, 2026-05-19). Full rationale,
+measurements, and upstreaming notes for each patch are in PATCHES.md.
 
   1.  patch: bugfixes                    - load_model_with_fallback fix + model-name validation
   2.  patch: reasoning-effort            - OpenAI reasoning_effort field, maps "none" → no thinking
