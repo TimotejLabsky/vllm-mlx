@@ -613,7 +613,10 @@ class SimpleEngine(BaseEngine):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     finished=True,
-                    finish_reason=None,
+                    # Patched: was None — OpenAI streaming clients (AI SDK,
+                    # opencode) discard responses where the final chunk lacks
+                    # a non-null finish_reason. Natural EOS is "stop".
+                    finish_reason="stop",
                 )
 
     async def chat(
