@@ -188,7 +188,8 @@ class SimpleEngine(BaseEngine):
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
-        self._system_kv_token_count = 0  # Tokens in cached prefix
+        self._system_kv_token_count = 0
+        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens  # Tokens in cached prefix
         # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
         self._system_kv_hits = 0
         self._system_kv_misses = 0
@@ -400,6 +401,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
         self._system_kv_hits = 0
         self._system_kv_misses = 0
         self._system_kv_tokens_saved = 0
@@ -1730,14 +1732,30 @@ class SimpleEngine(BaseEngine):
                     system_tokens = system_tokens_list
                     suffix_tokens = full_tokens_list[system_token_count:]
 
+                    # EXTENDED_PREFIX_MARKER: prefix-match against the cached
+                    # extended token sequence. Hit when the new request's
+                    # full_tokens_list starts with our cached _system_kv_token_ids.
+                    _cached_ids = self._system_kv_token_ids
+                    _cached_len = self._system_kv_token_count
+                    _prefix_match = (
+                        _cached_ids is not None
+                        and _cached_len > 0
+                        and len(full_tokens_list) > _cached_len
+                        and full_tokens_list[:_cached_len] == _cached_ids
+                    )
+                    if _prefix_match:
+                        # Override system_tokens / system_token_count / suffix_tokens
+                        # so the downstream restore logic uses our cached length.
+                        system_tokens = _cached_ids
+                        system_token_count = _cached_len
+                        suffix_tokens = full_tokens_list[_cached_len:]
                     if (
-                        system_hash == self._system_kv_hash
+                        _prefix_match
                         and self._system_kv_snapshot is not None
-                        and system_token_count == self._system_kv_token_count
                         and self._is_system_kv_safe()
                     ):
                         self._system_kv_hits += 1
-                        self._system_kv_tokens_saved += system_token_count
+                        self._system_kv_tokens_saved += _cached_len
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
                             text_model,
@@ -1761,7 +1779,60 @@ class SimpleEngine(BaseEngine):
                                     else saved_state
                                 )
 
-                            prompt_to_send = mx.array(suffix_tokens)
+                            # EXTEND HIT cache: prefill any new content beyond the
+                            # cached prefix up to (but not including) the gen-prompt
+                            # marker, then re-snapshot. This is what makes the cache
+                            # grow as the conversation progresses.
+                            _grow_marker = "<|im_start|>assistant\n"
+                            _grow_idx = full_prompt.rfind(_grow_marker)
+                            _grow_new_extended = None
+                            if _grow_idx > 0:
+                                _grow_new_extended = tokenizer.encode(
+                                    full_prompt[:_grow_idx],
+                                    add_special_tokens=add_special,
+                                )
+                            if (
+                                _grow_new_extended is not None
+                                and len(_grow_new_extended) > self._system_kv_token_count
+                                and _grow_new_extended[: self._system_kv_token_count]
+                                == self._system_kv_token_ids
+                            ):
+                                _grow_delta = _grow_new_extended[
+                                    self._system_kv_token_count :
+                                ]
+                                if _grow_delta:
+                                    # EXTENDED_PREFIX_MARKER: chunk size 2048 +
+                                    # eval-only-at-end (mlx-lm pattern). Profiled
+                                    # 2026-05-19: this beats default 512+eval+clear
+                                    # by ~12% on Qwen3.5-4B (and similar on 27B).
+                                    _grow_arr = mx.array(_grow_delta)
+                                    _grow_step = max(self._prefill_step_size, 2048)
+                                    while _grow_arr.size > _grow_step:
+                                        text_model(
+                                            _grow_arr[:_grow_step][None],
+                                            cache=backbone_cache,
+                                        )
+                                        _grow_arr = _grow_arr[_grow_step:]
+                                    if _grow_arr.size > 0:
+                                        text_model(
+                                            _grow_arr[None], cache=backbone_cache
+                                        )
+                                    mx.eval([c.state for c in backbone_cache])
+                                    _grow_snapshot = [
+                                        list(c.state) if isinstance(c.state, list) else c.state
+                                        for c in backbone_cache
+                                    ]
+                                    mx.eval(
+                                        [s for pair in _grow_snapshot for s in pair]
+                                    )
+                                    self._system_kv_snapshot = _grow_snapshot
+                                    self._system_kv_token_count = len(_grow_new_extended)
+                                    self._system_kv_token_ids = list(_grow_new_extended)
+                            prompt_to_send = mx.array(
+                                full_tokens_list[len(_grow_new_extended) :]
+                                if _grow_new_extended
+                                else suffix_tokens
+                            )
                             return backbone_cache, prompt_to_send
 
                         backbone_cache, prompt_to_send = (
@@ -1928,18 +1999,33 @@ class SimpleEngine(BaseEngine):
                 and system_tokens is not None
                 and suffix_tokens is not None
             ):
+                # EXTENDED_PREFIX_MARKER: cache the prompt UP TO the last
+                # <|im_start|>assistant\n marker (the gen prompt). Everything
+                # before is stable across turns (system + history + last
+                # <|im_end|>). The gen prompt and any thinking tokens after
+                # don't appear at the same position in subsequent turns
+                # (the chat template renders prior assistant turns with
+                # content instead).
                 mc = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
-                sys_arr = mx.array(system_tokens)
+                _gen_marker = "<|im_start|>assistant\n"
+                _gen_idx = full_prompt.rfind(_gen_marker)
+                if _gen_idx > 0:
+                    _cache_text = full_prompt[:_gen_idx]
+                    _extended_token_ids = tokenizer.encode(
+                        _cache_text, add_special_tokens=add_special
+                    )
+                else:
+                    _extended_token_ids = list(system_tokens) + list(suffix_tokens[:-1])
+                _arr = mx.array(_extended_token_ids)
 
-                # Prefill system tokens in chunks (matching generate_step)
                 step = self._prefill_step_size
-                while sys_arr.size > step:
-                    model(sys_arr[:step][None], cache=mc)
+                while _arr.size > step:
+                    model(_arr[:step][None], cache=mc)
                     mx.eval([c.state for c in mc])
-                    sys_arr = sys_arr[step:]
+                    _arr = _arr[step:]
                     mx.clear_cache()
-                if sys_arr.size > 0:
-                    model(sys_arr[None], cache=mc)
+                if _arr.size > 0:
+                    model(_arr[None], cache=mc)
                     mx.eval([c.state for c in mc])
 
                 self._system_kv_misses += 1
@@ -1950,16 +2036,19 @@ class SimpleEngine(BaseEngine):
                 if self._is_system_kv_safe():
                     self._system_kv_snapshot = snapshot
                     self._system_kv_hash = system_hash
-                    self._system_kv_token_count = system_token_count
+                    self._system_kv_token_count = len(_extended_token_ids)
+                    # EXTENDED_PREFIX_MARKER: store cached token IDs for prefix matching
+                    self._system_kv_token_ids = list(_extended_token_ids)
 
                 backbone_cache = mc
-                prompt_to_send = mx.array(suffix_tokens)
+                # Gen-prompt tail (and anything after) is whatever wasn't cached.
+                prompt_to_send = mx.array(full_tokens_list[len(_extended_token_ids):])
                 logger.info(
-                    "System KV cache: stored %d-token snapshot (%.1f MB), "
-                    "prefilling %d remaining",
-                    system_token_count,
+                    "System KV cache: stored %d-token EXTENDED snapshot (%.1f MB); "
+                    "decode prompt = %d tokens (gen-prompt tail)",
+                    len(_extended_token_ids),
                     sum(c.nbytes for c in mc) / 1e6,
-                    len(suffix_tokens),
+                    len(full_tokens_list) - len(_extended_token_ids),
                 )
 
             # --- SpecPrefill path (with fallback to normal on failure) ---
