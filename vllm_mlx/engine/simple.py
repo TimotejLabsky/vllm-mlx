@@ -393,6 +393,10 @@ class SimpleEngine(BaseEngine):
             # Probe whether this model's prompt cache is snapshot-safe for the
             # stream_chat system-prefix cache branch. This is also refreshed
             # below for MLLM text routing after the parallel TextModel exists.
+            # Upstream's probe (#541 lineage) classifies KVCache + hybrid
+            # ArraysCache as safe and excludes sliding-window RotatingKVCache —
+            # functionally identical to our retired patch #12 denylist
+            # (RotatingKVCache is not a KVCache/ArraysCache subclass, verified).
             if not self._is_mllm and self._model is not None:
                 backing_model = getattr(self._model, "model", self._model)
                 self._supports_system_kv_cache = self._probe_system_kv_cache_support(
