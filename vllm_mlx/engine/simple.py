@@ -179,6 +179,10 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+        # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
+        self._system_kv_hits = 0
+        self._system_kv_misses = 0
+        self._system_kv_tokens_saved = 0
         # True only when the model's prompt cache is composed entirely of
         # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
         # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
@@ -383,6 +387,9 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._system_kv_hits = 0
+        self._system_kv_misses = 0
+        self._system_kv_tokens_saved = 0
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
@@ -1679,6 +1686,8 @@ class SimpleEngine(BaseEngine):
                         and system_token_count == self._system_kv_token_count
                         and self._is_system_kv_safe()
                     ):
+                        self._system_kv_hits += 1
+                        self._system_kv_tokens_saved += system_token_count
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
                             text_model,
@@ -1883,6 +1892,7 @@ class SimpleEngine(BaseEngine):
                     model(sys_arr[None], cache=mc)
                     mx.eval([c.state for c in mc])
 
+                self._system_kv_misses += 1
                 # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
                 snapshot = [list(c.state) if isinstance(c.state, list) else c.state for c in mc]
                 mx.eval([s for pair in snapshot for s in pair])
@@ -2252,18 +2262,31 @@ class SimpleEngine(BaseEngine):
                 "keep_pct": self._specprefill_keep_pct,
             }
 
-        # System KV cache stats
-        if self._system_kv_snapshot is not None:
+        # System KV cache stats — patched to emit Prometheus-compatible
+        # fields (hits/misses/tokens_saved/entry_count) so metrics.py
+        # maps them onto the vllm_mlx_cache_* gauges. Broadened gate so
+        # misses are reported even before a snapshot is stored.
+        if (
+            self._system_kv_snapshot is not None
+            or self._system_kv_hits
+            or self._system_kv_misses
+        ):
             cache_bytes = 0
-            for entry in self._system_kv_snapshot:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    cache_bytes += entry[0].nbytes + entry[1].nbytes
-                elif isinstance(entry, list):
-                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+            if self._system_kv_snapshot is not None:
+                for entry in self._system_kv_snapshot:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        cache_bytes += entry[0].nbytes + entry[1].nbytes
+                    elif isinstance(entry, list):
+                        cache_bytes += sum(a.nbytes for a in entry if a is not None)
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,
                 "memory_mb": round(cache_bytes / 1e6, 1),
+                "hits": self._system_kv_hits,
+                "misses": self._system_kv_misses,
+                "tokens_saved": self._system_kv_tokens_saved,
+                "entry_count": 1 if self._system_kv_snapshot is not None else 0,
+                "current_memory_mb": round(cache_bytes / 1e6, 1),
             }
 
         # Include Metal memory stats
