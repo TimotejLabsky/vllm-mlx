@@ -7,8 +7,11 @@
 > The `main` branch of this fork carries a series of local patches on
 > top of upstream `7e304840`. Each patch is a separate commit prefixed
 > `patch:`. The branch is periodically rebased on `waybarrios/main` to
-> pick up upstream changes. See [`NOTICE`](NOTICE) for the patch list
-> and Apache License 2.0 attribution.
+> pick up upstream changes.
+>
+> See [`PATCHES.md`](PATCHES.md) for the full patch list with rationale,
+> measurements, and upstreaming candidates.
+> See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
 >
 > Upstream is [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx)
 > — for general use you almost certainly want that, not this fork.
