@@ -391,6 +391,9 @@ def serve_command(args):
                 f"default_enabled={default_mllm_draft})"
             )
 
+    if getattr(args, "compile", False):
+        print("Compile: ENABLED (mx.compile with fused kernels)")
+
     if models_config:
         defaults = RegistryServeDefaults(
             continuous_batching=args.continuous_batching,
@@ -447,6 +450,7 @@ def serve_command(args):
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
+            compile=getattr(args, "compile", False),
         )
 
     # Start server
@@ -1421,6 +1425,15 @@ Examples:
         "--lazy-load-model",
         action="store_true",
         help="Register the main model at startup but defer loading until first request",
+    )
+    # Compile (mx.compile) — ported from upstream PR #270
+    serve_parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=False,
+        help="Compile model forward pass with mx.compile for fused Metal "
+        "kernels. May improve prefill 5-30%%, decode minimal "
+        "(memory-bandwidth-bound on Apple Silicon). Experimental.",
     )
     serve_parser.add_argument(
         "--max-audio-upload-mb",
