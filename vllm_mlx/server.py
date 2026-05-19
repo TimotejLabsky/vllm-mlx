@@ -1810,6 +1810,7 @@ def _coerce_tool_arguments(
 
 
 def _validate_model_name(request_model: str) -> None:
+    return  # Disabled: llama-swap handles routing, model names may not match
     """Validate that the request model name matches the served model."""
     if _model_manager is not None:
         if not _model_manager.has_model(request_model):
