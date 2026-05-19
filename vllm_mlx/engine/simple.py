@@ -681,10 +681,12 @@ class SimpleEngine(BaseEngine):
         if tools and not self._is_mllm:
             return await aggregate_stream_chat()
 
-        # Text-only requests on MLLM models should always aggregate the
-        # streaming path for non-streaming chat. This keeps one execution seam
-        # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
-        if self._is_mllm and not has_media_content(messages):
+        # Text-only requests (MLLM-text or pure LLM mode) aggregate the
+        # streaming path so they go through _stream_generate_text and reuse
+        # the system-prefix KV cache. MLLM-with-media falls through to
+        # mlx_vlm. LLM-mode resolves the text model via
+        # _text_route_resources() inside _stream_generate_text.
+        if not has_media_content(messages):
             return await aggregate_stream_chat()
 
         # Convert tools for template if provided
@@ -774,11 +776,14 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Per-request routing: text-only through mlx_lm TextModel
+        # Per-request routing: text-only goes through mlx_lm TextModel.
+        # MLLM mode: use the parallel TextModel built by build_text_model.
+        # LLM mode: use the mlx_lm model directly (resolved by
+        # _text_route_resources). Either way, _stream_generate_text reuses
+        # the system-prompt KV cache across requests.
         if (
-            self._is_mllm
-            and self._text_model is not None
-            and not has_media_content(messages)
+            not has_media_content(messages)
+            and (not self._is_mllm or self._text_model is not None)
         ):
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
@@ -1480,6 +1485,20 @@ class SimpleEngine(BaseEngine):
                 finish_reason="length",
             )
 
+    def _text_route_resources(self):
+        """Return (text_model, text_tokenizer) for the text-only generation path.
+
+        MLLM models build a parallel mlx_lm TextModel via ``build_text_model``
+        for fast text-only routing; LLM models load the mlx_lm model directly
+        as ``self._model.model``. Either way the caller wants the same shape:
+        an mlx_lm Model and its tokenizer.
+        """
+        if self._text_model is not None and self._text_tokenizer is not None:
+            return self._text_model, self._text_tokenizer
+        if self._model is not None:
+            return self._model.model, self._model.tokenizer
+        return None, None
+
     async def _stream_generate_text(
         self,
         messages: list[dict[str, Any]],
@@ -1506,6 +1525,14 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.models import cache as cache_module
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        # Resolve the text-only model + tokenizer (works for both MLLM
+        # text routing and LLM mode where self._model is the mlx_lm model).
+        text_model, text_tokenizer = self._text_route_resources()
+        if text_model is None or text_tokenizer is None:
+            raise RuntimeError(
+                "_stream_generate_text called without an available text model"
+            )
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -1536,14 +1563,14 @@ class SimpleEngine(BaseEngine):
             template_kwargs["tools"] = tools
 
         try:
-            full_prompt = self._text_tokenizer.apply_chat_template(
+            full_prompt = text_tokenizer.apply_chat_template(
                 messages, **template_kwargs
             )
         except TypeError:
             # Template doesn't accept tools= or enable_thinking=
             template_kwargs.pop("tools", None)
             template_kwargs.pop("enable_thinking", None)
-            full_prompt = self._text_tokenizer.apply_chat_template(
+            full_prompt = text_tokenizer.apply_chat_template(
                 messages, **template_kwargs
             )
 
@@ -1577,7 +1604,7 @@ class SimpleEngine(BaseEngine):
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        if has_system and self._text_model is not None:
+        if has_system and text_model is not None:
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
@@ -1595,7 +1622,7 @@ class SimpleEngine(BaseEngine):
                 ]
 
                 # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
+                tokenizer = text_tokenizer
                 add_special = tokenizer.bos_token is None or not full_prompt.startswith(
                     tokenizer.bos_token
                 )
@@ -1645,7 +1672,7 @@ class SimpleEngine(BaseEngine):
                         backbone_cache, prompt_to_send = (
                             await self._run_blocking_serialized(
                                 make_cache_with_snapshot,
-                                self._text_model,
+                                text_model,
                                 self._system_kv_snapshot,
                             )
                         )
@@ -1686,7 +1713,7 @@ class SimpleEngine(BaseEngine):
 
         # For specprefill, ensure we have token IDs (not just prompt text)
         if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
+            tokenizer = text_tokenizer
             add_special = tokenizer.bos_token is None or not full_prompt.startswith(
                 tokenizer.bos_token
             )
@@ -1749,7 +1776,7 @@ class SimpleEngine(BaseEngine):
                 cache_module.trim_prompt_cache(prompt_cache, 1)
                 return mx.array([last_tok], dtype=mx.uint32)
             return mx.array(
-                self._text_tokenizer.encode(getattr(last_resp, "text", "")),
+                text_tokenizer.encode(getattr(last_resp, "text", "")),
                 dtype=mx.uint32,
             )
 
@@ -1773,7 +1800,7 @@ class SimpleEngine(BaseEngine):
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             for resp in mlx_stream_generate(
                 model,
-                self._text_tokenizer,
+                text_tokenizer,
                 prompt=prompt,
                 **resume_kwargs,
             ):
@@ -1786,7 +1813,7 @@ class SimpleEngine(BaseEngine):
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
 
-            model = self._text_model
+            model = text_model
             can_retire_processors = _processors_can_retire(all_processors)
             use_mtp = (
                 self._mtp
@@ -1886,7 +1913,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -1920,7 +1947,7 @@ class SimpleEngine(BaseEngine):
             else:
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
@@ -1994,7 +2021,7 @@ class SimpleEngine(BaseEngine):
                 # Phase 4: Sample the first token from the prefilled logits, then
                 # continue through mlx_lm's normal decode path so MTP and request-
                 # local logits processors remain active after sparse prefill.
-                eos_id = self._text_tokenizer.eos_token_id
+                eos_id = text_tokenizer.eos_token_id
                 seed_tokens = (
                     mx.array(full_tokens_list, dtype=mx.uint32)
                     if full_tokens_list is not None
@@ -2015,7 +2042,7 @@ class SimpleEngine(BaseEngine):
                 tok_id = y.item()
                 generated_ids.append(tok_id)
 
-                decoded = self._text_tokenizer.decode(generated_ids)
+                decoded = text_tokenizer.decode(generated_ids)
                 new_text = decoded[len(prev_decoded) :]
                 prev_decoded = decoded
 
@@ -2060,7 +2087,7 @@ class SimpleEngine(BaseEngine):
                 retired = False
                 for resp in mlx_stream_generate(
                     model,
-                    self._text_tokenizer,
+                    text_tokenizer,
                     prompt=continuation_prompt,
                     max_tokens=max_tokens - token_count,
                     sampler=sampler,
