@@ -805,6 +805,14 @@ def _prepare_chat_completion_invocation(
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
 
+    # Map OpenAI reasoning_effort="none" → chat_template_kwargs.enable_thinking=False
+    # (HA Extended OpenAI Conversation sends reasoning_effort; top-level
+    # enable_thinking does not actually suppress <think> in 0.2.9.)
+    if request.reasoning_effort == "none":
+        ctk = chat_kwargs.get("chat_template_kwargs") or {}
+        ctk.setdefault("enable_thinking", False)
+        chat_kwargs["chat_template_kwargs"] = ctk
+
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
 
