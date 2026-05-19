@@ -1,0 +1,38 @@
+vllm-mlx (TimotejLabsky fork)
+==============================
+
+This is a fork of waybarrios/vllm-mlx maintained for the
+personal-infrastructure homelab at github.com/TimotejLabsky/personal-infratructure.
+
+Upstream:
+  https://github.com/waybarrios/vllm-mlx  (Apache License 2.0)
+
+Original vLLM inspiration:
+  https://github.com/vllm-project/vllm  (Apache License 2.0)
+
+This fork carries a series of local patches on top of upstream commit
+7e304840713c2abce8ea1fb40cb960a740c01ce2. Each patch is a separate
+git commit on the `main` branch with the prefix `patch:`. The branch
+is periodically rebased on waybarrios/main to pick up upstream changes.
+
+Patch series (as of fork creation, 2026-05-19):
+
+  1.  patch: bugfixes                    - load_model_with_fallback fix + model-name validation
+  2.  patch: reasoning-effort            - OpenAI reasoning_effort field, maps "none" → no thinking
+  3.  patch: stream-finish-reason        - finish_reason="stop" fallback for natural EOS
+  4.  patch: llm-mode-kv-cache           - LLM-mode routes through system-KV cache path
+  5.  patch: system-kv-hybrid-guard      - VLLM_MLX_DISABLE_SYSTEM_KV kill switch
+  6.  patch: system-kv-hybrid-aliasing   - shallow-copy snapshot lists (fixes hybrid drift)
+  7.  patch: system-kv-metrics           - wire system_kv_cache into Prometheus gauges
+  8.  patch: incoming-reasoning-content  - preserve reasoning_content on incoming messages
+  9.  patch: cache-extended-prefix       - extend cache to full conversation history + grow-on-HIT
+  10. patch: status-system-kv            - /v1/status includes system_kv_cache
+
+Modifications are marked in source files with `EXTENDED_PREFIX_MARKER`
+comments where appropriate. The full change history is in `git log`.
+
+Apache License 2.0 obligations met:
+  - Original LICENSE file preserved at root
+  - Modifications marked with inline comments where impactful
+  - This NOTICE file added per §4(d) for derivative works
+  - Original attribution to vLLM (in upstream README) preserved
