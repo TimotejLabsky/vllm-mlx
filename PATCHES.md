@@ -1,6 +1,6 @@
 # Local patches in this fork
 
-This fork carries 10 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries 11 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
 For Apache 2.0 attribution see [`NOTICE`](NOTICE). For the consumer side of these changes (how they're wired into the homelab) see [`TimotejLabsky/personal-infratructure`](https://github.com/TimotejLabsky/personal-infratructure) — particularly `mac-studio/README.md`, `mac-studio/llama-swap-config.yaml`, and the historical patch scripts in `mac-studio/patches/`.
 
@@ -160,6 +160,59 @@ Extends the system-KV cache to cover the FULL conversation history (not just the
 One-line fix: add `stats.get("system_kv_cache")` to the cache fallback chain in the `/v1/status` endpoint. Without this, models using the system-KV cache returned `cache: null` from `/v1/status`, and downstream Prometheus exporters (e.g., `mac-studio-llm-exporter`) couldn't populate cache-hit/miss/saved metrics.
 
 **Upstreaming:** trivial, clear bug. One-line PR.
+
+---
+
+## 11. `30198aa` + `2a27820` — `patch: mx-compile` (+ inner-model traversal fix)
+
+**Files:** `vllm_mlx/compile.py` (new), `vllm_mlx/cli.py`, `vllm_mlx/server.py`, `vllm_mlx/engine/batched.py`
+
+Adds the `--compile` flag wiring `mx.compile(shapeless=True)` around the model forward pass. Off by default. New `compile.py` module with `apply_compile()` and `is_compiled()`; the engines call it after weights load.
+
+**Ported from upstream [PR #270](https://github.com/waybarrios/vllm-mlx/pull/270) (jackneil)**, which is currently DIRTY against upstream main, so the diff was applied by hand. Skipped the docs/tests deltas since our deployment doesn't need them and they'd add churn against the next rebase.
+
+**Why bother:** fuses elementwise Metal kernels in the model forward pass, reducing kernel launch overhead. PR #270 reported +33 % prefill on Qwen3-8B-4bit, decode unchanged (decode is memory-bandwidth-bound on Apple Silicon, not kernel-launch-bound). Effect is per-model — bigger attention shapes may see less benefit.
+
+**Follow-up commit `2a27820`** fixes the inner-model traversal in the SimpleEngine path. The original wiring grabbed `_engine._model`, which on `SimpleEngine` is the `MLXMultimodalLM` / `MLXLanguageModel` *wrapper*, not the MLX `nn.Module`. `mx.compile` threw `'MLXMultimodalLM' object has no attribute '__call__'`; `apply_compile`'s try/except swallowed it and the server logged `compiled` when nothing was actually compiled. The fix walks down to `_engine._model.model`, falls through to bare `._model`, then `._text_model`, and re-checks `is_compiled()` so the success log only fires when the wrap took.
+
+**Verified on mac-studio with Qwen3.5-4B-4bit (2026-05-19):**
+
+- Boot with `--compile`: server starts, `Model forward pass compiled with mx.compile(shapeless=True)` log line confirms wrap.
+- 3 warm requests, 2347-token prompt, 32-token completion, T=0.0 deterministic:
+
+| Run | --compile off | --compile on |
+|-----|---------------|--------------|
+| 1   | 2.603 s       | 2.454 s |
+| 2   | 2.466 s       | 2.464 s |
+| 3   | 2.464 s       | 2.471 s |
+| avg | 2.51 s        | 2.46 s |
+
+Result on this workload: within noise. Expected — Qwen3.5-4B-4bit at 32 completion tokens is decode-dominated (~60 ms/tok × 32 ≈ 2 s of the 2.5 s total), so the prefill speedup is invisible. To see the published +33 % needs a prompt:completion ratio that's prefill-heavy (large prompt, short answer), and ideally a model where the attention kernel-launch overhead is a larger fraction of forward-pass time. Recommended next A/B: Qwen3.6-27B-4bit with a 16K-token prompt and 16-token completion.
+
+**How to use:** add `--compile` to a llama-swap entry's `cmd:`. Verify it engaged by grepping the model's stdout/log for `Model forward pass compiled with mx.compile(shapeless=True)`.
+
+**Upstreaming:** the underlying PR is the upstream candidate; our copy is just a port to keep us moving while #270 sits open. The `2a27820` inner-model traversal fix would also need to go upstream as part of the same PR (the original PR's wiring assumed `_engine._model` was already an `nn.Module`).
+
+---
+
+## Future work / prospects
+
+Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
+
+- **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV.** Replaces the single-slot snapshot (PR #523) with a 4-slot LRU keyed by system-prefix hash. Directly addresses the opencode main-agent / sub-agent thrash pattern. Touches the same code as our patch #9 (`cache-extended-prefix`) but is **incompatible by construction** — they take opposite design directions (LRU over many short prefixes vs. one grow-on-HIT slot with the full conversation). Adopting #541 cleanly would mean rewriting patch #9 to thread grow-on-HIT through the LRU values. Plan: rebase #541 in as a replacement for #9, port grow-on-HIT onto the LRU values, real-load test with two opencode agents alternating before keeping. Substantial — deferred until a session needs it.
+
+- **[PR #233](https://github.com/waybarrios/vllm-mlx/pull/233) — TurboQuant KV cache compression (4.6×).** Compresses prefix cache via PolarQuant (Hadamard rotation + Lloyd-Max codebook). Lets us cache more agent prefixes inside the same 64 GB envelope. Blocked on upstream MLX-LM PR #1067 landing. Big patch (~46K LOC across 100 files) — wait for upstream maturity.
+
+- **[PR #528](https://github.com/waybarrios/vllm-mlx/pull/528) — canonicalize volatile system headers.** Strips `x-anthropic-billing-header` (with rotating `cch=<hash>` tokens) from Chat Completions + Responses system prompts. Reported 13.7× TTFT improvement on Gemma 4 26B with 60K-token prompts when the client is Claude Code. **Open question:** does opencode (which talks OpenAI Chat Completions through LiteLLM) inject any volatile content into its system prompts? If yes, this gives us free cache hits we're missing today. Worth a one-session inspection of the actual on-wire prompt before adopting.
+
+- **[Issue #502](https://github.com/waybarrios/vllm-mlx/issues/502) — DFlash speculative decoding for Qwen 3.5 / 3.6.** External block-diffusion draft model + verification against the target. Different shape from native MTP. Not implemented yet upstream; if it lands as a distinct backend, evaluate against our 27B-4bit dense + 35B-A3B MoE workloads.
+
+- **[Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) — adaptive idle polling.** 1 kHz step loop when scheduler is empty is wasted CPU. Not throughput-relevant on a dedicated Mac Studio, but worth picking up if a clean PR lands.
+
+PRs evaluated and rejected for our workload:
+
+- **PR #424** (sampling defaults + short prefix-cache reuse fix) — touches `MemoryAwarePrefixCache` (BatchedEngine paged-cache path). We use SimpleEngine for the heavy models, so the fix doesn't bite us.
+- **PR #449** (O(1) tool lookup in MCPExecutor) — relevant only with many MCP tools registered. We currently expose a small set (`mcp-search` DuckDuckGo proxy); the O(N) scan is not measurable here.
 
 ---
 
