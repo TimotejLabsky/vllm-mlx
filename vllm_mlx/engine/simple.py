@@ -210,15 +210,36 @@ class SimpleEngine(BaseEngine):
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
 
-        # System prompt KV cache (reduces repeated prefill across requests)
+        # System prompt KV cache (reduces repeated prefill across requests).
+        #
+        # The "active" slot is held in these four ivars (legacy single-slot
+        # interface). On lookup, ``_lru_promote(system_hash)`` swaps in the
+        # matching slot from ``_system_kv_lru`` if one exists, so downstream
+        # code (which still reads the legacy ivars) sees the right snapshot.
+        # On store, ``_lru_demote_active_to_lru()`` pushes the about-to-be-
+        # replaced active slot into the LRU before the new one is written.
+        # Default capacity (active + LRU) is 4, tunable via
+        # VLLM_MLX_SYSTEM_KV_SLOTS=N. =1 restores the single-slot behavior
+        # from before this patch.
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0
-        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens  # Tokens in cached prefix
+        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        # Side-stash LRU for inactive slots, keyed by system_hash.
+        # value: {"snapshot": list, "token_count": int, "token_ids": list}
+        from collections import OrderedDict as _OrderedDict
+        self._system_kv_lru: "_OrderedDict[str, dict]" = _OrderedDict()
+        # Capacity is the TOTAL slot count (active + LRU bag).
+        # The LRU bag therefore holds capacity-1 entries at most.
+        import os as _os
+        self._system_kv_capacity = max(1, int(
+            _os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4")
+        ))
         # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
         self._system_kv_hits = 0
         self._system_kv_misses = 0
         self._system_kv_tokens_saved = 0
+        self._system_kv_evictions = 0
         # True only when the model's prompt cache is composed entirely of
         # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
         # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
@@ -450,6 +471,8 @@ class SimpleEngine(BaseEngine):
         self._system_kv_hash = None
         self._system_kv_token_count = 0
         self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        self._system_kv_lru.clear()
+        self._system_kv_evictions = 0
         self._system_kv_hits = 0
         self._system_kv_misses = 0
         self._system_kv_tokens_saved = 0
@@ -1329,6 +1352,10 @@ class SimpleEngine(BaseEngine):
                         system_tokens = system_tokens_list
                         suffix_tokens = full_tokens_list[system_token_count:]
                         kv_cache_eligible = True
+                        # LRU promote: bring the matching slot (if any) into
+                        # the active position so the legacy hash equality
+                        # check below sees the right snapshot.
+                        self._lru_promote(system_hash)
                         # Read the snapshot reference once. If we promote to
                         # HIT, ``hit_snapshot`` is the exact list the hash
                         # check just validated against. A later concurrent
@@ -1418,6 +1445,11 @@ class SimpleEngine(BaseEngine):
 
                     snapshot = [c.state for c in bc]
                     mx.eval([s for pair in snapshot for s in pair])
+                    # LRU: demote the about-to-be-replaced active slot
+                    # to the bag before overwriting (only if it holds a
+                    # different system_hash from the new MISS).
+                    if self._system_kv_hash and self._system_kv_hash != system_hash:
+                        self._lru_demote_active_to_bag()
                     self._system_kv_snapshot = snapshot
                     self._system_kv_hash = system_hash
                     self._system_kv_token_count = system_token_count
@@ -1729,6 +1761,85 @@ class SimpleEngine(BaseEngine):
                 finish_reason="length",
             )
 
+    def _lru_promote(self, system_hash):
+        """Try to promote a slot matching ``system_hash`` from the LRU bag
+        into the "active" position (the legacy single-slot ivars).
+
+        - If the active slot already matches: no-op, return True.
+        - If a matching slot is in the LRU bag: swap it with active.
+          The displaced active slot (if any) goes into the bag.
+        - If nothing matches: return False.
+
+        Must run inside ``_generation_lock`` so the swap is atomic with
+        downstream reads. Multi-slot capacity is bounded by
+        ``_system_kv_capacity`` (active + bag).
+        """
+        if system_hash is None:
+            return False
+        if self._system_kv_hash == system_hash and self._system_kv_snapshot is not None:
+            return True
+        entry = self._system_kv_lru.pop(system_hash, None)
+        if entry is None:
+            return False
+        # Demote current active to bag (if any) before promoting the match.
+        if self._system_kv_snapshot is not None and self._system_kv_hash is not None:
+            self._system_kv_lru[self._system_kv_hash] = {
+                "snapshot": self._system_kv_snapshot,
+                "token_count": self._system_kv_token_count,
+                "token_ids": self._system_kv_token_ids,
+            }
+            self._system_kv_lru.move_to_end(self._system_kv_hash)
+        self._system_kv_snapshot = entry["snapshot"]
+        self._system_kv_hash = system_hash
+        self._system_kv_token_count = entry["token_count"]
+        self._system_kv_token_ids = entry["token_ids"]
+        return True
+
+    def _lru_demote_active_to_bag(self):
+        """Move the current active slot (if any) into the LRU bag, then
+        clear active. Called before overwriting active with a new MISS.
+
+        Evicts oldest entry from the bag if (bag + 1) would exceed
+        ``_system_kv_capacity - 1`` (leaving room for the incoming new
+        active slot). Issues ``mx.clear_cache()`` only on the eviction
+        path so the Metal allocator's reuse pool isn't flushed on the
+        common case (PR #541 measurement).
+
+        Must run inside ``_generation_lock``.
+        """
+        if self._system_kv_snapshot is None or self._system_kv_hash is None:
+            return
+        self._system_kv_lru[self._system_kv_hash] = {
+            "snapshot": self._system_kv_snapshot,
+            "token_count": self._system_kv_token_count,
+            "token_ids": self._system_kv_token_ids,
+        }
+        self._system_kv_lru.move_to_end(self._system_kv_hash)
+        # Clear active so the caller's assignment is clean.
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
+        self._system_kv_token_ids = None
+        # Trim bag to capacity-1 (leaving one slot for the incoming active).
+        evicted = 0
+        max_bag = max(0, self._system_kv_capacity - 1)
+        while len(self._system_kv_lru) > max_bag:
+            ev_hash, _ = self._system_kv_lru.popitem(last=False)
+            self._system_kv_evictions += 1
+            evicted += 1
+            logger.info(
+                "System KV cache EVICTED: hash=%s (capacity=%d, bag=%d)",
+                ev_hash,
+                self._system_kv_capacity,
+                len(self._system_kv_lru),
+            )
+        if evicted:
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
+
     def _is_system_kv_safe(self):
         """Return True if the system-KV snapshot is enabled for this engine.
 
@@ -1920,6 +2031,13 @@ class SimpleEngine(BaseEngine):
                 if prefix_valid:
                     system_tokens = system_tokens_list
                     suffix_tokens = full_tokens_list[system_token_count:]
+
+                    # LRU promote: if the LRU bag holds a slot for this
+                    # system_hash, swap it into the active position so the
+                    # legacy single-slot ivars below see the right snapshot.
+                    # No-op when capacity=1 or the matching slot is already
+                    # active.
+                    self._lru_promote(system_hash)
 
                     # EXTENDED_PREFIX_MARKER: prefix-match against the cached
                     # extended token sequence. Hit when the new request's
@@ -2223,6 +2341,11 @@ class SimpleEngine(BaseEngine):
                 mx.eval([s for pair in snapshot for s in pair])
 
                 if self._is_system_kv_safe():
+                    # LRU: push the current active slot (if any, for a
+                    # different system_hash) into the bag before we
+                    # overwrite active. Evicts oldest bag entry if needed.
+                    if self._system_kv_hash and self._system_kv_hash != system_hash:
+                        self._lru_demote_active_to_bag()
                     self._system_kv_snapshot = snapshot
                     self._system_kv_hash = system_hash
                     self._system_kv_token_count = len(_extended_token_ids)
@@ -2648,27 +2771,64 @@ class SimpleEngine(BaseEngine):
         # fields (hits/misses/tokens_saved/entry_count) so metrics.py
         # maps them onto the vllm_mlx_cache_* gauges. Broadened gate so
         # misses are reported even before a snapshot is stored.
+        #
+        # Multi-slot LRU note: active slot + bag entries are summed for
+        # the aggregate fields (memory_mb, current_memory_mb,
+        # entry_count). Legacy single-slot fields (tokens, hash) still
+        # describe the ACTIVE slot for backward compat with the
+        # Prometheus exporter and existing dashboards.
+
+        def _entry_bytes(snap):
+            n = 0
+            if not snap:
+                return 0
+            for layer in snap:
+                if isinstance(layer, tuple) and len(layer) == 2:
+                    n += layer[0].nbytes + layer[1].nbytes
+                elif isinstance(layer, list):
+                    n += sum(a.nbytes for a in layer if a is not None)
+            return n
+
         if (
             self._system_kv_snapshot is not None
+            or self._system_kv_lru
             or self._system_kv_hits
             or self._system_kv_misses
         ):
-            cache_bytes = 0
+            active_bytes = _entry_bytes(self._system_kv_snapshot)
+            bag_bytes = sum(_entry_bytes(e["snapshot"]) for e in self._system_kv_lru.values())
+            total_bytes = active_bytes + bag_bytes
+            slot_count = (1 if self._system_kv_snapshot is not None else 0) + len(self._system_kv_lru)
+            slots_view = []
             if self._system_kv_snapshot is not None:
-                for entry in self._system_kv_snapshot:
-                    if isinstance(entry, tuple) and len(entry) == 2:
-                        cache_bytes += entry[0].nbytes + entry[1].nbytes
-                    elif isinstance(entry, list):
-                        cache_bytes += sum(a.nbytes for a in entry if a is not None)
+                slots_view.append({
+                    "hash": self._system_kv_hash,
+                    "tokens": self._system_kv_token_count,
+                    "memory_mb": round(active_bytes / 1e6, 1),
+                    "active": True,
+                })
+            for slot_hash, entry in self._system_kv_lru.items():
+                slots_view.append({
+                    "hash": slot_hash,
+                    "tokens": entry["token_count"],
+                    "memory_mb": round(_entry_bytes(entry["snapshot"]) / 1e6, 1),
+                    "active": False,
+                })
             stats["system_kv_cache"] = {
+                # Legacy single-slot fields (describe ACTIVE slot):
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,
-                "memory_mb": round(cache_bytes / 1e6, 1),
+                # Aggregate over active + bag (Prometheus exporter reads these):
+                "memory_mb": round(total_bytes / 1e6, 1),
+                "current_memory_mb": round(total_bytes / 1e6, 1),
+                "entry_count": slot_count,
                 "hits": self._system_kv_hits,
                 "misses": self._system_kv_misses,
                 "tokens_saved": self._system_kv_tokens_saved,
-                "entry_count": 1 if self._system_kv_snapshot is not None else 0,
-                "current_memory_mb": round(cache_bytes / 1e6, 1),
+                # New multi-slot fields:
+                "evictions": self._system_kv_evictions,
+                "capacity": self._system_kv_capacity,
+                "slots": slots_view,
             }
 
         # Include Metal memory stats
