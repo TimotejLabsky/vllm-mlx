@@ -366,15 +366,21 @@ MLLM_PATTERNS = [
 
 
 # Config.json keys that, when present, indicate a multimodal model.
+#
+# IMPORTANT: token-id reservations are NOT included here. Text-only DWQ
+# quantizations of multimodal-capable architectures (Qwen3.5-27B-4bit-DWQ,
+# Qwen3.6-35B-A3B-4bit-DWQ, etc.) keep the vocabulary tokens
+# (`image_token_id`, `video_token_id`, `audio_token_id`, etc.) in their
+# config.json even though the checkpoint contains no vision_tower weights.
+# Treating those reservations as "VLM" forces MLLM loading and crashes with
+# "Missing 393 parameters: vision_tower.blocks.0.*". The discriminating
+# signal is the presence of actual module configs (vision_config,
+# audio_config) or the named module (vision_tower, mm_vision_tower).
 _VLM_CONFIG_KEYS = (
     "vision_config",
     "audio_config",
     "vision_tower",
     "mm_vision_tower",
-    "image_token_id",
-    "image_token_index",
-    "audio_token_id",
-    "audio_token_index",
 )
 
 # Substrings (case-insensitive) inside `architectures` entries that identify VLMs.
