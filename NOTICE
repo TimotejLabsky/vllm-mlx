@@ -34,6 +34,9 @@ and upstreaming notes for each patch are in PATCHES.md.
                                            RotatingKVCache instead of allowlisting KVCache; lets
                                            hybrid models (Qwen3.6-27B, Qwen3.5-27B, etc.) keep
                                            the system-KV cache enabled
+  13. patch: system-kv-multi-slot-lru    - Multi-slot LRU side-stash for system-KV snapshots
+                                           (capacity 4 via env VLLM_MLX_SYSTEM_KV_SLOTS).
+                                           Targets opencode multi-agent parallel-task thrash.
 
 Modifications are marked in source files with `EXTENDED_PREFIX_MARKER`
 comments where appropriate. The full change history is in `git log`.
