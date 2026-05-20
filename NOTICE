@@ -37,6 +37,10 @@ and upstreaming notes for each patch are in PATCHES.md.
   13. patch: system-kv-multi-slot-lru    - Multi-slot LRU side-stash for system-KV snapshots
                                            (capacity 4 via env VLLM_MLX_SYSTEM_KV_SLOTS).
                                            Targets opencode multi-agent parallel-task thrash.
+  14. patch: mllm-detect-via-hf-cache    - is_mllm_model() resolves HF repo IDs via the local
+                                           HF cache so config.json is inspected for VLM markers.
+                                           Fixes Qwen3.5-27B-4bit-DWQ "Missing vision_tower"
+                                           crash on startup.
 
 Modifications are marked in source files with `EXTENDED_PREFIX_MARKER`
 comments where appropriate. The full change history is in `git log`.
