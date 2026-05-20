@@ -27,13 +27,44 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
 
     Args:
         vlm_model: The mlx_vlm-loaded model (has .language_model attribute)
-        model_path: Path to the model directory (contains config.json + safetensors)
+        model_path: Local directory OR HuggingFace repo ID. Repo IDs are
+            resolved via the local HF cache.
 
     Returns:
         mlx_lm TextModel with MTP support, or None on failure.
+
+    Bug history: the old code only handled local directory paths. When
+    called with an HF repo ID (what ``SimpleEngine.start()`` passes on
+    the MLLM text-routing setup), the directory check failed and this
+    returned None. The caller set ``_text_model = None``, which made
+    ``stream_chat`` routing fall back to the MLLM media path — which has
+    no system-KV snapshot cache. Result: text-only requests to a true
+    VLM (Qwen3.6-27B-4bit dense, etc.) paid full cold prefill on every
+    turn, with ``cache_hits=0`` and ``cache_misses=0`` because the cache
+    code path never executed. Fix resolves the repo ID via the HF cache
+    so the function actually finds ``config.json``.
     """
     if vlm_model is None:
         return None
+
+    # Resolve HF repo ID → local snapshot directory if needed.
+    if (
+        isinstance(model_path, str)
+        and "/" in model_path
+        and not Path(model_path).is_dir()
+    ):
+        try:
+            from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+            cached = try_to_load_from_cache(
+                repo_id=model_path, filename="config.json"
+            )
+            if isinstance(cached, str):
+                cdir = Path(cached).parent
+                if cdir.is_dir():
+                    model_path = cdir
+        except Exception:
+            pass
 
     model_path = Path(model_path) if model_path else None
     if model_path is None or not (model_path / "config.json").exists():
