@@ -392,6 +392,7 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             max_request_tokens=max_request_tokens,
             force_mllm=getattr(args, "mllm", False),
+            force_text_only=getattr(args, "text_only", False),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
             trust_remote_code=trust_remote_code,
@@ -1447,6 +1448,18 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help=(
+            "Force LLM (text-only) loader path even when config.json declares "
+            "a multimodal architecture AND the checkpoint ships vision/audio "
+            "weights. Use when an upstream upload has self-inconsistent "
+            "processor metadata that breaks AutoProcessor while the language "
+            "weights are sound; mlx_lm's strict=False fallback discards "
+            "vision_tower.* tensors and serves it as text-only."
+        ),
     )
     serve_parser.add_argument(
         "--trust-remote-code",

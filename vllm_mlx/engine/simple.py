@@ -131,6 +131,7 @@ class SimpleEngine(BaseEngine):
         trust_remote_code: bool = False,
         enable_cache: bool = True,
         force_mllm: bool = False,
+        force_text_only: bool = False,
         mtp: bool = False,
         mtp_num_draft_tokens: int = 1,
         prefill_step_size: int = 2048,
@@ -151,6 +152,14 @@ class SimpleEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
+            force_text_only: Force LLM (text-only) loader path even when
+                config.json declares a multimodal architecture AND the
+                checkpoint ships vision/audio weights. Use when an upstream
+                upload has self-inconsistent processor metadata that breaks
+                AutoProcessor while the underlying language_model.* weights
+                are sound; mlx_lm's strict=False fallback discards the
+                vision_tower.* tensors and serves it as a text-only model.
+                Mutually exclusive with force_mllm (force_text_only wins).
             mtp: Enable native MTP speculative decoding (model must have MTP head)
             mtp_num_draft_tokens: Draft tokens per speculative MTP step
             prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
@@ -167,7 +176,7 @@ class SimpleEngine(BaseEngine):
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = (force_mllm or is_mllm_model(model_name)) and not force_text_only
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
