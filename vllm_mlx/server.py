@@ -4634,6 +4634,40 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         _sanitize_log_text(last_user_preview, limit=300),
     )
 
+    # Diagnostic: dump message-shape signature for analyzing MoE tool
+    # cycling. Off by default; enable per-server via
+    # ``VLLM_MLX_DEBUG_MESSAGES=1`` (or numeric > 0). Truncates content
+    # bodies — only emits role + presence-of-reasoning_content + tool-call
+    # signature per message so we can tell if the client is round-tripping
+    # reasoning back to us across tool-using turns.
+    import os as _os  # noqa: PLC0415
+    if _os.environ.get("VLLM_MLX_DEBUG_MESSAGES", "0") not in ("", "0", "false", "False"):
+        try:
+            sig = []
+            for m in request.messages:
+                rc = getattr(m, "reasoning_content", None)
+                tc = getattr(m, "tool_calls", None) or []
+                tc_sig = []
+                for t in tc:
+                    fn = t.get("function", {}) if isinstance(t, dict) else getattr(t, "function", {})
+                    name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)) or ""
+                    args = (fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)) or ""
+                    tc_sig.append(f"{name}({str(args)[:80]}...)")
+                content_len = (
+                    len(m.content) if isinstance(m.content, str)
+                    else len(str(m.content)) if m.content is not None else 0
+                )
+                sig.append({
+                    "role": m.role,
+                    "content_len": content_len,
+                    "reasoning": "yes" if rc else "no",
+                    "reasoning_len": len(rc) if rc else 0,
+                    "tool_calls": tc_sig,
+                })
+            logger.info("[DEBUG_MESSAGES] %s", sig)
+        except Exception as e:
+            logger.warning("[DEBUG_MESSAGES] dump failed: %s", e)
+
     engine = await _acquire_default_engine_for_request(
         raw_request,
         total_timeout=total_timeout,
