@@ -1,6 +1,6 @@
 # Local patches in this fork
 
-This fork carries 13 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries 14 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
 For Apache 2.0 attribution see [`NOTICE`](NOTICE). For the consumer side of these changes (how they're wired into the homelab) see [`TimotejLabsky/personal-infratructure`](https://github.com/TimotejLabsky/personal-infratructure) — particularly `mac-studio/README.md`, `mac-studio/llama-swap-config.yaml`, and the historical patch scripts in `mac-studio/patches/`.
 
@@ -291,6 +291,27 @@ Memory cost: each slot ~430 MB on the 27B-4bit dense (4K-token prompt), ~340 MB 
 **Design doc:** [`DESIGN-system-kv-lru.md`](DESIGN-system-kv-lru.md).
 
 **Upstreaming candidate:** strong. PR #541 upstream attempts the same direction but starts from PR #523's single-slot system-prefix cache (no grow-on-HIT). This patch is the equivalent layered on patch #9. Open question whether upstream prefers the simpler per-system-prefix slot or our grow-on-HIT semantics — discussion needed.
+
+---
+
+## 14. `33df3be` — `patch: mllm-detect-via-hf-cache`
+
+**Files:** `vllm_mlx/api/utils.py`
+
+Fixes `Qwen3.5-27B-4bit-DWQ` (and any text-only Qwen3.5 variant) failing to load with `Missing 393 parameters: vision_tower.blocks.0.*` on every startup.
+
+**Root cause:** `_try_read_config_json()` only handled local directory paths. When `is_mllm_model()` was called with the HF repo ID (which is what llama-swap passes in the launch command), the function returned `None` unconditionally and `is_mllm_model()` fell through to the legacy `MLLM_PATTERNS` substring matcher. That matcher includes `"qwen3_5"` (added upstream by PR #520 for the actual multimodal Qwen3.5 variants), so DWQ — whose checkpoint contains only text-only weights — got classified as MLLM. The MLLM loader then crashed mid-init with the missing-vision-weights error and the process exited (`exit 1`), which llama-swap surfaced as `process exited but not StateStopping`. 16 historical occurrences of this in our llama-swap log.
+
+**Fix:** when the input looks like an HF repo ID (`owner/repo` form with a slash, not a local dir), resolve it via `huggingface_hub.try_to_load_from_cache(repo_id, filename="config.json")` so the actual config.json gets inspected. The DWQ's config has `architectures: ["Qwen3_5ForConditionalGeneration"]` but **no `vision_config` key** — so `_config_indicates_vlm()` correctly returns False, the MLLM loader is never attempted, and the text-only path loads cleanly.
+
+Defensively wrapped in try/except so the fork keeps working if `huggingface_hub` is missing, the cache is unreachable, or the model isn't yet downloaded — falls through to the existing legacy matcher in those cases.
+
+**Verified end-to-end (2026-05-20):**
+
+- Before: `Loading MLLM: ... → Failed to load MLLM: Missing 393 parameters ... → exit 1`
+- After: `Loading model: ... → Model loaded successfully → SimpleEngine loaded (MLLM=False) → Uvicorn running`. `/v1/status` responds normally, system-KV cache enabled with hybrid `[ArraysCache, KVCache]` types.
+
+**Upstreaming:** clean bug fix, PR-worthy. The root issue affects every text-only quantization of an originally-multimodal model (Qwen3.5, Qwen2-VL DWQ derivatives, etc.) — upstream would benefit too.
 
 ---
 
