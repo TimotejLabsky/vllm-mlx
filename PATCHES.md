@@ -1,6 +1,6 @@
 # Local patches in this fork
 
-This fork carries 12 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries 13 patches on top of [`waybarrios/vllm-mlx@7e30484`](https://github.com/waybarrios/vllm-mlx/commit/7e304840). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
 For Apache 2.0 attribution see [`NOTICE`](NOTICE). For the consumer side of these changes (how they're wired into the homelab) see [`TimotejLabsky/personal-infratructure`](https://github.com/TimotejLabsky/personal-infratructure) — particularly `mac-studio/README.md`, `mac-studio/llama-swap-config.yaml`, and the historical patch scripts in `mac-studio/patches/`.
 
@@ -244,11 +244,63 @@ Also added an explicit `snapshot enabled` log line on the success path so a futu
 
 ---
 
+## 13. `024f58b` — `patch: system-kv-multi-slot-lru`
+
+**Files:** `vllm_mlx/engine/simple.py`
+
+Extends patch #9 from a single active slot to N slots via a side-stash LRU. Capacity defaults to 4 (env var `VLLM_MLX_SYSTEM_KV_SLOTS=N` to tune; `=1` restores the single-slot behavior).
+
+**Design (minimal-invasion):**
+
+- Keep the legacy 4 single-slot ivars exactly as-is (`_system_kv_snapshot`, `_system_kv_hash`, `_system_kv_token_count`, `_system_kv_token_ids`). They describe the "active" slot.
+- Add `_system_kv_lru: OrderedDict[hash, dict]` as a side-stash for inactive slots (capacity-1 entries max).
+- Two helpers (always inside `_generation_lock`):
+  - **`_lru_promote(system_hash)`** — if a matching slot is in the bag, swap it with the active slot. Now the legacy hash-equality checks and grow-on-HIT logic at the existing call sites Just Work.
+  - **`_lru_demote_active_to_bag()`** — before overwriting active with a new MISS for a different hash, push the displaced active into the bag. Evicts oldest if (bag + 1) would exceed capacity-1.
+- `mx.clear_cache()` only fires on the eviction path (PR #541 optimization), not the common store path.
+
+**Touch points (3 in `stream_chat`, 3 in `_stream_generate_text`):**
+
+- After computing `system_hash` at lookup: call `_lru_promote`.
+- Before each MISS store (replacing active for a different hash): call `_lru_demote_active_to_bag`.
+- Grow-on-HIT does NOT demote — it extends the same active slot in place.
+
+**TOCTOU:** same gate-time reference-capture contract as patch #9. A concurrent MISS that evicts a slot whose snapshot ref is held in a closure can't corrupt the in-flight restore — Python refcount keeps the list alive even after dict removal.
+
+**Stats backward compat (`/v1/status`, Prometheus exporter):**
+
+- Legacy fields (`tokens`, `hash`) still describe the ACTIVE slot.
+- Aggregate fields (`memory_mb`, `current_memory_mb`, `entry_count`) sum over active + bag. `entry_count` is now 0..capacity (was 0/1) — documented semantic shift.
+- New fields: `evictions`, `capacity`, `slots: [{hash, tokens, memory_mb, active}, ...]`.
+
+**Validated 2026-05-20 overnight on Qwen3.6-27B-4bit dense, capacity=4:**
+
+| Phase | Pattern | Result | Time / req |
+|---|---|---|---|
+| 1 | 4 cold MISSes (distinct prefixes) | 4 MISSes | ~24.3 s each |
+| 2 | 3 rounds × 4 prefixes, identical query | **12 HITs, 0 MISSes** | **~0.77 s each** |
+| 3 | 5th distinct prefix (forces eviction) | 1 MISS, 1 eviction | ~24.4 s |
+| 4 | Re-request evicted prefix | 1 cold MISS | ~24.3 s |
+
+Total: 12 HITs / 6 MISSes / 2 evictions / 50,517 tokens saved. **~32× speedup on hits** (24.3 s → 0.77 s). Without the LRU the same sequence would be 18 MISSes — ~7 minutes of cold prefill instead of 12 HITs at ~9 seconds.
+
+**Targets the opencode multi-agent thrash** observed live the same day on the 35B-A3B MoE: 3 distinct `system_hash` values appeared in a single session as opencode dispatched parallel sub-agents, each switch evicting the previous → cold prefill every turn. With capacity=4 default all 3 coexist.
+
+Memory cost: each slot ~430 MB on the 27B-4bit dense (4K-token prompt), ~340 MB on the 35B-MoE. Four slots = ~1.7 GB / ~1.4 GB peak — well within Mac Studio's 64 GB envelope alongside the model weights.
+
+**Design doc:** [`DESIGN-system-kv-lru.md`](DESIGN-system-kv-lru.md).
+
+**Upstreaming candidate:** strong. PR #541 upstream attempts the same direction but starts from PR #523's single-slot system-prefix cache (no grow-on-HIT). This patch is the equivalent layered on patch #9. Open question whether upstream prefers the simpler per-system-prefix slot or our grow-on-HIT semantics — discussion needed.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
 
-- **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV.** Replaces the single-slot snapshot (PR #523) with a 4-slot LRU keyed by system-prefix hash. Directly addresses the opencode main-agent / sub-agent thrash pattern. Touches the same code as our patch #9 (`cache-extended-prefix`) but is **incompatible by construction** — they take opposite design directions (LRU over many short prefixes vs. one grow-on-HIT slot with the full conversation). Adopting #541 cleanly would mean rewriting patch #9 to thread grow-on-HIT through the LRU values. Plan: rebase #541 in as a replacement for #9, port grow-on-HIT onto the LRU values, real-load test with two opencode agents alternating before keeping. Substantial — deferred until a session needs it.
+- **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV.** Implemented locally as patch #13 (above) layered on patch #9's grow-on-HIT, rather than as a straight rebase of #541 (which would lose grow-on-HIT). Tracking the upstream PR for any review insights to fold back into our patch.
+
+- **SSD persistence for system-KV snapshot.** Existing `vllm_mlx/ssd_cache.py` (PR #309, merged upstream) ships a complete SSD tier with KVCache + ArraysCache serializers, SQLite index, async writer thread, atomic temp+rename writes. Currently wired only into BatchedEngine's `MemoryAwarePrefixCache`. Could be wired into our SimpleEngine system-KV path with ~270 LOC: spill on LRU bag eviction, promote on MISS lookup, optional warm-restart on engine start. Net: process restart (TTL / crash / llama-swap swap) survives — ~200 ms disk read vs ~25 s cold prefill = 100× speedup on cache-resume. Design notes in [`DESIGN-system-kv-ssd.md`](DESIGN-system-kv-ssd.md). Recommendation: ship patch #13 first, gather a week of opencode metrics, then evaluate whether SSD pays for itself (the heavy-group fix made OOM crashes rare, so process restarts are mostly TTL-driven — bumping the TTL from 10 min → 1 h already paid for most of the win).
 
 - **[PR #233](https://github.com/waybarrios/vllm-mlx/pull/233) — TurboQuant KV cache compression (4.6×).** Compresses prefix cache via PolarQuant (Hadamard rotation + Lloyd-Max codebook). Lets us cache more agent prefixes inside the same 64 GB envelope. Blocked on upstream MLX-LM PR #1067 landing. Big patch (~46K LOC across 100 files) — wait for upstream maturity.
 
