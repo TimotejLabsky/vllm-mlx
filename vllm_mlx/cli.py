@@ -245,7 +245,12 @@ def serve_command(args):
     # (rather than filename heuristics) before engine construction. This
     # reuses the download's own resolution, so a bare HF repo id gets an
     # authoritative check with no second network lookup.
-    from .api.utils import MllmRouteUndetermined, is_mllm_model, resolve_mllm_route
+    from .api.utils import (
+        MllmRoute,
+        MllmRouteUndetermined,
+        is_mllm_model,
+        resolve_mllm_route,
+    )
     from .utils.download import DownloadConfig, ensure_model_downloaded
 
     download_config = DownloadConfig(
@@ -266,11 +271,16 @@ def serve_command(args):
         )
         resolved_model_path = str(resolved) if resolved is not None else None
         try:
-            mllm_route = resolve_mllm_route(
-                model_arg,
-                resolved_model_path,
-                force_mllm=getattr(args, "mllm", False),
-            )
+            if getattr(args, "text_only", False):
+                # (#30) the operator already decided: no config.json probe,
+                # so an unreadable config cannot fail a text-only route.
+                mllm_route = MllmRoute(False, "--text-only")
+            else:
+                mllm_route = resolve_mllm_route(
+                    model_arg,
+                    resolved_model_path,
+                    force_mllm=getattr(args, "mllm", False),
+                )
         except MllmRouteUndetermined as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -458,9 +468,16 @@ def serve_command(args):
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             max_tokens=args.max_tokens,
             max_request_tokens=max_request_tokens,
+            # (#30) --text-only wins over upstream #780's config.json route:
+            # a checkpoint with vision_config still loads the LLM path.
             force_mllm=(
-                mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
+                False
+                if getattr(args, "text_only", False)
+                else (
+                    mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
+                )
             ),
+            force_text_only=getattr(args, "text_only", False),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
             trust_remote_code=trust_remote_code,
@@ -1563,6 +1580,18 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help=(
+            "Force LLM (text-only) loader path even when config.json declares "
+            "a multimodal architecture AND the checkpoint ships vision/audio "
+            "weights. Use when an upstream upload has self-inconsistent "
+            "processor metadata that breaks AutoProcessor while the language "
+            "weights are sound; mlx_lm's strict=False fallback discards "
+            "vision_tower.* tensors and serves it as text-only."
+        ),
     )
     serve_parser.add_argument(
         "--trust-remote-code",
