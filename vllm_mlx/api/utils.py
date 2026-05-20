@@ -493,6 +493,78 @@ def _config_indicates_vlm(config: dict) -> bool:
     return False
 
 
+def _checkpoint_has_vision_weights(name_or_path: str) -> bool:
+    """Return True iff the checkpoint's safetensors index references any
+    vision/audio tower weights.
+
+    Some model variants (DWQ quantizations of multimodal architectures —
+    Qwen3.5-DWQ, Qwen3.6-MoE-DWQ, etc.) keep the multimodal vocabulary
+    markers in config.json (`vision_config`, `image_token_id`, etc.) but
+    only ship the text-only weights. Loading them as MLLM crashes with
+    "Missing 393 parameters: vision_tower.*". This check distinguishes
+    "config claims VLM" from "checkpoint actually has the weights".
+
+    Returns True (assume MLLM) when the index cannot be read or the
+    checkpoint format is unfamiliar — safer fallback. Only returns False
+    when we positively confirm a safetensors index exists AND it lacks
+    any vision/audio tower keys.
+
+    Heuristic: looks for any weight name containing "vision_tower",
+    "vision_model", "mm_vision", "audio_tower", or "audio_model".
+    """
+    # Resolve to local snapshot dir (handles HF repo IDs + local paths).
+    candidate_dir: Path | None = None
+    try:
+        p = Path(name_or_path)
+        if p.is_dir():
+            candidate_dir = p
+    except (TypeError, ValueError):
+        pass
+
+    if candidate_dir is None and isinstance(name_or_path, str) and "/" in name_or_path:
+        try:
+            from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+            cached = try_to_load_from_cache(
+                repo_id=name_or_path, filename="config.json"
+            )
+            if isinstance(cached, str):
+                cdir = Path(cached).parent
+                if cdir.is_dir():
+                    candidate_dir = cdir
+        except Exception:
+            candidate_dir = None
+
+    if candidate_dir is None:
+        return True  # cannot verify, assume yes
+
+    index_path = candidate_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            with index_path.open("r", encoding="utf-8") as f:
+                idx = json.load(f)
+            weight_map = idx.get("weight_map") or {}
+            if not isinstance(weight_map, dict):
+                return True
+            for key in weight_map:
+                lk = key.lower() if isinstance(key, str) else ""
+                if (
+                    "vision_tower" in lk
+                    or "vision_model" in lk
+                    or "mm_vision" in lk
+                    or "audio_tower" in lk
+                    or "audio_model" in lk
+                ):
+                    return True
+            return False  # confirmed: index has no vision/audio weights
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return True
+
+    # Single safetensors file (not sharded). Don't open it to inspect
+    # keys — that would mmap potentially many GB. Trust the config.
+    return True
+
+
 def _check_legacy_string_patterns(model_name: str) -> bool:
     """Validation 1: substring match of MLLM_PATTERNS against the input string.
 
@@ -529,7 +601,18 @@ def is_mllm_model(model_name: str) -> bool:
     """
     config = _try_read_config_json(model_name)
     if config is not None:
-        return _config_indicates_vlm(config)
+        if not _config_indicates_vlm(config):
+            return False
+        # Config says VLM, but verify the checkpoint actually ships
+        # vision/audio weights. Without this guard, DWQ text-only quants
+        # of multimodal architectures (which keep vision_config in their
+        # config.json for vocabulary continuity but omit vision_tower
+        # weights) get loaded as MLLM and the loader crashes with
+        # "Missing 393 parameters: vision_tower.*", OR — for text-only
+        # workloads on a real VLM — the text-routing path may not
+        # engage the system-KV cache the way LLM-direct does. Treat
+        # weights-absent as LLM-only.
+        return _checkpoint_has_vision_weights(model_name)
     return _check_legacy_string_patterns(model_name)
 
 
