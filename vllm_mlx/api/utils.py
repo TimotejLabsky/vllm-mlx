@@ -406,21 +406,55 @@ _MAX_CONFIG_JSON_BYTES = 1 * 1024 * 1024
 
 
 def _try_read_config_json(name_or_path: str) -> dict | None:
-    """Read config.json from a local model directory.
+    """Read config.json from a local model directory OR HF cache.
 
-    Returns None when the input is not a local directory, the directory has
-    no config.json, the file is too large, or it cannot be parsed.
+    For local directory inputs, reads ``<dir>/config.json`` directly. For
+    HuggingFace repo IDs (e.g. ``mlx-community/Qwen3.5-27B-4bit-DWQ``),
+    consults the local HF cache via ``try_to_load_from_cache`` so we can
+    inspect the downloaded config without hitting the network.
+
+    Returns None when the file is unavailable, too large, or unparseable.
+
+    Bug history: the old version only handled local dirs, which meant
+    HF repo IDs always fell through to the legacy substring matcher.
+    The matcher's ``qwen3_5`` pattern over-fires on text-only DWQ
+    variants whose architecture is ``Qwen3_5ForConditionalGeneration``
+    but whose checkpoints do NOT contain the vision_tower weights. With
+    this fix, ``_config_indicates_vlm`` runs on the actual config.json
+    (which has no ``vision_config``), correctly returns False, and the
+    MLLM loader is never even attempted.
     """
+    config_path: Path | None = None
+
     try:
         candidate = Path(name_or_path)
     except (TypeError, ValueError):
-        return None
+        candidate = None
 
-    if not candidate.is_dir():
-        return None
+    if candidate is not None and candidate.is_dir():
+        config_path = candidate / "config.json"
+        if not config_path.is_file():
+            config_path = None
 
-    config_path = candidate / "config.json"
-    if not config_path.is_file():
+    # HF repo-id fallback: ``owner/repo`` form is not a local directory,
+    # but the config may already be in the HuggingFace cache.
+    if config_path is None and isinstance(name_or_path, str) and "/" in name_or_path:
+        try:
+            from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+            cached = try_to_load_from_cache(
+                repo_id=name_or_path, filename="config.json"
+            )
+            if isinstance(cached, str):
+                cp = Path(cached)
+                if cp.is_file():
+                    config_path = cp
+        except Exception:
+            # huggingface_hub missing, network forbidden, or repo
+            # not in cache yet — fall through to legacy matcher.
+            config_path = None
+
+    if config_path is None:
         return None
 
     try:
