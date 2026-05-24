@@ -11,7 +11,7 @@ Original vLLM inspiration:
   https://github.com/vllm-project/vllm  (Apache License 2.0)
 
 This fork carries a series of local patches on top of upstream commit
-7e304840713c2abce8ea1fb40cb960a740c01ce2. Each patch is a separate
+9c83c84f78143811d997802dcfc6649eb491eb7a (v0.4.0rc1). Each patch is a separate
 git commit on the `main` branch with the prefix `patch:`. The branch
 is periodically rebased on waybarrios/main to pick up upstream changes.
 
