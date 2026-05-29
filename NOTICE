@@ -11,11 +11,12 @@ Original vLLM inspiration:
   https://github.com/vllm-project/vllm  (Apache License 2.0)
 
 This fork carries a series of local patches on top of upstream commit
-9c83c84f78143811d997802dcfc6649eb491eb7a (v0.4.0rc1). Each patch is a separate
+395b13c3a4a59b367de3d91fbe7e235477d60e49 (post-v0.4.0rc1 main, 2026-05-29;
+rebased from the previous pin 9c83c84f). Each patch is a separate
 git commit on the `main` branch with the prefix `patch:`. The branch
 is periodically rebased on waybarrios/main to pick up upstream changes.
 
-Patch series (last updated 2026-05-19). Full rationale, measurements,
+Patch series (last updated 2026-05-29). Full rationale, measurements,
 and upstreaming notes for each patch are in PATCHES.md.
 
   1.  patch: bugfixes                    - load_model_with_fallback fix + model-name validation
