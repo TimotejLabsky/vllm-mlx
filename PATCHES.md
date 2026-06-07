@@ -338,13 +338,40 @@ Ports [upstream PR #540](https://github.com/waybarrios/vllm-mlx/pull/540) (open,
 
 ---
 
+## 16. `patch: system-kv-ssd-persistence` — SSD-backed system-KV snapshot (survive restart)
+
+**Files:** `vllm_mlx/system_kv_ssd.py` (new), `vllm_mlx/engine/simple.py`, `tests/test_system_kv_ssd.py` (new)
+
+The SimpleEngine system-KV snapshot (#4/#6/#9/#12/#13) lives only in the serving process: TTL eviction, llama-swap model swap, manual restart, or OOM throws away every warm slot, and the next request pays a full cold prefill (~25 s on a 4 K-token dense prompt, ~70 s on a 13 K-token MoE workload). We bumped `Qwen3.6-27B-4bit`'s `ttl` 600→3600 purely to paper over this. This patch persists snapshots to NVMe so the next process **promotes** a stored prefix (~100 ms–1.5 s disk read) instead of recomputing it.
+
+**Opt-in, off by default.** Enabled per-model via `VLLM_MLX_SSD_SYSTEM_KV_DIR=<base>` (+ optional `VLLM_MLX_SSD_SYSTEM_KV_GB`, default 50). Gated on the same `_supports_system_kv_cache` probe as the in-RAM cache, so RotatingKVCache (sliding-window) models never persist.
+
+**Why a dedicated store, not `ssd_cache.SSDCacheTier` (PR #309) as the DESIGN-doc assumed:** the existing tier serializes via numpy (`np.array(layer.keys)`), which **raises** on MLX `bfloat16` (`Item size 2 ... does not match dtype B item size 1` — verified on the box). Our snapshots are unquantized bf16 KV interleaved with possibly-f32 recurrent `ArraysCache` state, so a numpy/float32 bridge can't round-trip them losslessly either. `system_kv_ssd.SystemKVSSDStore` uses **MLX-native safetensors** (`mx.save_safetensors`/`mx.load`) for dtype-exact data while **reusing the tier's tested `SSDIndex`** (SQLite, prefix-searchable) for metadata.
+
+**How it works (all inside the serialized generation worker, so the LRU/demote contract holds):**
+- *Promote (read):* at the top of the `_stream_generate_text` MISS block, before the cold prefill, `lookup_prefix(extended_tokens)` finds the longest stored entry whose tokens are a **prefix** of the request (`num_tokens <= len`), restores it whole into a fresh `make_prompt_cache`, and prefills only the delta forward. Prefix-only ⇒ **never a trim** ⇒ hybrid-safe (recurrent state restored at a boundary, exactly like the in-RAM path).
+- *Spill (write-through):* on a fresh MISS store, `enqueue_spill` writes the new prefix asynchronously (background writer thread). One write per distinct system prefix at creation; the grow path does **not** re-spill (a restart promotes the stored prefix and re-grows cheaply). Write-through (not eviction-triggered, as the DESIGN doc proposed) so the resident working set survives a SIGKILL from llama-swap, not just graceful eviction.
+- *Lifecycle:* store built in `start()`, drained + closed in `stop()`. Capacity-bounded LRU eviction on disk.
+
+**Verified (2026-06-07, Mac Studio):** `tests/test_system_kv_ssd.py` — **bit-identical round-trip** of a hybrid snapshot (bf16 KV tuples + f32 recurrent `ArraysCache` lists) through disk; prefix-lookup semantics (superset query hits, shorter query never matches); async-writer round-trip; capacity eviction; corrupt-entry quarantine + de-index. All pass. Both modules `py_compile` clean.
+
+**End-to-end A/B verified (2026-06-07, Mac Studio, real `Qwen3.6-27B-4bit`, out-of-band on :8123, MLLM-text-routed):** 3,718-token prompt.
+- **Cold prefill (first request): 36–39 s.** Spills a 397 MB snapshot to disk asynchronously.
+- **Kill serve (simulate restart) → relaunch → same prompt: 1.28–1.51 s** — `[system_kv_ssd] promoted ... (397 MB, 63 ms)` disk read, `restored 3711 tokens, prefilling 0 delta`. **~26–28× faster than cold.**
+- **Correctness:** promoted output is **byte-identical** to cold at T=0 (`sha=483607cd…` matched); subsequent in-RAM HIT (0.70 s) confirms the promoted slot grows normally.
+- Bugfix found during the A/B: the store must gate on `_is_system_kv_safe()`, **not** `_supports_system_kv_cache` — the latter is only set on the non-MLLM probe path, but Qwen3.6-27B loads `MLLM=True` and routes text through the LLM path, so gating on it skipped SSD init entirely.
+
+**Upstreaming:** strong candidate — fixes the bf16 gap the BatchedEngine SSD tier also latently has, and brings persistence to the pure-LLM path. The bf16 numpy-serializer crash is worth a standalone upstream bug report regardless.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
 
 - **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV. MERGED upstream (commit `1656c15`), now in our base as of the 2026-05-29 rebase.** Its `simple.py` changes are superseded by our patch #13 (rejected during the rebase — see the rebase note at the top of this file). #541's version starts from PR #523's single-slot cache with no grow-on-HIT, and re-introduces the allowlist probe that gates off hybrid ArraysCache models (which our patch #12 denylist fixes). Our #13 is a strict superset, so we keep ours. If upstream's structure later diverges in a way worth adopting, reconciliation would mean re-layering grow-on-HIT (#9) + denylist probe (#12) + longest-prefix-match (#9) on top of upstream's OrderedDict — non-trivial; defer until there's a concrete upstream improvement to fold in.
 
-- **SSD persistence for system-KV snapshot.** Existing `vllm_mlx/ssd_cache.py` (PR #309, merged upstream) ships a complete SSD tier with KVCache + ArraysCache serializers, SQLite index, async writer thread, atomic temp+rename writes. Currently wired only into BatchedEngine's `MemoryAwarePrefixCache`. Could be wired into our SimpleEngine system-KV path with ~270 LOC: spill on LRU bag eviction, promote on MISS lookup, optional warm-restart on engine start. Net: process restart (TTL / crash / llama-swap swap) survives — ~200 ms disk read vs ~25 s cold prefill = 100× speedup on cache-resume. Design notes in [`DESIGN-system-kv-ssd.md`](DESIGN-system-kv-ssd.md). Recommendation: ship patch #13 first, gather a week of opencode metrics, then evaluate whether SSD pays for itself (the heavy-group fix made OOM crashes rare, so process restarts are mostly TTL-driven — bumping the TTL from 10 min → 1 h already paid for most of the win).
+- **SSD persistence for system-KV snapshot — IMPLEMENTED as patch #16** (see above). Design notes in [`DESIGN-system-kv-ssd.md`](DESIGN-system-kv-ssd.md); note the implementation diverges from the doc on two points the build surfaced: (1) MLX-native safetensors instead of the numpy `ssd_cache` serializers (they crash on bf16), and (2) write-through-on-store instead of spill-on-eviction (survives SIGKILL). Remaining: end-to-end real-model A/B in an idle window, then a week of metrics before considering whether to drop the `ttl` 3600 workaround.
 
 - **[PR #233](https://github.com/waybarrios/vllm-mlx/pull/233) — TurboQuant KV cache compression (4.6×).** Compresses prefix cache via PolarQuant (Hadamard rotation + Lloyd-Max codebook). Lets us cache more agent prefixes inside the same 64 GB envelope. Blocked on upstream MLX-LM PR #1067 landing. Big patch (~46K LOC across 100 files) — wait for upstream maturity.
 
