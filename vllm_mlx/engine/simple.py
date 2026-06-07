@@ -289,6 +289,13 @@ class SimpleEngine(BaseEngine):
         # aliases buffers ``update_and_fetch`` mutates in place — snapshot
         # restore would silently desynchronize. Probed once in ``start()``.
         self._supports_system_kv_cache: bool = False
+        # SSD persistence for the system-KV snapshot (patch #16). Off unless
+        # VLLM_MLX_SSD_SYSTEM_KV_DIR is set; constructed in start() once the
+        # snapshot-safety probe has run (shares its gate). Lets a stored
+        # system prefix survive process restart / TTL eviction / model swap:
+        # promote (~100 ms-1.5 s disk read) instead of a 25-70 s cold prefill.
+        self._ssd_store = None  # SystemKVSSDStore | None
+        self._ssd_promotes = 0
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
@@ -455,6 +462,49 @@ class SimpleEngine(BaseEngine):
                     "stream_chat",
                 )
 
+            # Patch #16: SSD persistence for the system-KV snapshot. Opt-in via
+            # VLLM_MLX_SSD_SYSTEM_KV_DIR. Gated on _is_system_kv_safe() — the
+            # SAME gate the _stream_generate_text spill/promote sites use — so
+            # the store is built whenever that path can cache (covers both
+            # non-MLLM models and MLLM models whose text route uses the LLM
+            # path, e.g. Qwen3.6-27B which loads MLLM=True). Not gated on the
+            # _supports_system_kv_cache probe: that only runs for non-MLLM and
+            # only gates the separate stream_chat (MLLM+media) cache branch.
+            import os as _os
+
+            ssd_base = _os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_DIR")
+            if ssd_base and self._is_system_kv_safe():
+                try:
+                    import re as _re
+
+                    from ..system_kv_ssd import (
+                        SystemKVSSDConfig,
+                        SystemKVSSDStore,
+                    )
+
+                    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", self._model_name)
+                    max_gb = float(
+                        _os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_GB", "50")
+                    )
+                    self._ssd_store = SystemKVSSDStore(
+                        SystemKVSSDConfig(
+                            cache_dir=_os.path.join(ssd_base, safe),
+                            max_size_gb=max_gb,
+                        )
+                    )
+                    self._ssd_store.start_writer()
+                    logger.info(
+                        "System KV SSD persistence ENABLED: %s (cap %.0f GB)",
+                        _os.path.join(ssd_base, safe),
+                        max_gb,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "System KV SSD persistence init failed (%s); disabled",
+                        e,
+                    )
+                    self._ssd_store = None
+
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
@@ -561,6 +611,12 @@ class SimpleEngine(BaseEngine):
         self._system_kv_misses = 0
         self._system_kv_tokens_saved = 0
         self._supports_system_kv_cache = False
+        if self._ssd_store is not None:
+            try:
+                self._ssd_store.close()
+            except Exception:
+                logger.debug("System KV SSD store close failed", exc_info=True)
+            self._ssd_store = None
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -2548,7 +2604,57 @@ class SimpleEngine(BaseEngine):
                     )
                 else:
                     _extended_token_ids = list(system_tokens) + list(suffix_tokens[:-1])
-                _arr = mx.array(_extended_token_ids)
+
+                # Patch #16: before the (expensive) cold prefill, try to promote
+                # a persisted prefix from SSD. lookup_prefix only returns an
+                # entry whose tokens are a PREFIX of _extended_token_ids
+                # (num_tokens <= query len), so we restore the stored state
+                # whole at that boundary and prefill FORWARD from there — never
+                # a trim. That is hybrid-safe: recurrent ArraysCache state is
+                # restored intact, exactly like the in-RAM snapshot path. The
+                # disk read runs here, inside the serialized generation worker
+                # (already off the event loop).
+                _prefill_start = 0
+                _promoted = False
+                if self._ssd_store is not None and self._is_system_kv_safe():
+                    try:
+                        _ext_key = tuple(_extended_token_ids)
+                        _ssd_meta = self._ssd_store.lookup_prefix(_ext_key)
+                        if (
+                            _ssd_meta is not None
+                            and 0 < _ssd_meta["num_tokens"] <= len(_extended_token_ids)
+                        ):
+                            _ptoks = _ext_key[: _ssd_meta["num_tokens"]]
+                            _ssd_snap = self._ssd_store.read_entry(
+                                _ptoks, _ssd_meta["file_path"]
+                            )
+                            if _ssd_snap is not None and len(_ssd_snap) == len(mc):
+                                for _i, _st in enumerate(_ssd_snap):
+                                    mc[_i].state = (
+                                        list(_st) if isinstance(_st, list) else _st
+                                    )
+                                _prefill_start = _ssd_meta["num_tokens"]
+                                _promoted = True
+                                self._ssd_promotes += 1
+                                logger.info(
+                                    "System KV SSD PROMOTE: restored %d tokens "
+                                    "from disk, prefilling %d delta (hash=%s)",
+                                    _prefill_start,
+                                    len(_extended_token_ids) - _prefill_start,
+                                    system_hash,
+                                )
+                    except Exception as _ssd_e:
+                        logger.warning(
+                            "System KV SSD promote failed (%s); cold prefill",
+                            _ssd_e,
+                        )
+                        _prefill_start = 0
+                        _promoted = False
+                        mc = make_prompt_cache(
+                            model, max_kv_size=self._max_kv_size or None
+                        )
+
+                _arr = mx.array(_extended_token_ids[_prefill_start:])
 
                 step = self._prefill_step_size
                 while _arr.size > step:
@@ -2578,6 +2684,14 @@ class SimpleEngine(BaseEngine):
                     self._system_kv_token_count = len(_extended_token_ids)
                     # EXTENDED_PREFIX_MARKER: store cached token IDs for prefix matching
                     self._system_kv_token_ids = list(_extended_token_ids)
+                    # Patch #16: write-through to SSD when freshly computed (not
+                    # promoted from disk). One async write per distinct system
+                    # prefix at creation; the grow path does NOT re-spill — a
+                    # restart promotes the stored prefix and re-grows cheaply.
+                    if self._ssd_store is not None and not _promoted:
+                        self._ssd_store.enqueue_spill(
+                            tuple(_extended_token_ids), snapshot
+                        )
 
                 backbone_cache = mc
                 # Gen-prompt tail (and anything after) is whatever wasn't cached.
@@ -3064,6 +3178,14 @@ class SimpleEngine(BaseEngine):
                 "capacity": self._system_kv_capacity,
                 "slots": slots_view,
             }
+            # Patch #16: SSD persistence tier (present only when enabled).
+            if self._ssd_store is not None:
+                try:
+                    ssd_stats = self._ssd_store.get_stats()
+                    ssd_stats["promotes"] = self._ssd_promotes
+                    stats["system_kv_cache"]["ssd"] = ssd_stats
+                except Exception:
+                    pass
 
         # Include Metal memory stats
         try:
