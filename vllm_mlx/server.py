@@ -1069,11 +1069,27 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
         status_code=503,
-        detail={
-            "error": exc.code,
-            "message": str(exc),
-        },
+        detail={"error": exc.code, "message": str(exc)},
     ) from exc
+
+
+def _probe_engine_busy(engine, tracker, request_id: str) -> None:
+    """Pre-admission probe for streaming routes.
+
+    Streaming responses send 200 OK headers before the engine generator runs,
+    so an EngineBusy raised mid-stream can't become a clean 503. This probes
+    the engine's serialized-route admission *before* the StreamingResponse is
+    built. No-op unless the engine exposes ``raise_if_serialized_busy`` and is
+    in fail_fast admission mode.
+    """
+    probe = getattr(engine, "raise_if_serialized_busy", None)
+    if probe is None:
+        return
+    try:
+        probe(request_id)
+    except EngineBusy as exc:
+        tracker.finish(result="busy")
+        _raise_engine_busy(exc)
 
 
 @dataclass
@@ -5131,6 +5147,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     try:
         if request.stream:
+            _probe_engine_busy(engine, tracker, "stream-completion")
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
@@ -5379,6 +5396,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
+            # Fork patch #15: pre-stream 503 admission probe. Upstream's
+            # _build_chat_streaming_response does not probe, so the fork
+            # semantic is re-bound in front of upstream's helper rather than
+            # replacing it — the helper also collects constrained
+            # (json_object/json_schema) streams, which we want.
+            _probe_engine_busy(engine, tracker, "stream-chat")
             response, release_on_exit = await _build_chat_streaming_response(
                 engine,
                 prepared.messages,
@@ -5790,6 +5813,7 @@ async def create_anthropic_message(
 
     try:
         if anthropic_request.stream:
+            _probe_engine_busy(engine, tracker, "stream-anthropic")
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
@@ -5829,6 +5853,9 @@ async def create_anthropic_message(
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
