@@ -35,6 +35,7 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
+    EngineBusy,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
@@ -220,19 +221,37 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
-        self._generation_lock_admission = (
-            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
+
+        # Admission control for the serialized MLX route (upstream PR #540).
+        #
+        # Upstream defaults this to "fail_fast": a second request that arrives
+        # while the lock is held is rejected immediately with EngineBusy →
+        # HTTP 503, rather than queueing behind the (120s-bounded) lock. We
+        # default to "wait" instead, because OpenCode and similar agents fire a
+        # title + main request *simultaneously* (see the stream_chat note in
+        # _stream_chat_impl) and the serialize-and-queue path handles that
+        # correctly — fail_fast-by-default would 503 one of every such pair.
+        # Operators that see request pileup under heavy concurrent traffic can
+        # opt into load shedding with
+        # ``VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=fail_fast``.
+        admission = (
+            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "wait")
             .strip()
             .lower()
         )
-        if self._generation_lock_admission not in {"fail_fast", "wait"}:
+        if admission not in {"fail_fast", "wait"}:
             logger.warning(
-                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
-                self._generation_lock_admission,
+                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using wait",
+                admission,
             )
-            self._generation_lock_admission = "fail_fast"
+            admission = "wait"
+        self._generation_lock_admission = admission
         self._generation_waiters = 0
         self._generation_busy_rejections = 0
+        # Best-effort record of whoever currently holds the serialized lock,
+        # used only to annotate EngineBusy errors. Set on acquire, cleared on
+        # release.
+        self._generation_lock_holder: dict[str, Any] | None = None
 
         # System prompt KV cache (reduces repeated prefill across requests).
         #
@@ -550,14 +569,86 @@ class SimpleEngine(BaseEngine):
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
-    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
+    def _generation_lock_holder_summary(self) -> str:
+        """One-line description of the current serialized-lock holder."""
+        holder = self._generation_lock_holder
+        if not holder:
+            return "none"
+        started_at = holder.get("started_at")
+        elapsed_s = round(time.time() - started_at, 1) if started_at else "unknown"
+        return (
+            f"{holder.get('request_id', 'unknown')}:"
+            f"{holder.get('kind', 'unknown')}:"
+            f"elapsed_s={elapsed_s}"
+        )
+
+    def _reject_if_busy(self, request_id: str) -> None:
+        """Raise EngineBusy when fail_fast admission is on and the lock is held."""
+        if (
+            self._generation_lock_admission == "fail_fast"
+            and self._generation_lock.locked()
+        ):
+            self._generation_busy_rejections += 1
+            raise EngineBusy(
+                "SimpleEngine serialized route is busy; "
+                f"request_id={request_id}; "
+                f"active={self._generation_lock_holder_summary()}; "
+                f"waiters={self._generation_waiters}; "
+                "retry later"
+            )
+
+    def raise_if_serialized_busy(self, request_id: str = "stream") -> None:
+        """Pre-admission probe for streaming routes.
+
+        Streaming handlers return a ``StreamingResponse`` and only begin
+        consuming the engine generator after the 200 OK headers are sent, so an
+        EngineBusy raised mid-generator cannot become a clean 503. Calling this
+        before constructing the response lets fail_fast reject streaming
+        requests with a proper 503 too. No-op in the default "wait" mode.
+        """
+        self._reject_if_busy(request_id)
+
+    @asynccontextmanager
+    async def _acquire_generation_slot(self, request_id: str, kind: str):
+        """Admission-controlled acquisition of the serialized MLX lock.
+
+        In "fail_fast" mode a request that arrives while the lock is held is
+        rejected immediately with EngineBusy. In "wait" mode (default) this is
+        equivalent to ``async with self._generation_lock`` and preserves the
+        legacy serialize-and-queue behavior.
+        """
+        self._reject_if_busy(request_id)
+
+        self._generation_waiters += 1
+        acquired = False
+        try:
+            async with self._generation_lock:
+                acquired = True
+                self._generation_waiters -= 1
+                self._generation_lock_holder = {
+                    "request_id": request_id,
+                    "kind": kind,
+                    "started_at": time.time(),
+                }
+                try:
+                    yield
+                finally:
+                    self._generation_lock_holder = None
+        finally:
+            if not acquired and self._generation_waiters > 0:
+                self._generation_waiters -= 1
+
+    async def _run_blocking_serialized(
+        self, func, /, *args, request_id: str | None = None, on_cancel=None, **kwargs
+    ):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
         finishes, or a follow-up request can enter MLX/Metal concurrently and
         corrupt the command-buffer state.
         """
-        async with self._generation_lock:
+        request_id = request_id or f"simple-{id(func):x}"
+        async with self._acquire_generation_slot(request_id, "blocking_serialized"):
 
             def run_bound():
                 _bind_worker_generation_streams()
@@ -840,7 +931,9 @@ class SimpleEngine(BaseEngine):
                             yield output
                     return
 
-        async with self._generation_lock:
+        async with self._acquire_generation_slot(
+            f"stream-{id(prompt):x}", "stream_generate"
+        ):
             # Non-stream chat runs in a worker thread and rebinds generation
             # streams there. Rebind again on the current thread before
             # stream_generate so nonstream->stream mode switches remain valid.
@@ -1166,7 +1259,9 @@ class SimpleEngine(BaseEngine):
             if self._text_model is None and not has_media_content(messages):
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
+                async with self._acquire_generation_slot(
+                    f"mllm-{id(messages):x}", "mllm_stream_chat"
+                ):
                     _bind_worker_generation_streams()
                     for chunk in self._model.stream_chat(
                         messages=messages,
@@ -2851,7 +2946,7 @@ class SimpleEngine(BaseEngine):
             "loaded": self._loaded,
             "running": self._loaded,
             "num_running": self._num_running,
-            "num_waiting": 0,
+            "num_waiting": self._generation_waiters,
             "num_requests_processed": self._total_requests_processed,
             "total_prompt_tokens": self._total_prompt_tokens,
             "total_completion_tokens": self._total_completion_tokens,
@@ -2860,6 +2955,13 @@ class SimpleEngine(BaseEngine):
                 "prompt_tps": 0.0,
             },
             "requests": requests_snapshot,
+            "generation_lock": {
+                "locked": self._generation_lock.locked(),
+                "admission": self._generation_lock_admission,
+                "waiters": self._generation_waiters,
+                "busy_rejections": self._generation_busy_rejections,
+                "holder": self._generation_lock_holder_summary(),
+            },
         }
 
         # MLLM prefix cache stats, remapped to the shape BatchedEngine emits

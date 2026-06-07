@@ -317,6 +317,27 @@ Defensively wrapped in try/except so the fork keeps working if `huggingface_hub`
 
 ---
 
+## 15. `patch: simpleengine-busy-admission` — serialized-route admission control (port of upstream PR #540)
+
+**Files:** `vllm_mlx/engine/base.py`, `vllm_mlx/engine/simple.py`, `vllm_mlx/server.py`
+
+Ports [upstream PR #540](https://github.com/waybarrios/vllm-mlx/pull/540) (open, branch `604/simpleengine-admission-telemetry`, closes #495): adds admission control to `SimpleEngine`'s serialized MLX `_generation_lock` so a second concurrent request can fail fast with `EngineBusy` → retryable **HTTP 503** (`error=text_generation_busy`) instead of piling up behind the 120 s-bounded lock under heavy agent traffic.
+
+**What it adds:**
+- `EngineBusy(RuntimeError)` (code `text_generation_busy`) in `engine/base.py`.
+- An `_acquire_generation_slot(request_id, kind)` async context manager that replaces all **three** of our `async with self._generation_lock:` entry points (`_run_blocking_serialized`, `_stream_generate_impl`, and the MLLM text-only `stream_chat` fallback — upstream only had the first two; the MLLM-text site is our fork's addition from patch #4). Tracks `_generation_waiters`, `_generation_busy_rejections`, and a best-effort `_generation_lock_holder` summary surfaced in `get_stats()["generation_lock"]` and `num_waiting`.
+- Server-side: `EngineBusy` → 503 translation on the non-stream `/v1/completions`, `/v1/chat/completions`, and `/v1/messages` (Anthropic) paths, plus a pre-stream `raise_if_serialized_busy()` probe so `fail_fast` can also reject **streaming** requests with a clean 503 before the SSE headers are sent (upstream #540 only covered non-stream).
+
+**Two deliberate divergences from upstream:**
+1. **Default `wait`, not `fail_fast`.** Upstream defaults to `fail_fast`. We default to `wait` (legacy serialize-and-queue, **zero behavior change**) because OpenCode and similar agents fire a *title + main* request simultaneously (see the note at `_stream_chat_impl`), and the queue path handles that correctly — `fail_fast`-by-default would 503 one of every such pair. Opt into load shedding per-deployment with `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=fail_fast`.
+2. **Fixed an upstream bug.** Upstream's `__init__` reads the env var, validates it, then unconditionally re-assigns `self._generation_lock_admission = "fail_fast"` — silently ignoring `wait` and the env entirely. Our port respects the configured value and only falls back to the default on an invalid string.
+
+**Verified (2026-06-02, standalone algorithm replica — full engine import needs the Mac Studio venv):** `fail_fast` rejects the 2nd concurrent acquire with the right code + holder annotation and increments `busy_rejections`; waiter accounting returns to 0; holder clears on release; `wait` mode serializes 3 concurrent requests with no rejection. All three edited modules byte-compile.
+
+**Upstreaming:** already upstream as an open PR; the `wait` default + env-respect fix are the parts worth contributing back as review feedback on #540.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
