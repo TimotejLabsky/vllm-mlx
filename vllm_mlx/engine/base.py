@@ -37,6 +37,17 @@ class GenerationOutput:
     mtp_accepted: int = 0
 
 
+class EngineBusy(RuntimeError):
+    """Raised when a serialized engine route is already serving a request.
+
+    The server translates this into a retryable HTTP 503 with
+    ``error=text_generation_busy`` so callers can back off and retry instead
+    of piling up behind the serialized MLX generation lock.
+    """
+
+    code = "text_generation_busy"
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""

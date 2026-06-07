@@ -162,7 +162,7 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import suspend_cancellation
+from .engine.base import EngineBusy, suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -979,6 +979,33 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+def _raise_engine_busy(exc: EngineBusy) -> None:
+    """Translate serialized-engine admission failures into retryable HTTP 503."""
+    raise HTTPException(
+        status_code=503,
+        detail={"error": exc.code, "message": str(exc)},
+    ) from exc
+
+
+def _probe_engine_busy(engine, tracker, request_id: str) -> None:
+    """Pre-admission probe for streaming routes.
+
+    Streaming responses send 200 OK headers before the engine generator runs,
+    so an EngineBusy raised mid-stream can't become a clean 503. This probes
+    the engine's serialized-route admission *before* the StreamingResponse is
+    built. No-op unless the engine exposes ``raise_if_serialized_busy`` and is
+    in fail_fast admission mode.
+    """
+    probe = getattr(engine, "raise_if_serialized_busy", None)
+    if probe is None:
+        return
+    try:
+        probe(request_id)
+    except EngineBusy as exc:
+        tracker.finish(result="busy")
+        _raise_engine_busy(exc)
 
 
 @dataclass
@@ -4623,6 +4650,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     try:
         if request.stream:
+            _probe_engine_busy(engine, tracker, "stream-completion")
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
@@ -4681,6 +4709,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
+            except EngineBusy as exc:
+                tracker.finish(result="busy")
+                _raise_engine_busy(exc)
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -4860,6 +4891,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
+            _probe_engine_busy(engine, tracker, "stream-chat")
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
@@ -4893,6 +4925,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -5275,6 +5310,7 @@ async def create_anthropic_message(
 
     try:
         if anthropic_request.stream:
+            _probe_engine_busy(engine, tracker, "stream-anthropic")
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
             )
@@ -5314,6 +5350,9 @@ async def create_anthropic_message(
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
