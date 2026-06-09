@@ -42,6 +42,7 @@ from .base import (
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import bind_generation_streams
+from ..system_kv import SystemKVManager
 
 logger = logging.getLogger(__name__)
 
@@ -264,49 +265,13 @@ class SimpleEngine(BaseEngine):
         # release.
         self._generation_lock_holder: dict[str, Any] | None = None
 
-        # System prompt KV cache (reduces repeated prefill across requests).
-        #
-        # The "active" slot is held in these four ivars (legacy single-slot
-        # interface). On lookup, ``_lru_promote(system_hash)`` swaps in the
-        # matching slot from ``_system_kv_lru`` if one exists, so downstream
-        # code (which still reads the legacy ivars) sees the right snapshot.
-        # On store, ``_lru_demote_active_to_lru()`` pushes the about-to-be-
-        # replaced active slot into the LRU before the new one is written.
-        # Default capacity (active + LRU) is 4, tunable via
-        # VLLM_MLX_SYSTEM_KV_SLOTS=N. =1 restores the single-slot behavior
-        # from before this patch.
-        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
-        self._system_kv_hash = None  # Hash of system prefix text
-        self._system_kv_token_count = 0
-        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
-        # Side-stash LRU for inactive slots, keyed by system_hash.
-        # value: {"snapshot": list, "token_count": int, "token_ids": list}
-        from collections import OrderedDict as _OrderedDict
-        self._system_kv_lru: "_OrderedDict[str, dict]" = _OrderedDict()
-        # Capacity is the TOTAL slot count (active + LRU bag).
-        # The LRU bag therefore holds capacity-1 entries at most.
-        import os as _os
-        self._system_kv_capacity = max(1, int(
-            _os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4")
-        ))
-        # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
-        self._system_kv_hits = 0
-        self._system_kv_misses = 0
-        self._system_kv_tokens_saved = 0
-        self._system_kv_evictions = 0
-        # True only when the model's prompt cache is composed entirely of
-        # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
-        # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
-        # aliases buffers ``update_and_fetch`` mutates in place — snapshot
-        # restore would silently desynchronize. Probed once in ``start()``.
-        self._supports_system_kv_cache: bool = False
-        # SSD persistence for the system-KV snapshot (patch #16). Off unless
-        # VLLM_MLX_SSD_SYSTEM_KV_DIR is set; constructed in start() once the
-        # snapshot-safety probe has run (shares its gate). Lets a stored
-        # system prefix survive process restart / TTL eviction / model swap:
-        # promote (~100 ms-1.5 s disk read) instead of a 25-70 s cold prefill.
-        self._ssd_store = None  # SystemKVSSDStore | None
-        self._ssd_promotes = 0
+        # System prompt KV cache (fork patches #4/#6/#9/#12/#13 + #16).
+        # State and helpers live in ``SystemKVManager``
+        # (vllm_mlx/system_kv.py) to keep this file's diff vs upstream
+        # small. The legacy ``_system_kv_*`` / ``_supports_system_kv_cache``
+        # / ``_ssd_store`` ivar names remain available (read AND write) via
+        # the delegating properties below.
+        self._system_kv = SystemKVManager()
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
@@ -459,62 +424,17 @@ class SimpleEngine(BaseEngine):
                     self._mtp_num_draft_tokens,
                 )
 
-            # Probe whether this model's prompt cache is snapshot-safe for the
-            # stream_chat system-prefix cache branch. This is also refreshed
-            # below for MLLM text routing after the parallel TextModel exists.
-            # Upstream's probe (#541 lineage) classifies KVCache + hybrid
-            # ArraysCache as safe and excludes sliding-window RotatingKVCache —
-            # functionally identical to our retired patch #12 denylist
-            # (RotatingKVCache is not a KVCache/ArraysCache subclass, verified).
+            # RotatingKVCache denylist probe for the stream_chat
+            # system-prefix cache branch (patch #12); see
+            # SystemKVManager.probe_snapshot_support for the full rationale.
+            # Only relevant for the LLM path; MLLM gates via _is_system_kv_safe.
             if not self._is_mllm and self._model is not None:
-                backing_model = getattr(self._model, "model", self._model)
-                self._supports_system_kv_cache = self._probe_system_kv_cache_support(
-                    backing_model,
-                    "stream_chat",
-                )
+                self._system_kv.probe_snapshot_support(self._model)
 
-            # Patch #16: SSD persistence for the system-KV snapshot. Opt-in via
-            # VLLM_MLX_SSD_SYSTEM_KV_DIR. Gated on _is_system_kv_safe() — the
-            # SAME gate the _stream_generate_text spill/promote sites use — so
-            # the store is built whenever that path can cache (covers both
-            # non-MLLM models and MLLM models whose text route uses the LLM
-            # path, e.g. Qwen3.6-27B which loads MLLM=True). Not gated on the
-            # _supports_system_kv_cache probe: that only runs for non-MLLM and
-            # only gates the separate stream_chat (MLLM+media) cache branch.
-            import os as _os
-
-            ssd_base = _os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_DIR")
-            if ssd_base and self._is_system_kv_safe():
-                try:
-                    import re as _re
-
-                    from ..system_kv_ssd import (
-                        SystemKVSSDConfig,
-                        SystemKVSSDStore,
-                    )
-
-                    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", self._model_name)
-                    max_gb = float(
-                        _os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_GB", "50")
-                    )
-                    self._ssd_store = SystemKVSSDStore(
-                        SystemKVSSDConfig(
-                            cache_dir=_os.path.join(ssd_base, safe),
-                            max_size_gb=max_gb,
-                        )
-                    )
-                    self._ssd_store.start_writer()
-                    logger.info(
-                        "System KV SSD persistence ENABLED: %s (cap %.0f GB)",
-                        _os.path.join(ssd_base, safe),
-                        max_gb,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "System KV SSD persistence init failed (%s); disabled",
-                        e,
-                    )
-                    self._ssd_store = None
+            # Patch #16: SSD persistence for the system-KV snapshot. Opt-in
+            # via VLLM_MLX_SSD_SYSTEM_KV_DIR; gating rationale documented on
+            # SystemKVManager.maybe_start_ssd_store.
+            self._system_kv.maybe_start_ssd_store(self._model_name)
 
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
@@ -635,22 +555,9 @@ class SimpleEngine(BaseEngine):
         self._text_tokenizer = None
         self._draft_model = None
         self._loaded = False
-        self._system_kv_snapshot = None
-        self._system_kv_hash = None
-        self._system_kv_token_count = 0
-        self._system_kv_token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
-        self._system_kv_lru.clear()
-        self._system_kv_evictions = 0
-        self._system_kv_hits = 0
-        self._system_kv_misses = 0
-        self._system_kv_tokens_saved = 0
-        self._supports_system_kv_cache = False
-        if self._ssd_store is not None:
-            try:
-                self._ssd_store.close()
-            except Exception:
-                logger.debug("System KV SSD store close failed", exc_info=True)
-            self._ssd_store = None
+        # Release the system-KV snapshot stack (active slot + LRU bag +
+        # counters + SSD store) — see SystemKVManager.reset().
+        self._system_kv.reset()
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -1667,24 +1574,19 @@ class SimpleEngine(BaseEngine):
                         system_tokens = system_tokens_list
                         suffix_tokens = full_tokens_list[system_token_count:]
                         kv_cache_eligible = True
-                        # LRU promote: bring the matching slot (if any) into
-                        # the active position so the legacy hash equality
-                        # check below sees the right snapshot.
-                        self._lru_promote(system_hash)
-                        # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the hash
-                        # check just validated against. A later concurrent
-                        # MISS that reassigns ``self._system_kv_snapshot``
-                        # before our serialized worker restores it cannot
-                        # alias what we captured here.
-                        candidate_snapshot = self._system_kv_snapshot
-                        if (
-                            system_hash == self._system_kv_hash
-                            and candidate_snapshot is not None
-                            and system_token_count == self._system_kv_token_count
-                        ):
+                        # LRU promote + exact (hash, token_count) lookup.
+                        # ``hit_snapshot`` is the snapshot reference read
+                        # once at the gate: if we promote to HIT it is the
+                        # exact list the hash check just validated against.
+                        # A later concurrent MISS that reassigns
+                        # ``self._system_kv_snapshot`` before our serialized
+                        # worker restores it cannot alias what we captured
+                        # here.
+                        hit_snapshot = self._system_kv.lookup_active(
+                            system_hash, system_token_count
+                        )
+                        if hit_snapshot is not None:
                             cache_hit = True
-                            hit_snapshot = candidate_snapshot
                             logger.info(
                                 "System KV cache HIT (stream_chat): reusing %d "
                                 "tokens, prefilling %d new (hash=%s)",
@@ -1760,14 +1662,11 @@ class SimpleEngine(BaseEngine):
 
                     snapshot = [c.state for c in bc]
                     mx.eval([s for pair in snapshot for s in pair])
-                    # LRU: demote the about-to-be-replaced active slot
-                    # to the bag before overwriting (only if it holds a
-                    # different system_hash from the new MISS).
-                    if self._system_kv_hash and self._system_kv_hash != system_hash:
-                        self._lru_demote_active_to_bag()
-                    self._system_kv_snapshot = snapshot
-                    self._system_kv_hash = system_hash
-                    self._system_kv_token_count = system_token_count
+                    # Demote-then-store (inside the serialized worker):
+                    # see SystemKVManager.store_snapshot.
+                    self._system_kv.store_snapshot(
+                        system_hash, snapshot, system_token_count
+                    )
                     try:
                         cache_mb = sum(c.nbytes for c in bc) / 1e6
                     except Exception:
@@ -2090,111 +1989,129 @@ class SimpleEngine(BaseEngine):
                 finish_reason="length",
             )
 
+    # --- System-KV delegation surface (fork patches #4/#6/#9/#12/#13/#16) ---
+    # The snapshot stack lives in ``SystemKVManager`` (vllm_mlx/system_kv.py);
+    # these properties and one-line methods keep the legacy attribute names
+    # working unchanged. Tests and the generation paths both READ and WRITE
+    # the ivar names, so every property has a real setter. All mutations
+    # still happen inside ``_generation_lock`` / the serialized worker —
+    # the threading contract is unchanged.
+
+    @property
+    def _system_kv_snapshot(self):
+        return self._system_kv.snapshot
+
+    @_system_kv_snapshot.setter
+    def _system_kv_snapshot(self, value):
+        self._system_kv.snapshot = value
+
+    @property
+    def _system_kv_hash(self):
+        return self._system_kv.system_hash
+
+    @_system_kv_hash.setter
+    def _system_kv_hash(self, value):
+        self._system_kv.system_hash = value
+
+    @property
+    def _system_kv_token_count(self):
+        return self._system_kv.token_count
+
+    @_system_kv_token_count.setter
+    def _system_kv_token_count(self, value):
+        self._system_kv.token_count = value
+
+    @property
+    def _system_kv_token_ids(self):
+        return self._system_kv.token_ids
+
+    @_system_kv_token_ids.setter
+    def _system_kv_token_ids(self, value):
+        self._system_kv.token_ids = value
+
+    @property
+    def _system_kv_lru(self):
+        return self._system_kv.lru
+
+    @_system_kv_lru.setter
+    def _system_kv_lru(self, value):
+        self._system_kv.lru = value
+
+    @property
+    def _system_kv_capacity(self):
+        return self._system_kv.capacity
+
+    @_system_kv_capacity.setter
+    def _system_kv_capacity(self, value):
+        self._system_kv.capacity = value
+
+    @property
+    def _system_kv_hits(self):
+        return self._system_kv.hits
+
+    @_system_kv_hits.setter
+    def _system_kv_hits(self, value):
+        self._system_kv.hits = value
+
+    @property
+    def _system_kv_misses(self):
+        return self._system_kv.misses
+
+    @_system_kv_misses.setter
+    def _system_kv_misses(self, value):
+        self._system_kv.misses = value
+
+    @property
+    def _system_kv_tokens_saved(self):
+        return self._system_kv.tokens_saved
+
+    @_system_kv_tokens_saved.setter
+    def _system_kv_tokens_saved(self, value):
+        self._system_kv.tokens_saved = value
+
+    @property
+    def _system_kv_evictions(self):
+        return self._system_kv.evictions
+
+    @_system_kv_evictions.setter
+    def _system_kv_evictions(self, value):
+        self._system_kv.evictions = value
+
+    @property
+    def _supports_system_kv_cache(self):
+        return self._system_kv.supports_snapshot
+
+    @_supports_system_kv_cache.setter
+    def _supports_system_kv_cache(self, value):
+        self._system_kv.supports_snapshot = value
+
+    @property
+    def _ssd_store(self):
+        return self._system_kv.ssd_store
+
+    @_ssd_store.setter
+    def _ssd_store(self, value):
+        self._system_kv.ssd_store = value
+
+    @property
+    def _ssd_promotes(self):
+        return self._system_kv.ssd_promotes
+
+    @_ssd_promotes.setter
+    def _ssd_promotes(self, value):
+        self._system_kv.ssd_promotes = value
+
     def _lru_promote(self, system_hash):
-        """Try to promote a slot matching ``system_hash`` from the LRU bag
-        into the "active" position (the legacy single-slot ivars).
-
-        - If the active slot already matches: no-op, return True.
-        - If a matching slot is in the LRU bag: swap it with active.
-          The displaced active slot (if any) goes into the bag.
-        - If nothing matches: return False.
-
-        Must run inside ``_generation_lock`` so the swap is atomic with
-        downstream reads. Multi-slot capacity is bounded by
-        ``_system_kv_capacity`` (active + bag).
-        """
-        if system_hash is None:
-            return False
-        if self._system_kv_hash == system_hash and self._system_kv_snapshot is not None:
-            return True
-        entry = self._system_kv_lru.pop(system_hash, None)
-        if entry is None:
-            return False
-        # Demote current active to bag (if any) before promoting the match.
-        if self._system_kv_snapshot is not None and self._system_kv_hash is not None:
-            self._system_kv_lru[self._system_kv_hash] = {
-                "snapshot": self._system_kv_snapshot,
-                "token_count": self._system_kv_token_count,
-                "token_ids": self._system_kv_token_ids,
-            }
-            self._system_kv_lru.move_to_end(self._system_kv_hash)
-        self._system_kv_snapshot = entry["snapshot"]
-        self._system_kv_hash = system_hash
-        self._system_kv_token_count = entry["token_count"]
-        self._system_kv_token_ids = entry["token_ids"]
-        return True
+        """Delegate to ``SystemKVManager.lru_promote`` (patch #13)."""
+        return self._system_kv.lru_promote(system_hash)
 
     def _lru_demote_active_to_bag(self):
-        """Move the current active slot (if any) into the LRU bag, then
-        clear active. Called before overwriting active with a new MISS.
-
-        Evicts oldest entry from the bag if (bag + 1) would exceed
-        ``_system_kv_capacity - 1`` (leaving room for the incoming new
-        active slot). Issues ``mx.clear_cache()`` only on the eviction
-        path so the Metal allocator's reuse pool isn't flushed on the
-        common case (PR #541 measurement).
-
-        Must run inside ``_generation_lock``.
-        """
-        if self._system_kv_snapshot is None or self._system_kv_hash is None:
-            return
-        self._system_kv_lru[self._system_kv_hash] = {
-            "snapshot": self._system_kv_snapshot,
-            "token_count": self._system_kv_token_count,
-            "token_ids": self._system_kv_token_ids,
-        }
-        self._system_kv_lru.move_to_end(self._system_kv_hash)
-        # Clear active so the caller's assignment is clean.
-        self._system_kv_snapshot = None
-        self._system_kv_hash = None
-        self._system_kv_token_count = 0
-        self._system_kv_token_ids = None
-        # Trim bag to capacity-1 (leaving one slot for the incoming active).
-        evicted = 0
-        max_bag = max(0, self._system_kv_capacity - 1)
-        while len(self._system_kv_lru) > max_bag:
-            ev_hash, _ = self._system_kv_lru.popitem(last=False)
-            self._system_kv_evictions += 1
-            evicted += 1
-            logger.info(
-                "System KV cache EVICTED: hash=%s (capacity=%d, bag=%d)",
-                ev_hash,
-                self._system_kv_capacity,
-                len(self._system_kv_lru),
-            )
-        if evicted:
-            try:
-                import mlx.core as mx
-                mx.clear_cache()
-            except Exception:
-                pass
+        """Delegate to ``SystemKVManager.lru_demote_active_to_bag``."""
+        return self._system_kv.lru_demote_active_to_bag()
 
     def _is_system_kv_safe(self):
-        """Return True if the system-KV snapshot is enabled for this engine.
-
-        Reads ``VLLM_MLX_DISABLE_SYSTEM_KV`` env var once and caches the
-        result. Set the var to ``1``/``true``/``yes`` (typically per-model
-        in the llama-swap launch config) to disable the snapshot path on
-        models known to produce drifted/looping output on cache replay
-        (hybrid Qwen3.5/3.6/Qwen3-Next family — see mlx-lm#1162).
-        """
-        cached = getattr(self, "_system_kv_safe_cached", None)
-        if cached is not None:
-            return cached
-
-        import os
-
-        disabled = os.environ.get("VLLM_MLX_DISABLE_SYSTEM_KV", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if disabled:
-            logger.info(
-                "system-KV snapshot disabled by VLLM_MLX_DISABLE_SYSTEM_KV env var"
-            )
-        self._system_kv_safe_cached = not disabled
-        return self._system_kv_safe_cached
+        """Delegate to ``SystemKVManager.is_safe`` (kill-switch, patch #5)."""
+        return self._system_kv.is_safe()
 
     def _text_route_resources(self):
         """Return (text_model, text_tokenizer) for the text-only generation path.
@@ -2380,16 +2297,14 @@ class SimpleEngine(BaseEngine):
                     self._lru_promote(system_hash)
 
                     # EXTENDED_PREFIX_MARKER: prefix-match against the cached
-                    # extended token sequence. Hit when the new request's
-                    # full_tokens_list starts with our cached _system_kv_token_ids.
-                    _cached_ids = self._system_kv_token_ids
-                    _cached_len = self._system_kv_token_count
-                    _prefix_match = (
-                        _cached_ids is not None
-                        and _cached_len > 0
-                        and len(full_tokens_list) > _cached_len
-                        and full_tokens_list[:_cached_len] == _cached_ids
+                    # extended token sequence (see
+                    # SystemKVManager.match_extended_prefix). Hit when the new
+                    # request's full_tokens_list starts with our cached
+                    # _system_kv_token_ids.
+                    _cached_ids, _cached_len = self._system_kv.match_extended_prefix(
+                        full_tokens_list
                     )
+                    _prefix_match = _cached_ids is not None
                     if _prefix_match:
                         # Override system_tokens / system_token_count / suffix_tokens
                         # so the downstream restore logic uses our cached length.
@@ -2401,8 +2316,7 @@ class SimpleEngine(BaseEngine):
                         and self._system_kv_snapshot is not None
                         and self._is_system_kv_safe()
                     ):
-                        self._system_kv_hits += 1
-                        self._system_kv_tokens_saved += _cached_len
+                        self._system_kv.record_hit(_cached_len)
                         # Cache HIT — restore KV state into fresh backbone cache
                         def make_cache_with_snapshot(
                             text_model,
@@ -2726,25 +2640,12 @@ class SimpleEngine(BaseEngine):
                 snapshot = self._snapshot_prompt_cache(mc)
                 self._eval_cache_snapshot(snapshot)
 
-                if self._is_system_kv_safe():
-                    # LRU: push the current active slot (if any, for a
-                    # different system_hash) into the bag before we
-                    # overwrite active. Evicts oldest bag entry if needed.
-                    if self._system_kv_hash and self._system_kv_hash != system_hash:
-                        self._lru_demote_active_to_bag()
-                    self._system_kv_snapshot = snapshot
-                    self._system_kv_hash = system_hash
-                    self._system_kv_token_count = len(_extended_token_ids)
-                    # EXTENDED_PREFIX_MARKER: store cached token IDs for prefix matching
-                    self._system_kv_token_ids = list(_extended_token_ids)
-                    # Patch #16: write-through to SSD when freshly computed (not
-                    # promoted from disk). One async write per distinct system
-                    # prefix at creation; the grow path does NOT re-spill — a
-                    # restart promotes the stored prefix and re-grows cheaply.
-                    if self._ssd_store is not None and not _promoted:
-                        self._ssd_store.enqueue_spill(
-                            tuple(_extended_token_ids), snapshot
-                        )
+                # Kill-switch-gated demote-then-store + SSD write-through
+                # (inside the serialized worker): see
+                # SystemKVManager.store_extended.
+                self._system_kv.store_extended(
+                    system_hash, snapshot, _extended_token_ids, promoted=_promoted
+                )
 
                 backbone_cache = mc
                 # Gen-prompt tail (and anything after) is whatever wasn't cached.
@@ -3223,87 +3124,12 @@ class SimpleEngine(BaseEngine):
                 "backbone_pct": self._specprefill_backbone_pct,
             }
 
-        # System KV cache stats — patched to emit Prometheus-compatible
-        # fields (hits/misses/tokens_saved/entry_count) so metrics.py
-        # maps them onto the vllm_mlx_cache_* gauges. Broadened gate so
-        # misses are reported even before a snapshot is stored.
-        #
-        # Multi-slot LRU note: active slot + bag entries are summed for
-        # the aggregate fields (memory_mb, current_memory_mb,
-        # entry_count). Legacy single-slot fields (tokens, hash) still
-        # describe the ACTIVE slot for backward compat with the
-        # Prometheus exporter and existing dashboards.
-
-        def _entry_bytes(snap):
-            n = 0
-            if not snap:
-                return 0
-            for layer in snap:
-                if isinstance(layer, tuple) and len(layer) == 2:
-                    n += layer[0].nbytes + layer[1].nbytes
-                elif isinstance(layer, list):
-                    n += sum(a.nbytes for a in layer if a is not None)
-            return n
-
-        if (
-            self._system_kv_snapshot is not None
-            or self._system_kv_lru
-            or self._system_kv_hits
-            or self._system_kv_misses
-        ):
-            active_bytes = _entry_bytes(self._system_kv_snapshot)
-            bag_bytes = sum(_entry_bytes(e["snapshot"]) for e in self._system_kv_lru.values())
-            total_bytes = active_bytes + bag_bytes
-            slot_count = (1 if self._system_kv_snapshot is not None else 0) + len(self._system_kv_lru)
-            slots_view = []
-            if self._system_kv_snapshot is not None:
-                slots_view.append({
-                    "hash": self._system_kv_hash,
-                    "tokens": self._system_kv_token_count,
-                    "memory_mb": round(active_bytes / 1e6, 1),
-                    "active": True,
-                })
-            for slot_hash, entry in self._system_kv_lru.items():
-                slots_view.append({
-                    "hash": slot_hash,
-                    "tokens": entry["token_count"],
-                    "memory_mb": round(_entry_bytes(entry["snapshot"]) / 1e6, 1),
-                    "active": False,
-                })
-            stats["system_kv_cache"] = {
-                # Legacy single-slot fields (describe ACTIVE slot):
-                "tokens": self._system_kv_token_count,
-                "hash": self._system_kv_hash,
-                # Aggregate over active + bag (Prometheus exporter reads these):
-                "memory_mb": round(total_bytes / 1e6, 1),
-                "current_memory_mb": round(total_bytes / 1e6, 1),
-                "entry_count": slot_count,
-                "hits": self._system_kv_hits,
-                "misses": self._system_kv_misses,
-                # hit_rate is read by metrics.py (vllm_mlx_cache_hit_rate gauge);
-                # the legacy hit_rate key only existed on the MLLM
-                # memory_aware_cache block, so the production non-MLLM path
-                # reported a constant 0% even at the real ~89% hit rate.
-                "hit_rate": (
-                    self._system_kv_hits
-                    / (self._system_kv_hits + self._system_kv_misses)
-                    if (self._system_kv_hits + self._system_kv_misses)
-                    else 0.0
-                ),
-                "tokens_saved": self._system_kv_tokens_saved,
-                # New multi-slot fields:
-                "evictions": self._system_kv_evictions,
-                "capacity": self._system_kv_capacity,
-                "slots": slots_view,
-            }
-            # Patch #16: SSD persistence tier (present only when enabled).
-            if self._ssd_store is not None:
-                try:
-                    ssd_stats = self._ssd_store.get_stats()
-                    ssd_stats["promotes"] = self._ssd_promotes
-                    stats["system_kv_cache"]["ssd"] = ssd_stats
-                except Exception:
-                    pass
+        # System KV cache stats (Prometheus-compatible fields incl. the SSD
+        # tier) — assembled by SystemKVManager.stats(); None when the cache
+        # has seen no activity.
+        _system_kv_stats = self._system_kv.stats()
+        if _system_kv_stats is not None:
+            stats["system_kv_cache"] = _system_kv_stats
 
         # Include Metal memory stats
         try:
