@@ -296,7 +296,7 @@ Total: 12 HITs / 6 MISSes / 2 evictions / 50,517 tokens saved. **~32× speedup o
 
 Memory cost: each slot ~430 MB on the 27B-4bit dense (4K-token prompt), ~340 MB on the 35B-MoE. Four slots = ~1.7 GB / ~1.4 GB peak — well within Mac Studio's 64 GB envelope alongside the model weights.
 
-**Design doc:** [`DESIGN-system-kv-lru.md`](DESIGN-system-kv-lru.md).
+**Design doc:** [`docs/fork/DESIGN-system-kv-lru.md`](docs/fork/DESIGN-system-kv-lru.md).
 
 **Upstreaming candidate:** strong. PR #541 upstream attempts the same direction but starts from PR #523's single-slot system-prefix cache (no grow-on-HIT). This patch is the equivalent layered on patch #9. Open question whether upstream prefers the simpler per-system-prefix slot or our grow-on-HIT semantics — discussion needed.
 
@@ -426,7 +426,7 @@ Open upstream PRs/issues worth tracking — not yet applied here, with the reaso
 
 - **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV. MERGED upstream (commit `1656c15`), now in our base as of the 2026-05-29 rebase.** Its `simple.py` changes are superseded by our patch #13 (rejected during the rebase — see the rebase note at the top of this file). #541's version starts from PR #523's single-slot cache with no grow-on-HIT, and re-introduces the allowlist probe that gates off hybrid ArraysCache models (which our patch #12 denylist fixes). Our #13 is a strict superset, so we keep ours. If upstream's structure later diverges in a way worth adopting, reconciliation would mean re-layering grow-on-HIT (#9) + denylist probe (#12) + longest-prefix-match (#9) on top of upstream's OrderedDict — non-trivial; defer until there's a concrete upstream improvement to fold in.
 
-- **SSD persistence for system-KV snapshot — IMPLEMENTED as patch #16** (see above). Design notes in [`DESIGN-system-kv-ssd.md`](DESIGN-system-kv-ssd.md); note the implementation diverges from the doc on two points the build surfaced: (1) MLX-native safetensors instead of the numpy `ssd_cache` serializers (they crash on bf16), and (2) write-through-on-store instead of spill-on-eviction (survives SIGKILL). Remaining: end-to-end real-model A/B in an idle window, then a week of metrics before considering whether to drop the `ttl` 3600 workaround.
+- **SSD persistence for system-KV snapshot — IMPLEMENTED as patch #16** (see above). Design notes in [`docs/fork/DESIGN-system-kv-ssd.md`](docs/fork/DESIGN-system-kv-ssd.md); note the implementation diverges from the doc on two points the build surfaced: (1) MLX-native safetensors instead of the numpy `ssd_cache` serializers (they crash on bf16), and (2) write-through-on-store instead of spill-on-eviction (survives SIGKILL). Remaining: end-to-end real-model A/B in an idle window, then a week of metrics before considering whether to drop the `ttl` 3600 workaround.
 
 - **[PR #233](https://github.com/waybarrios/vllm-mlx/pull/233) — TurboQuant KV cache compression (4.6×).** **CLOSED upstream without merging (checked 2026-06-09)** — dropped from tracking. If KV-compression pressure returns (more agent prefixes than the 64 GB envelope holds), re-evaluate whatever upstream's then-current approach is rather than resurrecting this branch.
 
