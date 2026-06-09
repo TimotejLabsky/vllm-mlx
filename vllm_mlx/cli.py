@@ -325,7 +325,14 @@ def serve_command(args):
     else:
         print("Mode: Simple (maximum throughput)")
         if args.enable_mtp:
-            print("MTP: enabled (native speculative decoding)")
+            # Honest banner: native mlx_lm MTP self-speculation is currently
+            # inert on the SimpleEngine text route (effective draft depth 1) —
+            # the engine logs a matching runtime warning. See PATCHES / the
+            # decode-throughput finding for the port that would make it active.
+            print(
+                "MTP: configured (note: native self-speculation is currently "
+                "inert on the SimpleEngine text route — effective draft depth 1)"
+            )
         if args.enable_mtp and getattr(args, "mllm", False):
             print("MTP + MLLM: per-request routing (text-only → MTP, media → MLLM)")
         if args.specprefill and args.specprefill_draft_model:
