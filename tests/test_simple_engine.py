@@ -12,6 +12,24 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
+class _FakeCacheLayer:
+    """Stand-in for one mlx_lm KVCache layer in the fork's snapshot path.
+
+    The system-KV MISS branch snapshots ``c.state`` (a tuple of arrays),
+    ``mx.eval``s each element, and logs ``sum(c.nbytes for c in cache)``,
+    so the fake needs a real-array tuple state and an ``nbytes`` int.
+    """
+
+    nbytes = 8
+
+    def __init__(self):
+        self.state = (mx.zeros(1), mx.zeros(1))
+        # Pre-evaluate: the serialized worker rebinds to a fresh MLX stream,
+        # so lazy arrays scheduled on the test thread's default stream would
+        # fail to evaluate there.
+        mx.eval(*self.state)
+
+
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
@@ -122,7 +140,17 @@ class TestSimpleEngineConcurrency:
 
     @pytest.mark.anyio
     async def test_lock_prevents_concurrent_chat(self, mock_llm_model):
-        """Test that the lock prevents concurrent chat calls."""
+        """Test that the lock prevents concurrent chat calls.
+
+        The fork routes plain-text non-MLLM chat through
+        ``_stream_generate_text`` (system-KV text route, patch #4), which
+        tokenizes for real and cannot run against a MagicMock model. Media-
+        shaped messages keep ``chat()`` on the legacy blocking
+        ``self._model.chat`` path (the real ``has_media_content`` gate), which
+        is the seam this test mocks; the serialization property under test —
+        ``_run_blocking_serialized`` holding ``_generation_lock`` — is the
+        same lock every route uses.
+        """
         from vllm_mlx.engine.simple import SimpleEngine
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
@@ -130,11 +158,26 @@ class TestSimpleEngineConcurrency:
             engine._model = mock_llm_model
             engine._loaded = True
             engine._generation_lock_admission = "wait"
+            # chat() recomputes prompt accounting via apply_chat_template
+            # (tokenize=True) on the legacy path.
+            mock_llm_model.tokenizer.apply_chat_template = MagicMock(
+                return_value=[1, 2, 3]
+            )
 
-            # Launch multiple concurrent chat calls
+            # Launch multiple concurrent chat calls (media part pins the
+            # legacy mlx blocking-chat path on a non-MLLM engine).
             tasks = [
                 engine.chat(
-                    messages=[{"role": "user", "content": f"test {i}"}], max_tokens=10
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": "x.png"}},
+                                {"type": "text", "text": f"test {i}"},
+                            ],
+                        }
+                    ],
+                    max_tokens=10,
                 )
                 for i in range(5)
             ]
@@ -147,15 +190,41 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
+    def test_default_admission_waits_and_respects_env(self, monkeypatch):
+        """Fork default admission is "wait"; the env var is respected.
+
+        Diverges from upstream PR #540 (patch #15): upstream defaults to
+        fail_fast and has a bug where VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION
+        is validated but then unconditionally overwritten with fail_fast.
+        The fork defaults to "wait" (OpenCode fires title + main request
+        simultaneously) and honors the env var as an opt-in to load shedding.
+        """
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            monkeypatch.delenv(
+                "VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", raising=False
+            )
+            engine = SimpleEngine("test-model")
+            assert engine._generation_lock_admission == "wait"
+
+            monkeypatch.setenv(
+                "VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast"
+            )
+            engine_env = SimpleEngine("test-model")
+            assert engine_env._generation_lock_admission == "fail_fast"
+
     @pytest.mark.anyio
-    async def test_default_admission_rejects_second_serialized_request(self):
-        """Default SimpleEngine admission fails fast instead of queueing."""
+    async def test_fail_fast_admission_rejects_second_serialized_request(self):
+        """fail_fast admission (opt-in; fork default is "wait") rejects a
+        second serialized request with EngineBusy instead of queueing."""
         from vllm_mlx.engine.base import EngineBusy
         from vllm_mlx.engine.simple import SimpleEngine
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._loaded = True
+            engine._generation_lock_admission = "fail_fast"
 
             started = threading.Event()
             release = threading.Event()
@@ -281,6 +350,15 @@ class TestSimpleEngineConcurrency:
             assert output.finish_reason == "stop"
             mock_llm_model.chat.assert_not_called()
 
+    @pytest.mark.skip(
+        reason="upstream #523/#541 cache API; fork carries the patches "
+        "#9/#12/#13 system-KV stack — see PATCHES.md. The fork routes "
+        "non-MLLM text chat through _stream_generate_text, whose contract "
+        "is plain-dict messages (server.py normalizes Pydantic Message "
+        "objects via model_dump before the engine boundary); the upstream "
+        "in-stream_chat normalization gate this test exercised is only "
+        "reachable on the non-MLLM media path."
+    )
     @pytest.mark.anyio
     async def test_stream_chat_cache_path_accepts_pydantic_message_objects(self):
         """`stream_chat`'s declared signature is ``list[dict]`` but real callers
@@ -347,40 +425,39 @@ class TestSimpleEngineConcurrency:
 
     @pytest.mark.anyio
     async def test_stream_chat_skips_cache_path_when_no_system_message(self):
-        """If the message list has no system role, the cache-eligibility
-        check must short-circuit ``has_system = False`` without entering the
-        probe-divergence step or the cache-aware streaming branch."""
+        """If the message list has no system role, the fork's text route
+        (``_stream_generate_text``, which non-MLLM stream_chat dispatches to)
+        must short-circuit ``has_system = False``: no system-prefix
+        tokenization, no snapshot store, no LRU mutation — the raw rendered
+        prompt goes straight to ``mlx_lm.stream_generate`` uncached."""
         from vllm_mlx.engine.simple import SimpleEngine
 
+        rendered = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = (
-            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
-        )
+        tokenizer.apply_chat_template.return_value = rendered
         tokenizer.bos_token = None
         tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        # The text route drives the raw mlx_lm model (self._model.model).
+        model.model = MagicMock()
 
-        called_stream_generate = []
+        captured: list[dict] = []
 
-        async def fake_stream_generate(*, prompt, **kwargs):
-            called_stream_generate.append(prompt)
-            out = MagicMock(
-                text="hi",
-                new_text="hi",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            captured.append({"prompt": prompt, **kw})
+            yield SimpleNamespace(text="hi", finish_reason="stop")
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+        ):
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
                 c
@@ -389,83 +466,59 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        # No system → cache path skipped → only the initial apply_chat_template
-        # call (for ``prompt``) happens, no probe renders.
+        # No system → system-KV machinery never engages: the prompt render is
+        # the only template call, the system prefix is never tokenized, and
+        # nothing is stored or counted.
         assert tokenizer.apply_chat_template.call_count == 1
-        assert called_stream_generate
+        assert tokenizer.encode.call_count == 0
+        assert engine._system_kv_snapshot is None
+        assert len(engine._system_kv_lru) == 0
+        assert engine._system_kv_misses == 0
+        assert engine._system_kv_hits == 0
+        # Uncached: the full rendered prompt string, no prompt_cache kwarg.
+        assert captured and captured[0]["prompt"] == rendered
+        assert "prompt_cache" not in captured[0]
         assert chunks and chunks[0].text == "hi"
 
     @pytest.mark.anyio
-    async def test_stream_chat_cache_path_falls_back_when_mlx_raises(self):
-        """When the cache-aware ``_run_with_cache`` body raises *before* the
-        first generated token, the path must surface the failure as a
-        pre-first-token error and fall back to the uncached
-        ``self.stream_generate`` instead of bubbling the exception out."""
+    async def test_stream_chat_cache_path_surfaces_error_when_mlx_raises(self):
+        """Fork semantics (patches #4/#9): the text route's serialized worker
+        has no uncached in-request fallback — a failure before the first
+        generated token propagates to the caller as the original exception
+        (upstream #523's silent stream_generate fallback only exists on the
+        fork's non-MLLM media path). The failed request must also not poison
+        engine state: nothing may be stored in the snapshot slot or LRU."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        # Probe-divergence renders that DO diverge, so the cache path is
-        # entered. The boundary lies after the system block, well past the
-        # 16-char minimum.
-        def apply_chat_template_side_effect(messages, **kwargs):
-            # Find the last user message content to make probes diverge.
-            user_content = ""
-            for m in reversed(messages):
-                role = (
-                    m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-                )
-                if role == "user":
-                    content = (
-                        m.get("content")
-                        if isinstance(m, dict)
-                        else getattr(m, "content", "")
-                    )
-                    user_content = content or ""
-                    break
-            return (
-                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         tokenizer.bos_token = None
-        # Return long enough token lists that the system-prefix slice is
-        # a proper prefix of the full sequence and ``kv_cache_eligible``
-        # becomes True.
+        # Long enough token lists that the system-prefix slice is a proper
+        # prefix of the full sequence, so the MISS prefill branch is entered.
         tokenizer.encode = MagicMock(
             side_effect=[
                 list(range(50)),  # full prompt
                 list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
             ]
         )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
-        # ``self._model.model`` is dereferenced inside _run_with_cache.
         model.model = MagicMock()
 
-        fallback_calls = []
-
-        async def fake_stream_generate(*, prompt, **kwargs):
-            fallback_calls.append(prompt)
-            out = MagicMock(
-                text="fallback-response",
-                new_text="fallback-response",
-                prompt_tokens=50,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
-
-        # Force the cache-aware path to raise before the first emit so we
-        # exercise the pre-first-token error → uncached fallback branch.
+        # Force the cache-aware worker to raise before the first emit.
         def make_prompt_cache_raises(*args, **kwargs):
             raise RuntimeError("simulated mlx-lm failure")
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
                 side_effect=make_prompt_cache_raises,
@@ -475,71 +528,94 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
-            chunks = [
-                c
+            chunks = []
+            with pytest.raises(RuntimeError, match="simulated mlx-lm failure"):
                 async for c in engine.stream_chat(
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": "hello"},
                     ],
-                )
-            ]
+                ):
+                    chunks.append(c)
 
-        # The cache-path failure must NOT propagate; we should see the
-        # fallback's chunk instead.
-        assert fallback_calls, "uncached stream_generate fallback was not invoked"
-        assert chunks and chunks[0].text == "fallback-response"
+        # Error surfaced before any token was streamed, and the failed MISS
+        # stored nothing.
+        assert chunks == []
+        assert engine._system_kv_snapshot is None
+        assert len(engine._system_kv_lru) == 0
 
     @pytest.mark.anyio
-    async def test_stream_chat_skips_cache_path_when_decode_controls_present(self):
-        """If the request carries ``stop`` or ``logits_processors`` (or any non-default
-        ``top_k`` / ``min_p`` / ``presence_penalty`` / ``repetition_penalty``), the
-        cache branch must be skipped so those controls flow through
-        ``self.stream_generate``.
-        The cache branch drives ``mlx_lm.stream_generate`` directly with only
-        prompt/max_tokens/sampler/prompt_cache, silently dropping any other decode
-        controls.
-        Gating here keeps cache-eligible and uncached requests on identical decode
-        semantics."""
+    async def test_stream_chat_cache_path_honors_decode_controls(self):
+        """Fork semantics (patches #4/#9, inverting upstream #523's gate):
+        active decode controls do NOT skip the system-KV cache path. The
+        fork's text route builds the sampler from ``top_k``/``min_p``, layers
+        penalty processors via ``make_logits_processors``, forwards request
+        ``logits_processors`` into ``mlx_lm.stream_generate``, and matches
+        ``stop`` sequences in the consumer loop — all while still storing and
+        reusing the system-prefix KV snapshot."""
         from vllm_mlx.engine.simple import SimpleEngine
 
         tokenizer = MagicMock()
-        # Render contains a system block so ``has_system`` would otherwise send us
-        # into the cache branch.
         tokenizer.apply_chat_template.return_value = (
             "<|im_start|>system\nYou are helpful.<|im_end|>\n"
             "<|im_start|>user\nhello<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
 
-        fallback_kwargs: list[dict] = []
+        gen_calls: list[dict] = []
+        sampler_calls: list[dict] = []
+        penalty_calls: list[dict] = []
 
-        async def fake_stream_generate(*, prompt, **kw):
-            fallback_kwargs.append(kw)
-            out = MagicMock(
-                text="ok",
-                new_text="ok",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
+        def sentinel_processor(tokens, logits):
+            return logits
 
-        sentinel_processor = MagicMock(name="logits_processor")
+        def penalty_processor(tokens, logits):
+            return logits
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            gen_calls.append({"prompt": prompt, **kw})
+            # Text containing the stop sequence: the consumer loop must
+            # detect it and finish with reason "stop".
+            yield SimpleNamespace(text="ok<|im_end|>", finish_reason=None)
+
+        def fake_make_sampler(**kw):
+            sampler_calls.append(kw)
+            return MagicMock()
+
+        def fake_make_logits_processors(**kw):
+            penalty_calls.append(kw)
+            return [penalty_processor]
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeCacheLayer()],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", side_effect=fake_make_sampler),
+            patch(
+                "mlx_lm.sample_utils.make_logits_processors",
+                side_effect=fake_make_logits_processors,
+            ),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+        ):
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
                 c
@@ -550,75 +626,86 @@ class TestSimpleEngineConcurrency:
                     ],
                     stop=["<|im_end|>"],
                     logits_processors=[sentinel_processor],
+                    top_k=40,
+                    min_p=0.1,
+                    presence_penalty=0.5,
+                    repetition_penalty=1.2,
                 )
             ]
 
-        # Cache-path probe (``apply_chat_template`` called a second + third time for
-        # probe-divergence) must NOT happen — only the initial prompt render.
-        assert tokenizer.apply_chat_template.call_count == 1
-        # The uncached fallback must have been invoked.
-        # The decode-control kwargs must have been threaded through.
-        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
-        assert fallback_kwargs[0].get("stop") == ["<|im_end|>"]
-        assert fallback_kwargs[0].get("logits_processors") == [sentinel_processor]
-        assert chunks and chunks[0].text == "ok"
+        # The cache path ran despite active decode controls: the MISS stored
+        # a snapshot and only the post-prefix suffix went to mlx_lm.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        assert engine._system_kv_token_count == 40
+        assert gen_calls, "mlx_lm.stream_generate was not invoked"
+        assert gen_calls[0]["prompt"].tolist() == list(range(40, 50))
+        assert "prompt_cache" in gen_calls[0]
+        # ...and every decode control was threaded through, not dropped.
+        assert sampler_calls == [
+            {"temp": 0.7, "top_p": 0.9, "top_k": 40, "min_p": 0.1}
+        ]
+        assert penalty_calls == [
+            {"repetition_penalty": 1.2, "presence_penalty": 0.5}
+        ]
+        assert gen_calls[0]["logits_processors"] == [
+            sentinel_processor,
+            penalty_processor,
+        ]
+        # stop sequences are enforced in the consumer loop.
+        assert chunks and chunks[-1].finished
+        assert chunks[-1].finish_reason == "stop"
 
     @pytest.mark.anyio
     async def test_stream_chat_takes_cache_path_when_decode_controls_are_no_ops(self):
         """server.py always sets ``top_k=0``, ``min_p=0.0``, ``presence_penalty=0.0``,
-        ``repetition_penalty=1.0`` (no-ops) in ``chat_kwargs``.
-        The gate must compare against those defaults so the common path still hits the
-        cache.
-        Only *active* controls should block."""
+        ``repetition_penalty=1.0`` (no-ops) in ``chat_kwargs``; the common
+        path must still hit the system-KV cache. Fork semantics: the text
+        route locates the system prefix via the ChatML marker on the single
+        prompt render (no probe-divergence re-renders), prefills it once, and
+        stores the snapshot in the active slot."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        def apply_chat_template_side_effect(messages, **kwargs):
-            user_content = ""
-            for m in reversed(messages):
-                role = (
-                    m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-                )
-                if role == "user":
-                    content = (
-                        m.get("content")
-                        if isinstance(m, dict)
-                        else getattr(m, "content", "")
-                    )
-                    user_content = content or ""
-                    break
-            return (
-                "<|im_start|>system\nYou are helpful.<|im_end|>\n"
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(side_effect=[list(range(50)), list(range(20))])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        gen_calls: list[dict] = []
+
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            gen_calls.append({"prompt": prompt, **kw})
+            yield SimpleNamespace(text="ok", finish_reason="stop")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeCacheLayer()],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+        ):
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
-            # Probe normally runs in start(); short-circuit it here so the
-            # gate doesn't trip on the synthetic engine state.
-            engine._supports_system_kv_cache = True
 
-            # No fallback needed since cache path should be exercised.
-            # Patch _run_blocking_serialized to short-circuit cache execution cleanly
-            # without needing a real mlx_lm.
-            async def short_circuit(func, *args, on_cancel=None, **kw):
-                # Simulate immediate completion with no responses.
-                # The producer-task harness will fire _emit_done().
-                return None
-
-            engine._run_blocking_serialized = short_circuit  # type: ignore[method-assign]
-
-            _ = [
+            chunks = [
                 c
                 async for c in engine.stream_chat(
                     messages=[
@@ -632,18 +719,26 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        # Probe-divergence ran ⇒ apply_chat_template called for prompt + 2 probes.
-        assert tokenizer.apply_chat_template.call_count == 3
+        # Cache path engaged: one MISS stored an extended-prefix snapshot in
+        # the active slot, and only the gen-prompt tail went to mlx_lm.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        assert engine._system_kv_token_count == 40
+        assert engine._system_kv_token_ids == list(range(40))
+        assert gen_calls and gen_calls[0]["prompt"].tolist() == list(range(40, 50))
+        assert "prompt_cache" in gen_calls[0]
+        # Marker-based prefix detection: exactly one template render, no
+        # probe-divergence re-renders.
+        assert tokenizer.apply_chat_template.call_count == 1
+        assert chunks and chunks[0].text == "ok"
 
     @pytest.mark.anyio
-    async def test_stream_chat_skips_cache_path_when_mtp_active(self):
-        """When ``self._mtp`` is configured, the cache branch must be skipped.
-        The branch calls ``mlx_lm.stream_generate`` directly with no ``mtp`` /
-        ``num_draft_tokens`` kwargs, while ``MLXLanguageModel.stream_generate``
-        attaches them from ``self._mtp`` / ``self._mtp_num_draft_tokens``.
-        Running the same request through the cache branch would silently drop
-        speculative decoding for cache-eligible turns while keeping it on
-        uncached turns — different engine semantics for the same request."""
+    async def test_stream_chat_cache_path_layers_mtp_on_top(self):
+        """Fork semantics (patches #4/#9, inverting upstream #523's gate):
+        ``self._mtp`` does NOT skip the system-KV cache path. The text route
+        stacks a fresh MTP cache on top of the snapshotted backbone cache and
+        signals speculative decoding to mlx_lm via ``num_draft_tokens`` —
+        cache-eligible and uncached turns share the same MTP semantics."""
         from vllm_mlx.engine.simple import SimpleEngine
 
         tokenizer = MagicMock()
@@ -653,32 +748,41 @@ class TestSimpleEngineConcurrency:
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
+        backbone_layer = _FakeCacheLayer()
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
+        # The text route checks model.mtp and stacks make_mtp_cache() output.
+        model.model.mtp = MagicMock(name="mtp_head")
+        model.model.make_mtp_cache = MagicMock(return_value=["mtp-cache"])
 
-        fallback_kwargs: list[dict] = []
+        gen_calls: list[dict] = []
 
-        async def fake_stream_generate(*, prompt, **kw):
-            fallback_kwargs.append(kw)
-            out = MagicMock(
-                text="ok",
-                new_text="ok",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            gen_calls.append({"prompt": prompt, **kw})
+            yield SimpleNamespace(text="ok", finish_reason="stop")
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[backbone_layer],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+        ):
             engine = SimpleEngine("test-model", mtp=True, mtp_num_draft_tokens=4)
             engine._model = model
             engine._loaded = True
-            # Isolate the gate to the feature under test.
-            engine._supports_system_kv_cache = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
                 c
@@ -690,23 +794,26 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        # Cache-path probes must NOT run — only the initial prompt render.
-        assert tokenizer.apply_chat_template.call_count == 1
-        # The uncached wrapper must have been invoked.
-        # MTP kwargs are layered on inside ``MLXLanguageModel.stream_generate``,
-        # not at this seam, so this test only proves the cache branch was
-        # bypassed; the wrapper attaches MTP itself when ``self._mtp`` is set.
-        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        # Cache path engaged despite MTP.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        # MTP cache stacked on the snapshotted backbone; speculative decode
+        # signalled via num_draft_tokens (the text route never passes mtp=).
+        assert gen_calls, "mlx_lm.stream_generate was not invoked"
+        assert gen_calls[0]["prompt_cache"] == [backbone_layer, "mtp-cache"]
+        assert gen_calls[0]["num_draft_tokens"] == 4
+        assert "mtp" not in gen_calls[0]
+        assert gen_calls[0]["prompt"].tolist() == list(range(40, 50))
         assert chunks and chunks[0].text == "ok"
 
     @pytest.mark.anyio
-    async def test_stream_chat_skips_cache_path_when_specprefill_loaded(self):
-        """A loaded SpecPrefill draft model (``self._draft_model is not None``)
-        triggers ``_stream_generate_specprefill`` routing inside the wrapper for
-        large prompts.
-        The cache branch has no equivalent routing, so it must be skipped
-        whenever a draft model is loaded so all requests go through the
-        wrapper's SpecPrefill decision."""
+    async def test_stream_chat_cache_path_runs_with_specprefill_loaded(self):
+        """Fork semantics (patches #4/#9, inverting upstream #523's gate): a
+        loaded SpecPrefill draft model does NOT skip the system-KV cache path.
+        The text route integrates the two — when SpecPrefill engages it scores
+        only the post-prefix suffix on top of the snapshotted backbone cache —
+        and below ``specprefill_threshold`` (suffix too short) the request
+        stays on the cached normal decode path without touching the scorer."""
         from vllm_mlx.engine.simple import SimpleEngine
 
         tokenizer = MagicMock()
@@ -716,32 +823,43 @@ class TestSimpleEngineConcurrency:
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
 
-        fallback_kwargs: list[dict] = []
+        gen_calls: list[dict] = []
 
-        async def fake_stream_generate(*, prompt, **kw):
-            fallback_kwargs.append(kw)
-            out = MagicMock(
-                text="ok",
-                new_text="ok",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            gen_calls.append({"prompt": prompt, **kw})
+            yield SimpleNamespace(text="ok", finish_reason="stop")
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        score_tokens_mock = MagicMock(name="score_tokens")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[_FakeCacheLayer()],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+            patch("vllm_mlx.specprefill.score_tokens", score_tokens_mock),
+        ):
+            # Default specprefill_threshold (8192) far exceeds the 10-token
+            # suffix, so SpecPrefill must not engage for this request.
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._draft_model = MagicMock(name="specprefill_draft_model")
             engine._loaded = True
-            engine._supports_system_kv_cache = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
                 c
@@ -753,16 +871,24 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert tokenizer.apply_chat_template.call_count == 1
-        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        # Cache path engaged despite the loaded draft model.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        assert gen_calls, "mlx_lm.stream_generate was not invoked"
+        assert gen_calls[0]["prompt"].tolist() == list(range(40, 50))
+        assert "prompt_cache" in gen_calls[0]
+        # Suffix below threshold → SpecPrefill scorer untouched.
+        score_tokens_mock.assert_not_called()
         assert chunks and chunks[0].text == "ok"
 
     @pytest.mark.anyio
-    async def test_stream_chat_skips_cache_path_when_max_kv_size_set(self):
-        """Configured ``max_kv_size`` caps the prompt cache.
-        The cache branch builds its cache with ``make_prompt_cache(model)``
-        without forwarding ``max_kv_size``, so a non-zero engine-level bound
-        must force the uncached path."""
+    async def test_stream_chat_cache_path_forwards_max_kv_size(self):
+        """Fork semantics (patches #4/#9, inverting upstream #523's gate): a
+        non-zero engine ``max_kv_size`` does NOT force the uncached path.
+        The text route forwards the bound into ``make_prompt_cache(model,
+        max_kv_size=N)`` when it builds the snapshot cache, so bounded-KV
+        serving and the system-KV cache compose instead of excluding each
+        other."""
         from vllm_mlx.engine.simple import SimpleEngine
 
         tokenizer = MagicMock()
@@ -772,31 +898,42 @@ class TestSimpleEngineConcurrency:
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
 
-        fallback_kwargs: list[dict] = []
+        gen_calls: list[dict] = []
+        cache_calls: list[dict] = []
 
-        async def fake_stream_generate(*, prompt, **kw):
-            fallback_kwargs.append(kw)
-            out = MagicMock(
-                text="ok",
-                new_text="ok",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
+        def fake_make_prompt_cache(*args, **kw):
+            cache_calls.append(kw)
+            return [_FakeCacheLayer()]
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kw):
+            gen_calls.append({"prompt": prompt, **kw})
+            yield SimpleNamespace(text="ok", finish_reason="stop")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=fake_make_prompt_cache,
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+        ):
             engine = SimpleEngine("test-model", max_kv_size=4096)
             engine._model = model
             engine._loaded = True
-            engine._supports_system_kv_cache = True
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
                 c
@@ -808,82 +945,75 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert tokenizer.apply_chat_template.call_count == 1
-        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        # Cache path engaged under bounded KV, with the bound forwarded into
+        # the snapshot cache constructor.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        assert cache_calls and cache_calls[0].get("max_kv_size") == 4096
+        assert gen_calls and gen_calls[0]["prompt"].tolist() == list(range(40, 50))
+        assert "prompt_cache" in gen_calls[0]
         assert chunks and chunks[0].text == "ok"
 
     @pytest.mark.anyio
-    async def test_stream_chat_skips_cache_path_when_model_has_non_kv_cache(self):
-        """Models whose ``make_prompt_cache`` returns ``RotatingKVCache``
-        (sliding-window models like gemma3_text, olmo3, recurrent_gemma) cannot
-        be safely snapshotted: ``.state`` aliases buffers that
-        ``update_and_fetch`` mutates in place, so restoring a captured snapshot
-        on the next turn would silently desynchronize from the running cache.
-        ``start()`` probes ``make_prompt_cache`` once and sets
-        ``_supports_system_kv_cache=False`` for those models; the gate must
-        then skip the cache branch."""
+    async def test_system_kv_probe_denylists_rotating_kv_cache_only(self):
+        """Fork semantics (patches #6/#9): the ``start()`` snapshot-safety
+        probe is a DENYLIST, not upstream #541's all-KVCache allowlist.
+        Only ``RotatingKVCache`` entries (sliding-window models — gemma3_text,
+        olmo3, recurrent_gemma — whose ``.state`` aliases in-place-mutated
+        ring buffers) disable ``_supports_system_kv_cache``. An
+        ``ArraysCache`` + ``KVCache`` hybrid (Gated DeltaNet layers in
+        Qwen3.6 etc.) is ALLOWED — patch #6 shallow-copies the list state at
+        capture/restore."""
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
         from vllm_mlx.engine.simple import SimpleEngine
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = (
-            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
-            "<|im_start|>user\nhello<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-
-        model = MagicMock()
-        model.tokenizer = tokenizer
-
-        fallback_kwargs: list[dict] = []
-
-        async def fake_stream_generate(*, prompt, **kw):
-            fallback_kwargs.append(kw)
-            out = MagicMock(
-                text="ok",
-                new_text="ok",
-                prompt_tokens=3,
-                completion_tokens=1,
-                finished=True,
-                finish_reason="stop",
-            )
-            yield out
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            # RotatingKVCache anywhere in the probe cache → snapshot-unsafe.
             engine = SimpleEngine("test-model")
-            engine._model = model
-            engine._loaded = True
-            # Simulate the probe finding non-KVCache entries (rotating cache).
-            engine._supports_system_kv_cache = False
-            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+            engine._model = MagicMock()  # pre-set so start() skips loading
+            with patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[KVCache(), RotatingKVCache(max_size=8)],
+            ):
+                await engine.start()
+            assert engine._supports_system_kv_cache is False
 
-            chunks = [
-                c
-                async for c in engine.stream_chat(
-                    messages=[
-                        {"role": "system", "content": "You are helpful."},
-                        {"role": "user", "content": "hello"},
-                    ],
-                )
-            ]
+            # ArraysCache+KVCache hybrid passes the denylist (upstream's
+            # allowlist would have rejected it).
+            engine_hybrid = SimpleEngine("test-model")
+            engine_hybrid._model = MagicMock()
+            with patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=[KVCache(), ArraysCache(2)],
+            ):
+                await engine_hybrid.start()
+            assert engine_hybrid._supports_system_kv_cache is True
 
-        # Cache-path probes must NOT run when the model isn't snapshot-safe.
-        assert tokenizer.apply_chat_template.call_count == 1
-        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
-        assert chunks and chunks[0].text == "ok"
+            # Probe failure fails closed.
+            engine_err = SimpleEngine("test-model")
+            engine_err._model = MagicMock()
+            with patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=RuntimeError("probe boom"),
+            ):
+                await engine_err.start()
+            assert engine_err._supports_system_kv_cache is False
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_skips_cache_path_when_text_model_unsafe(self):
-        """Same snapshot-safety contract as the LLM path, but for MLLM text
-        routing: ``_stream_generate_text`` must not enter the system-KV cache
-        branch when ``start()``'s probe of the derived ``_text_model`` returned
-        non-KVCache entries (e.g. a sliding-window text head). The gate must
-        fall back to the uncached path — no encode of the system prefix, no
-        snapshot store, no LRU mutation."""
-        from collections import OrderedDict
-
+    async def test_stream_generate_text_env_disable_skips_snapshot_persistence(
+        self, monkeypatch
+    ):
+        """Fork semantics: the text route's snapshot kill-switch is
+        ``VLLM_MLX_DISABLE_SYSTEM_KV=1`` (``_is_system_kv_safe``), used for
+        models that drift/loop on cache replay (hybrid Qwen3.5/3.6 family —
+        mlx-lm#1162); the ``_supports_system_kv_cache`` probe only gates the
+        separate non-MLLM media-path branch. When disabled, the request still
+        prefills its own prompt cache, but NOTHING may persist: no active-slot
+        snapshot, no LRU entry, and no future HIT."""
         from vllm_mlx.engine.simple import SimpleEngine
+
+        monkeypatch.setenv("VLLM_MLX_DISABLE_SYSTEM_KV", "1")
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = (
@@ -892,7 +1022,13 @@ class TestSimpleEngineConcurrency:
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
         tokenizer.decode = MagicMock(return_value="")
         tokenizer.eos_token_id = 99
 
@@ -903,16 +1039,6 @@ class TestSimpleEngineConcurrency:
         engine._loaded = True
         engine._text_model = text_model
         engine._text_tokenizer = tokenizer
-        # Probe at start() decided this text model is NOT snapshot-safe.
-        engine._supports_system_kv_cache = False
-        engine._system_kv_cache = OrderedDict()
-        # Seed counters to verify they don't move on the uncached path.
-        engine._system_kv_cache_stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
 
         def fake_stream_generate(*args, **kw):
             # _run_all iterates this synchronously (`for resp in ...`), so the
@@ -928,10 +1054,9 @@ class TestSimpleEngineConcurrency:
             )
 
         with (
-            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
-                return_value=["backbone-cache"],
+                return_value=[_FakeCacheLayer()],
             ),
             patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
             patch(
@@ -953,47 +1078,26 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert chunks, "expected uncached fallback to emit at least one chunk"
-        # System-prefix tokenization must NOT have been invoked: the only
-        # encode() call is the full-prompt one for the uncached path. The
-        # cache branch would have issued a second encode() for the system
-        # prefix before storing.
-        assert tokenizer.encode.call_count <= 1, (
-            "snapshot path ran despite _supports_system_kv_cache=False: "
-            f"encode called {tokenizer.encode.call_count} times"
-        )
-        # And nothing should have landed in the LRU or moved counters.
-        assert len(engine._system_kv_cache) == 0
-        assert engine._system_kv_cache_stats == {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
+        assert chunks, "expected the request to still stream output"
+        # The miss is counted (the prefill genuinely happened)…
+        assert engine._system_kv_misses == 1
+        # …but nothing was persisted for replay: no active slot, no LRU
+        # entry, no hit accounting.
+        assert engine._system_kv_snapshot is None
+        assert engine._system_kv_hash is None
+        assert engine._system_kv_token_ids is None
+        assert len(engine._system_kv_lru) == 0
+        assert engine._system_kv_hits == 0
+        assert engine._system_kv_tokens_saved == 0
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_skips_cache_path_under_bounded_kv(self):
-        """Bounded-KV snapshot-safety contract for the MLLM text route.
-
-        When ``_max_kv_size > 0`` the runtime cache branch builds the prompt
-        cache via ``make_prompt_cache(model, max_kv_size=N)``. For models
-        without a custom ``make_cache``, ``mlx_lm.models.cache.make_prompt_cache``
-        returns ``RotatingKVCache`` whose ``.state`` aliases buffers that
-        ``update_and_fetch`` mutates in place — snapshot capture would corrupt
-        the cached prefix on the next decode.
-
-        The startup probe is now wired with the same ``max_kv_size`` arg as
-        the runtime constructor, so under bounded KV the probe sees
-        ``RotatingKVCache`` and sets ``_supports_system_kv_cache=False``.
-        This test locks in the runtime side of that chain: with the flag set
-        False (the correct post-probe state for ``_max_kv_size > 0``),
-        ``_stream_generate_text`` must fall back to the uncached path — no
-        encode of the system prefix, no LRU store, no counter movement.
-
-        Regression for PR #541 review (Thump604, 2026-05-17 16:04 UTC).
-        """
-        from collections import OrderedDict
-
+    async def test_stream_generate_text_forwards_max_kv_size_under_bounded_kv(self):
+        """Bounded-KV contract for the fork's text route (patches #4/#9,
+        diverging from upstream #541 which skipped the cache branch entirely
+        under ``_max_kv_size > 0``): ``_stream_generate_text`` builds its
+        snapshot cache via ``make_prompt_cache(model, max_kv_size=N)`` — the
+        engine bound is forwarded, not silently dropped — and the system-KV
+        snapshot still stores and serves."""
         from vllm_mlx.engine.simple import SimpleEngine
 
         tokenizer = MagicMock()
@@ -1003,29 +1107,29 @@ class TestSimpleEngineConcurrency:
             "<|im_start|>assistant\n"
         )
         tokenizer.bos_token = None
-        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # extended prefix (up to gen-prompt marker)
+            ]
+        )
         tokenizer.decode = MagicMock(return_value="")
         tokenizer.eos_token_id = 99
 
         text_model = MagicMock()
         text_model.mtp = None
 
-        engine = SimpleEngine("test-model", force_mllm=True)
+        engine = SimpleEngine("test-model", force_mllm=True, max_kv_size=2048)
         engine._loaded = True
         engine._text_model = text_model
         engine._text_tokenizer = tokenizer
-        # Bounded-KV serving: the startup probe (called with the same
-        # max_kv_size as runtime) would have built RotatingKVCache and
-        # flipped this flag to False.
-        engine._max_kv_size = 2048
-        engine._supports_system_kv_cache = False
-        engine._system_kv_cache = OrderedDict()
-        engine._system_kv_cache_stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
+
+        cache_calls: list[dict] = []
+
+        def fake_make_prompt_cache(*args, **kw):
+            cache_calls.append(kw)
+            return [_FakeCacheLayer()]
 
         def fake_stream_generate(*args, **kw):
             yield SimpleNamespace(
@@ -1039,10 +1143,9 @@ class TestSimpleEngineConcurrency:
             )
 
         with (
-            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
-                return_value=["backbone-cache"],
+                side_effect=fake_make_prompt_cache,
             ),
             patch("mlx_lm.sample_utils.make_sampler", return_value=MagicMock()),
             patch(
@@ -1064,20 +1167,13 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert chunks, "expected uncached fallback to emit at least one chunk"
-        # The cache branch would have issued a second encode() for the system
-        # prefix before storing; under bounded KV the gate must skip that.
-        assert tokenizer.encode.call_count <= 1, (
-            "snapshot path ran under _max_kv_size>0: "
-            f"encode called {tokenizer.encode.call_count} times"
-        )
-        assert len(engine._system_kv_cache) == 0
-        assert engine._system_kv_cache_stats == {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
+        assert chunks, "expected the cached path to emit at least one chunk"
+        # The snapshot cache was built WITH the engine bound.
+        assert cache_calls and cache_calls[0].get("max_kv_size") == 2048
+        # And the cache path genuinely engaged under bounded KV.
+        assert engine._system_kv_misses == 1
+        assert engine._system_kv_snapshot is not None
+        assert engine._system_kv_token_count == 40
 
     @pytest.mark.anyio
     async def test_stream_chat_system_cache_copies_arrays_cache_state(self):
@@ -1186,60 +1282,41 @@ class TestSimpleEngineConcurrency:
     async def test_stream_chat_uses_gate_time_snapshot_under_concurrent_mutation(
         self,
     ):
-        """A concurrent MISS that mutates ``self._system_kv_cache`` between
-        the cache-hit gate (which runs outside ``_run_blocking_serialized``) and
-        the snapshot restore (which runs inside the serialized worker) must not
-        corrupt the HIT. The restore must use the snapshot reference captured at
-        gate time, not re-read ``self._system_kv_cache`` later — otherwise a
-        different system prefix's KV would be loaded under the hash that decided
-        HIT.
+        """A concurrent MISS that reassigns ``self._system_kv_snapshot``
+        between the cache-hit gate (which runs outside
+        ``_run_blocking_serialized``) and the snapshot restore (which runs
+        inside the serialized worker) must not corrupt the HIT.
 
-        Simulates the race by replacing the cache entry for the same hash inside
-        the ``_run_blocking_serialized`` hook (executed after the gate but
-        before the worker enters the cache branch), then asserts the restore
-        loop wrote the gate-time entries, not the post-gate intruder."""
-        import hashlib
-        from collections import OrderedDict
+        Fork semantics (patches #9/#12): the HIT path passes the snapshot to
+        the worker as an explicit ``_run_blocking_serialized`` argument bound
+        at gate time; the worker must restore from that reference, never
+        re-read the active-slot ivar.
 
+        Simulates the race by reassigning the active-slot snapshot inside the
+        ``_run_blocking_serialized`` hook (executed after the gate but before
+        the worker restores), then asserts the restore loop wrote the
+        gate-time entries, not the post-gate intruder."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        # Same template the positive test uses: divergence falls at the user
-        # content so the detected system prefix is the leading frame up through
-        # ``<|im_start|>user\n``.
-        def apply_chat_template_side_effect(messages, **kwargs):
-            user_content = ""
-            for m in reversed(messages):
-                role = (
-                    m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-                )
-                if role == "user":
-                    content = (
-                        m.get("content")
-                        if isinstance(m, dict)
-                        else getattr(m, "content", "")
-                    )
-                    user_content = content or ""
-                    break
-            return (
-                "<|im_start|>system\nYou are helpful.<|im_end|>\n"
-                f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-
-        expected_prefix = (
-            "<|im_start|>system\nYou are helpful.<|im_end|>\n" "<|im_start|>user\n"
-        )
-        expected_hash = hashlib.sha256(expected_prefix.encode()).hexdigest()[:16]
-
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
         tokenizer.bos_token = None
-        # First encode = full prompt tokens; second = system prefix tokens.
-        # range(20) is a prefix of range(50), so prefix-match validation passes.
-        tokenizer.encode = MagicMock(side_effect=[list(range(50)), list(range(20))])
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(50)),  # full prompt
+                list(range(20)),  # system prefix (proper prefix of above)
+                list(range(40)),  # HIT grow probe == cached ids → no grow
+            ]
+        )
+        tokenizer.eos_token_id = 99
 
         model = MagicMock()
         model.tokenizer = tokenizer
+        model.model = MagicMock()
 
         original_snapshot = [("ORIGINAL_K", "ORIGINAL_V")]
         intruder_snapshot = [("INTRUDER_K", "INTRUDER_V")]
@@ -1263,20 +1340,21 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
-            engine._supports_system_kv_cache = True
-            # Pre-seed HIT state matching the divergence-detected prefix.
-            engine._system_kv_cache = OrderedDict(
-                [(expected_hash, (original_snapshot, 20))]
-            )
+            # Pre-seed an active-slot HIT: the cached extended prefix
+            # (range(40)) is a proper prefix of the new request's full token
+            # list (range(50)) — the fork's longest-prefix-match gate.
+            engine._system_kv_snapshot = original_snapshot
+            engine._system_kv_hash = "seeded-hash"
+            engine._system_kv_token_count = 40
+            engine._system_kv_token_ids = list(range(40))
 
             async def serialized_with_race(func, *args, on_cancel=None, **kw):
-                # Simulate a concurrent MISS replacing the cache entry for the
-                # same hash AFTER the gate's HIT decision but BEFORE the worker
-                # restores. The gate captured a reference to the original
-                # tuple; replacement here must not affect that capture.
-                engine._system_kv_cache[expected_hash] = (intruder_snapshot, 20)
-                await asyncio.to_thread(func)
-                return None
+                # Simulate a concurrent MISS reassigning the active slot AFTER
+                # the gate's HIT decision but BEFORE the worker restores. The
+                # gate passed the original snapshot as an argument;
+                # reassignment here must not affect that binding.
+                engine._system_kv_snapshot = intruder_snapshot
+                return await asyncio.to_thread(func, *args, **kw)
 
             engine._run_blocking_serialized = (
                 serialized_with_race  # type: ignore[method-assign]
@@ -1289,6 +1367,7 @@ class TestSimpleEngineConcurrency:
                     return_value=[MockCacheEntry()],
                 ),
                 patch("mlx_lm.sample_utils.make_sampler"),
+                patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
             ):
                 _ = [
                     c
@@ -1300,8 +1379,10 @@ class TestSimpleEngineConcurrency:
                     )
                 ]
 
-        # Restore wrote the gate-time snapshot exactly once.
-        # If the worker had re-read ``self._system_kv_cache`` we would see
+        # The gate decided HIT…
+        assert engine._system_kv_hits == 1
+        # …and the restore wrote the gate-time snapshot exactly once.
+        # If the worker had re-read ``self._system_kv_snapshot`` we would see
         # ``("INTRUDER_K", "INTRUDER_V")`` instead — that's the TOCTOU bug.
         assert captured_states == [("ORIGINAL_K", "ORIGINAL_V")], (
             "Snapshot restore did not use the gate-time reference; "
@@ -1768,7 +1849,13 @@ class TestSimpleEngineConcurrency:
 
     @pytest.mark.anyio
     async def test_specprefill_success_preserves_mtp_path(self):
-        """Successful sparse prefill should continue through the normal MTP path."""
+        """Successful sparse prefill should continue through the normal MTP path.
+
+        Fork guard (patch #17): the content-phase resume forwards ``mtp=``
+        only when ``inspect.signature(stream_generate)`` exposes an explicit
+        ``mtp`` parameter (VAR_KEYWORD is not enough), so the fake must
+        declare ``mtp`` in its signature for the kwarg to arrive.
+        """
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -1783,9 +1870,9 @@ class TestSimpleEngineConcurrency:
 
             return _sample
 
-        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+        def fake_stream_generate(model, tokenizer, prompt, *, mtp=None, **kwargs):
             captured["prompt"] = prompt.tolist()
-            captured["kwargs"] = kwargs
+            captured["kwargs"] = {**kwargs, "mtp": mtp}
             yield SimpleNamespace(text="B", finish_reason="stop")
 
         def fake_select_chunks(_importance, **kwargs):
@@ -1829,7 +1916,9 @@ class TestSimpleEngineConcurrency:
                 "mlx_lm.sample_utils.make_logits_processors",
                 return_value=[],
             ),
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            # Replace (not side_effect-wrap) so inspect.signature() sees the
+            # fake's explicit ``mtp`` parameter and the guard forwards it.
+            patch("mlx_lm.stream_generate", fake_stream_generate),
             patch(
                 "vllm_mlx.specprefill.score_tokens",
                 return_value=mx.array([1.0, 0.9, 0.8], dtype=mx.float32),
@@ -1868,6 +1957,97 @@ class TestSimpleEngineConcurrency:
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
         assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
+
+    @pytest.mark.anyio
+    async def test_specprefill_drops_mtp_when_stream_generate_lacks_param(self):
+        """Patch #17 guard, degraded side: when the installed mlx_lm
+        ``stream_generate`` does NOT expose an explicit ``mtp`` parameter
+        (deployed mlx_lm 0.31.3 — VAR_KEYWORD doesn't count), the SpecPrefill
+        content-phase resume must drop the kwarg and continue without native
+        MTP instead of raising TypeError."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        def fake_make_sampler(**kwargs):
+            def _sample(_logprobs):
+                return mx.array([17], dtype=mx.uint32)
+
+            return _sample
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            # No explicit ``mtp`` parameter — like mlx_lm 0.31.3. A forwarded
+            # mtp= would land in **kwargs here; the guard must not send it.
+            captured["kwargs"] = kwargs
+            yield SimpleNamespace(text="B", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 99
+        tokenizer.encode.return_value = [5, 6, 7]
+        tokenizer.decode.side_effect = lambda ids: "".join(
+            {17: "A", 99: ""}.get(tok, f"<{tok}>") for tok in ids
+        )
+
+        text_model = MagicMock()
+        text_model.mtp = object()
+        text_model.make_mtp_cache.return_value = ["mtp-cache"]
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+            specprefill_enabled=True,
+            specprefill_threshold=1,
+        )
+        engine._loaded = True
+        engine._text_model = text_model
+        engine._text_tokenizer = tokenizer
+        engine._draft_model = object()
+
+        with (
+            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=["backbone-cache"],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", side_effect=fake_make_sampler),
+            patch(
+                "mlx_lm.sample_utils.make_logits_processors",
+                return_value=[],
+            ),
+            patch("mlx_lm.stream_generate", fake_stream_generate),
+            patch(
+                "vllm_mlx.specprefill.score_tokens",
+                return_value=mx.array([1.0, 0.9, 0.8], dtype=mx.float32),
+            ),
+            patch(
+                "vllm_mlx.specprefill.select_chunks",
+                return_value=mx.array([0, 1, 2], dtype=mx.int32),
+            ),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 3, 32), dtype=mx.float32),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=4,
+                    temperature=0.6,
+                    top_p=0.95,
+                )
+            ]
+
+        # No TypeError, generation completed, and the kwarg was dropped.
+        assert [chunk.new_text for chunk in outputs] == ["A", "B"]
+        assert "mtp" not in captured["kwargs"]
 
     @pytest.mark.anyio
     async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
@@ -2301,7 +2481,16 @@ class TestSimpleEngineConcurrency:
     async def test_cancellation_does_not_release_lock_before_worker_finishes(
         self, mock_llm_model
     ):
-        """A cancelled blocking chat call must not overlap the next worker."""
+        """A cancelled blocking chat call must not overlap the next worker.
+
+        Media-shaped messages pin ``chat()`` on the legacy blocking
+        ``self._model.chat`` path (the fork routes plain-text non-MLLM chat
+        through ``_stream_generate_text``, which tokenizes for real and can't
+        run on a MagicMock model); the property under test —
+        ``_run_blocking_serialized`` keeping ``_generation_lock`` held until
+        the worker thread actually finishes — is the same lock and runner
+        every route uses.
+        """
         from threading import Event, Lock
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -2337,24 +2526,38 @@ class TestSimpleEngineConcurrency:
 
         mock_llm_model.chat = MagicMock(side_effect=chat_side_effect)
 
+        def media_messages(text: str) -> list[dict]:
+            # Media part pins the legacy mlx blocking-chat path on a
+            # non-MLLM engine (see docstring).
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "x.png"}},
+                        {"type": "text", "text": text},
+                    ],
+                }
+            ]
+
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
             engine._generation_lock_admission = "wait"
+            # chat() recomputes prompt accounting via apply_chat_template
+            # (tokenize=True) on the legacy path.
+            mock_llm_model.tokenizer.apply_chat_template = MagicMock(
+                return_value=[1, 2, 3]
+            )
 
             task1 = asyncio.create_task(
-                engine.chat(
-                    messages=[{"role": "user", "content": "first"}], max_tokens=8
-                )
+                engine.chat(messages=media_messages("first"), max_tokens=8)
             )
             await asyncio.to_thread(first_started.wait, 1.0)
 
             task1.cancel()
             task2 = asyncio.create_task(
-                engine.chat(
-                    messages=[{"role": "user", "content": "second"}], max_tokens=8
-                )
+                engine.chat(messages=media_messages("second"), max_tokens=8)
             )
 
             await asyncio.sleep(0.05)
@@ -2619,60 +2822,76 @@ class TestSimpleEngineConcurrency:
 
 
 class TestSimpleEngineClearRuntimeCaches:
-    """Operational reset (DELETE /v1/cache) must actually release the
-    multi-slot system-prompt KV cache state introduced in the LRU patch —
-    otherwise multi-GB Metal-heap snapshots can survive a reset while
-    /v1/cache/stats still reports them.
+    """Releasing the multi-slot system-prompt KV cache state (patches
+    #9/#12/#13: active-slot ivars + ``_system_kv_lru`` bag).
+
+    Fork semantics differ from upstream #523/#541: ``clear_runtime_caches``
+    is the MLLM model-cache hook only (returns None for non-MLLM engines);
+    the system-KV snapshot stack — multi-GB Metal-heap state — is released
+    by ``stop()``.
     """
 
-    def test_clear_runtime_caches_drops_lru_and_resets_counters(self):
-        from collections import OrderedDict
+    @pytest.fixture
+    def anyio_backend(self):
+        return "asyncio"
 
+    def _seed_system_kv_state(self, engine):
+        # Active slot + LRU bag + non-zero counters, as if the engine had
+        # been serving traffic with three distinct system prefixes.
+        engine._system_kv_snapshot = [(b"active_k", b"active_v")]
+        engine._system_kv_hash = "hash_active"
+        engine._system_kv_token_count = 28000
+        engine._system_kv_token_ids = [1, 2, 3]
+        engine._system_kv_lru["hash_a"] = {
+            "snapshot": [(b"snap_a_k", b"snap_a_v")],
+            "token_count": 6500,
+            "token_ids": [4, 5, 6],
+        }
+        engine._system_kv_lru["hash_b"] = {
+            "snapshot": [(b"snap_b_k", b"snap_b_v")],
+            "token_count": 900,
+            "token_ids": [7, 8, 9],
+        }
+        engine._system_kv_hits = 5
+        engine._system_kv_misses = 2
+        engine._system_kv_tokens_saved = 140000
+        engine._system_kv_evictions = 1
+        engine._supports_system_kv_cache = True
+
+    @pytest.mark.anyio
+    async def test_stop_drops_lru_and_resets_counters(self):
         from vllm_mlx.engine.simple import SimpleEngine
 
-        engine = SimpleEngine("test-model")
-        # Seed a populated LRU + non-zero counters as if the engine had been
-        # serving traffic with two distinct system prefixes.
-        engine._system_kv_cache = OrderedDict(
-            [
-                ("hash_a", ([b"snap_a_layer_0", b"snap_a_layer_1"], 28000)),
-                ("hash_b", ([b"snap_b_layer_0", b"snap_b_layer_1"], 6500)),
-            ]
-        )
-        engine._system_kv_cache_stats = {
-            "hits": 5,
-            "misses": 2,
-            "stores": 2,
-            "evictions": 0,
-        }
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        self._seed_system_kv_state(engine)
 
-        result = engine.clear_runtime_caches()
+        # Fork divergence: clear_runtime_caches has no system-KV semantics
+        # for non-MLLM engines — it must not touch the snapshot stack.
+        assert engine.clear_runtime_caches() is None
+        assert len(engine._system_kv_lru) == 2
+        assert engine._system_kv_snapshot is not None
 
-        assert len(engine._system_kv_cache) == 0, "LRU must be empty after clear"
-        assert engine._system_kv_cache_stats == {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }, "counters must reset so /v1/cache/stats reflects cleared state"
-        assert result is not None
-        assert result["system_kv_cache"] == {"dropped_entries": 2}
+        # stop() is the operational release path for the snapshot stack.
+        await engine.stop()
 
-    def test_clear_runtime_caches_no_op_when_lru_empty_and_counters_zero(self):
-        from collections import OrderedDict
+        assert engine._system_kv_snapshot is None
+        assert engine._system_kv_hash is None
+        assert engine._system_kv_token_count == 0
+        assert engine._system_kv_token_ids is None
+        assert len(engine._system_kv_lru) == 0, "LRU bag must be empty after stop"
+        assert engine._system_kv_hits == 0
+        assert engine._system_kv_misses == 0
+        assert engine._system_kv_tokens_saved == 0
+        assert engine._system_kv_evictions == 0
+        assert engine._supports_system_kv_cache is False
 
+    def test_clear_runtime_caches_no_op_for_non_mllm(self):
         from vllm_mlx.engine.simple import SimpleEngine
 
-        engine = SimpleEngine("test-model")
-        engine._system_kv_cache = OrderedDict()
-        engine._system_kv_cache_stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
 
-        result = engine.clear_runtime_caches()
-
-        # Non-MLLM, empty LRU, zeroed counters → nothing to report.
-        assert result is None
+        # Non-MLLM → nothing to report (MLLM engines clear the model cache).
+        assert engine.clear_runtime_caches() is None
