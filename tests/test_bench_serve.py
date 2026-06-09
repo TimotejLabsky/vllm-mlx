@@ -581,15 +581,15 @@ class TestAutoDetectionParsing:
 
     def test_parse_metrics_text_with_cache_stats(self):
         text = (
-            "# HELP vllm_prefix_cache_hits_total Total prefix cache hits\n"
-            "# TYPE vllm_prefix_cache_hits_total counter\n"
-            "vllm_prefix_cache_hits_total 42\n"
-            "# HELP vllm_prefix_cache_misses_total Total prefix cache misses\n"
-            "# TYPE vllm_prefix_cache_misses_total counter\n"
-            "vllm_prefix_cache_misses_total 8\n"
-            "# HELP vllm_prefix_cache_tokens_saved_total Tokens saved\n"
-            "# TYPE vllm_prefix_cache_tokens_saved_total counter\n"
-            "vllm_prefix_cache_tokens_saved_total 1024\n"
+            "# HELP vllm_mlx_cache_hits Total cache hits\n"
+            "# TYPE vllm_mlx_cache_hits gauge\n"
+            "vllm_mlx_cache_hits 42.0\n"
+            "# HELP vllm_mlx_cache_misses Total cache misses\n"
+            "# TYPE vllm_mlx_cache_misses gauge\n"
+            "vllm_mlx_cache_misses 8.0\n"
+            "# HELP vllm_mlx_cache_tokens_saved Tokens saved\n"
+            "# TYPE vllm_mlx_cache_tokens_saved gauge\n"
+            "vllm_mlx_cache_tokens_saved 1024.0\n"
         )
         result = parse_metrics_text(text)
         assert result["cache_hits"] == 42

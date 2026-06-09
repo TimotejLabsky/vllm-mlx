@@ -365,6 +365,35 @@ The SimpleEngine system-KV snapshot (#4/#6/#9/#12/#13) lives only in the serving
 
 ---
 
+## 17. `patch: perf-observability-and-guards`
+
+**Files:** `vllm_mlx/engine/simple.py`, `vllm_mlx/server.py`, `vllm_mlx/cli.py`, `vllm_mlx/bench_serve.py`, `tests/test_bench_serve.py`
+
+A batch of low-risk observability fixes + correctness guards from a multi-agent, adversarially-verified performance study (2026-06-08/09). The study's honest top-line: the system-KV prefix cache already captured the big win (13–32×), and decode is at the 4-bit memory-bandwidth floor (`mx.compile` measured 0% — patch #11), so the real near-term opportunities are (a) making the cache *observable* and (b) closing silent-degradation traps. This patch ships those; the larger bets (native-MTP-on-SimpleEngine port, BatchedEngine-for-MoE A/B) are tracked in Future work.
+
+**Observability fixes:**
+
+- **`bench_serve` cache metrics read the wrong name.** `parse_metrics_text` greped `vllm_prefix_cache_{hits,misses,tokens_saved}_total` — names the server emits *nowhere*. The server exposes `vllm_mlx_cache_*` gauges (`metrics.py`). Every bench run silently recorded `hit_rate=0, tokens_saved=0` into its SQLite results even on a genuinely ~89%-hit agent workload. Fixed the three names + made `_extract` tolerate float gauge values; updated the mirrored test fixture.
+- **`system_kv_cache.hit_rate` was never emitted on the production path.** `metrics.py` reads a `hit_rate` key, but the only one populated was on the MLLM `memory_aware_cache` block — absent for the non-MLLM / LLM-route path the heavy models actually use, so the `vllm_mlx_cache_hit_rate` gauge sat at a constant 0. Added the one-line field to `get_stats`'s `system_kv_cache` dict.
+- **Per-request lock-wait timer.** TTFT conflated queue-wait + cold-prefill + warm-hit into one unlabeled number. Added a `perf_counter` wait timer in `_acquire_generation_slot`, surfaced as `generation_lock.{wait_count,wait_avg_ms,wait_max_ms}` in `get_stats` — the one TTFT component not derivable from hit/miss counts.
+- **`VLLM_MLX_DEBUG_PROMPT_CAPTURE=1`** (server.py, OpenAI path) dumps the *untruncated* system prefix + tool-list ordering, so two consecutive opencode turns can be diffed to confirm/deny volatile content (timestamps, session ids, reordered tools) defeating the longest-prefix HIT — resolves the canonicalization findings empirically instead of by guess. (Existing `VLLM_MLX_DEBUG_MESSAGES` truncates content; the `[REQUEST]` dump is Anthropic-only.)
+
+**Correctness guards:**
+
+- **Loud MLLM text-route degradation.** When `build_text_model` returns `None` or raises (swallowed before), an `_is_mllm` model silently falls back to the cacheless `mlx_vlm` path — full cold prefill (~25–70 s) *every turn*, with the 13–32× system-KV win invisibly gone. Now logs a loud warning and surfaces `mllm_text_route_degraded` in `/v1/status`. `--text-only` remains the manual mitigation (forces the pure-LLM route).
+- **SpecPrefill + native-MTP TypeError guard.** The SpecPrefill content-phase resume passed `mtp=use_mtp` unconditionally to `mlx_lm.stream_generate`. Verified against the deployed **mlx_lm 0.31.3**: `stream_generate` takes `**kwargs` but forwards to `generate_step`, which has *no* `**kwargs` and *no* `mtp` param — so the kwarg raises `TypeError` downstream (latent on every SpecPrefill request, not just when MTP is co-enabled). Now forwards `mtp` only when `inspect.signature(stream_generate)` actually exposes it (version-agnostic; degrades with a warning otherwise). The regular text route signals MTP via `num_draft_tokens` and never hits this site.
+- **Honest MTP banner.** `cli.py` printed "MTP: enabled (native speculative decoding)" under SimpleEngine, where native mlx_lm MTP self-speculation is inert (the text route calls `stream_generate` with no `draft_model`; effective draft depth 1, matching the engine's own runtime warning). Reworded to say so.
+
+**O(n²) hygiene:**
+
+- The per-token stop-string scan re-scanned the entire accumulated output every token (`any(seq in accumulated_text ...)`). Bounded it to the tail window that could contain a *newly* completed stop sequence (`len(new_text)+max_stop_len-1` chars). Semantically identical (earlier matches were already caught on prior iterations); O(len(new_text)) per token. **Hygiene, not a tok/s claim** — it runs on the asyncio consumer, off the GPU critical path.
+
+**Verified:** all five files `py_compile` clean; the `mtp` guard and the bf16/`mtp` signature facts confirmed against the installed mlx_lm 0.31.3; instrumentation validated end-to-end on an M1 Pro with a local model (hit_rate / lock-wait / prompt-capture fields populate, bench reads nonzero cache stats). Perf A/Bs that need the production 27B/35B at scale run on the Mac Studio.
+
+**Upstreaming:** the bench-metric-name fix, the `hit_rate` field, and the SpecPrefill `mtp` TypeError guard are clean, isolated bug fixes — all PR-worthy. The debug-capture flag and lock-wait timer are general-purpose observability.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
