@@ -231,6 +231,7 @@ class SystemKVManager:
         self.hits = 0
         self.misses = 0
         self.tokens_saved = 0
+        self.ssd_promotes = 0
         self.supports_snapshot = False
         if self.ssd_store is not None:
             try:
@@ -381,15 +382,20 @@ class SystemKVManager:
         to the bag before overwriting (only if it holds a
         different system_hash from the new MISS).
 
-        Does not touch ``token_ids`` — the stream_chat branch caches the
-        literal system prefix, not the extended prefix. Runs inside the
-        serialized generation worker.
+        Clears ``token_ids`` — the stream_chat branch caches the literal
+        system prefix, not the extended prefix, so a stale extended token
+        list from a prior ``store_extended`` for the same hash must not
+        linger. (It could never produce a false extended HIT —
+        ``match_extended_prefix`` requires ``len(token_ids) == token_count``
+        to match — but the slot state should be honest, not
+        accidentally-safe.) Runs inside the serialized generation worker.
         """
         if self.system_hash and self.system_hash != system_hash:
             self.lru_demote_active_to_bag()
         self.snapshot = snapshot
         self.system_hash = system_hash
         self.token_count = token_count
+        self.token_ids = None
 
     def store_extended(self, system_hash, snapshot, extended_token_ids, promoted):
         """Install an EXTENDED-prefix snapshot as the active slot
