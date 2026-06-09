@@ -800,6 +800,9 @@ class TestLifecycleFailureHandling:
             tools=[{"type": "function"}],
             tool_choice=None,
             enable_thinking=None,
+            # Fork patch #2 (reasoning-effort, PATCHES.md): the prep path reads
+            # request.reasoning_effort, so the stub request must carry it.
+            reasoning_effort=None,
             video_fps=None,
             video_max_frames=None,
             specprefill=None,
@@ -3052,9 +3055,14 @@ class TestLifecycleFailureHandling:
     async def test_count_tokens_validates_model_before_resident_acquire(
         self, monkeypatch
     ):
-        """count_tokens should reject wrong model names before cold resident acquire."""
-        from fastapi import HTTPException
+        """Fork contract: count_tokens accepts mismatched model names.
 
+        Upstream rejects wrong model names with a 404 before the cold resident
+        acquire. PATCHES.md patch #1 (`patch: bugfixes`) deliberately disables
+        `_validate_model_name()` because llama-swap routes by config key, so a
+        "wrong" model name is expected traffic: the request must proceed to
+        the resident acquire and return a token count instead of 404ing.
+        """
         import vllm_mlx.server as srv
 
         calls = {"acquire": 0}
@@ -3070,9 +3078,16 @@ class TestLifecycleFailureHandling:
             async def is_disconnected(self):
                 return False
 
+        class FakeTokenizer:
+            def encode(self, text):
+                return [0] * len(text.split())
+
+        class FakeEngine:
+            tokenizer = FakeTokenizer()
+
         async def fake_acquire_default_engine_for_request(*args, **kwargs):
             calls["acquire"] += 1
-            raise AssertionError("acquire should not run for wrong-model count_tokens")
+            return FakeEngine()
 
         monkeypatch.setattr(
             srv,
@@ -3086,10 +3101,13 @@ class TestLifecycleFailureHandling:
             raising=False,
         )
 
-        with pytest.raises(HTTPException, match="does not exist"):
-            await srv.count_anthropic_tokens(FakeRequest())
+        response = await srv.count_anthropic_tokens(FakeRequest())
 
-        assert calls["acquire"] == 0
+        # Mismatched model name was accepted (no HTTPException) and the
+        # request flowed through the resident acquire to a real count:
+        # "sys" (1 token) + "hi" (1 token).
+        assert calls["acquire"] == 1
+        assert response == {"input_tokens": 2}
 
     @pytest.mark.anyio
     async def test_anthropic_messages_refresh_idle_unload_activity(self, monkeypatch):
