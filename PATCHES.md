@@ -400,6 +400,26 @@ A batch of low-risk observability fixes + correctness guards from a multi-agent,
 
 ---
 
+## 18. `refactor: system-kv-module-extraction`
+
+**Files:** `vllm_mlx/system_kv.py` (new), `vllm_mlx/engine/simple.py`
+
+**Pure code motion, zero behavior change.** Extracts the system-KV snapshot cache stack (patches #4/#6/#9/#12/#13 state + helpers + probe + stats, and patch #16's SSD-store lifecycle) out of `engine/simple.py` into a `SystemKVManager` class in `vllm_mlx/system_kv.py` — the same containment pattern patch #16 proved with `system_kv_ssd.py`. Motivation: `engine/simple.py` is the file upstream churns hardest; before this refactor our diff there was ~1,100 lines and every rebase conflicted in the cache regions. After: simple.py shrinks by 213 lines (3232 → 3019), the cache internals live in a fork-owned module upstream never touches, and the remaining simple.py surface is thin orchestration calls plus a stable delegation block.
+
+**What moved:** all slot/LRU/counter state, `lru_promote`/`lru_demote_active_to_bag`, the `VLLM_MLX_DISABLE_SYSTEM_KV` kill switch, the start()-time RotatingKVCache denylist probe, SSD store start/drain/close, the stop() reset, the full `get_stats()["system_kv_cache"]` assembly, and the gate/store bookkeeping (`lookup_active`, `match_extended_prefix`, `record_hit`, `store_snapshot`, `store_extended`). Log strings byte-identical (the "snapshot enabled" canary line and friends).
+
+**What stayed in simple.py:** the generation-interleaved code — grow-on-HIT closure, MISS prefill loop, SSD promote-from-disk restore (they drive `model(...)`/`mx.eval` mid-worker) — and the request-site log lines that format request-local values.
+
+**Compatibility surface:** `SimpleEngine` keeps the full legacy attribute API via 13 property+setter pairs (`_system_kv_snapshot`, `_system_kv_lru`, counters, `_supports_system_kv_cache`, `_ssd_store`, …) plus one-line delegating methods (`_lru_promote`, `_lru_demote_active_to_bag`, `_is_system_kv_safe`). The TOCTOU gate-time contract is unchanged: snapshots are captured under the generation lock (`lookup_active`) and passed explicitly into worker closures.
+
+**Verified:** full suite at exact pre-refactor baseline (2173 passed, 12 skipped, 0 failed) with **zero test edits** — the suite adapted on 2026-06-09 pins these semantics (TOCTOU, denylist probe, counters, stats shape) and was used as the behavioral oracle.
+
+**Rebase impact:** upstream changes to simple.py's cache regions should now be rejected as before, but conflicts will be smaller and rarer; `system_kv.py` is fork-owned and conflict-free by construction.
+
+**Upstreaming:** n/a (fork infrastructure), though the module boundary would make the eventual #6+#12 upstream PR easier to cut.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
