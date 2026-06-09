@@ -3863,6 +3863,12 @@ async def status():
         or stats.get("prefix_cache")
         or stats.get("system_kv_cache"),
         "mtp": stats.get("mtp") or {"enabled": False},
+        # Serialized-lock telemetry (waiters / busy_rejections / wait_*_ms): the
+        # one TTFT component not derivable from cache hit/miss counts. Computed
+        # in the engine's get_stats but previously dropped here.
+        "generation_lock": stats.get("generation_lock"),
+        # Surface the silent MLLM text-route fallback (cacheless mlx_vlm path).
+        "text_route_degraded": stats.get("mllm_text_route_degraded", False),
         "requests": stats.get("requests", []),
     }
 
