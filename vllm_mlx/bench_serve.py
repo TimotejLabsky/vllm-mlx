@@ -499,7 +499,13 @@ def parse_status_response(data: dict) -> dict:
 def parse_metrics_text(text: str) -> dict:
     """Parse Prometheus text exposition format from GET /metrics.
 
-    Extracts the three prefix-cache counters used for bench reporting.
+    Extracts the three cache counters used for bench reporting.
+
+    The server emits these as gauges named ``vllm_mlx_cache_*`` (see
+    ``metrics.py``); they hold cumulative counts, so before/after delta math in
+    the bench harness still works. The previous ``vllm_prefix_cache_*_total``
+    names were emitted nowhere, so every run silently recorded 0 hits even at
+    the real ~89% system-KV hit rate.
 
     Args:
         text: Raw response body from the /metrics endpoint.
@@ -510,14 +516,15 @@ def parse_metrics_text(text: str) -> dict:
     """
 
     def _extract(metric_name: str) -> int:
-        pattern = rf"^{re.escape(metric_name)}\s+(\d+)"
+        # Gauges serialize as floats (e.g. ``42.0``); accept and truncate.
+        pattern = rf"^{re.escape(metric_name)}\s+(\d+(?:\.\d+)?)"
         m = re.search(pattern, text, re.MULTILINE)
-        return int(m.group(1)) if m else 0
+        return int(float(m.group(1))) if m else 0
 
     return {
-        "cache_hits": _extract("vllm_prefix_cache_hits_total"),
-        "cache_misses": _extract("vllm_prefix_cache_misses_total"),
-        "tokens_saved": _extract("vllm_prefix_cache_tokens_saved_total"),
+        "cache_hits": _extract("vllm_mlx_cache_hits"),
+        "cache_misses": _extract("vllm_mlx_cache_misses"),
+        "tokens_saved": _extract("vllm_mlx_cache_tokens_saved"),
     }
 
 
