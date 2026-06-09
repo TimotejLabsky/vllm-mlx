@@ -187,6 +187,47 @@ class TestSimpleEngineConcurrency:
             await first
 
     @pytest.mark.anyio
+    async def test_admission_env_wait_is_respected(self, monkeypatch):
+        """VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait queues instead of rejecting."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "wait")
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+
+            assert engine._generation_lock_admission == "wait"
+
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_call():
+                started.set()
+                release.wait(timeout=1.0)
+                return "ok"
+
+            first = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    slow_call,
+                    request_id="first-serialized-request",
+                )
+            )
+            await asyncio.to_thread(started.wait, 1.0)
+
+            second = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    lambda: "late",
+                    request_id="second-serialized-request",
+                )
+            )
+            await asyncio.sleep(0.05)
+            release.set()
+
+            assert await first == "ok"
+            assert await second == "late"
+            assert engine._generation_busy_rejections == 0
+
+    @pytest.mark.anyio
     async def test_blocking_serialized_tracks_active_request(self):
         """Busy errors include the current blocking serialized holder."""
         from vllm_mlx.engine.simple import SimpleEngine
