@@ -807,8 +807,14 @@ class TestHelperFunctions:
         assert [model.id for model in response.data] == ["fast", "smart"]
 
     def test_validate_model_name_checks_registry_when_present(self, monkeypatch):
-        """Registry-backed validation should accept registered names and reject unknown ones."""
-        from fastapi import HTTPException
+        """Fork contract: model-name validation is deliberately disabled.
+
+        PATCHES.md patch #1 (`patch: bugfixes`) makes `_validate_model_name()`
+        an early-return no-op because llama-swap routes by config key, not by
+        the served HF model id — strict upstream validation would 404 every
+        proxied request. Mismatched/unknown model names must therefore be
+        accepted (no HTTPException), even when a registry is present.
+        """
         import vllm_mlx.server as server
 
         class FakeManager:
@@ -824,13 +830,15 @@ class TestHelperFunctions:
         monkeypatch.setattr(server, "_model_manager", FakeManager())
         monkeypatch.setattr(server, "_model_name", None)
 
+        # Registered name accepted.
         server._validate_model_name("fast")
+        # Unknown name ALSO accepted (would 404 upstream) — patch #1 contract.
+        server._validate_model_name("missing")
 
-        with pytest.raises(HTTPException) as exc_info:
-            server._validate_model_name("missing")
-
-        assert exc_info.value.status_code == 404
-        assert "fast" in exc_info.value.detail
+        # Single-model mode with a mismatched name is accepted too.
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        server._validate_model_name("anything-else")
 
     def test_build_reasoning_parser_uses_configured_name_and_engine_tokenizer(
         self, monkeypatch
@@ -3275,26 +3283,44 @@ class TestStreamChatCompletion:
         )
         import vllm_mlx.server as server
 
+        # Fork adaptation (PATCHES.md patch #4, llm-mode-kv-cache): pure-LLM
+        # streaming routes through SimpleEngine._stream_generate_text, which
+        # calls mlx_lm.stream_generate(self._model.model, ...) in a serialized
+        # worker thread after rebinding MLX streams via
+        # bind_generation_streams(). The thread-validity contract is therefore
+        # "generation runs on the thread that last bound the streams", not
+        # "generation runs on the load thread". The fake mlx_lm.stream_generate
+        # below raises the Stream(gpu, N) error if that rebind did not happen
+        # on the generating thread — preserving the original test's intent.
+        bound_thread = {"id": None}
+
+        def fake_bind_generation_streams():
+            bound_thread["id"] = threading.get_ident()
+
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
-                self._load_thread = None
+                # Sentinel inner mlx model handed to mlx_lm.stream_generate by
+                # _text_route_resources(); plain namespace so the engine's
+                # make_prompt_cache probe fails cleanly and disables caching.
+                self.model = SimpleNamespace()
                 self.tokenizer = MagicMock()
                 self.tokenizer.apply_chat_template.return_value = "user: Count"
                 self.tokenizer.bos_token = None
                 self.tokenizer.encode.return_value = [1, 2, 3]
 
             def load(self):
-                self._load_thread = threading.get_ident()
+                # Initial ownership belongs to the load thread.
+                bound_thread["id"] = threading.get_ident()
 
-            def stream_generate(self, **_kwargs):
-                if threading.get_ident() != self._load_thread:
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                yield SimpleNamespace(
-                    text="one, two, three",
-                    prompt_tokens=3,
-                    finished=True,
-                    finish_reason="stop",
-                )
+        def fake_mlx_stream_generate(_model, _tokenizer, prompt=None, **_kwargs):
+            if threading.get_ident() != bound_thread["id"]:
+                raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+            yield SimpleNamespace(
+                text="one, two, three",
+                prompt_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
 
         async def engine_factory(spec):
             return SimpleEngine(spec.model_name)
@@ -3312,6 +3338,11 @@ class TestStreamChatCompletion:
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
             patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+            patch(
+                "vllm_mlx.engine.simple.bind_generation_streams",
+                side_effect=fake_bind_generation_streams,
+            ),
+            patch("mlx_lm.stream_generate", fake_mlx_stream_generate),
         ):
             try:
                 engine = await manager.ensure_loaded("default")
@@ -3323,10 +3354,16 @@ class TestStreamChatCompletion:
                     stream=True,
                 )
 
+                # Production passes dict messages (extract_multimodal_content
+                # output) to stream_chat_completion; the fork's real
+                # _stream_generate_text path requires that shape.
+                dict_messages = [
+                    {"role": m.role, "content": m.content} for m in request.messages
+                ]
                 chunks = [
                     chunk
                     async for chunk in _ensure_sse_terminal(
-                        stream_chat_completion(engine, request.messages, request),
+                        stream_chat_completion(engine, dict_messages, request),
                         "data: [DONE]\n\n",
                     )
                 ]
@@ -3848,8 +3885,16 @@ class TestChatCompletionStreamingModeSwitching:
         def fake_bind_generation_streams(*_args, **_kwargs):
             bound_thread["id"] = threading.get_ident()
 
+        # Fork adaptation (PATCHES.md patch #4, llm-mode-kv-cache): both
+        # stream and non-stream pure-LLM requests route through
+        # _stream_generate_text, which calls mlx_lm.stream_generate on
+        # self._model.model in a serialized worker thread after rebinding MLX
+        # streams. The thread-validity check therefore lives in the patched
+        # mlx_lm.stream_generate below (the wrapper's chat/stream_generate
+        # methods are never called on this route).
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
+                self.model = SimpleNamespace()
                 self.tokenizer = MagicMock()
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
@@ -3861,24 +3906,15 @@ class TestChatCompletionStreamingModeSwitching:
                 # Initial ownership belongs to the load thread.
                 bound_thread["id"] = threading.get_ident()
 
-            def chat(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                return SimpleNamespace(
-                    text="one, two, three",
-                    tokens=[11, 12, 13],
-                    finish_reason="stop",
-                )
-
-            def stream_generate(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                yield SimpleNamespace(
-                    text="one, two, three",
-                    prompt_tokens=3,
-                    finished=True,
-                    finish_reason="stop",
-                )
+        def fake_mlx_stream_generate(_model, _tokenizer, prompt=None, **_kwargs):
+            if bound_thread["id"] != threading.get_ident():
+                raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+            yield SimpleNamespace(
+                text="one, two, three",
+                prompt_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
 
         engine = SimpleEngine("test-model")
 
@@ -3897,6 +3933,7 @@ class TestChatCompletionStreamingModeSwitching:
                 "vllm_mlx.engine.simple.bind_generation_streams",
                 side_effect=fake_bind_generation_streams,
             ),
+            patch("mlx_lm.stream_generate", fake_mlx_stream_generate),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)
@@ -4056,8 +4093,11 @@ class TestChatCompletionStreamingModeSwitching:
         def fake_bind_generation_streams(*_args, **_kwargs):
             bound_thread["id"] = threading.get_ident()
 
+        # Fork adaptation (PATCHES.md patch #4): see
+        # test_nonstream_then_stream_chat_completion_keeps_stream_thread_valid.
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
+                self.model = SimpleNamespace()
                 self.tokenizer = MagicMock()
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
@@ -4069,24 +4109,15 @@ class TestChatCompletionStreamingModeSwitching:
                 # Initial ownership belongs to the load thread.
                 bound_thread["id"] = threading.get_ident()
 
-            def chat(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                return SimpleNamespace(
-                    text="one, two, three",
-                    tokens=[11, 12, 13],
-                    finish_reason="stop",
-                )
-
-            def stream_generate(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                yield SimpleNamespace(
-                    text="one, two, three",
-                    prompt_tokens=3,
-                    finished=True,
-                    finish_reason="stop",
-                )
+        def fake_mlx_stream_generate(_model, _tokenizer, prompt=None, **_kwargs):
+            if bound_thread["id"] != threading.get_ident():
+                raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+            yield SimpleNamespace(
+                text="one, two, three",
+                prompt_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
 
         engine = SimpleEngine("test-model")
 
@@ -4105,6 +4136,7 @@ class TestChatCompletionStreamingModeSwitching:
                 "vllm_mlx.engine.simple.bind_generation_streams",
                 side_effect=fake_bind_generation_streams,
             ),
+            patch("mlx_lm.stream_generate", fake_mlx_stream_generate),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)
@@ -4189,8 +4221,11 @@ class TestChatCompletionStreamingModeSwitching:
             def extract_tool_calls(self, text):
                 return SimpleNamespace(tools_called=False, tool_calls=[], content=text)
 
+        # Fork adaptation (PATCHES.md patch #4): see
+        # test_nonstream_then_stream_chat_completion_keeps_stream_thread_valid.
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
+                self.model = SimpleNamespace()
                 self.tokenizer = MagicMock()
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
@@ -4201,24 +4236,15 @@ class TestChatCompletionStreamingModeSwitching:
             def load(self):
                 bound_thread["id"] = threading.get_ident()
 
-            def chat(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                return SimpleNamespace(
-                    text="one, two, three",
-                    tokens=[11, 12, 13],
-                    finish_reason="stop",
-                )
-
-            def stream_generate(self, **_kwargs):
-                if bound_thread["id"] != threading.get_ident():
-                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
-                yield SimpleNamespace(
-                    text="one, two, three",
-                    prompt_tokens=3,
-                    finished=True,
-                    finish_reason="stop",
-                )
+        def fake_mlx_stream_generate(_model, _tokenizer, prompt=None, **_kwargs):
+            if bound_thread["id"] != threading.get_ident():
+                raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+            yield SimpleNamespace(
+                text="one, two, three",
+                prompt_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
 
         engine = SimpleEngine("test-model")
 
@@ -4237,6 +4263,7 @@ class TestChatCompletionStreamingModeSwitching:
                 "vllm_mlx.engine.simple.bind_generation_streams",
                 side_effect=fake_bind_generation_streams,
             ),
+            patch("mlx_lm.stream_generate", fake_mlx_stream_generate),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)
