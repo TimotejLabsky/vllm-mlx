@@ -11,6 +11,8 @@
 >
 > See [`PATCHES.md`](PATCHES.md) for the full patch list with rationale,
 > measurements, and upstreaming candidates.
+> See [`docs/fork/`](docs/fork/) for fork design docs and investigations
+> (e.g. why we run SimpleEngine + system-KV instead of continuous batching).
 > See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
 >
 > Upstream is [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx)
