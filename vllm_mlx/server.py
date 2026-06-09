@@ -4970,6 +4970,36 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except Exception as e:
             logger.warning("[DEBUG_MESSAGES] dump failed: %s", e)
 
+    # Diagnostic: dump the FULL (untruncated) system prefix + tool-list ordering
+    # for prompt-canonicalization analysis. Off by default; enable per-server
+    # with ``VLLM_MLX_DEBUG_PROMPT_CAPTURE=1``. Diff two consecutive turns from
+    # the same client to spot any volatile token (timestamp, session id, or a
+    # reordered tool list) that lands BEFORE the first user turn and silently
+    # defeats the system-KV longest-prefix HIT — resolves the opencode
+    # volatile-prefix / tool-order cache findings without guessing.
+    if _os.environ.get("VLLM_MLX_DEBUG_PROMPT_CAPTURE", "0") not in ("", "0", "false", "False"):
+        try:
+            sys_parts = [
+                str(m.content)
+                for m in request.messages
+                if m.role == "system" and m.content is not None
+            ]
+            tool_names = []
+            for t in (getattr(request, "tools", None) or []):
+                fn = t.get("function", {}) if isinstance(t, dict) else getattr(t, "function", {})
+                nm = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)) or ""
+                tool_names.append(nm)
+            logger.info(
+                "[PROMPT_CAPTURE] system_chars=%d tools=%d tool_order=%s\n"
+                "----- SYSTEM PREFIX (verbatim) -----\n%s\n----- END SYSTEM PREFIX -----",
+                sum(len(s) for s in sys_parts),
+                len(tool_names),
+                tool_names,
+                "\n".join(sys_parts),
+            )
+        except Exception as e:
+            logger.warning("[PROMPT_CAPTURE] dump failed: %s", e)
+
     engine = await _acquire_default_engine_for_request(
         raw_request,
         total_timeout=total_timeout,
