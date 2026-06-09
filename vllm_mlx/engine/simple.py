@@ -248,6 +248,13 @@ class SimpleEngine(BaseEngine):
         self._generation_lock_admission = admission
         self._generation_waiters = 0
         self._generation_busy_rejections = 0
+        # Lock-wait accounting: how long requests queue behind the serialized
+        # generation lock. This is the one TTFT component not derivable from
+        # cache hit/miss counts; surfaced in get_stats()["generation_lock"] so
+        # p50/p99 TTFT can be split into queue-wait vs prefill vs warm-hit.
+        self._generation_lock_wait_total = 0.0
+        self._generation_lock_wait_max = 0.0
+        self._generation_lock_wait_count = 0
         # Best-effort record of whoever currently holds the serialized lock,
         # used only to annotate EngineBusy errors. Set on acquire, cleared on
         # release.
@@ -544,11 +551,34 @@ class SimpleEngine(BaseEngine):
                     else:
                         self._text_model = None
                         self._text_tokenizer = None
+                        self._text_route_degraded = True
+                        self._text_route_degraded_reason = (
+                            "build_text_model returned None"
+                        )
+                        logger.warning(
+                            "MLLM text routing UNAVAILABLE for %s "
+                            "(build_text_model returned None): text requests fall "
+                            "back to the cacheless mlx_vlm path — full cold "
+                            "prefill every turn, NO system-KV cache. Pass "
+                            "--text-only to force the pure-LLM route and keep the "
+                            "13-32x prefix-cache win.",
+                            self._model_name,
+                        )
 
                 except Exception as e:
-                    logger.error("MLLM text routing setup failed: %s", e)
                     self._text_model = None
                     self._text_tokenizer = None
+                    self._text_route_degraded = True
+                    self._text_route_degraded_reason = f"setup error: {e}"
+                    logger.error(
+                        "MLLM text routing setup FAILED for %s (%s): text "
+                        "requests fall back to the cacheless mlx_vlm path — full "
+                        "cold prefill every turn, NO system-KV cache. Pass "
+                        "--text-only to force the pure-LLM route and keep the "
+                        "13-32x prefix-cache win.",
+                        self._model_name,
+                        e,
+                    )
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -677,10 +707,16 @@ class SimpleEngine(BaseEngine):
 
         self._generation_waiters += 1
         acquired = False
+        _wait_t0 = time.perf_counter()
         try:
             async with self._generation_lock:
                 acquired = True
                 self._generation_waiters -= 1
+                _wait_s = time.perf_counter() - _wait_t0
+                self._generation_lock_wait_total += _wait_s
+                self._generation_lock_wait_count += 1
+                if _wait_s > self._generation_lock_wait_max:
+                    self._generation_lock_wait_max = _wait_s
                 self._generation_lock_holder = {
                     "request_id": request_id,
                     "kind": kind,
@@ -2924,6 +2960,24 @@ class SimpleEngine(BaseEngine):
 
                 last_resp = None
                 retired = False
+                # Native MTP self-speculation: only forward the ``mtp`` kwarg
+                # when this mlx_lm build's stream_generate actually accepts it,
+                # so co-enabling --enable-mtp with SpecPrefill degrades cleanly
+                # instead of raising TypeError on builds whose stream_generate
+                # has no such parameter. The regular text route signals MTP via
+                # num_draft_tokens and never reaches this path.
+                spec_gen_kwargs = {}
+                if use_mtp:
+                    import inspect as _inspect
+
+                    if "mtp" in _inspect.signature(mlx_stream_generate).parameters:
+                        spec_gen_kwargs["mtp"] = use_mtp
+                    else:
+                        logger.warning(
+                            "SpecPrefill: installed mlx_lm.stream_generate has no "
+                            "'mtp' parameter; native MTP self-speculation is "
+                            "unavailable on this route (continuing without it)"
+                        )
                 for resp in mlx_stream_generate(
                     model,
                     text_tokenizer,
@@ -2933,7 +2987,7 @@ class SimpleEngine(BaseEngine):
                     prefill_step_size=self._prefill_step_size,
                     logits_processors=seeded_processors,
                     prompt_cache=prompt_cache,
-                    mtp=use_mtp,
+                    **spec_gen_kwargs,
                 ):
                     if abort_event.is_set():
                         logger.info(
@@ -2984,6 +3038,10 @@ class SimpleEngine(BaseEngine):
         accumulated_text = ""
         token_count = 0
         finished = False
+        # Longest stop string, precomputed once so the per-token stop scan below
+        # stays bounded instead of re-scanning the whole accumulated text every
+        # token (which made stop-sequence matching O(n^2) over a generation).
+        _max_stop_len = max((len(s) for s in stop), default=0) if stop else 0
         try:
             while True:
                 kind, payload = await response_queue.get()
@@ -2998,8 +3056,19 @@ class SimpleEngine(BaseEngine):
                 accumulated_text += new_text
 
                 stop_hit = False
-                if stop:
-                    stop_hit = any(stop_seq in accumulated_text for stop_seq in stop)
+                if stop and _max_stop_len:
+                    # A newly completed stop sequence must end inside new_text,
+                    # so it can begin no earlier than (len(new_text) +
+                    # max_stop_len - 1) chars from the end. Scanning only that
+                    # tail window is O(len(new_text)) per token; matches in
+                    # earlier text were already caught on a prior iteration.
+                    window_len = len(new_text) + _max_stop_len - 1
+                    window = (
+                        accumulated_text
+                        if window_len >= len(accumulated_text)
+                        else accumulated_text[-window_len:]
+                    )
+                    stop_hit = any(stop_seq in window for stop_seq in stop)
                 finished = stop_hit or token_count >= max_tokens
                 finish_reason = getattr(resp, "finish_reason", None)
                 if stop_hit:
@@ -3074,6 +3143,18 @@ class SimpleEngine(BaseEngine):
                 "admission": self._generation_lock_admission,
                 "waiters": self._generation_waiters,
                 "busy_rejections": self._generation_busy_rejections,
+                "wait_count": self._generation_lock_wait_count,
+                "wait_avg_ms": (
+                    round(
+                        1000.0
+                        * self._generation_lock_wait_total
+                        / self._generation_lock_wait_count,
+                        2,
+                    )
+                    if self._generation_lock_wait_count
+                    else 0.0
+                ),
+                "wait_max_ms": round(1000.0 * self._generation_lock_wait_max, 2),
                 "holder": self._generation_lock_holder_summary(),
             },
         }
@@ -3172,6 +3253,16 @@ class SimpleEngine(BaseEngine):
                 "entry_count": slot_count,
                 "hits": self._system_kv_hits,
                 "misses": self._system_kv_misses,
+                # hit_rate is read by metrics.py (vllm_mlx_cache_hit_rate gauge);
+                # the legacy hit_rate key only existed on the MLLM
+                # memory_aware_cache block, so the production non-MLLM path
+                # reported a constant 0% even at the real ~89% hit rate.
+                "hit_rate": (
+                    self._system_kv_hits
+                    / (self._system_kv_hits + self._system_kv_misses)
+                    if (self._system_kv_hits + self._system_kv_misses)
+                    else 0.0
+                ),
                 "tokens_saved": self._system_kv_tokens_saved,
                 # New multi-slot fields:
                 "evictions": self._system_kv_evictions,
@@ -3197,6 +3288,15 @@ class SimpleEngine(BaseEngine):
                 stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
         except Exception:
             pass
+
+        # Surface MLLM text-route degradation (build_text_model failed) so the
+        # silent fallback to the cacheless mlx_vlm path — which costs a full cold
+        # prefill every turn — is visible in /v1/status instead of hidden.
+        if getattr(self, "_text_route_degraded", False):
+            stats["mllm_text_route_degraded"] = True
+            stats["mllm_text_route_degraded_reason"] = getattr(
+                self, "_text_route_degraded_reason", None
+            )
 
         return stats
 
