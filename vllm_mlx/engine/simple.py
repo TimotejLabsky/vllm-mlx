@@ -41,6 +41,7 @@ from .base import (
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import bind_generation_streams
+from .. import system_kv as system_kv_mod
 from ..system_kv import SystemKVManager
 
 logger = logging.getLogger(__name__)
@@ -2215,16 +2216,10 @@ class SimpleEngine(BaseEngine):
         system_tokens = None
         suffix_tokens = None
         full_tokens_list = None
-        cache_blocking_controls = []
-        if not self._supports_system_kv_cache:
-            cache_blocking_controls.append("non_kv_cache_class")
-        if cache_blocking_controls:
-            logger.info(
-                "System KV cache SKIP (text route): request or engine has "
-                "controls/features the cache branch cannot honor (%s); using "
-                "uncached path",
-                cache_blocking_controls,
-            )
+        # Checkpointed partial restore (system-kv-partial-restore): plan
+        # built at gate time when the strict prefix match fails; consumed
+        # by the worker's MISS block.
+        _partial_plan = None
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2287,6 +2282,15 @@ class SimpleEngine(BaseEngine):
                         full_tokens_list
                     )
                     _prefix_match = _cached_ids is not None
+                    if not _prefix_match:
+                        # Strict prefix match failed — the prompt diverges
+                        # from the cached chain (compaction / retry / edited
+                        # turn / interleaved session). Plan a checkpointed
+                        # partial restore against the active slot; the
+                        # worker's MISS block picks the restore position.
+                        _partial_plan = self._system_kv.plan_partial_restore(
+                            full_tokens_list
+                        )
                     if _prefix_match:
                         # Override system_tokens / system_token_count / suffix_tokens
                         # so the downstream restore logic uses our cached length.
@@ -2344,17 +2348,51 @@ class SimpleEngine(BaseEngine):
                                     # by ~12% on Qwen3.5-4B (and similar on 27B).
                                     _grow_arr = mx.array(_grow_delta)
                                     _grow_step = max(self._prefill_step_size, 2048)
+                                    _grow_consumed = self._system_kv_token_count
+                                    _grow_ckpts = self._system_kv.checkpoints
+                                    _grow_ckpt_cap = self._system_kv.ckpt_capacity
                                     while _grow_arr.size > _grow_step:
                                         text_model(
                                             _grow_arr[:_grow_step][None],
                                             cache=backbone_cache,
                                         )
+                                        # Partial-restore checkpoint at the
+                                        # grow-chunk boundary: capture LAZY
+                                        # references only (recurrent layers;
+                                        # no-op on pure-attn) — they are
+                                        # ancestors of the final state, so
+                                        # the eval-only-at-end pattern below
+                                        # materializes them. Keeps the
+                                        # profiled ~12% win over per-chunk
+                                        # eval.
+                                        _grow_consumed += _grow_step
+                                        _grow_rec = (
+                                            system_kv_mod.capture_recurrent_states(
+                                                backbone_cache
+                                            )
+                                        )
+                                        if _grow_rec:
+                                            _grow_ckpts = (
+                                                system_kv_mod.append_checkpoint(
+                                                    _grow_ckpts,
+                                                    _grow_consumed,
+                                                    _grow_rec,
+                                                    _grow_ckpt_cap,
+                                                )
+                                            )
                                         _grow_arr = _grow_arr[_grow_step:]
                                     if _grow_arr.size > 0:
                                         text_model(
                                             _grow_arr[None], cache=backbone_cache
                                         )
                                     mx.eval([c.state for c in backbone_cache])
+                                    mx.eval([
+                                        a
+                                        for cp in _grow_ckpts
+                                        for st in cp["states"].values()
+                                        for a in st
+                                        if a is not None
+                                    ])
                                     _grow_snapshot = [
                                         list(c.state) if isinstance(c.state, list) else c.state
                                         for c in backbone_cache
@@ -2365,6 +2403,7 @@ class SimpleEngine(BaseEngine):
                                     self._system_kv_snapshot = _grow_snapshot
                                     self._system_kv_token_count = len(_grow_new_extended)
                                     self._system_kv_token_ids = list(_grow_new_extended)
+                                    self._system_kv.checkpoints = _grow_ckpts
                             prompt_to_send = mx.array(
                                 full_tokens_list[len(_grow_new_extended) :]
                                 if _grow_new_extended
@@ -2554,51 +2593,209 @@ class SimpleEngine(BaseEngine):
                 else:
                     _extended_token_ids = list(system_tokens) + list(suffix_tokens[:-1])
 
-                # Patch #16: before the (expensive) cold prefill, try to promote
-                # a persisted prefix from SSD. lookup_prefix only returns an
-                # entry whose tokens are a PREFIX of _extended_token_ids
-                # (num_tokens <= query len), so we restore the stored state
-                # whole at that boundary and prefill FORWARD from there — never
-                # a trim. That is hybrid-safe: recurrent ArraysCache state is
-                # restored intact, exactly like the in-RAM snapshot path. The
-                # disk read runs here, inside the serialized generation worker
-                # (already off the event loop).
+                # Warm-start the cold prefill from the best available source
+                # (patch #16 + system-kv-partial-restore). Three candidates,
+                # highest restore position wins:
+                #
+                #   ssd_full    — stored entry that IS a prefix of the new
+                #                 chain: restore whole at its boundary, no
+                #                 trim (the original patch #16 promote).
+                #   ram_partial — gate-time plan vs the active in-RAM slot
+                #                 (divergent chain): attention KV sliced to
+                #                 the restore position, recurrent state from
+                #                 a checkpoint captured AT that position.
+                #                 Never trims ArraysCache.
+                #   ssd_partial — same, against a stored divergent entry
+                #                 (shared system prefix, different history).
+                #
+                # All disk reads run here, inside the serialized generation
+                # worker (already off the event loop).
                 _prefill_start = 0
                 _promoted = False
+                _ckpt_carry = []  # donor checkpoints valid for the new chain
+                _ext_key = tuple(_extended_token_ids)
+                _ext_len = len(_extended_token_ids)
+                _partial_min = self._system_kv.partial_min
+
+                # Candidate: in-RAM partial restore.
+                _ram_pos, _ram_states = 0, None
+                if _partial_plan is not None:
+                    _ram_pos, _ram_states = system_kv_mod.select_restore_pos(
+                        _partial_plan, _ext_len
+                    )
+                    if _ram_pos < _partial_min:
+                        _ram_pos, _ram_states = 0, None
+
+                # Candidate: SSD full-prefix promote.
+                _ssd_full_meta = None
                 if self._ssd_store is not None and self._is_system_kv_safe():
                     try:
-                        _ext_key = tuple(_extended_token_ids)
-                        _ssd_meta = self._ssd_store.lookup_prefix(_ext_key)
-                        if (
-                            _ssd_meta is not None
-                            and 0 < _ssd_meta["num_tokens"] <= len(_extended_token_ids)
-                        ):
-                            _ptoks = _ext_key[: _ssd_meta["num_tokens"]]
-                            _ssd_snap = self._ssd_store.read_entry(
-                                _ptoks, _ssd_meta["file_path"]
-                            )
-                            if _ssd_snap is not None and len(_ssd_snap) == len(mc):
-                                for _i, _st in enumerate(_ssd_snap):
-                                    mc[_i].state = (
-                                        list(_st) if isinstance(_st, list) else _st
-                                    )
-                                _prefill_start = _ssd_meta["num_tokens"]
-                                _promoted = True
-                                self._ssd_promotes += 1
-                                logger.info(
-                                    "System KV SSD PROMOTE: restored %d tokens "
-                                    "from disk, prefilling %d delta (hash=%s)",
-                                    _prefill_start,
-                                    len(_extended_token_ids) - _prefill_start,
-                                    system_hash,
-                                )
-                    except Exception as _ssd_e:
-                        logger.warning(
-                            "System KV SSD promote failed (%s); cold prefill",
-                            _ssd_e,
+                        _m = self._ssd_store.lookup_prefix(_ext_key)
+                        if _m is not None and 0 < _m["num_tokens"] <= _ext_len:
+                            _ssd_full_meta = _m
+                    except Exception:
+                        logger.debug(
+                            "System KV SSD full-prefix lookup failed",
+                            exc_info=True,
                         )
-                        _prefill_start = 0
+
+                # Candidate: SSD shared-prefix (divergent) partial restore.
+                # Only consulted when it could beat the other two; meta-only
+                # reads (no tensor I/O) until a winner is chosen.
+                _best_other = max(
+                    _ram_pos,
+                    _ssd_full_meta["num_tokens"] if _ssd_full_meta else 0,
+                )
+                _ssd_partial = None  # (candidate, restore_pos)
+                if self._ssd_store is not None and self._is_system_kv_safe():
+                    try:
+                        for _cand in self._ssd_store.lookup_shared(_ext_key):
+                            if _cand["common_len"] <= _best_other:
+                                break  # sorted desc — nothing better follows
+                            _cmeta = self._ssd_store.read_meta(
+                                _cand["file_path"]
+                            )
+                            if _cmeta is None:
+                                continue
+                            _cap = min(_cand["common_len"], _ext_len)
+                            _has_rec = any(
+                                lm["kind"] == "arrays"
+                                for lm in _cmeta["layers"]
+                            )
+                            if _has_rec:
+                                _cpos = max(
+                                    (
+                                        c["pos"]
+                                        for c in _cmeta["checkpoints"]
+                                        if c["pos"] <= _cap
+                                    ),
+                                    default=0,
+                                )
+                            else:
+                                _cpos = _cap
+                            if _cpos > _best_other and _cpos >= _partial_min:
+                                _ssd_partial = (_cand, _cpos)
+                                _best_other = _cpos
+                    except Exception:
+                        logger.debug(
+                            "System KV SSD shared-prefix scan failed",
+                            exc_info=True,
+                        )
+
+                def _install(states):
+                    for _i, _st in enumerate(states):
+                        mc[_i].state = (
+                            list(_st) if isinstance(_st, list) else _st
+                        )
+
+                # Ordered candidates, best restore position first; the first
+                # one that applies cleanly wins, failures fall through to the
+                # next (and ultimately to cold prefill). RAM wins ties — no
+                # disk read.
+                _candidates = []
+                if _ram_pos > 0 and _partial_plan is not None:
+                    _candidates.append((_ram_pos, 0, "ram_partial", None))
+                if _ssd_full_meta is not None:
+                    _candidates.append(
+                        (_ssd_full_meta["num_tokens"], 1, "ssd_full", None)
+                    )
+                if _ssd_partial is not None:
+                    _candidates.append(
+                        (_ssd_partial[1], 2, "ssd_partial", _ssd_partial[0])
+                    )
+                _candidates.sort(key=lambda c: (-c[0], c[1]))
+
+                for _cpos, _, _kind, _cand in _candidates:
+                    try:
+                        if _kind == "ram_partial":
+                            _states = system_kv_mod.build_partial_restore_states(
+                                _partial_plan["snapshot"], _ram_states, _cpos
+                            )
+                            if _states is None:
+                                continue
+                            _install(_states)
+                            _ckpt_carry = self._system_kv.carry_checkpoints(
+                                _partial_plan["checkpoints"], _cpos
+                            )
+                            self._system_kv.record_partial_hit(_cpos)
+                            logger.info(
+                                "System KV PARTIAL restore (RAM): %d of %d "
+                                "shared tokens from active slot (donor %d), "
+                                "prefilling %d (hash=%s)",
+                                _cpos,
+                                min(_partial_plan["d"], _ext_len),
+                                _partial_plan["donor_len"],
+                                _ext_len - _cpos,
+                                system_hash,
+                            )
+                        elif _kind == "ssd_full":
+                            _entry = self._ssd_store.read_entry(
+                                _ext_key[:_cpos], _ssd_full_meta["file_path"]
+                            )
+                            if (
+                                _entry is None
+                                or len(_entry["snapshot"]) != len(mc)
+                            ):
+                                continue
+                            _install(_entry["snapshot"])
+                            _promoted = True
+                            _ckpt_carry = self._system_kv.carry_checkpoints(
+                                _entry["checkpoints"], _cpos
+                            )
+                            self._ssd_promotes += 1
+                            logger.info(
+                                "System KV SSD PROMOTE: restored %d tokens "
+                                "from disk, prefilling %d delta (hash=%s)",
+                                _cpos,
+                                _ext_len - _cpos,
+                                system_hash,
+                            )
+                        else:  # ssd_partial
+                            _entry = self._ssd_store.read_entry(
+                                _cand["tokens"], _cand["file_path"]
+                            )
+                            if (
+                                _entry is None
+                                or len(_entry["snapshot"]) != len(mc)
+                            ):
+                                continue
+                            _cstates = {}
+                            for _cp in _entry["checkpoints"]:
+                                if _cp["pos"] == _cpos:
+                                    _cstates = _cp["states"]
+                            _states = system_kv_mod.build_partial_restore_states(
+                                _entry["snapshot"], _cstates, _cpos
+                            )
+                            if _states is None:
+                                continue
+                            _install(_states)
+                            _ckpt_carry = self._system_kv.carry_checkpoints(
+                                _entry["checkpoints"], _cpos
+                            )
+                            self._system_kv.record_partial_hit(_cpos)
+                            logger.info(
+                                "System KV PARTIAL restore (SSD): %d of %d "
+                                "shared tokens from divergent entry, "
+                                "prefilling %d (hash=%s)",
+                                _cpos,
+                                _cand["common_len"],
+                                _ext_len - _cpos,
+                                system_hash,
+                            )
+                        _prefill_start = _cpos
+                        break
+                    except Exception as _ws_e:
+                        logger.warning(
+                            "System KV warm-start (%s @ %d) failed (%s); "
+                            "trying next source",
+                            _kind,
+                            _cpos,
+                            _ws_e,
+                        )
+                        # A failed _install may have left partial layer
+                        # state — rebuild the cache before the next attempt.
                         _promoted = False
+                        _ckpt_carry = []
                         mc = make_prompt_cache(
                             model, max_kv_size=self._max_kv_size or None
                         )
@@ -2606,9 +2803,21 @@ class SimpleEngine(BaseEngine):
                 _arr = mx.array(_extended_token_ids[_prefill_start:])
 
                 step = self._prefill_step_size
+                _consumed = _prefill_start
+                _ckpt_cap = self._system_kv.ckpt_capacity
                 while _arr.size > step:
                     model(_arr[:step][None], cache=mc)
                     self._eval_cache_snapshot([c.state for c in mc])
+                    _consumed += step
+                    # Capture a partial-restore checkpoint at the chunk
+                    # boundary: recurrent-layer states only (attention KV at
+                    # any position slices from the final snapshot). No-op on
+                    # pure-attention models.
+                    _rec = system_kv_mod.capture_recurrent_states(mc)
+                    if _rec:
+                        _ckpt_carry = system_kv_mod.append_checkpoint(
+                            _ckpt_carry, _consumed, _rec, _ckpt_cap
+                        )
                     _arr = _arr[step:]
                     mx.clear_cache()
                 if _arr.size > 0:
@@ -2626,7 +2835,8 @@ class SimpleEngine(BaseEngine):
                 # (inside the serialized worker): see
                 # SystemKVManager.store_extended.
                 self._system_kv.store_extended(
-                    system_hash, snapshot, _extended_token_ids, promoted=_promoted
+                    system_hash, snapshot, _extended_token_ids,
+                    promoted=_promoted, checkpoints=_ckpt_carry,
                 )
 
                 backbone_cache = mc
