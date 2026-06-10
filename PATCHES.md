@@ -467,6 +467,28 @@ Unknown templates fall back to the uncached path exactly as before. The existing
 
 ---
 
+## 21. `patch: rotating-safe-snapshots` — meta_state-aware caching + arch-agnostic MLLM text route
+
+**Files:** `vllm_mlx/system_kv.py`, `vllm_mlx/system_kv_ssd.py`, `vllm_mlx/engine/simple.py`, `vllm_mlx/text_model_from_vlm.py`, `tests/test_system_kv_partial.py`
+
+Completes the Gemma 4 caching fix that #20 (template markers) started. Two independent blockers remained, found by walking the live path on the box:
+
+**(a) `build_text_model` hard-coded the Qwen3.5 TextModel class.** Feeding gemma-4's `text_config` into `qwen3_5.TextModelArgs` crashed ("float division by zero"), and the caller's None fallback silently routed all gemma text requests through the **cacheless mlx_vlm path** (caught by patch #17's loud-degradation warning). Now resolves the mlx_lm class dynamically from `text_config.model_type` (gemma4 → `mlx_lm.models.gemma4_text`); the Qwen3.5/3.6 family keeps its MTP-capable path. A weight-name **coverage guard (≥90%)** fails closed if a vlm/mlx_lm namespace mismatch would otherwise produce a silently half-loaded model. Side benefit: gemma keeps vision (no `--text-only` needed).
+
+**(b) Snapshots only captured `.state` — RotatingKVCache needs `meta_state` too.** The sliding-window ring's indices (`keep, max_size, offset, _idx`) live in `meta_state`; state-only restore desynchronizes the ring (the original reason patch #12 denylisted these models — and a **latent text-route hazard**: that probe only ever gated `stream_chat`, so a `--text-only` Rotating model would have cached unsafely). Snapshots, checkpoints, and SSD entries (format v3) now carry per-layer `meta_state` + a **kind** classification (`trim` / `ckpt` / `opaque`) captured from the live cache classes — state shape alone cannot distinguish a Rotating tuple from a trimmable KVCache tuple:
+
+- `trim` (plain KVCache): partial restore slices to any position, as in #19.
+- `ckpt` (ArraysCache recurrent + RotatingKVCache sliding-window): restorable only at checkpoint positions, with meta applied after state (mirroring mlx-lm's own `save_prompt_cache`/`from_state` round-trip).
+- `opaque` (e.g. QuantizedKVCache): whole-snapshot restore round-trips via state+meta; partial restore refuses.
+
+v1/v2 SSD entries and pre-existing in-RAM slots load with `meta/kinds = None` and fall back to shape-based classification — correct for everything that could have produced them (Rotating models could not cache before v3).
+
+**Verified (2026-06-10, M1 Pro):** real-RotatingKVCache round-trip test — restore past the rotation point continues **bit-identically** to the uninterrupted cache, plus a negative control documenting that state-only restore desyncs (`offset/_idx` mismatch). Full suite 2190 passed / 0 failed. Live gemma-4 A/B recorded in the infra deploy table.
+
+**Upstreaming:** (a) is a clean bug fix — strong PR candidate. (b) extends the #19/#20 series; together they make the pure-LLM cache path cover every mlx-lm cache class except quantized partial-restore.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
