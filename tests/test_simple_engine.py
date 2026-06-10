@@ -1573,7 +1573,18 @@ class TestSimpleEngineConcurrency:
                 )
 
                 assert engine._text_model is text_model
-                assert engine._text_tokenizer is tokenizer
+                # The text-route tokenizer is wrapped in mlx_lm's
+                # TokenizerWrapper so the model's FULL eos set
+                # (generation_config.json) terminates generation (gemma-4
+                # declares three eos ids; the bare HF tokenizer only carries
+                # one). The wrapper must delegate to the original.
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+                wrapped = engine._text_tokenizer
+                if isinstance(wrapped, TokenizerWrapper):
+                    assert wrapped._tokenizer is tokenizer
+                else:
+                    assert wrapped is tokenizer
                 assert captured["build_thread"] == worker_thread
                 assert captured["build_thread"] != event_loop_thread
                 assert captured["enable_mtp"] is False
