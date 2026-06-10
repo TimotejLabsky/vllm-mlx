@@ -1562,7 +1562,17 @@ class TestSimpleEngineConcurrency:
             await engine.start()
 
         assert engine._text_model is text_model
-        assert engine._text_tokenizer is tokenizer
+        # The text-route tokenizer is wrapped in mlx_lm's TokenizerWrapper
+        # so the model's FULL eos set (generation_config.json) terminates
+        # generation (gemma-4 declares three eos ids; the bare HF tokenizer
+        # only carries one). The wrapper must delegate to the original.
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        wrapped = engine._text_tokenizer
+        if isinstance(wrapped, TokenizerWrapper):
+            assert wrapped._tokenizer is tokenizer
+        else:
+            assert wrapped is tokenizer
 
     @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
