@@ -496,6 +496,26 @@ Post-fix probe (26B, served): correct short answers with `finish_reason=stop`, a
 
 ---
 
+## 22. `patch: dry-sampler` — sequence-level repetition penalty (loop breaker)
+
+**Files:** `vllm_mlx/dry_sampler.py` (new), `vllm_mlx/engine/simple.py`, `vllm_mlx/server.py`, `vllm_mlx/api/models.py`, `tests/test_dry_sampler.py` (new)
+
+Long agentic sessions on quantized models hit **block-level repetition collapse** (Qwen3.6-27B-4bit at deep context emits the same paragraph indefinitely at T=0). Token-level penalties can't break these loops — each token is locally optimal; the loop is a sequence phenomenon. DRY (p-e-w's sampler, community-proven in koboldcpp/llama.cpp/text-generation-webui; vLLM PR #11368 died stale, so no upstream to borrow from) penalizes the token that would **extend a repeated suffix**, exponentially in the repeat length: `multiplier * base^(match_len − allowed_length)`. An 8-token loop at defaults eats a ~27-logit penalty — breaks argmax at T=0; incidental short repeats stay free.
+
+**Implementation:**
+- `DRYLogitsProcessor` rides mlx-lm's standard logits-processor chain (`processor(tokens, logits)`), appended in `_stream_generate_text` next to the existing penalty processors. Match lengths for all positions come from a **Z-array over the reversed window** — O(window) per token. That's load-bearing: the pathological repetitive context is exactly where naive per-occurrence scans degrade to O(window²).
+- **Sequence breakers** (default `\n : " *`) cap matches at structural boundaries and are never penalized themselves (they're the escape hatch). This makes tool-call JSON near-immune — content between quotes/colons rarely clears `allowed_length`.
+- Config: request fields `dry_multiplier/base/allowed_length/range/sequence_breakers` (OpenAI + completions APIs) override per-model `VLLM_MLX_DRY_*` env defaults; off unless a multiplier > 0 arrives from either. Exponent capped at 18 (fp16-safe).
+- Interaction: any custom logits processor **disables MTP** for the request (existing engine rule) — don't enable DRY defaults on the MTP heavies casually.
+
+**Verified:** 10 unit tests including a randomized cross-check against an independent O(n²) reference implementation (breaker semantics included), fp16 overflow guard, env/request precedence. Full suite 2200 passed / 0 failed.
+
+**Deployment intent:** enabled via the LiteLLM route for `Qwen3.6-27B-4bit` (`extra_body`: multiplier 0.8, base 1.75, allowed_length 3, range 2048) — allowed_length one above the community default as extra tool-call-JSON margin.
+
+**Upstreaming:** vLLM rejected/preferred not to merge DRY upstream; for vllm-mlx it's a natural fit (single-stream serving is where loops hurt most). PR-worthy.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
