@@ -95,27 +95,8 @@ def build_text_model(
     if vlm_model is None:
         return None
 
-    # Resolve HF repo ID → local snapshot directory if needed.
-    if (
-        isinstance(model_path, str)
-        and "/" in model_path
-        and not Path(model_path).is_dir()
-    ):
-        try:
-            from huggingface_hub import try_to_load_from_cache  # type: ignore
-
-            cached = try_to_load_from_cache(
-                repo_id=model_path, filename="config.json"
-            )
-            if isinstance(cached, str):
-                cdir = Path(cached).parent
-                if cdir.is_dir():
-                    model_path = cdir
-        except Exception:
-            pass
-
-    model_path = Path(model_path) if model_path else None
-    if model_path is None or not (model_path / "config.json").exists():
+    model_path = _resolve_model_path(model_path)
+    if model_path is None:
         return None
 
     model_type = ""
@@ -171,6 +152,11 @@ def build_text_model(
         # Quantize the TextModel skeleton to match source weights.
         # Use a predicate that only quantizes layers that have .scales in source.
         # This prevents quantizing layers like mtp.fc which are BF16.
+        # Mixed-precision quants (gemma-4, OptiQ-style) carry PER-LAYER
+        # overrides in the quantization config — returning the override dict
+        # from the predicate makes nn.quantize use it (mlx-lm loader
+        # convention). Override keys use the VLM namespace
+        # (``language_model.<path>``), our skeleton paths don't — check both.
         quantization = text_config.get("quantization", config.get("quantization", None))
         if quantization is not None:
             # Per-layer quantization overrides (e.g. 8-bit MoE gates over a 4-bit
@@ -185,6 +171,10 @@ def build_text_model(
             }
 
             def _class_predicate(path, module):
+                for key in (path, f"language_model.{path}"):
+                    override = quantization.get(key)
+                    if isinstance(override, dict):
+                        return override
                 if not hasattr(module, "to_quantized"):
                     return False
                 if f"{path}.scales" not in all_weight_names:
@@ -253,6 +243,30 @@ def build_text_model(
 
                 inject_mtp_support(text_model, model_path, config)
 
+        # Materialize every lazy init-time array — parameters AND ad-hoc
+        # module buffers (rope frequency tables etc.) that parameters()
+        # cannot enumerate — by running a one-token forward HERE, on the
+        # build thread. Lazy arrays pin to the stream of the thread that
+        # created them (thread-local since mlx_lm's generation_stream
+        # rework); without this warmup the first real forward happens on a
+        # generation worker thread and dies with "There is no
+        # Stream(gpu, N) in current thread" (observed on gemma-4, whose
+        # rope buffers are built at init — Qwen3.5 computes them per
+        # forward and never hit this).
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+
+            _warm_cache = make_prompt_cache(text_model)
+            mx.eval(text_model(mx.array([[1]]), cache=_warm_cache))
+            del _warm_cache
+        except Exception as e:
+            logger.warning(
+                "TextModel warmup forward failed (%s); refusing text model "
+                "(first worker-thread forward would crash)",
+                e,
+            )
+            return None
+
         if hasattr(text_model, "mtp") and text_model.mtp is not None:
             mx.eval(text_model.mtp.parameters())
             num_mtp = text_config.get(
@@ -306,6 +320,68 @@ def build_text_model(
             exc_info=True,
         )
         return None
+
+
+def _resolve_model_path(model_path: str | Path) -> Path | None:
+    """Resolve an HF repo ID or local dir to the snapshot directory holding
+    config.json, or None."""
+    if (
+        isinstance(model_path, str)
+        and "/" in model_path
+        and not Path(model_path).is_dir()
+    ):
+        try:
+            from huggingface_hub import try_to_load_from_cache  # type: ignore
+
+            cached = try_to_load_from_cache(
+                repo_id=model_path, filename="config.json"
+            )
+            if isinstance(cached, str):
+                cdir = Path(cached).parent
+                if cdir.is_dir():
+                    model_path = cdir
+        except Exception:
+            pass
+    path = Path(model_path) if model_path else None
+    if path is None or not (path / "config.json").exists():
+        return None
+    return path
+
+
+def wrap_tokenizer_with_eos(tokenizer: Any, model_path: str | Path) -> Any:
+    """Wrap a bare HF tokenizer in mlx_lm's TokenizerWrapper carrying the
+    model's FULL eos set from ``generation_config.json``.
+
+    The MLLM text route hands mlx_lm's ``stream_generate`` the processor's
+    raw tokenizer; mlx_lm then wraps it with a single ``eos_token_id``.
+    Models whose generation_config declares SEVERAL terminators (gemma-4:
+    ``[1, 106, 50]`` — end-of-text, ``<turn|>``, end-of-channel) never stop
+    on the extra ones via that path: turn markers leak into content and
+    generation runs to max_tokens. Pre-wrapping with the full set fixes the
+    stop behavior for every family (the old code special-cased Qwen3.5's
+    ``<|im_end|>`` only).
+    """
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    if isinstance(tokenizer, TokenizerWrapper):
+        return tokenizer
+    eos_ids: set[int] = set()
+    base_eos = getattr(tokenizer, "eos_token_id", None)
+    if base_eos is not None:
+        eos_ids.add(int(base_eos))
+    path = _resolve_model_path(model_path)
+    if path is not None:
+        gen_cfg = path / "generation_config.json"
+        if gen_cfg.exists():
+            try:
+                declared = json.loads(gen_cfg.read_text()).get("eos_token_id")
+                if isinstance(declared, int):
+                    eos_ids.add(declared)
+                elif isinstance(declared, list):
+                    eos_ids.update(int(x) for x in declared)
+            except Exception:
+                logger.debug("generation_config eos read failed", exc_info=True)
+    return TokenizerWrapper(tokenizer, eos_token_ids=eos_ids or None)
 
 
 def _load_mtp_weights(model_path: Path) -> list[tuple[str, mx.array]]:
