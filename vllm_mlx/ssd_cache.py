@@ -321,6 +321,64 @@ class SSDIndex:
                 )
         return results
 
+    def lookup_shared_prefix(
+        self, query_tokens: tuple[int, ...], limit: int = 4
+    ) -> list[dict]:
+        """Find entries that SHARE a token prefix with ``query_tokens``
+        without being a full prefix of it (divergent chains).
+
+        Prefilters on ``prefix_hash`` — entries whose first
+        ``_PREFIX_FILTER_TOKENS`` tokens match the query's — then computes
+        the exact token-level common prefix from the stored blob. Queries
+        shorter than the filter width return [] (a shareable prefix that
+        short is never worth a partial restore).
+
+        Returns up to ``limit`` dicts with ``common_len`` added, sorted by
+        common_len descending. Entries that are full prefixes of the query
+        are excluded — ``lookup_prefix`` already serves those (restore
+        without trimming).
+        """
+        query_len = len(query_tokens)
+        if query_len < _PREFIX_FILTER_TOKENS:
+            return []
+        query_blob = _tokens_to_blob(query_tokens)
+        qhash = _prefix_hash(query_tokens)
+
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, "
+                "memory_bytes FROM entries WHERE prefix_hash = ?",
+                (qhash,),
+            )
+            rows = cur.fetchall()
+
+        results = []
+        for row in rows:
+            stored_blob = row["tokens_blob"]
+            n = row["num_tokens"]
+            # Full-prefix entries belong to lookup_prefix.
+            if n <= query_len and stored_blob == query_blob[: n * 4]:
+                continue
+            common_bytes = os.path.commonprefix([stored_blob, query_blob])
+            common_len = len(common_bytes) // 4
+            if common_len <= 0:
+                continue
+            results.append(
+                {
+                    "token_hash": row["token_hash"],
+                    "file_path": row["file_path"],
+                    "memory_bytes": row["memory_bytes"],
+                    "num_tokens": n,
+                    "common_len": common_len,
+                    # The entry's own token key — read_entry needs it for
+                    # index touch/quarantine (the query's prefix is NOT
+                    # this entry's key on a divergent match).
+                    "tokens": _blob_to_tokens(stored_blob),
+                }
+            )
+        results.sort(key=lambda r: r["common_len"], reverse=True)
+        return results[:limit]
+
     def delete_entry(self, tokens_key: tuple[int, ...]) -> None:
         """Delete an entry by token sequence."""
         token_hash = _tokens_hash(tokens_key)
