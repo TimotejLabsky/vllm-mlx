@@ -441,6 +441,32 @@ The system-KV cache (#4/#9/#13/#16) restores only **exact prefix extensions**: w
 
 ---
 
+## 20. `patch: template-family-prefix-markers` — extend the system-KV cache beyond ChatML
+
+**Files:** `vllm_mlx/system_kv.py`, `vllm_mlx/engine/simple.py`, `tests/test_system_kv_partial.py`
+
+The extended-prefix cache's two prompt anchors — the system-prefix boundary (first user-turn marker) and the generation-prompt boundary (rfind of the gen marker) — were hard-coded ChatML strings (`<|im_start|>user\n` / `<|im_start|>assistant\n`). Every non-ChatML family silently bypassed the entire caching stack (#4/#9/#13/#16/#19): **measured 2026-06-10 on gemma-4-31b (warm TTFT 24.2 s == cold 23.7 s) and gemma-4-26b-a4b (3.6 s == 3.6 s)** — identical re-sent prompts paid full prefill every turn, and the SSD env was inert.
+
+Replaced with a `TEMPLATE_MARKERS` table + `detect_template_markers()` in `system_kv.py`, detected once per request from the rendered prompt. Families and markers were **verified against each deployed model's actual `apply_chat_template` output**, not guessed:
+
+| Family | Boundary marker | Gen marker | Models in lineup |
+|---|---|---|---|
+| chatml | `<\|im_start\|>user\n` | `<\|im_start\|>assistant\n` | all Qwen (unchanged — byte-identical behavior) |
+| phi4 | `<\|im_start\|>user<\|im_sep\|>` | `<\|im_start\|>assistant<\|im_sep\|>` | Phi-4 reasoning/mini |
+| gemma4 | `<\|turn>user\n` | `<\|turn>model\n` | gemma-4-31b, gemma-4-26b-a4b (NEW format — not Gemma 3's `<start_of_turn>`) |
+| llama3 | `<\|start_header_id\|>user<\|end_header_id\|>` | `…assistant…` | Nemotron-Super-49B |
+| glm4 | `<\|user\|>` | `<\|assistant\|>` | GLM-4.7-Flash |
+| harmony | `<\|start\|>user<\|message\|>` | `<\|start\|>assistant` | gpt-oss-20b |
+| mistral | `[INST]` | `[/INST]` | Devstral, Mistral-Small-3.2 (gen boundary = last `[/INST]`, which holds a stable position across turns) |
+
+Unknown templates fall back to the uncached path exactly as before. The existing `prefix_valid` token-prefix validation remains the safety net for any family whose tokenizer breaks the text-prefix ⇒ token-prefix assumption.
+
+**Verified:** marker unit tests against real rendered-template fixtures (boundary contains the system content, never leaks the user turn; gen marker anchors the final generation prompt); full suite 2187 passed / 0 failed. Live A/B on gemma-4 recorded in the infra deploy table.
+
+**Upstreaming:** pairs with #19 — together they make the pure-LLM cache path template-portable.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
