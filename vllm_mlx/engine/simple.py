@@ -2220,6 +2220,11 @@ class SimpleEngine(BaseEngine):
         # built at gate time when the strict prefix match fails; consumed
         # by the worker's MISS block.
         _partial_plan = None
+        # Template-family markers (set when a known family is detected);
+        # initialized here so the worker closure never sees them unbound
+        # on the no-system / unknown-template paths.
+        _tpl_family = None
+        _tpl_gen_marker = None
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2307,6 +2312,7 @@ class SimpleEngine(BaseEngine):
                         def make_cache_with_snapshot(
                             text_model,
                             system_kv_snapshot,
+                            system_kv_meta,
                             _max_kv_size=self._max_kv_size,
                         ):
                             import mlx.core as mx
@@ -2315,9 +2321,12 @@ class SimpleEngine(BaseEngine):
                             backbone_cache = make_prompt_cache(
                                 text_model, max_kv_size=_max_kv_size or None
                             )
-                            SimpleEngine._restore_prompt_cache(
-                                backbone_cache,
-                                system_kv_snapshot,
+                            # Shallow-copies lists (patch #6 aliasing) and
+                            # applies per-layer meta_state (ring indices for
+                            # RotatingKVCache sliding-window layers).
+                            system_kv_mod.apply_snapshot_states(
+                                backbone_cache, system_kv_snapshot,
+                                system_kv_meta,
                             )
 
                             # EXTEND HIT cache: prefill any new content beyond the
@@ -2351,6 +2360,9 @@ class SimpleEngine(BaseEngine):
                                     _grow_consumed = self._system_kv_token_count
                                     _grow_ckpts = self._system_kv.checkpoints
                                     _grow_ckpt_cap = self._system_kv.ckpt_capacity
+                                    _grow_kinds = system_kv_mod.classify_layers(
+                                        backbone_cache
+                                    )
                                     while _grow_arr.size > _grow_step:
                                         text_model(
                                             _grow_arr[:_grow_step][None],
@@ -2358,25 +2370,26 @@ class SimpleEngine(BaseEngine):
                                         )
                                         # Partial-restore checkpoint at the
                                         # grow-chunk boundary: capture LAZY
-                                        # references only (recurrent layers;
-                                        # no-op on pure-attn) — they are
-                                        # ancestors of the final state, so
-                                        # the eval-only-at-end pattern below
-                                        # materializes them. Keeps the
-                                        # profiled ~12% win over per-chunk
-                                        # eval.
+                                        # references only (ckpt-class layers;
+                                        # no-op on all-trimmable models) —
+                                        # they are ancestors of the final
+                                        # state, so the eval-only-at-end
+                                        # pattern below materializes them.
+                                        # Keeps the profiled ~12% win over
+                                        # per-chunk eval.
                                         _grow_consumed += _grow_step
-                                        _grow_rec = (
-                                            system_kv_mod.capture_recurrent_states(
-                                                backbone_cache
+                                        _grow_st, _grow_meta = (
+                                            system_kv_mod.capture_checkpoint_states(
+                                                backbone_cache, _grow_kinds
                                             )
                                         )
-                                        if _grow_rec:
+                                        if _grow_st:
                                             _grow_ckpts = (
                                                 system_kv_mod.append_checkpoint(
                                                     _grow_ckpts,
                                                     _grow_consumed,
-                                                    _grow_rec,
+                                                    _grow_st,
+                                                    _grow_meta,
                                                     _grow_ckpt_cap,
                                                 )
                                             )
@@ -2404,6 +2417,12 @@ class SimpleEngine(BaseEngine):
                                     self._system_kv_token_count = len(_grow_new_extended)
                                     self._system_kv_token_ids = list(_grow_new_extended)
                                     self._system_kv.checkpoints = _grow_ckpts
+                                    self._system_kv.snapshot_meta = (
+                                        system_kv_mod.capture_snapshot_meta(
+                                            backbone_cache
+                                        )
+                                    )
+                                    self._system_kv.snapshot_kinds = _grow_kinds
                             prompt_to_send = mx.array(
                                 full_tokens_list[len(_grow_new_extended) :]
                                 if _grow_new_extended
@@ -2416,6 +2435,7 @@ class SimpleEngine(BaseEngine):
                                 make_cache_with_snapshot,
                                 text_model,
                                 self._system_kv_snapshot,
+                                self._system_kv.snapshot_meta,
                             )
                         )
                         cache_hit = True
@@ -2618,13 +2638,15 @@ class SimpleEngine(BaseEngine):
                 _partial_min = self._system_kv.partial_min
 
                 # Candidate: in-RAM partial restore.
-                _ram_pos, _ram_states = 0, None
+                _ram_pos, _ram_states, _ram_metas = 0, None, None
                 if _partial_plan is not None:
-                    _ram_pos, _ram_states = system_kv_mod.select_restore_pos(
-                        _partial_plan, _ext_len
+                    _ram_pos, _ram_states, _ram_metas = (
+                        system_kv_mod.select_restore_pos(
+                            _partial_plan, _ext_len
+                        )
                     )
                     if _ram_pos < _partial_min:
-                        _ram_pos, _ram_states = 0, None
+                        _ram_pos, _ram_states, _ram_metas = 0, None, None
 
                 # Candidate: SSD full-prefix promote.
                 _ssd_full_meta = None
@@ -2658,9 +2680,20 @@ class SimpleEngine(BaseEngine):
                             if _cmeta is None:
                                 continue
                             _cap = min(_cand["common_len"], _ext_len)
-                            _has_rec = any(
-                                lm["kind"] == "arrays"
-                                for lm in _cmeta["layers"]
+                            # Format v3 entries carry per-layer kinds; fall
+                            # back to shape-based inference for v1/v2 (which
+                            # predate Rotating-capable caching, so "arrays"
+                            # is the only ckpt-class kind they can contain).
+                            _ckinds = _cmeta.get("kinds")
+                            if _ckinds and any(k == "opaque" for k in _ckinds):
+                                continue
+                            _has_rec = (
+                                any(k == "ckpt" for k in _ckinds)
+                                if _ckinds
+                                else any(
+                                    lm["kind"] == "arrays"
+                                    for lm in _cmeta["layers"]
+                                )
                             )
                             if _has_rec:
                                 _cpos = max(
@@ -2682,11 +2715,8 @@ class SimpleEngine(BaseEngine):
                             exc_info=True,
                         )
 
-                def _install(states):
-                    for _i, _st in enumerate(states):
-                        mc[_i].state = (
-                            list(_st) if isinstance(_st, list) else _st
-                        )
+                def _install(states, metas=None):
+                    system_kv_mod.apply_snapshot_states(mc, states, metas)
 
                 # Ordered candidates, best restore position first; the first
                 # one that applies cleanly wins, failures fall through to the
@@ -2708,12 +2738,17 @@ class SimpleEngine(BaseEngine):
                 for _cpos, _, _kind, _cand in _candidates:
                     try:
                         if _kind == "ram_partial":
-                            _states = system_kv_mod.build_partial_restore_states(
-                                _partial_plan["snapshot"], _ram_states, _cpos
+                            _states, _smetas = (
+                                system_kv_mod.build_partial_restore_states(
+                                    _partial_plan["snapshot"], _ram_states,
+                                    _cpos,
+                                    kinds=_partial_plan.get("kinds"),
+                                    ckpt_metas=_ram_metas,
+                                )
                             )
                             if _states is None:
                                 continue
-                            _install(_states)
+                            _install(_states, _smetas)
                             _ckpt_carry = self._system_kv.carry_checkpoints(
                                 _partial_plan["checkpoints"], _cpos
                             )
@@ -2737,7 +2772,7 @@ class SimpleEngine(BaseEngine):
                                 or len(_entry["snapshot"]) != len(mc)
                             ):
                                 continue
-                            _install(_entry["snapshot"])
+                            _install(_entry["snapshot"], _entry.get("meta"))
                             _promoted = True
                             _ckpt_carry = self._system_kv.carry_checkpoints(
                                 _entry["checkpoints"], _cpos
@@ -2760,15 +2795,21 @@ class SimpleEngine(BaseEngine):
                             ):
                                 continue
                             _cstates = {}
+                            _cmetas = {}
                             for _cp in _entry["checkpoints"]:
                                 if _cp["pos"] == _cpos:
                                     _cstates = _cp["states"]
-                            _states = system_kv_mod.build_partial_restore_states(
-                                _entry["snapshot"], _cstates, _cpos
+                                    _cmetas = _cp.get("metas") or {}
+                            _states, _smetas = (
+                                system_kv_mod.build_partial_restore_states(
+                                    _entry["snapshot"], _cstates, _cpos,
+                                    kinds=_entry.get("kinds"),
+                                    ckpt_metas=_cmetas,
+                                )
                             )
                             if _states is None:
                                 continue
-                            _install(_states)
+                            _install(_states, _smetas)
                             _ckpt_carry = self._system_kv.carry_checkpoints(
                                 _entry["checkpoints"], _cpos
                             )
@@ -2805,18 +2846,24 @@ class SimpleEngine(BaseEngine):
                 step = self._prefill_step_size
                 _consumed = _prefill_start
                 _ckpt_cap = self._system_kv.ckpt_capacity
+                _layer_kinds = None
                 while _arr.size > step:
                     model(_arr[:step][None], cache=mc)
                     self._eval_cache_snapshot([c.state for c in mc])
                     _consumed += step
                     # Capture a partial-restore checkpoint at the chunk
-                    # boundary: recurrent-layer states only (attention KV at
-                    # any position slices from the final snapshot). No-op on
-                    # pure-attention models.
-                    _rec = system_kv_mod.capture_recurrent_states(mc)
-                    if _rec:
+                    # boundary: ckpt-class layers only — recurrent state +
+                    # sliding-window state/meta (attention KV at any
+                    # position slices from the final snapshot). No-op on
+                    # all-trimmable models.
+                    if _layer_kinds is None:
+                        _layer_kinds = system_kv_mod.classify_layers(mc)
+                    _cst, _cmt = system_kv_mod.capture_checkpoint_states(
+                        mc, _layer_kinds
+                    )
+                    if _cst:
                         _ckpt_carry = system_kv_mod.append_checkpoint(
-                            _ckpt_carry, _consumed, _rec, _ckpt_cap
+                            _ckpt_carry, _consumed, _cst, _cmt, _ckpt_cap
                         )
                     _arr = _arr[step:]
                     mx.clear_cache()
@@ -2830,6 +2877,9 @@ class SimpleEngine(BaseEngine):
                 # entries cannot alias the saved system-prefix state.
                 snapshot = self._snapshot_prompt_cache(mc)
                 self._eval_cache_snapshot(snapshot)
+                if _layer_kinds is None:
+                    _layer_kinds = system_kv_mod.classify_layers(mc)
+                snapshot_meta = system_kv_mod.capture_snapshot_meta(mc)
 
                 # Kill-switch-gated demote-then-store + SSD write-through
                 # (inside the serialized worker): see
@@ -2837,6 +2887,7 @@ class SimpleEngine(BaseEngine):
                 self._system_kv.store_extended(
                     system_hash, snapshot, _extended_token_ids,
                     promoted=_promoted, checkpoints=_ckpt_carry,
+                    meta=snapshot_meta, kinds=_layer_kinds,
                 )
 
                 backbone_cache = mc

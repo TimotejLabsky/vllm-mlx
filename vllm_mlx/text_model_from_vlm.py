@@ -123,17 +123,41 @@ def build_text_model(
     try:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
-        model_type = text_config.get("model_type") or config.get("model_type", "")
-        TextModel, TextModelArgs = _import_text_model_classes(model_type)
-        text_model_cls = f"{TextModel.__module__}.{TextModel.__qualname__}"
-        logger.debug(
-            "Building TextModel for model_type=%r using %s", model_type, text_model_cls
-        )
 
-        # Build args with proper __post_init__ (handles partial_rotary_factor,
-        # rope_scaling, head_dim derivation)
-        args = TextModelArgs.from_dict(text_config)
-        text_model = TextModel(args)
+        model_type = str(
+            text_config.get("model_type") or config.get("model_type") or ""
+        )
+        if model_type in ("qwen3_5", "qwen3_5_moe", ""):
+            # Qwen3.5/3.6 family: import from qwen3_5 — TextModel and
+            # TextModelArgs handle both dense and MoE natively
+            # (MTPDecoderLayer auto-selects SparseMoeBlock when
+            # args.num_experts > 0). qwen3_5_moe.py does NOT export these.
+            from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+            # Build args with proper __post_init__ (handles
+            # partial_rotary_factor, rope_scaling, head_dim derivation)
+            args = TextModelArgs.from_dict(text_config)
+            text_model = TextModel(args)
+        else:
+            # Generic path: build the text model from the mlx_lm class for
+            # this model_type (e.g. gemma4 -> mlx_lm.models.gemma4_text).
+            # Previously this function fed every config into the qwen3_5
+            # TextModelArgs, which crashed on gemma-4 ("float division by
+            # zero") — and the caller's None fallback silently routed text
+            # requests through the cacheless mlx_vlm path (no system-KV).
+            import importlib
+
+            try:
+                mod = importlib.import_module(f"mlx_lm.models.{model_type}")
+            except ImportError:
+                logger.warning(
+                    "No mlx_lm model class for text model_type %r; "
+                    "MLLM text routing unavailable",
+                    model_type,
+                )
+                return None
+            args = mod.ModelArgs.from_dict(text_config)
+            text_model = mod.Model(args)
 
         # Keep the ordinary text route independent from draft tensors unless
         # the serving engine explicitly enabled speculative MTP decoding.
@@ -178,6 +202,29 @@ def build_text_model(
                 bits=quantization.get("bits", 8),
                 class_predicate=_class_predicate,
             )
+
+        # Fail closed before serving a half-loaded model: strict=False below
+        # silently ignores name mismatches in BOTH directions, so a namespace
+        # divergence between the vlm's language_model and the mlx_lm class
+        # would produce a model that loads fine and generates garbage. Require
+        # the vlm/MTP weights to cover (nearly) all skeleton parameters —
+        # MTP-only gaps are expected and handled by the second load below.
+        skeleton_names = {
+            name for name, _ in mlx.utils.tree_flatten(text_model.parameters())
+        }
+        coverage = (
+            len(skeleton_names & all_weight_names) / len(skeleton_names)
+            if skeleton_names
+            else 0.0
+        )
+        if coverage < 0.9:
+            logger.warning(
+                "TextModel weight-name coverage only %.0f%% for model_type %r "
+                "(vlm namespace mismatch); refusing half-loaded text model",
+                coverage * 100,
+                model_type,
+            )
+            return None
 
         # Transfer backbone + lm_head weights from vlm language_model (zero-copy).
         # strict=False because TextModel has MTP params that vlm doesn't have yet.
