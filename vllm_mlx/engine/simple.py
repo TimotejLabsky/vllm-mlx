@@ -463,6 +463,23 @@ class SimpleEngine(BaseEngine):
                                 self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                             )
 
+                        # Register the model's FULL eos set (generation_config
+                        # may declare several terminators — gemma-4 has three)
+                        # so stream_generate stops on all of them instead of
+                        # leaking turn markers and running to max_tokens.
+                        try:
+                            from ..text_model_from_vlm import (
+                                wrap_tokenizer_with_eos,
+                            )
+
+                            self._text_tokenizer = wrap_tokenizer_with_eos(
+                                self._text_tokenizer, self._model_name
+                            )
+                        except Exception:
+                            logger.debug(
+                                "text-route eos wrap failed", exc_info=True
+                            )
+
                         has_mtp = (
                             hasattr(self._text_model, "mtp")
                             and self._text_model.mtp is not None
