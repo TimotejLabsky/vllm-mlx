@@ -793,6 +793,13 @@ def _prepare_chat_completion_invocation(
         "min_p": _resolve_min_p(request.min_p),
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
+        # DRY sequence-level repetition penalty (fork patch) — None values
+        # defer to per-model VLLM_MLX_DRY_* env defaults in the engine.
+        "dry_multiplier": getattr(request, "dry_multiplier", None),
+        "dry_base": getattr(request, "dry_base", None),
+        "dry_allowed_length": getattr(request, "dry_allowed_length", None),
+        "dry_range": getattr(request, "dry_range", None),
+        "dry_sequence_breakers": getattr(request, "dry_sequence_breakers", None),
     }
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
 
@@ -913,6 +920,13 @@ def _prepare_anthropic_invocation(
         "repetition_penalty": _resolve_repetition_penalty(
             openai_request.repetition_penalty
         ),
+        # DRY sequence-level repetition penalty (fork patch) — None values
+        # defer to per-model VLLM_MLX_DRY_* env defaults in the engine.
+        "dry_multiplier": getattr(openai_request, "dry_multiplier", None),
+        "dry_base": getattr(openai_request, "dry_base", None),
+        "dry_allowed_length": getattr(openai_request, "dry_allowed_length", None),
+        "dry_range": getattr(openai_request, "dry_range", None),
+        "dry_sequence_breakers": getattr(openai_request, "dry_sequence_breakers", None),
     }
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         openai_request.chat_template_kwargs

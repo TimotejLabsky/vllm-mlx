@@ -184,6 +184,13 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    # DRY sequence-level repetition penalty (fork patch; see dry_sampler.py).
+    # None = fall back to VLLM_MLX_DRY_* env defaults; multiplier 0 = off.
+    dry_multiplier: float | None = None
+    dry_base: float | None = None
+    dry_allowed_length: int | None = None
+    dry_range: int | None = None
+    dry_sequence_breakers: list[str] | None = None
     max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stream_options: StreamOptions | None = (
@@ -306,6 +313,13 @@ class CompletionRequest(BaseModel):
     top_k: int | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    # DRY sequence-level repetition penalty (fork patch; see dry_sampler.py).
+    # None = fall back to VLLM_MLX_DRY_* env defaults; multiplier 0 = off.
+    dry_multiplier: float | None = None
+    dry_base: float | None = None
+    dry_allowed_length: int | None = None
+    dry_range: int | None = None
+    dry_sequence_breakers: list[str] | None = None
     max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
