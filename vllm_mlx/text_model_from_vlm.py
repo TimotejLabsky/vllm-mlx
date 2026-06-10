@@ -108,11 +108,16 @@ def build_text_model(
         model_type = str(
             text_config.get("model_type") or config.get("model_type") or ""
         )
-        if model_type in ("qwen3_5", "qwen3_5_moe", ""):
-            # Qwen3.5/3.6 family: import from qwen3_5 — TextModel and
-            # TextModelArgs handle both dense and MoE natively
-            # (MTPDecoderLayer auto-selects SparseMoeBlock when
-            # args.num_experts > 0). qwen3_5_moe.py does NOT export these.
+        if model_type.startswith("qwen3_5") or model_type == "":
+            # Qwen3.5/3.6 family — text_config carries model_type
+            # "qwen3_5_text" / "qwen3_5_moe_text" (the top-level config says
+            # "qwen3_5"/"qwen3_5_moe"), so match by PREFIX: an exact-set
+            # check here once silently broke text routing (and with it the
+            # whole system-KV cache) for every Qwen MLLM in the lineup.
+            # Import from qwen3_5 — TextModel and TextModelArgs handle both
+            # dense and MoE natively (MTPDecoderLayer auto-selects
+            # SparseMoeBlock when args.num_experts > 0). qwen3_5_moe.py does
+            # NOT export these.
             from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
             # Build args with proper __post_init__ (handles
@@ -121,24 +126,38 @@ def build_text_model(
             text_model = TextModel(args)
         else:
             # Generic path: build the text model from the mlx_lm class for
-            # this model_type (e.g. gemma4 -> mlx_lm.models.gemma4_text).
+            # this model_type (e.g. gemma4_text -> mlx_lm.models.gemma4_text).
             # Previously this function fed every config into the qwen3_5
             # TextModelArgs, which crashed on gemma-4 ("float division by
             # zero") — and the caller's None fallback silently routed text
             # requests through the cacheless mlx_vlm path (no system-KV).
+            # Fallback chain: exact module; then the name with a trailing
+            # "_text" stripped (text-config model_types often add the suffix
+            # while the mlx_lm module is named after the family).
             import importlib
 
-            try:
-                mod = importlib.import_module(f"mlx_lm.models.{model_type}")
-            except ImportError:
+            mod = None
+            candidates = [model_type]
+            if model_type.endswith("_text"):
+                candidates.append(model_type[: -len("_text")])
+            for cand in candidates:
+                try:
+                    mod = importlib.import_module(f"mlx_lm.models.{cand}")
+                    break
+                except ImportError:
+                    continue
+            if mod is None:
                 logger.warning(
-                    "No mlx_lm model class for text model_type %r; "
-                    "MLLM text routing unavailable",
+                    "No mlx_lm model class for text model_type %r "
+                    "(tried %s); MLLM text routing unavailable",
                     model_type,
+                    candidates,
                 )
                 return None
-            args = mod.ModelArgs.from_dict(text_config)
-            text_model = mod.Model(args)
+            model_cls = getattr(mod, "TextModel", None) or mod.Model
+            args_cls = getattr(mod, "TextModelArgs", None) or mod.ModelArgs
+            args = args_cls.from_dict(text_config)
+            text_model = model_cls(args)
 
         # Keep the ordinary text route independent from draft tensors unless
         # the serving engine explicitly enabled speculative MTP decoding.
