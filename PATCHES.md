@@ -485,6 +485,13 @@ v1/v2 SSD entries and pre-existing in-RAM slots load with `meta/kinds = None` an
 
 **Verified (2026-06-10, M1 Pro):** real-RotatingKVCache round-trip test — restore past the rotation point continues **bit-identically** to the uninterrupted cache, plus a negative control documenting that state-only restore desyncs (`offset/_idx` mismatch). Full suite 2190 passed / 0 failed. Live gemma-4 A/B recorded in the infra deploy table.
 
+**Three more gotchas surfaced by the live gemma bring-up (same patch series):**
+1. **Per-layer quantization overrides** — gemma-4's config carries 120 per-layer entries (8-bit MLP/router on select layers) keyed in the **VLM namespace** (`language_model.<path>`); uniform `nn.quantize` produced `[quantized_matmul] shapes incompatible`. The class predicate now returns the override dict (mlx-lm loader convention), checking both namespaces.
+2. **Thread-local stream pinning** — lazy init-time module buffers (gemma's rope tables; NOT in `parameters()`, so the coverage guard can't see them) pin to the build thread's stream; the first worker-thread forward died with `There is no Stream(gpu, 1) in current thread`. `build_text_model` now runs a **one-token warmup forward** on the build thread to materialize everything (fails closed if the warmup itself fails). Qwen3.5 never hit this — it computes rope per forward.
+3. **Multi-eos termination** — gemma-4's `generation_config.json` declares **three** eos ids (`end_of_text`, `<turn|>`, end-of-channel); the MLLM text route handed `stream_generate` a bare HF tokenizer carrying one, so `<turn|>` leaked into content and generation ran to max_tokens. The text-route tokenizer is now pre-wrapped in mlx_lm's `TokenizerWrapper` with the full declared eos set (`wrap_tokenizer_with_eos`) — generalizing the old hard-coded Qwen3.5 `<|im_end|>` special case.
+
+Post-fix probe (26B, served): correct short answers with `finish_reason=stop`, and the first-ever gemma cache HIT: `reusing 32 cached tokens, prefilling 3`.
+
 **Upstreaming:** (a) is a clean bug fix — strong PR candidate. (b) extends the #19/#20 series; together they make the pure-LLM cache path cover every mlx-lm cache class except quantized partial-restore.
 
 ---
