@@ -2173,6 +2173,16 @@ class SimpleEngine(BaseEngine):
         repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
         stop = kwargs.pop("stop", None)
         external_logits_processors = kwargs.pop("logits_processors", None)
+        # DRY sequence-level repetition penalty (fork patch): request values
+        # override per-model VLLM_MLX_DRY_* env defaults; multiplier <= 0
+        # (or nothing configured) keeps it fully off.
+        dry_kwargs = {
+            "multiplier": kwargs.pop("dry_multiplier", None),
+            "base": kwargs.pop("dry_base", None),
+            "allowed_length": kwargs.pop("dry_allowed_length", None),
+            "window": kwargs.pop("dry_range", None),
+            "sequence_breakers": kwargs.pop("dry_sequence_breakers", None),
+        }
         abort_event = threading.Event()
 
         # Per-request enable_thinking override; fall back to env var / default True.
@@ -2220,6 +2230,28 @@ class SimpleEngine(BaseEngine):
             presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
+        # DRY rides the same logits-processor chain. NOTE: any custom
+        # processor disables MTP for the request (existing rule below), so
+        # don't enable DRY defaults on the MTP heavies unless trading
+        # speculative decode for loop-breaking is intentional.
+        try:
+            from ..dry_sampler import build_dry_processor
+
+            _dry_proc = build_dry_processor(text_tokenizer, **dry_kwargs)
+            if _dry_proc is not None:
+                all_processors.append(_dry_proc)
+                logger.info(
+                    "DRY sampler active: multiplier=%.2f base=%.2f "
+                    "allowed=%d window=%d breakers=%d",
+                    _dry_proc.multiplier,
+                    _dry_proc.base,
+                    _dry_proc.allowed_length,
+                    _dry_proc.window,
+                    len(_dry_proc.breaker_ids),
+                )
+        except Exception:
+            logger.warning("DRY sampler setup failed; continuing without",
+                           exc_info=True)
         custom_logits_active = bool(all_processors)
         max_tokens = max_tokens or 4096
 
