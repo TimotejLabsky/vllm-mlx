@@ -2225,15 +2225,15 @@ class SimpleEngine(BaseEngine):
         has_system = any(m.get("role") == "system" for m in messages)
 
         if has_system and text_model is not None:
-            # Find system prefix boundary in full prompt text.
-            # ChatML format: system section ends where first non-system message begins.
-            # Works with tools (rendered inside system section by Qwen templates).
-            system_prefix_end = -1
-            for marker in ("<|im_start|>user\n", "<|im_start|>assistant\n"):
-                idx = full_prompt.find(marker)
-                if idx > 0:
-                    system_prefix_end = idx
-                    break
+            # Find system prefix boundary in full prompt text: the system
+            # section ends where the first user/assistant turn begins.
+            # Template-family-aware (system_kv.TEMPLATE_MARKERS) — was
+            # hard-coded ChatML, which silently disabled caching for
+            # Gemma 4 / GLM / Mistral / Llama-3 / Phi-4 / Harmony prompts.
+            # Works with tools (rendered inside the system section).
+            _tpl_family, system_prefix_end, _tpl_gen_marker = (
+                system_kv_mod.detect_template_markers(full_prompt)
+            )
 
             if system_prefix_end > 0:
                 system_prefix_text = full_prompt[:system_prefix_end]
@@ -2324,7 +2324,7 @@ class SimpleEngine(BaseEngine):
                             # cached prefix up to (but not including) the gen-prompt
                             # marker, then re-snapshot. This is what makes the cache
                             # grow as the conversation progresses.
-                            _grow_marker = "<|im_start|>assistant\n"
+                            _grow_marker = _tpl_gen_marker
                             _grow_idx = full_prompt.rfind(_grow_marker)
                             _grow_new_extended = None
                             if _grow_idx > 0:
@@ -2583,7 +2583,7 @@ class SimpleEngine(BaseEngine):
                 # (the chat template renders prior assistant turns with
                 # content instead).
                 mc = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
-                _gen_marker = "<|im_start|>assistant\n"
+                _gen_marker = _tpl_gen_marker
                 _gen_idx = full_prompt.rfind(_gen_marker)
                 if _gen_idx > 0:
                     _cache_text = full_prompt[:_gen_idx]
