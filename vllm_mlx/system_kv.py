@@ -29,6 +29,113 @@ from collections import OrderedDict
 logger = logging.getLogger(__name__)
 
 
+def common_prefix_len(a, b):
+    """Length of the longest common prefix of two token-id sequences."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def capture_recurrent_states(prompt_cache):
+    """Shallow-copy the list-state (ArraysCache/recurrent) layers of a live
+    prompt cache, keyed by layer index. Returns {} for pure-attention models.
+
+    Same aliasing discipline as patch #6: ``ArraysCache.state`` returns the
+    live ``self.cache`` list whose elements are REBOUND (never mutated in
+    place) by subsequent forwards, so a shallow list copy pins the state at
+    this position. Tuple-state (KVCache) layers are skipped — their state at
+    any position p is recoverable from the final snapshot by slicing
+    ``keys[..., :p, :]`` (see ``build_partial_restore_states``).
+    """
+    states = {}
+    for i, c in enumerate(prompt_cache):
+        st = c.state
+        if isinstance(st, list):
+            states[i] = list(st)
+    return states
+
+
+def append_checkpoint(checkpoints, pos, states, capacity):
+    """Append a {pos, states} checkpoint, keeping the list sorted and
+    bounded. When the cap is exceeded, drop every other checkpoint
+    (geometric thinning — early positions stay covered at coarser
+    granularity, which is what divergence-point restore needs).
+    """
+    if checkpoints and checkpoints[-1]["pos"] >= pos:
+        return checkpoints
+    checkpoints.append({"pos": pos, "states": states})
+    if len(checkpoints) > max(1, capacity):
+        thinned = checkpoints[::2]
+        if thinned[-1] is not checkpoints[-1]:
+            thinned.append(checkpoints[-1])
+        checkpoints = thinned
+    return checkpoints
+
+
+def select_restore_pos(plan, cap):
+    """Pick the restore position for a partial-restore ``plan``, bounded by
+    ``cap`` (the new request's extended-prefix length — restoring past it
+    would leave nothing to prefill forward from).
+
+    Pure-attention donor: exactly ``min(d, cap)`` — any position is
+    recoverable by slicing. Hybrid donor: the highest checkpoint position
+    <= ``min(d, cap)`` (recurrent state restores only where captured).
+
+    Returns ``(pos, ckpt_states)``; ``(0, None)`` when nothing usable.
+    """
+    d = min(plan["d"], cap)
+    if d <= 0:
+        return 0, None
+    if plan["has_recurrent"]:
+        if d == plan["donor_len"]:
+            # The donor's entire chain is shared (e.g. identical request
+            # resent): the snapshot itself holds the recurrent state AT d —
+            # restore it whole, no checkpoint needed.
+            states = {
+                i: st
+                for i, st in enumerate(plan["snapshot"])
+                if isinstance(st, list)
+            }
+            return d, states
+        pos = 0
+        states = None
+        for cp in plan["checkpoints"]:
+            if pos < cp["pos"] <= d:
+                pos = cp["pos"]
+                states = cp["states"]
+        if states is None:
+            return 0, None
+        return pos, states
+    return d, {}
+
+
+def build_partial_restore_states(snapshot, ckpt_states, pos):
+    """Per-layer states to install for a restore at position ``pos``.
+
+    Tuple-state (KVCache) layers: slice the donor snapshot to ``pos`` —
+    the ``state`` setter re-derives ``offset`` from ``keys.shape[2]``, so
+    assignment is position-exact. List-state (recurrent) layers: take the
+    checkpoint's state captured AT ``pos`` (shallow-copied on assignment by
+    the caller, mirroring patch #6). Never trims ArraysCache.
+
+    Returns the per-layer list, or None if a recurrent layer has no
+    checkpoint state (caller must fall back to cold prefill).
+    """
+    out = []
+    for i, st in enumerate(snapshot):
+        if isinstance(st, tuple):
+            k, v = st
+            out.append((k[..., :pos, :], v[..., :pos, :]))
+        else:
+            ck = ckpt_states.get(i) if ckpt_states else None
+            if ck is None:
+                return None
+            out.append(ck)
+    return out
+
+
 class SystemKVManager:
     """State + helpers for the system-prompt KV snapshot cache."""
 
@@ -48,8 +155,15 @@ class SystemKVManager:
         self.system_hash = None  # Hash of system prefix text
         self.token_count = 0
         self.token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        # Partial-restore checkpoints (patch: system-kv-partial-restore).
+        # list[{"pos": int, "states": {layer_idx: list[mx.array]}}], sorted
+        # ascending by pos. Recurrent-layer states only — attention KV at any
+        # position is sliced from ``snapshot``. Empty for pure-attention
+        # models (any position is restorable by slicing alone).
+        self.checkpoints: list = []
         # Side-stash LRU for inactive slots, keyed by system_hash.
-        # value: {"snapshot": list, "token_count": int, "token_ids": list}
+        # value: {"snapshot": list, "token_count": int, "token_ids": list,
+        #         "checkpoints": list}
         self.lru: "OrderedDict[str, dict]" = OrderedDict()
         # Capacity is the TOTAL slot count (active + LRU bag).
         # The LRU bag therefore holds capacity-1 entries at most.
@@ -57,11 +171,22 @@ class SystemKVManager:
         self.capacity = max(1, int(
             _os.environ.get("VLLM_MLX_SYSTEM_KV_SLOTS", "4")
         ))
+        # Partial-restore knobs: max checkpoints kept per slot (geometric
+        # thinning above the cap) and the minimum restorable prefix worth a
+        # partial restore (below it, cold prefill is cheap enough).
+        self.ckpt_capacity = max(1, int(
+            _os.environ.get("VLLM_MLX_SYSTEM_KV_CHECKPOINTS", "8")
+        ))
+        self.partial_min = max(0, int(
+            _os.environ.get("VLLM_MLX_SYSTEM_KV_PARTIAL_MIN", "256")
+        ))
         # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
         self.hits = 0
         self.misses = 0
         self.tokens_saved = 0
         self.evictions = 0
+        self.partial_hits = 0
+        self.partial_tokens_saved = 0
         # True only when the model's prompt cache is composed entirely of
         # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
         # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
@@ -226,11 +351,14 @@ class SystemKVManager:
         self.system_hash = None
         self.token_count = 0
         self.token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        self.checkpoints = []
         self.lru.clear()
         self.evictions = 0
         self.hits = 0
         self.misses = 0
         self.tokens_saved = 0
+        self.partial_hits = 0
+        self.partial_tokens_saved = 0
         self.ssd_promotes = 0
         self.supports_snapshot = False
         if self.ssd_store is not None:
@@ -270,12 +398,14 @@ class SystemKVManager:
                 "snapshot": self.snapshot,
                 "token_count": self.token_count,
                 "token_ids": self.token_ids,
+                "checkpoints": self.checkpoints,
             }
             self.lru.move_to_end(self.system_hash)
         self.snapshot = entry["snapshot"]
         self.system_hash = system_hash
         self.token_count = entry["token_count"]
         self.token_ids = entry["token_ids"]
+        self.checkpoints = entry.get("checkpoints", [])
         return True
 
     def lru_demote_active_to_bag(self):
@@ -296,6 +426,7 @@ class SystemKVManager:
             "snapshot": self.snapshot,
             "token_count": self.token_count,
             "token_ids": self.token_ids,
+            "checkpoints": self.checkpoints,
         }
         self.lru.move_to_end(self.system_hash)
         # Clear active so the caller's assignment is clean.
@@ -303,6 +434,7 @@ class SystemKVManager:
         self.system_hash = None
         self.token_count = 0
         self.token_ids = None
+        self.checkpoints = []
         # Trim bag to capacity-1 (leaving one slot for the incoming active).
         evicted = 0
         max_bag = max(0, self.capacity - 1)
@@ -375,6 +507,59 @@ class SystemKVManager:
         self.hits += 1
         self.tokens_saved += tokens_saved
 
+    def record_partial_hit(self, tokens_restored):
+        """Bump the PARTIAL-HIT counters. The restored tokens also count
+        toward the aggregate ``tokens_saved`` gauge (they are prompt tokens
+        the prefill did not recompute), while ``partial_*`` keep the
+        partial path separately observable.
+        """
+        self.partial_hits += 1
+        self.partial_tokens_saved += tokens_restored
+        self.tokens_saved += tokens_restored
+
+    def plan_partial_restore(self, full_tokens_list):
+        """Plan a checkpointed partial restore against the ACTIVE slot.
+
+        Called at gate time (after ``lru_promote``) when the strict
+        extended-prefix match failed: the new prompt shares only the first
+        D tokens with the cached chain (divergence — opencode compaction,
+        edited turns, regenerated/retried turns, interleaved sessions on
+        one system prompt).
+
+        Returns gate-time references (concurrent slot reassignment cannot
+        alias them — same pattern as ``lookup_active``): ``{"d", "snapshot",
+        "checkpoints", "has_recurrent", "donor_len"}``, or None when even
+        the full divergence point cannot clear ``partial_min``. The actual
+        restore position is chosen in the worker via
+        ``select_restore_pos`` — it must also be capped to the new
+        request's extended-prefix length, which only the worker knows.
+        Must run inside ``_generation_lock``.
+        """
+        if not self.is_safe():
+            return None
+        snapshot = self.snapshot
+        token_ids = self.token_ids
+        if snapshot is None or not token_ids:
+            return None
+        d = common_prefix_len(full_tokens_list, token_ids)
+        if d < self.partial_min:
+            return None
+        return {
+            "d": d,
+            "snapshot": snapshot,
+            "checkpoints": self.checkpoints,
+            "has_recurrent": any(isinstance(st, list) for st in snapshot),
+            "donor_len": self.token_count,
+        }
+
+    def carry_checkpoints(self, checkpoints, pos):
+        """Checkpoints from a donor chain that remain valid on a new chain
+        restored at ``pos`` (common prefix ⇒ every checkpoint at or before
+        the restore position describes the same tokens). Returns a fresh
+        list so donor and new slot never share the mutable container.
+        """
+        return [cp for cp in (checkpoints or []) if cp["pos"] <= pos]
+
     def store_snapshot(self, system_hash, snapshot, token_count):
         """Install ``snapshot`` as the active slot (stream_chat MISS store).
 
@@ -396,12 +581,19 @@ class SystemKVManager:
         self.system_hash = system_hash
         self.token_count = token_count
         self.token_ids = None
+        self.checkpoints = []
 
-    def store_extended(self, system_hash, snapshot, extended_token_ids, promoted):
+    def store_extended(
+        self, system_hash, snapshot, extended_token_ids, promoted,
+        checkpoints=None,
+    ):
         """Install an EXTENDED-prefix snapshot as the active slot
         (text-route MISS store), gated on the kill switch: when disabled
         the request still prefilled its own prompt cache, but NOTHING
         persists. Runs inside the serialized generation worker.
+
+        ``checkpoints`` is the partial-restore checkpoint list captured
+        during this prefill (plus any carried over a partial restore).
         """
         if self.is_safe():
             # LRU: push the current active slot (if any, for a
@@ -414,13 +606,15 @@ class SystemKVManager:
             self.token_count = len(extended_token_ids)
             # EXTENDED_PREFIX_MARKER: store cached token IDs for prefix matching
             self.token_ids = list(extended_token_ids)
+            self.checkpoints = list(checkpoints) if checkpoints else []
             # Patch #16: write-through to SSD when freshly computed (not
             # promoted from disk). One async write per distinct system
             # prefix at creation; the grow path does NOT re-spill — a
             # restart promotes the stored prefix and re-grows cheaply.
             if self.ssd_store is not None and not promoted:
                 self.ssd_store.enqueue_spill(
-                    tuple(extended_token_ids), snapshot
+                    tuple(extended_token_ids), snapshot,
+                    checkpoints=self.checkpoints,
                 )
 
     # ------------------------------------------------------------------
@@ -453,6 +647,13 @@ class SystemKVManager:
                     n += sum(a.nbytes for a in layer if a is not None)
             return n
 
+        def _ckpt_bytes(ckpts):
+            n = 0
+            for cp in ckpts or []:
+                for st in cp["states"].values():
+                    n += sum(a.nbytes for a in st if a is not None)
+            return n
+
         if not (
             self.snapshot is not None
             or self.lru
@@ -461,8 +662,11 @@ class SystemKVManager:
         ):
             return None
 
-        active_bytes = _entry_bytes(self.snapshot)
-        bag_bytes = sum(_entry_bytes(e["snapshot"]) for e in self.lru.values())
+        active_bytes = _entry_bytes(self.snapshot) + _ckpt_bytes(self.checkpoints)
+        bag_bytes = sum(
+            _entry_bytes(e["snapshot"]) + _ckpt_bytes(e.get("checkpoints"))
+            for e in self.lru.values()
+        )
         total_bytes = active_bytes + bag_bytes
         slot_count = (1 if self.snapshot is not None else 0) + len(self.lru)
         slots_view = []
@@ -501,6 +705,10 @@ class SystemKVManager:
                 else 0.0
             ),
             "tokens_saved": self.tokens_saved,
+            # Partial-restore (checkpointed) fields:
+            "partial_hits": self.partial_hits,
+            "partial_tokens_saved": self.partial_tokens_saved,
+            "checkpoints": len(self.checkpoints),
             # New multi-slot fields:
             "evictions": self.evictions,
             "capacity": self.capacity,
