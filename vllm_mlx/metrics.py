@@ -261,6 +261,16 @@ class MetricsCollector:
                 "Prompt tokens saved by cache reuse since startup/reset.",
                 registry=registry,
             ),
+            "cache_partial_hits": Gauge(
+                "vllm_mlx_cache_partial_hits",
+                "Checkpointed partial-prefix restores since startup/reset.",
+                registry=registry,
+            ),
+            "cache_partial_tokens_saved": Gauge(
+                "vllm_mlx_cache_partial_tokens_saved",
+                "Prompt tokens restored via partial-prefix restore.",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -455,6 +465,12 @@ class MetricsCollector:
             self._prom["cache_tokens_saved"].set(
                 _coerce_float(cache_stats.get("tokens_saved", 0))
             )
+            self._prom["cache_partial_hits"].set(
+                _coerce_float(cache_stats.get("partial_hits", 0))
+            )
+            self._prom["cache_partial_tokens_saved"].set(
+                _coerce_float(cache_stats.get("partial_tokens_saved", 0))
+            )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024
             )
@@ -469,6 +485,8 @@ class MetricsCollector:
             self._prom["cache_hit_rate"].set(0)
             self._prom["cache_utilization_ratio"].set(0)
             self._prom["cache_tokens_saved"].set(0)
+            self._prom["cache_partial_hits"].set(0)
+            self._prom["cache_partial_tokens_saved"].set(0)
             self._prom["cache_memory_bytes"].set(0)
             self._prom["cache_memory_limit_bytes"].set(0)
 
