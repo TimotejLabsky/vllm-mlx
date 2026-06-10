@@ -420,6 +420,27 @@ A batch of low-risk observability fixes + correctness guards from a multi-agent,
 
 ---
 
+## 19. `patch: system-kv-partial-restore` — checkpointed partial-prefix restore (divergent chains)
+
+**Files:** `vllm_mlx/system_kv.py`, `vllm_mlx/system_kv_ssd.py`, `vllm_mlx/ssd_cache.py`, `vllm_mlx/engine/simple.py`, `vllm_mlx/metrics.py`, `tests/test_system_kv_partial.py` (new), `tests/test_system_kv_ssd.py` (adapted)
+
+The system-KV cache (#4/#9/#13/#16) restores only **exact prefix extensions**: when a new prompt shares the first D tokens with a cached chain but diverges after (opencode compaction, retried/edited turns, identical-request resends, interleaved sessions on one system prompt), the whole warm state is useless and the request pays a full cold prefill. This is the one workload shape where vLLM-style paged/block caches beat the snapshot design — but blocks can't hold recurrent (`ArraysCache`) state, which is why mlx-lm's own prefix cache refuses hybrids entirely (mlx-lm#980). This patch closes the gap with the llama.cpp #19408 idea adapted to our snapshot architecture: **position-indexed recurrent checkpoints + trimmable attention KV.**
+
+**Key insight:** only recurrent layers need per-position checkpoints. Attention KV at any position p is recoverable from the final snapshot by slicing `keys[..., :p, :]` — `KVCache.state`'s setter re-derives `offset` from the shape, so a sliced assignment is position-exact. So a checkpoint is just the (fixed-size) recurrent-layer states at a chunk boundary — cheap. Pure-attention models need **no checkpoints at all**: any divergence point is restorable by slicing alone.
+
+**How it works:**
+- *Capture:* during the MISS cold-prefill loop and the grow-on-HIT loop, after each prefill chunk, shallow-copy the list-state (recurrent) layers (`capture_recurrent_states` — same rebind-not-mutate aliasing discipline patch #6 verified bit-identical) into `{"pos", "states"}` checkpoints. Bounded per slot by `VLLM_MLX_SYSTEM_KV_CHECKPOINTS` (default 8) with drop-every-other geometric thinning. The grow path captures lazily (references only) to preserve the profiled eval-only-at-end pattern.
+- *Plan (gate time):* when `match_extended_prefix` fails, `plan_partial_restore` computes the divergence point D vs the active slot and hands gate-time references into the worker (same TOCTOU pattern as `lookup_active`). Floor: `VLLM_MLX_SYSTEM_KV_PARTIAL_MIN` (default 256 tokens).
+- *Restore (worker MISS block):* ordered candidates by restore position — in-RAM partial, SSD full-prefix promote (#16, unchanged semantics), SSD shared-prefix partial — first clean apply wins, failures fall through to the next source and ultimately cold prefill. Restore = sliced attention KV + checkpoint recurrent state, prefill forward from there. **Never trims `ArraysCache`** — restores only at positions where recurrent state was captured (avoiding exactly the trim-path crash that killed the parked trimmable experiment). `d == donor_len` fast path: the snapshot itself is the checkpoint (identical-request resend).
+- *SSD format v2:* checkpoints ride along in the entry's safetensors (`c{n}_l{i}_s{j}` keys) + meta; v1 entries read back with `checkpoints == []`. New `SSDIndex.lookup_shared_prefix` finds divergent stored entries via the existing `prefix_hash` column (first-16-token hash) + exact common-prefix from the token blob — so partial restore works **across restarts** too.
+- *Observability:* `partial_hits` / `partial_tokens_saved` in `system_kv_cache` stats + new `vllm_mlx_cache_partial_{hits,tokens_saved}` Prometheus gauges; restored tokens also count in the aggregate `tokens_saved`.
+
+**Verified (2026-06-10, M1 Pro):** unit suite `tests/test_system_kv_partial.py` (13 tests: helpers, real-KVCache trim offset semantics, aliasing, per-slot checkpoint LRU, SSD v2 round-trip bit-identical, v1 back-compat, shared-prefix lookup); full suite 2186 passed / 0 failed. End-to-end on a real served model (`Qwen3-0.6B-8bit`, T=0): divergent chains hit both live paths — `PARTIAL restore (RAM): 54 of 54 shared tokens, prefilling 16` and, after a process restart with empty RAM, `PARTIAL restore (SSD): 54 of 54 shared tokens from divergent entry, prefilling 18`. All three warm outputs (RAM partial, restored-chain continuation, SSD partial) **byte-identical** to a cache-disabled cold server. Hybrid checkpoint capture/restore is unit-tested; live hybrid A/B runs on the Mac Studio at deploy (no small hybrid model on the dev box).
+
+**Upstreaming:** the strongest candidate yet — upstream has no partial-prefix story for the pure-LLM path and nothing at all for hybrids.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
