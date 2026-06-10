@@ -418,13 +418,40 @@ class MetricsCollector:
             _coerce_float(stats.get("metal_cache_memory_gb")) * 1e9
         )
 
+        # Prefer the cache block with actual ACTIVITY over declaration order.
+        # MLLM-classified models whose text goes through the LLM route (e.g.
+        # Qwen3.5-4B/9B, Qwen3.6-27B) expose an idle memory_aware_cache
+        # (media path, unused) alongside the active system_kv_cache — the old
+        # first-present-wins scan masked the live counters behind zeros.
+        # This was the root cause of the "dense 27B cache observability"
+        # mystery (2026-06-01 deploy notes).
         cache_type = "none"
         cache_stats = None
-        for candidate in ("memory_aware_cache", "paged_cache", "prefix_cache", "system_kv_cache"):
-            if candidate in stats:
-                cache_type = candidate
-                cache_stats = stats[candidate]
-                break
+        _present = [
+            (c, stats[c])
+            for c in (
+                "memory_aware_cache",
+                "paged_cache",
+                "prefix_cache",
+                "system_kv_cache",
+            )
+            if isinstance(stats.get(c), dict)
+        ]
+
+        def _cache_activity(d: dict) -> float:
+            return sum(
+                _coerce_float(d.get(k, 0))
+                for k in ("hits", "misses", "tokens_saved")
+            )
+
+        _active = sorted(
+            ((c, d) for c, d in _present if _cache_activity(d) > 0),
+            key=lambda cd: cd[0] != "system_kv_cache",
+        )
+        if _active:
+            cache_type, cache_stats = _active[0]
+        elif _present:
+            cache_type, cache_stats = _present[0]
 
         for candidate in ("none", "prefix_cache", "memory_aware_cache", "paged_cache", "system_kv_cache"):
             self._prom["cache_type"].labels(cache_type=candidate).set(
