@@ -29,6 +29,51 @@ from collections import OrderedDict
 logger = logging.getLogger(__name__)
 
 
+# Template-family turn markers for the extended-prefix cache. The cache
+# needs two anchors in the RENDERED prompt: where the system prefix ends
+# (first user/assistant turn marker) and where the final generation prompt
+# begins (rfind of the gen marker — everything before it is stable across
+# turns and cacheable). These were hard-coded ChatML strings, which silently
+# disabled caching for every non-ChatML family (Gemma 4, GLM, Mistral,
+# Llama-3, Phi-4, Harmony) — warm TTFT == cold TTFT, measured 2026-06-10.
+# Markers below were verified against each model's actual rendered template
+# (apply_chat_template with a multi-turn fixture), not guessed.
+#
+# Order matters only for collision safety: ChatML first (most common),
+# Mistral's bare "[INST]" last (likeliest to appear inside user content).
+TEMPLATE_MARKERS = (
+    # (family, boundary markers (first find() ends the system prefix),
+    #  generation-prompt marker (rfind() = extended-cache boundary))
+    ("chatml", ("<|im_start|>user\n", "<|im_start|>assistant\n"),
+     "<|im_start|>assistant\n"),
+    ("phi4", ("<|im_start|>user<|im_sep|>",),
+     "<|im_start|>assistant<|im_sep|>"),
+    ("gemma4", ("<|turn>user\n",), "<|turn>model\n"),
+    ("llama3", ("<|start_header_id|>user<|end_header_id|>",),
+     "<|start_header_id|>assistant<|end_header_id|>"),
+    ("glm4", ("<|user|>",), "<|assistant|>"),
+    ("harmony", ("<|start|>user<|message|>",), "<|start|>assistant"),
+    ("mistral", ("[INST]",), "[/INST]"),
+)
+
+
+def detect_template_markers(full_prompt):
+    """Detect the chat-template family of a rendered prompt.
+
+    Returns ``(family, system_prefix_end, gen_marker)`` where
+    ``system_prefix_end`` is the index of the first user-turn marker
+    (> 0 on success), or ``(None, -1, None)`` when no family matches —
+    callers fall back to the uncached path, same as before this table
+    existed.
+    """
+    for family, boundary_markers, gen_marker in TEMPLATE_MARKERS:
+        for marker in boundary_markers:
+            idx = full_prompt.find(marker)
+            if idx > 0:
+                return family, idx, gen_marker
+    return None, -1, None
+
+
 def common_prefix_len(a, b):
     """Length of the longest common prefix of two token-id sequences."""
     n = min(len(a), len(b))

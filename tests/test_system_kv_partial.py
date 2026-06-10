@@ -328,3 +328,51 @@ if __name__ == "__main__":
     test_ssd_lookup_shared()
     print("OK  SSD shared-prefix lookup")
     print("\nALL PASS")
+
+
+# ---------------------------------------------------------------------------
+# template-family marker detection (fixtures = REAL rendered templates,
+# captured via apply_chat_template on the deployed models 2026-06-10)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_template_markers():
+    from vllm_mlx.system_kv import detect_template_markers
+
+    fixtures = {
+        "chatml": ("<|im_start|>system\nSYS<|im_end|>\n<|im_start|>user\nU1"
+                   "<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n"
+                   "<|im_start|>user\nU2<|im_end|>\n<|im_start|>assistant\n"),
+        "gemma4": ("<bos><|turn>system\nSYS<turn|>\n<|turn>user\nU1<turn|>\n"
+                   "<|turn>model\nA1<turn|>\n<|turn>user\nU2<turn|>\n"
+                   "<|turn>model\n<|channel>thought\n<channel|>"),
+        "glm4": ("[gMASK]<sop><|system|>SYS<|user|>U1<|assistant|></think>A1"
+                 "<|user|>U2<|assistant|><think>"),
+        "mistral": ("<s>[SYSTEM_PROMPT]SYS[/SYSTEM_PROMPT][INST]U1[/INST]A1"
+                    "</s>[INST]U2[/INST]"),
+        "llama3": ("<|begin_of_text|><|start_header_id|>system<|end_header_id|>"
+                   "\n\nSYS<|eot_id|><|start_header_id|>user<|end_header_id|>"
+                   "\n\nU1<|eot_id|><|start_header_id|>assistant"
+                   "<|end_header_id|>\n\n"),
+        "harmony": ("<|start|>system<|message|>meta<|end|><|start|>developer"
+                    "<|message|>SYS<|end|><|start|>user<|message|>U1<|end|>"
+                    "<|start|>assistant"),
+        "phi4": ("<|im_start|>system<|im_sep|>SYS<|im_end|><|im_start|>user"
+                 "<|im_sep|>U1<|im_end|><|im_start|>assistant<|im_sep|>"),
+    }
+    for family, prompt in fixtures.items():
+        det_family, boundary, gen_marker = detect_template_markers(prompt)
+        assert det_family == family, f"{family}: detected {det_family}"
+        assert 0 < boundary < len(prompt)
+        # the system content must be fully inside the detected prefix
+        assert "SYS" in prompt[:boundary], f"{family}: boundary cuts system"
+        assert "U1" not in prompt[:boundary], f"{family}: boundary leaks user"
+        # the gen marker must anchor the FINAL generation prompt
+        gi = prompt.rfind(gen_marker)
+        assert gi > boundary, f"{family}: gen marker before boundary"
+        assert "U2" not in prompt[gi:] or family in ("mistral",), (
+            f"{family}: gen boundary excludes last user turn"
+        )
+
+    # no family: plain text falls back to uncached (-1)
+    assert detect_template_markers("just some text") == (None, -1, None)
