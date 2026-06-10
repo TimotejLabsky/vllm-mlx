@@ -3770,10 +3770,25 @@ async def status():
             "peak_memory_gb": stats.get("metal_peak_memory_gb"),
             "cache_memory_gb": stats.get("metal_cache_memory_gb"),
         },
-        "cache": stats.get("memory_aware_cache")
-        or stats.get("paged_cache")
-        or stats.get("prefix_cache")
-        or stats.get("system_kv_cache"),
+        # Activity-preferring selection (mirrors metrics.py): an idle MLLM
+        # memory_aware_cache must not mask the active system_kv_cache block.
+        "cache": next(
+            (
+                blk
+                for blk in (
+                    stats.get("system_kv_cache"),
+                    stats.get("memory_aware_cache"),
+                    stats.get("paged_cache"),
+                    stats.get("prefix_cache"),
+                )
+                if isinstance(blk, dict)
+                and any(blk.get(k) for k in ("hits", "misses", "tokens_saved"))
+            ),
+            stats.get("memory_aware_cache")
+            or stats.get("paged_cache")
+            or stats.get("prefix_cache")
+            or stats.get("system_kv_cache"),
+        ),
         "mtp": stats.get("mtp") or {"enabled": False},
         # Serialized-lock telemetry (waiters / busy_rejections / wait_*_ms): the
         # one TTFT component not derivable from cache hit/miss counts. Computed
