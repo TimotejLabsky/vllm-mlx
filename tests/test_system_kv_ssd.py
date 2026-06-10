@@ -72,7 +72,7 @@ def test_roundtrip_bit_identical():
         tensors, meta = flatten_snapshot(snap)
         from vllm_mlx.system_kv_ssd import _snapshot_nbytes
 
-        store._write_entry(tokens, tensors, meta, [], _snapshot_nbytes(snap))
+        store._write_entry(tokens, tensors, meta, [], None, None, _snapshot_nbytes(snap))
 
         # prefix lookup with a superset of the stored tokens
         hit = store.lookup_prefix(tuple(range(150)))
@@ -129,7 +129,7 @@ def test_capacity_eviction():
             snap = _make_hybrid_snapshot(seq=32)
             toks = tuple(range(base, base + 40))
             tensors, meta = flatten_snapshot(snap)
-            store._write_entry(toks, tensors, meta, [], _snapshot_nbytes(snap))
+            store._write_entry(toks, tensors, meta, [], None, None, _snapshot_nbytes(snap))
         assert store._index.get_entry_count() <= 2, "capacity not enforced"
         assert store._stats.evictions >= 1
         store.close()
@@ -146,7 +146,7 @@ def test_corrupt_quarantine():
         snap = _make_hybrid_snapshot(seq=32)
         tokens = tuple(range(40))
         tensors, meta = flatten_snapshot(snap)
-        store._write_entry(tokens, tensors, meta, [], _snapshot_nbytes(snap))
+        store._write_entry(tokens, tensors, meta, [], None, None, _snapshot_nbytes(snap))
         hit = store.lookup_prefix(tuple(range(60)))
         assert hit is not None
         # corrupt the snapshot file

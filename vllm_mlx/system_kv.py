@@ -83,34 +83,96 @@ def common_prefix_len(a, b):
     return i
 
 
-def capture_recurrent_states(prompt_cache):
-    """Shallow-copy the list-state (ArraysCache/recurrent) layers of a live
-    prompt cache, keyed by layer index. Returns {} for pure-attention models.
+def classify_layers(prompt_cache):
+    """Per-layer snapshot semantics, from the live cache CLASSES (state
+    shape alone cannot distinguish a RotatingKVCache from a KVCache — both
+    return a (keys, values) tuple, but slicing a rotated ring buffer is
+    wrong).
 
-    Same aliasing discipline as patch #6: ``ArraysCache.state`` returns the
-    live ``self.cache`` list whose elements are REBOUND (never mutated in
-    place) by subsequent forwards, so a shallow list copy pins the state at
-    this position. Tuple-state (KVCache) layers are skipped — their state at
-    any position p is recoverable from the final snapshot by slicing
-    ``keys[..., :p, :]`` (see ``build_partial_restore_states``).
+    - ``trim``:   plain KVCache — state at any position p is recoverable
+                  from the final snapshot by slicing ``keys[..., :p, :]``.
+    - ``ckpt``:   position-bound state — ArraysCache (recurrent) and
+                  RotatingKVCache (sliding-window ring + meta indices).
+                  Restorable only at positions where a checkpoint captured
+                  it.
+    - ``opaque``: everything else (e.g. QuantizedKVCache) — whole-snapshot
+                  restore round-trips via state/meta_state, but no partial
+                  restore.
     """
-    states = {}
-    for i, c in enumerate(prompt_cache):
+    kinds = []
+    for c in prompt_cache:
         st = c.state
-        if isinstance(st, list):
-            states[i] = list(st)
-    return states
+        if isinstance(st, list) or type(c).__name__ == "RotatingKVCache":
+            kinds.append("ckpt")
+        elif (
+            isinstance(st, tuple)
+            and len(st) == 2
+            and all(hasattr(a, "ndim") for a in st)
+        ):
+            kinds.append("trim")
+        else:
+            kinds.append("opaque")
+    return kinds
 
 
-def append_checkpoint(checkpoints, pos, states, capacity):
-    """Append a {pos, states} checkpoint, keeping the list sorted and
-    bounded. When the cap is exceeded, drop every other checkpoint
+def capture_snapshot_meta(prompt_cache):
+    """Per-layer ``meta_state`` (None when trivial). RotatingKVCache carries
+    its ring indices here — restoring its state WITHOUT meta desynchronizes
+    the window (the original reason patch #12 denylisted it). mlx-lm's own
+    ``save_prompt_cache``/``load_prompt_cache`` round-trip exactly this pair.
+    """
+    metas = []
+    for c in prompt_cache:
+        m = getattr(c, "meta_state", "")
+        metas.append(m if m else None)
+    return metas
+
+
+def apply_snapshot_states(prompt_cache, states, metas=None):
+    """Install per-layer states (+ meta_state where present) into a fresh
+    prompt cache. Lists are shallow-copied (patch #6 aliasing discipline);
+    meta is applied AFTER state, mirroring mlx-lm's ``from_state`` order.
+    """
+    for i, st in enumerate(states):
+        prompt_cache[i].state = list(st) if isinstance(st, list) else st
+        m = metas[i] if metas and i < len(metas) else None
+        if m:
+            prompt_cache[i].meta_state = m
+
+
+def capture_checkpoint_states(prompt_cache, kinds=None):
+    """Shallow-copy the checkpoint-class layers of a live prompt cache at
+    the current position. Returns ``(states, metas)`` keyed by layer index
+    — ``({}, {})`` for models with no checkpoint-class layers.
+
+    Same aliasing discipline as patch #6: list states are rebound (never
+    mutated in place) by subsequent forwards, so a shallow copy pins them;
+    tuple states are immutable mx.arrays. Rotating layers additionally pin
+    ``meta_state`` (ring indices at this position).
+    """
+    if kinds is None:
+        kinds = classify_layers(prompt_cache)
+    states = {}
+    metas = {}
+    for i, c in enumerate(prompt_cache):
+        if kinds[i] != "ckpt":
+            continue
+        st = c.state
+        states[i] = list(st) if isinstance(st, list) else st
+        m = getattr(c, "meta_state", "")
+        metas[i] = m if m else None
+    return states, metas
+
+
+def append_checkpoint(checkpoints, pos, states, metas, capacity):
+    """Append a {pos, states, metas} checkpoint, keeping the list sorted
+    and bounded. When the cap is exceeded, drop every other checkpoint
     (geometric thinning — early positions stay covered at coarser
     granularity, which is what divergence-point restore needs).
     """
     if checkpoints and checkpoints[-1]["pos"] >= pos:
         return checkpoints
-    checkpoints.append({"pos": pos, "states": states})
+    checkpoints.append({"pos": pos, "states": states, "metas": metas})
     if len(checkpoints) > max(1, capacity):
         thinned = checkpoints[::2]
         if thinned[-1] is not checkpoints[-1]:
@@ -124,61 +186,96 @@ def select_restore_pos(plan, cap):
     ``cap`` (the new request's extended-prefix length — restoring past it
     would leave nothing to prefill forward from).
 
-    Pure-attention donor: exactly ``min(d, cap)`` — any position is
-    recoverable by slicing. Hybrid donor: the highest checkpoint position
-    <= ``min(d, cap)`` (recurrent state restores only where captured).
+    All-trimmable donor: exactly ``min(d, cap)`` — any position is
+    recoverable by slicing. Donor with checkpoint-class layers (recurrent
+    or sliding-window): the highest checkpoint position <= ``min(d, cap)``
+    (such state restores only where captured).
 
-    Returns ``(pos, ckpt_states)``; ``(0, None)`` when nothing usable.
+    Returns ``(pos, ckpt_states, ckpt_metas)``; ``(0, None, None)`` when
+    nothing usable.
     """
     d = min(plan["d"], cap)
     if d <= 0:
-        return 0, None
-    if plan["has_recurrent"]:
+        return 0, None, None
+    kinds = plan.get("kinds")
+    has_ckpt_layers = (
+        any(k == "ckpt" for k in kinds)
+        if kinds
+        else any(isinstance(st, list) for st in plan["snapshot"])
+    )
+    if has_ckpt_layers:
         if d == plan["donor_len"]:
             # The donor's entire chain is shared (e.g. identical request
-            # resent): the snapshot itself holds the recurrent state AT d —
-            # restore it whole, no checkpoint needed.
-            states = {
-                i: st
-                for i, st in enumerate(plan["snapshot"])
-                if isinstance(st, list)
-            }
-            return d, states
+            # resent): the snapshot itself holds the checkpoint-class state
+            # AT d — restore it whole, no checkpoint needed.
+            states = {}
+            metas = {}
+            snap_metas = plan.get("metas")
+            for i, st in enumerate(plan["snapshot"]):
+                is_ckpt = (
+                    kinds[i] == "ckpt" if kinds else isinstance(st, list)
+                )
+                if is_ckpt:
+                    states[i] = st
+                    metas[i] = (
+                        snap_metas[i]
+                        if snap_metas and i < len(snap_metas)
+                        else None
+                    )
+            return d, states, metas
         pos = 0
         states = None
+        metas = None
         for cp in plan["checkpoints"]:
             if pos < cp["pos"] <= d:
                 pos = cp["pos"]
                 states = cp["states"]
+                metas = cp.get("metas")
         if states is None:
-            return 0, None
-        return pos, states
-    return d, {}
+            return 0, None, None
+        return pos, states, metas
+    return d, {}, {}
 
 
-def build_partial_restore_states(snapshot, ckpt_states, pos):
-    """Per-layer states to install for a restore at position ``pos``.
+def build_partial_restore_states(snapshot, ckpt_states, pos,
+                                 kinds=None, ckpt_metas=None):
+    """Per-layer ``(states, metas)`` to install for a restore at ``pos``.
 
-    Tuple-state (KVCache) layers: slice the donor snapshot to ``pos`` —
+    ``trim`` layers (plain KVCache): slice the donor snapshot to ``pos`` —
     the ``state`` setter re-derives ``offset`` from ``keys.shape[2]``, so
-    assignment is position-exact. List-state (recurrent) layers: take the
-    checkpoint's state captured AT ``pos`` (shallow-copied on assignment by
-    the caller, mirroring patch #6). Never trims ArraysCache.
+    assignment is position-exact. ``ckpt`` layers (ArraysCache recurrent,
+    RotatingKVCache sliding-window): take the checkpoint's state (+ meta —
+    ring indices for Rotating) captured AT ``pos``. Never trims either.
+    ``opaque`` layers refuse partial restore entirely.
 
-    Returns the per-layer list, or None if a recurrent layer has no
-    checkpoint state (caller must fall back to cold prefill).
+    Without ``kinds`` (legacy donors, e.g. SSD format <= v2), falls back to
+    shape-based classification: tuple => trim, list => ckpt — correct for
+    every model that could have produced such an entry (Rotating models
+    could not cache before kinds existed).
+
+    Returns ``(states_list, metas_list)``, or ``(None, None)`` if a ckpt
+    layer has no checkpoint state or an opaque layer is present (caller
+    falls back to the next restore source / cold prefill).
     """
     out = []
+    metas = []
     for i, st in enumerate(snapshot):
-        if isinstance(st, tuple):
+        kind = kinds[i] if kinds else (
+            "ckpt" if isinstance(st, list) else "trim"
+        )
+        if kind == "trim":
             k, v = st
             out.append((k[..., :pos, :], v[..., :pos, :]))
-        else:
+            metas.append(None)
+        elif kind == "ckpt":
             ck = ckpt_states.get(i) if ckpt_states else None
             if ck is None:
-                return None
+                return None, None
             out.append(ck)
-    return out
+            metas.append(ckpt_metas.get(i) if ckpt_metas else None)
+        else:  # opaque
+            return None, None
+    return out, metas
 
 
 class SystemKVManager:
@@ -200,11 +297,18 @@ class SystemKVManager:
         self.system_hash = None  # Hash of system prefix text
         self.token_count = 0
         self.token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        # Per-layer meta_state + kind for the active snapshot (meta-state
+        # patch): RotatingKVCache needs meta (ring indices) to round-trip;
+        # kinds drive partial-restore semantics (trim/ckpt/opaque) since
+        # state shape can't distinguish Rotating from plain KVCache.
+        self.snapshot_meta = None  # list[meta_state | None] | None
+        self.snapshot_kinds = None  # list["trim"|"ckpt"|"opaque"] | None
         # Partial-restore checkpoints (patch: system-kv-partial-restore).
-        # list[{"pos": int, "states": {layer_idx: list[mx.array]}}], sorted
-        # ascending by pos. Recurrent-layer states only — attention KV at any
-        # position is sliced from ``snapshot``. Empty for pure-attention
-        # models (any position is restorable by slicing alone).
+        # list[{"pos": int, "states": {layer_idx: state},
+        #       "metas": {layer_idx: meta_state | None}}], sorted ascending
+        # by pos. Checkpoint-class layers only (recurrent + sliding-window)
+        # — attention KV at any position is sliced from ``snapshot``. Empty
+        # for all-trimmable models (any position restorable by slicing).
         self.checkpoints: list = []
         # Side-stash LRU for inactive slots, keyed by system_hash.
         # value: {"snapshot": list, "token_count": int, "token_ids": list,
@@ -396,6 +500,8 @@ class SystemKVManager:
         self.system_hash = None
         self.token_count = 0
         self.token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
+        self.snapshot_meta = None
+        self.snapshot_kinds = None
         self.checkpoints = []
         self.lru.clear()
         self.evictions = 0
@@ -444,6 +550,8 @@ class SystemKVManager:
                 "token_count": self.token_count,
                 "token_ids": self.token_ids,
                 "checkpoints": self.checkpoints,
+                "meta": self.snapshot_meta,
+                "kinds": self.snapshot_kinds,
             }
             self.lru.move_to_end(self.system_hash)
         self.snapshot = entry["snapshot"]
@@ -451,6 +559,8 @@ class SystemKVManager:
         self.token_count = entry["token_count"]
         self.token_ids = entry["token_ids"]
         self.checkpoints = entry.get("checkpoints", [])
+        self.snapshot_meta = entry.get("meta")
+        self.snapshot_kinds = entry.get("kinds")
         return True
 
     def lru_demote_active_to_bag(self):
@@ -472,6 +582,8 @@ class SystemKVManager:
             "token_count": self.token_count,
             "token_ids": self.token_ids,
             "checkpoints": self.checkpoints,
+            "meta": self.snapshot_meta,
+            "kinds": self.snapshot_kinds,
         }
         self.lru.move_to_end(self.system_hash)
         # Clear active so the caller's assignment is clean.
@@ -479,6 +591,8 @@ class SystemKVManager:
         self.system_hash = None
         self.token_count = 0
         self.token_ids = None
+        self.snapshot_meta = None
+        self.snapshot_kinds = None
         self.checkpoints = []
         # Trim bag to capacity-1 (leaving one slot for the incoming active).
         evicted = 0
@@ -586,6 +700,11 @@ class SystemKVManager:
         token_ids = self.token_ids
         if snapshot is None or not token_ids:
             return None
+        kinds = self.snapshot_kinds
+        # Opaque layers (e.g. QuantizedKVCache) can't be trimmed or
+        # checkpoint-restored — no partial plan for such donors.
+        if kinds and any(k == "opaque" for k in kinds):
+            return None
         d = common_prefix_len(full_tokens_list, token_ids)
         if d < self.partial_min:
             return None
@@ -593,7 +712,8 @@ class SystemKVManager:
             "d": d,
             "snapshot": snapshot,
             "checkpoints": self.checkpoints,
-            "has_recurrent": any(isinstance(st, list) for st in snapshot),
+            "kinds": kinds,
+            "metas": self.snapshot_meta,
             "donor_len": self.token_count,
         }
 
@@ -630,7 +750,7 @@ class SystemKVManager:
 
     def store_extended(
         self, system_hash, snapshot, extended_token_ids, promoted,
-        checkpoints=None,
+        checkpoints=None, meta=None, kinds=None,
     ):
         """Install an EXTENDED-prefix snapshot as the active slot
         (text-route MISS store), gated on the kill switch: when disabled
@@ -638,7 +758,9 @@ class SystemKVManager:
         persists. Runs inside the serialized generation worker.
 
         ``checkpoints`` is the partial-restore checkpoint list captured
-        during this prefill (plus any carried over a partial restore).
+        during this prefill (plus any carried over a partial restore);
+        ``meta``/``kinds`` are the per-layer meta_state and trim/ckpt/opaque
+        classification captured alongside the snapshot.
         """
         if self.is_safe():
             # LRU: push the current active slot (if any, for a
@@ -652,6 +774,8 @@ class SystemKVManager:
             # EXTENDED_PREFIX_MARKER: store cached token IDs for prefix matching
             self.token_ids = list(extended_token_ids)
             self.checkpoints = list(checkpoints) if checkpoints else []
+            self.snapshot_meta = meta
+            self.snapshot_kinds = kinds
             # Patch #16: write-through to SSD when freshly computed (not
             # promoted from disk). One async write per distinct system
             # prefix at creation; the grow path does NOT re-spill — a
@@ -660,6 +784,7 @@ class SystemKVManager:
                 self.ssd_store.enqueue_spill(
                     tuple(extended_token_ids), snapshot,
                     checkpoints=self.checkpoints,
+                    meta=meta, kinds=kinds,
                 )
 
     # ------------------------------------------------------------------
