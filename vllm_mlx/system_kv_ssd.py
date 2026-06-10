@@ -159,36 +159,51 @@ def unflatten_snapshot(tensors: dict, layer_meta: list[dict]) -> list:
 
 
 def flatten_checkpoints(checkpoints: list | None) -> tuple[dict, list[dict]]:
-    """Flatten partial-restore checkpoints (format v2).
+    """Flatten partial-restore checkpoints (format v2/v3).
 
-    Checkpoint ``n``'s recurrent state for layer ``i``, array ``j`` becomes
-    tensor key ``c{n}_l{i}_s{j}``; metadata records position and per-layer
-    array counts so ``unflatten_checkpoints`` can rebuild the
-    ``{"pos": int, "states": {layer_idx: list}}`` shape exactly.
+    Checkpoint ``n``'s state for layer ``i``, array ``j`` becomes tensor key
+    ``c{n}_l{i}_s{j}``; metadata records position, per-layer array counts,
+    layer state kind (list vs tuple — Rotating sliding-window states are
+    tuples), and the layer's ``meta_state`` (JSON-able tuple of strings) so
+    ``unflatten_checkpoints`` rebuilds the
+    ``{"pos", "states": {i: state}, "metas": {i: meta|None}}`` shape exactly.
     """
     tensors: dict[str, Any] = {}
     ckpt_meta: list[dict] = []
     for n, cp in enumerate(checkpoints or []):
         layers = []
+        cp_metas = cp.get("metas") or {}
         for i, st in sorted(cp["states"].items()):
-            for j, a in enumerate(st):
+            seq = st if isinstance(st, list) else list(st)
+            for j, a in enumerate(seq):
                 tensors[f"c{n}_l{i}_s{j}"] = a
-            layers.append({"i": i, "n": len(st)})
+            m = cp_metas.get(i)
+            layers.append({
+                "i": i,
+                "n": len(seq),
+                "tuple": not isinstance(st, list),
+                "meta": list(m) if m else None,
+            })
         ckpt_meta.append({"pos": cp["pos"], "layers": layers})
     return tensors, ckpt_meta
 
 
 def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
     """Inverse of ``flatten_checkpoints``. Missing meta (format v1 entries)
-    is handled by the caller passing ``[]``.
+    is handled by the caller passing ``[]``. ``meta_state`` values are
+    restored to tuples of strings (the mlx-lm convention).
     """
     checkpoints: list = []
     for n, cm in enumerate(ckpt_meta or []):
         states = {}
+        metas = {}
         for lm in cm["layers"]:
             i = lm["i"]
-            states[i] = [tensors[f"c{n}_l{i}_s{j}"] for j in range(lm["n"])]
-        checkpoints.append({"pos": cm["pos"], "states": states})
+            seq = [tensors[f"c{n}_l{i}_s{j}"] for j in range(lm["n"])]
+            states[i] = tuple(seq) if lm.get("tuple") else seq
+            m = lm.get("meta")
+            metas[i] = tuple(m) if m else None
+        checkpoints.append({"pos": cm["pos"], "states": states, "metas": metas})
     return checkpoints
 
 
@@ -228,9 +243,13 @@ class SystemKVSSDStore:
                 continue
             if item is None:  # poison pill
                 break
-            tokens, tensors, layer_meta, ckpt_meta, nbytes = item
+            (tokens, tensors, layer_meta, ckpt_meta,
+             snap_meta, kinds, nbytes) = item
             try:
-                self._write_entry(tokens, tensors, layer_meta, ckpt_meta, nbytes)
+                self._write_entry(
+                    tokens, tensors, layer_meta, ckpt_meta,
+                    snap_meta, kinds, nbytes,
+                )
             except Exception:
                 logger.exception(
                     "[system_kv_ssd] failed to write entry (%d tokens)", len(tokens)
@@ -263,9 +282,11 @@ class SystemKVSSDStore:
         tokens: tuple[int, ...],
         snapshot: list,
         checkpoints: list | None = None,
+        meta: list | None = None,
+        kinds: list | None = None,
     ) -> bool:
-        """Queue a snapshot (+ partial-restore checkpoints) for async
-        write-through. False if dropped.
+        """Queue a snapshot (+ partial-restore checkpoints + per-layer
+        meta_state/kinds) for async write-through. False if dropped.
 
         Flattening (cheap, no copy — mx arrays are reference-held) happens on
         the caller's thread so the snapshot reference can't drift before the
@@ -278,10 +299,16 @@ class SystemKVSSDStore:
         except Exception:
             logger.exception("[system_kv_ssd] flatten failed; skipping spill")
             return False
+        # meta_state values are tuples of strings (mlx-lm convention) —
+        # JSON-encode as lists, restored to tuples in read_entry.
+        snap_meta_json = (
+            [list(m) if m else None for m in meta] if meta else None
+        )
         nbytes = _snapshot_nbytes(snapshot)
         try:
             self._spill_queue.put_nowait(
-                (tokens, tensors, layer_meta, ckpt_meta, nbytes)
+                (tokens, tensors, layer_meta, ckpt_meta,
+                 snap_meta_json, kinds, nbytes)
             )
             return True
         except queue.Full:
@@ -298,6 +325,8 @@ class SystemKVSSDStore:
         tensors: dict,
         layer_meta: list[dict],
         ckpt_meta: list[dict],
+        snap_meta: list | None,
+        kinds: list | None,
         nbytes: int,
     ) -> None:
         import mlx.core as mx
@@ -319,10 +348,12 @@ class SystemKVSSDStore:
         with open(meta_path, "w") as f:
             json.dump(
                 {
-                    "format": 2,
+                    "format": 3,
                     "layers": layer_meta,
                     "num_tokens": len(tokens),
                     "checkpoints": ckpt_meta,
+                    "meta": snap_meta,
+                    "kinds": kinds,
                 },
                 f,
             )
@@ -412,11 +443,14 @@ class SystemKVSSDStore:
 
     def read_entry(self, tokens: tuple[int, ...], file_path: str) -> dict | None:
         """Load an entry from disk. Returns ``{"snapshot": list,
-        "checkpoints": list}`` or None on failure.
+        "checkpoints": list, "meta": list | None, "kinds": list | None}``
+        or None on failure.
 
         Synchronous (safetensors read + dtype-exact mx.load). Quarantines and
-        de-indexes a corrupt entry so it isn't retried. Format v1 entries
-        (no checkpoint meta) load with ``checkpoints == []``.
+        de-indexes a corrupt entry so it isn't retried. Format v1/v2 entries
+        load with ``checkpoints == []`` / ``meta is None`` / ``kinds is
+        None`` — correct for every model that could have written them
+        (Rotating models could not cache before format v3).
         """
         import mlx.core as mx
 
@@ -432,6 +466,13 @@ class SystemKVSSDStore:
             checkpoints = unflatten_checkpoints(
                 tensors, meta.get("checkpoints", [])
             )
+            snap_meta_raw = meta.get("meta")
+            snap_meta = (
+                [tuple(m) if m else None for m in snap_meta_raw]
+                if snap_meta_raw
+                else None
+            )
+            snap_kinds = meta.get("kinds")
             mx.eval([a for st in snapshot for a in st])
             mx.eval([
                 a
@@ -460,7 +501,12 @@ class SystemKVSSDStore:
             len(checkpoints),
             dt * 1000.0,
         )
-        return {"snapshot": snapshot, "checkpoints": checkpoints}
+        return {
+            "snapshot": snapshot,
+            "checkpoints": checkpoints,
+            "meta": snap_meta,
+            "kinds": snap_kinds,
+        }
 
     def _quarantine(self, tokens: tuple[int, ...], file_path: str) -> None:
         try:
