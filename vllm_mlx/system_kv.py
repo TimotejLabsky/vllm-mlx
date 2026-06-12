@@ -448,7 +448,7 @@ class SystemKVManager:
             )
             self.supports_snapshot = False
 
-    def maybe_start_ssd_store(self, model_name: str) -> None:
+    def maybe_start_ssd_store(self, model_name: str, idle_check=None) -> None:
         """Patch #16: SSD persistence for the system-KV snapshot.
 
         Opt-in via VLLM_MLX_SSD_SYSTEM_KV_DIR. Gated on is_safe() — the
@@ -479,7 +479,8 @@ class SystemKVManager:
                     SystemKVSSDConfig(
                         cache_dir=_os.path.join(ssd_base, safe),
                         max_size_gb=max_gb,
-                    )
+                    ),
+                    idle_check=idle_check,
                 )
                 self.ssd_store.start_writer()
                 logger.info(
