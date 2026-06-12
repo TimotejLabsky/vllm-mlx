@@ -210,7 +210,11 @@ def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
 class SystemKVSSDStore:
     """NVMe-backed persistence for SimpleEngine system-KV snapshots."""
 
-    def __init__(self, config: SystemKVSSDConfig) -> None:
+    def __init__(
+        self,
+        config: SystemKVSSDConfig,
+        idle_check=None,
+    ) -> None:
         self._config = config
         self._cache_dir = config.cache_dir
         self._data_dir = os.path.join(self._cache_dir, "data")
@@ -222,6 +226,15 @@ class SystemKVSSDStore:
         self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
         self._writer_stop = threading.Event()
         self._writer_thread: threading.Thread | None = None
+        # Defer-until-idle (2026-06-12): multi-GB spills (an 80K-token 27B
+        # snapshot is ~5 GB) used to serialize + write WHILE the next
+        # generation ran — unified-memory spikes and I/O on the writer
+        # thread degraded decode and contributed to a Metal abort under
+        # tight memory. When ``idle_check`` (a callable returning True when
+        # no generation is in flight) is provided, the writer holds heavy
+        # work until the engine is idle; queued spills drain in the gaps
+        # between turns and on close().
+        self._idle_check = idle_check
 
     # ---- writer lifecycle -------------------------------------------------
 
@@ -236,6 +249,7 @@ class SystemKVSSDStore:
         logger.info("[system_kv_ssd] writer thread started (%s)", self._cache_dir)
 
     def _writer_loop(self) -> None:
+        draining = False  # close() sets the poison pill; drain without waiting
         while not self._writer_stop.is_set():
             try:
                 item = self._spill_queue.get(timeout=0.5)
@@ -243,6 +257,25 @@ class SystemKVSSDStore:
                 continue
             if item is None:  # poison pill
                 break
+            # Wait for an idle window before the heavy serialization —
+            # unless we're draining at shutdown (idle never comes then).
+            if self._idle_check is not None and not draining:
+                while not self._writer_stop.is_set():
+                    try:
+                        if self._idle_check():
+                            break
+                    except Exception:
+                        break
+                    time.sleep(1.0)
+                    # If close() queued the pill behind this item, switch to
+                    # drain mode so shutdown isn't blocked by a busy engine.
+                    if not self._spill_queue.empty():
+                        try:
+                            if self._spill_queue.queue[-1] is None:  # type: ignore[attr-defined]
+                                draining = True
+                                break
+                        except Exception:
+                            pass
             (tokens, tensors, layer_meta, ckpt_meta,
              snap_meta, kinds, nbytes) = item
             try:

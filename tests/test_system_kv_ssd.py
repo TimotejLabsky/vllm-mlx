@@ -173,3 +173,58 @@ if __name__ == "__main__":
     test_corrupt_quarantine()
     print("OK  corrupt-entry quarantine")
     print("\nALL PASS")
+
+
+def test_spill_defers_until_idle():
+    """Defer-until-idle (2026-06-12): the writer must hold heavy
+    serialization while the engine is busy and land it once idle."""
+    import time as _time
+
+    d = tempfile.mkdtemp(prefix="skv-idle-")
+    try:
+        busy = {"flag": True}
+        store = SystemKVSSDStore(
+            SystemKVSSDConfig(cache_dir=d),
+            idle_check=lambda: not busy["flag"],
+        )
+        store.start_writer()
+        snap = _make_hybrid_snapshot(seq=32)
+        tokens = tuple(range(48))
+        assert store.enqueue_spill(tokens, snap)
+        # busy: nothing may land
+        _time.sleep(2.5)
+        assert store.lookup_prefix(tuple(range(60))) is None, (
+            "spill landed while engine busy"
+        )
+        # idle: spill drains
+        busy["flag"] = False
+        deadline = _time.time() + 10.0
+        hit = None
+        while _time.time() < deadline:
+            hit = store.lookup_prefix(tuple(range(60)))
+            if hit:
+                break
+            _time.sleep(0.2)
+        assert hit is not None, "spill never landed after idle"
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_close_drains_even_when_busy():
+    """Shutdown must not deadlock on a never-idle engine: close() drains."""
+    d = tempfile.mkdtemp(prefix="skv-drain-")
+    try:
+        store = SystemKVSSDStore(
+            SystemKVSSDConfig(cache_dir=d),
+            idle_check=lambda: False,  # never idle
+        )
+        store.start_writer()
+        snap = _make_hybrid_snapshot(seq=32)
+        tokens = tuple(range(40))
+        assert store.enqueue_spill(tokens, snap)
+        store.close()  # must return (poison pill flips writer to drain mode)
+        # entry either landed during drain or was dropped — but close returned
+        assert True
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

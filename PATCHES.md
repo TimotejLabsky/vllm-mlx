@@ -367,6 +367,8 @@ The SimpleEngine system-KV snapshot (#4/#6/#9/#12/#13) lives only in the serving
 - **Correctness:** promoted output is **byte-identical** to cold at T=0 (`sha=483607cd…` matched); subsequent in-RAM HIT (0.70 s) confirms the promoted slot grows normally.
 - Bugfix found during the A/B: the store must gate on `_is_system_kv_safe()`, **not** `_supports_system_kv_cache` — the latter is only set on the non-MLLM probe path, but Qwen3.6-27B loads `MLLM=True` and routes text through the LLM path, so gating on it skipped SSD init entirely.
 
+**Spill scheduling fix (2026-06-12, defer-until-idle):** write-through spills of deep-session snapshots (an 80K-token 27B chain is ~5 GB) used to serialize + write on the writer thread WHILE the next generation ran — unified-memory spikes and I/O degraded decode and contributed to a Metal abort under tight memory. The store now takes an ``idle_check`` callable (engine passes a generation-lock probe) and the writer holds heavy work until no generation is in flight; ``close()`` flips to drain mode so shutdown never deadlocks on a busy engine. Spills land in the gaps between turns.
+
 **Upstreaming:** strong candidate — brings persistence to the pure-LLM path. ~~The bf16 numpy-serializer crash is worth a standalone upstream bug report regardless.~~ **Resolved upstream 2026-06-09 by PR #563 (`967d4f3`)** — they fixed the BatchedEngine tier with an f32-fallback cast (2× disk for bf16); our MLX-native safetensors store remains dtype-exact and is unaffected (verified #563 doesn't touch the `ssd_cache.py` symbols we import).
 
 ---
