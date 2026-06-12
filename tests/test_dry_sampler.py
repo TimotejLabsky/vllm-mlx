@@ -20,8 +20,11 @@ def _logits():
     return mx.zeros((1, VOCAB), dtype=mx.float32)
 
 
-def _apply(proc, seq):
-    out = proc(mx.array(seq), _logits())
+def _apply(proc, seq, prompt=(999,)):
+    """Prime the stateful processor with a prompt call (records gen_start),
+    then apply with ``seq`` as the GENERATED region."""
+    proc(mx.array(list(prompt)), _logits())
+    out = proc(mx.array(list(prompt) + list(seq)), _logits())
     mx.eval(out)
     return out
 
@@ -143,9 +146,41 @@ def test_fp16_no_overflow():
                               window=512)
     seq = list(range(20, 40)) + [99] + list(range(20, 40))
     logits = mx.zeros((1, 128), dtype=mx.float16)
-    out = proc(mx.array(seq), logits)
+    proc(mx.array([999]), logits)  # prime gen_start
+    out = proc(mx.array([999] + seq), logits)
     mx.eval(out)
     assert mx.isfinite(out).all().item()
+
+
+def test_prompt_repeats_are_ignored():
+    """Regression for the 2026-06-12 incident: re-emitting a command that
+    appears in the PROMPT (conversation history) is legitimate agentic
+    repetition and must not be penalized. Only generation-internal repeats
+    count."""
+    proc = DRYLogitsProcessor(multiplier=0.8, base=1.75, allowed_length=2,
+                              window=512)
+    command = [30, 31, 32, 33, 34, 35]  # "git log ... | head -20"
+    prompt = [1, 2] + command + [3, 4]
+    # generation re-emits the command up to its last token: the only match
+    # is in the prompt region -> token 35 must NOT be penalized
+    out = _apply(proc, command[:-1], prompt=prompt)
+    assert out[0, 35].item() == 0.0
+    # but the SAME repeat occurring twice within the generation is caught
+    proc2 = DRYLogitsProcessor(multiplier=0.8, base=1.75, allowed_length=2,
+                               window=512)
+    out2 = _apply(proc2, command + [9] + command[:-1], prompt=prompt)
+    assert out2[0, 35].item() < 0.0
+
+
+def test_first_call_records_gen_start_and_is_noop():
+    proc = DRYLogitsProcessor(multiplier=0.8, base=1.75, allowed_length=2,
+                              window=512)
+    # a prompt full of repeats produces NO penalty on the first call
+    seq = [10, 11, 12] * 10
+    out = proc(mx.array(seq), _logits())
+    mx.eval(out)
+    assert mx.all(out == 0).item()
+    assert proc._gen_start == len(seq)
 
 
 def test_build_from_env_and_request(monkeypatch):

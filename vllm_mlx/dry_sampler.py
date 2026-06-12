@@ -101,7 +101,23 @@ def resolve_breaker_ids(tokenizer: Any, breakers: Iterable[str]) -> set[int]:
 
 
 class DRYLogitsProcessor:
-    """mlx-lm-compatible logits processor implementing DRY."""
+    """mlx-lm-compatible logits processor implementing DRY.
+
+    GENERATION-ONLY matching (deliberate divergence from the original DRY,
+    which matches over the whole context): the processor records the token
+    count of its FIRST invocation — mlx-lm applies processors with
+    ``tokens == prompt`` before sampling the first token — and matches only
+    within tokens generated after that point. Whole-context matching
+    corrupted agentic tool calls in production: re-running a shell command
+    from earlier in the conversation is a long verbatim repeat with no
+    sequence breakers inside bash text, so the exponential penalty forced
+    mid-command divergence ("head -20" became "headdefault-20"). Loops —
+    the thing DRY exists to break — repeat within the current generation,
+    so the restriction costs nothing.
+
+    Stateful per request: construct a fresh instance per generation (the
+    engine does).
+    """
 
     def __init__(
         self,
@@ -116,16 +132,27 @@ class DRYLogitsProcessor:
         self.allowed_length = max(1, int(allowed_length))
         self.window = max(8, int(window))
         self.breaker_ids = breaker_ids or set()
+        self._gen_start: int | None = None
 
     def __call__(self, tokens: Any, logits: Any):
         import mlx.core as mx
 
         if self.multiplier <= 0:
             return logits
+        n_total = len(tokens)
+        if self._gen_start is None:
+            # First invocation: tokens == the prompt. Everything after this
+            # boundary is generated output — the only region we match in.
+            self._gen_start = n_total
+            return logits
+        gen_len = n_total - self._gen_start
+        if gen_len < 1:
+            return logits
+        span = min(gen_len, self.window)
         try:
-            seq = tokens[-self.window:].tolist()
+            seq = tokens[-span:].tolist()
         except Exception:
-            seq = list(tokens)[-self.window:]
+            seq = list(tokens)[-span:]
         n = len(seq)
         if n < self.allowed_length + 1:
             return logits
