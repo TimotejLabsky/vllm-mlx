@@ -510,7 +510,9 @@ Long agentic sessions on quantized models hit **block-level repetition collapse*
 
 **Verified:** 10 unit tests including a randomized cross-check against an independent O(n²) reference implementation (breaker semantics included), fp16 overflow guard, env/request precedence. Full suite 2200 passed / 0 failed.
 
-**Deployment intent:** enabled via the LiteLLM route for `Qwen3.6-27B-4bit` (`extra_body`: multiplier 0.8, base 1.75, allowed_length 3, range 2048) — allowed_length one above the community default as extra tool-call-JSON margin.
+**Deployment intent:** enabled via the LiteLLM route for `Qwen3.6-27B-4bit` (`extra_body`: multiplier 0.8, base 1.75, allowed_length 16, range 2048).
+
+**Production incident (2026-06-12) → GENERATION-ONLY matching.** The first live session with whole-context matching corrupted repeated shell tool-calls: re-running a command from earlier in the conversation is a long verbatim repeat with **no sequence breakers inside bash text**, so the exponential penalty forced mid-command divergence (`...llama-swap-config.yaml | head -20` came out as `...llama-swap-defaultconfig.yaml | headdefault-20`). Fix (deliberate divergence from the original DRY): the processor records the prompt length on its first invocation and **matches only within the current generation** — re-emitting prompt content (prior commands, filenames, history) is legitimate agentic behavior, while the loops DRY exists to break repeat within one generation by definition. Deployment `allowed_length` also raised 3 → 16: within-generation echoes of identifiers/code lines up to ~16 tokens are normal in coding output; collapse loops repeat 50+-token blocks and still get a decisive penalty. Regression-tested (prompt-region repeats unpenalized; generation-internal repeats caught).
 
 **Upstreaming:** vLLM rejected/preferred not to merge DRY upstream; for vllm-mlx it's a natural fit (single-stream serving is where loops hurt most). PR-worthy.
 
