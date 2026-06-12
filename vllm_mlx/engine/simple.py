@@ -433,8 +433,14 @@ class SimpleEngine(BaseEngine):
 
             # Patch #16: SSD persistence for the system-KV snapshot. Opt-in
             # via VLLM_MLX_SSD_SYSTEM_KV_DIR; gating rationale documented on
-            # SystemKVManager.maybe_start_ssd_store.
-            self._system_kv.maybe_start_ssd_store(self._model_name)
+            # SystemKVManager.maybe_start_ssd_store. The idle probe lets the
+            # SSD writer defer multi-GB spills until no generation is in
+            # flight (asyncio.Lock.locked() is a plain attribute read —
+            # safe from the writer thread).
+            self._system_kv.maybe_start_ssd_store(
+                self._model_name,
+                idle_check=lambda: not self._generation_lock.locked(),
+            )
 
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
