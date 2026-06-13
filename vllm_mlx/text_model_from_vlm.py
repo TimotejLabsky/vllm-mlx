@@ -224,6 +224,21 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
 
                 inject_mtp_support(text_model, model_path, config)
 
+        # Put the derived TextModel in eval mode. mlx_lm.load / mlx_vlm.load
+        # both eval() their models; this freshly-built TextModel defaults to
+        # training=True. Hybrid gated-delta layers (Qwen3.5/3.6 linear
+        # attention) select their compute path with `use_kernel = not
+        # self.training`, so in training mode every gated-delta forward falls
+        # to the slow Python recurrence instead of the Metal kernel — a large,
+        # context-scaling prefill penalty plus a decode hit on this VLM->text
+        # path (upstream measured ~6x prefill / +15% decode on Qwen3.6-35B-A3B
+        # 4-bit). Placed AFTER inject_mtp_support so it recurses into the mtp
+        # submodule, and BEFORE the warmup forward so the warmup materializes
+        # lazy buffers on the actual (kernel) compute path. Numerically
+        # identical output; only the compute path changes.
+        # Cherry-picked from upstream 527f457 (#606).
+        text_model.train(False)
+
         # Materialize every lazy init-time array — parameters AND ad-hoc
         # module buffers (rope frequency tables etc.) that parameters()
         # cannot enumerate — by running a one-token forward HERE, on the
