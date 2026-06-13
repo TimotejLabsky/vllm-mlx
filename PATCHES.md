@@ -538,6 +538,28 @@ One line — `text_model.train(False)` — but placed AFTER `inject_mtp_support`
 
 ---
 
+## 24. `patch: system-kv-ram-budget` — cap the resident slot set (memory-abort guard)
+
+**Files:** `vllm_mlx/system_kv.py`, `tests/test_system_kv_partial.py`
+
+The system-KV slot snapshots are the only **unbounded** RAM term in the serving process: a grown deep-context slot is multi-GB (a ~80K-token 27B chain ≈ 5 GB), so the default 4 slots can hold ~14 GB beside ~15 GB of weights on the 64 GB box — implicated in the live jetsam / Metal-abort cluster on the 27B coding route.
+
+Adds `VLLM_MLX_SYSTEM_KV_RAM_MB` (MB; **0/unset = unlimited, exactly the prior unbounded behavior** — a no-op until enabled per-model). When set, a new `enforce_ram_budget()` runs at every store site (inside `_generation_lock`) and evicts LRU-bag entries until the resident set (active + bag + checkpoints) fits:
+
+- **Never evicts the active slot** — the in-flight request needs it. The budget caps the BAG overhang (slots that exist only to skip a future cold prefill). If the active slot alone exceeds the budget, it is kept with a warning.
+- **SSD-spilled bag entries first** (re-acquiring them is a ~1.3 s promote, not a ~25-39 s cold prefill), then oldest-first within each class. A per-slot `spilled` flag (set from the `enqueue_spill` accept / promote result) and cached `bytes` ride into the bag dict on demote.
+- `mx.clear_cache()` fires once after eviction (same discipline as the capacity-eviction path).
+
+TOCTOU contract unchanged from patch #13: a worker holding an evicted snapshot ref keeps it alive by refcount after the dict drop. The `_entry_bytes` / `_ckpt_bytes` accounting helpers were hoisted from `stats()` to module scope (`entry_bytes` / `ckpt_bytes`) for reuse — pure code motion, byte-identical numbers.
+
+**Verified:** 4 new unit tests (no-op at budget 0; bag-evicted / active-kept under budget; spilled-first ordering; oversized-active retained). Full suite 2212 passed.
+
+**Deployment intent:** `VLLM_MLX_SYSTEM_KV_RAM_MB=6144` on the Qwen3.6-27B-4bit route ONLY, after correlating slot-RAM with the crash timestamps; then watch `llm_backend_crashes_total` for two weeks.
+
+**Upstreaming:** plausible — an unbounded snapshot set is a general risk on memory-constrained single-box deployments; gated behind an env so the default is unchanged.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
