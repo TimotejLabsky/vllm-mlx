@@ -83,6 +83,35 @@ def common_prefix_len(a, b):
     return i
 
 
+def entry_bytes(snap):
+    """In-RAM bytes of one snapshot (sum of per-layer array ``nbytes``).
+
+    ``KVCache`` layers are 2-tuples ``(keys, values)``; recurrent / rotating
+    layers are lists of arrays. Cheap (attribute reads, no ``mx.eval``).
+    Hoisted to module scope (was nested in ``stats()``) so the RAM-budget
+    enforcement path can account each slot at store time, not only on the
+    stats poll.
+    """
+    n = 0
+    if not snap:
+        return 0
+    for layer in snap:
+        if isinstance(layer, tuple) and len(layer) == 2:
+            n += layer[0].nbytes + layer[1].nbytes
+        elif isinstance(layer, list):
+            n += sum(a.nbytes for a in layer if a is not None)
+    return n
+
+
+def ckpt_bytes(ckpts):
+    """In-RAM bytes of a slot's partial-restore checkpoints."""
+    n = 0
+    for cp in ckpts or []:
+        for st in cp["states"].values():
+            n += sum(a.nbytes for a in st if a is not None)
+    return n
+
+
 def classify_layers(prompt_cache):
     """Per-layer snapshot semantics, from the live cache CLASSES (state
     shape alone cannot distinguish a RotatingKVCache from a KVCache — both
@@ -329,6 +358,24 @@ class SystemKVManager:
         self.partial_min = max(0, int(
             _os.environ.get("VLLM_MLX_SYSTEM_KV_PARTIAL_MIN", "256")
         ))
+        # RAM byte budget for the resident slot set (active + LRU bag +
+        # checkpoints). The slot snapshots are the only UNBOUNDED RAM term in
+        # the serving process: a grown deep-context slot is multi-GB (a ~80K
+        # 27B chain ≈ 5 GB), so 4 slots can hold ~14 GB beside ~15 GB weights
+        # on a 64 GB box — observed alongside the live jetsam/Metal-abort
+        # cluster on the 27B coding route. When set (MB; 0/unset = unlimited,
+        # preserving the prior unbounded behavior), ``enforce_ram_budget``
+        # evicts LRU-bag entries (SSD-spilled first — cheap to re-promote —
+        # then oldest, never the in-use active slot) until the resident set
+        # fits. Deploy per-model via VLLM_MLX_SYSTEM_KV_RAM_MB.
+        self.ram_budget_bytes = max(0, int(
+            _os.environ.get("VLLM_MLX_SYSTEM_KV_RAM_MB", "0")
+        )) * 1024 * 1024
+        # Whether the ACTIVE slot's prefix is covered by an SSD entry (came
+        # from a promote, or its write-through spill was accepted) — drives
+        # the cheap-to-recover-first eviction order. Tracked here because it
+        # rides into the bag dict on demote.
+        self.active_spilled = False
         # Prometheus-side counters — see vllm-mlx-system-kv-metrics.py
         self.hits = 0
         self.misses = 0
@@ -504,6 +551,7 @@ class SystemKVManager:
         self.snapshot_meta = None
         self.snapshot_kinds = None
         self.checkpoints = []
+        self.active_spilled = False
         self.lru.clear()
         self.evictions = 0
         self.hits = 0
@@ -553,6 +601,8 @@ class SystemKVManager:
                 "checkpoints": self.checkpoints,
                 "meta": self.snapshot_meta,
                 "kinds": self.snapshot_kinds,
+                "bytes": entry_bytes(self.snapshot) + ckpt_bytes(self.checkpoints),
+                "spilled": self.active_spilled,
             }
             self.lru.move_to_end(self.system_hash)
         self.snapshot = entry["snapshot"]
@@ -562,6 +612,7 @@ class SystemKVManager:
         self.checkpoints = entry.get("checkpoints", [])
         self.snapshot_meta = entry.get("meta")
         self.snapshot_kinds = entry.get("kinds")
+        self.active_spilled = entry.get("spilled", False)
         return True
 
     def lru_demote_active_to_bag(self):
@@ -585,6 +636,8 @@ class SystemKVManager:
             "checkpoints": self.checkpoints,
             "meta": self.snapshot_meta,
             "kinds": self.snapshot_kinds,
+            "bytes": entry_bytes(self.snapshot) + ckpt_bytes(self.checkpoints),
+            "spilled": self.active_spilled,
         }
         self.lru.move_to_end(self.system_hash)
         # Clear active so the caller's assignment is clean.
@@ -595,6 +648,7 @@ class SystemKVManager:
         self.snapshot_meta = None
         self.snapshot_kinds = None
         self.checkpoints = []
+        self.active_spilled = False
         # Trim bag to capacity-1 (leaving one slot for the incoming active).
         evicted = 0
         max_bag = max(0, self.capacity - 1)
@@ -607,6 +661,76 @@ class SystemKVManager:
                 ev_hash,
                 self.capacity,
                 len(self.lru),
+            )
+        if evicted:
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
+
+    def enforce_ram_budget(self):
+        """Evict LRU-bag slots until the resident set fits ``ram_budget_bytes``.
+
+        No-op when the budget is 0/unset (default — prior unbounded
+        behavior). The in-use ACTIVE slot is never evicted: the budget caps
+        the BAG overhang (the slots that exist only to avoid a future cold
+        prefill), which is the unbounded term behind the 27B memory-abort
+        cluster. If the active slot alone exceeds the budget, we log and keep
+        it — the in-flight request needs it.
+
+        Eviction order: SSD-spilled bag entries first (re-acquiring them is a
+        ~1.3 s promote, not a ~25-39 s cold prefill), oldest-first within each
+        class. ``mx.clear_cache()`` fires once after eviction so the Metal
+        allocator returns the freed buffers (same discipline as
+        ``lru_demote_active_to_bag``).
+
+        Runs inside ``_generation_lock`` (called from the store sites). The
+        TOCTOU contract is unchanged: a worker holding an evicted snapshot ref
+        in its closure keeps it alive by refcount after the dict drop.
+        """
+        budget = self.ram_budget_bytes
+        if budget <= 0:
+            return
+        active_bytes = entry_bytes(self.snapshot) + ckpt_bytes(self.checkpoints)
+
+        def _total():
+            return active_bytes + sum(
+                e.get("bytes", 0) for e in self.lru.values()
+            )
+
+        if _total() <= budget:
+            return
+        evicted = 0
+        # Two passes: spilled (cheap to recover) then unspilled, each
+        # oldest-first (OrderedDict insertion order == LRU order).
+        for spilled_first in (True, False):
+            if _total() <= budget:
+                break
+            for ev_hash in list(self.lru.keys()):
+                if _total() <= budget:
+                    break
+                entry = self.lru.get(ev_hash)
+                if entry is None or bool(entry.get("spilled")) != spilled_first:
+                    continue
+                self.lru.pop(ev_hash, None)
+                self.evictions += 1
+                evicted += 1
+                logger.info(
+                    "System KV cache RAM-budget EVICTED: hash=%s "
+                    "(%.0f MB, spilled=%s; budget=%.0f MB, resident=%.0f MB)",
+                    ev_hash,
+                    entry.get("bytes", 0) / 1e6,
+                    bool(entry.get("spilled")),
+                    budget / 1e6,
+                    _total() / 1e6,
+                )
+        if active_bytes > budget and not self.lru:
+            logger.warning(
+                "System KV active slot (%.0f MB) exceeds RAM budget "
+                "(%.0f MB); keeping it (in-flight request needs it)",
+                active_bytes / 1e6,
+                budget / 1e6,
             )
         if evicted:
             try:
@@ -748,6 +872,10 @@ class SystemKVManager:
         self.token_count = token_count
         self.token_ids = None
         self.checkpoints = []
+        # stream_chat (MLLM+media) branch has no SSD tier; the slot is not
+        # SSD-covered, so it is evicted last under RAM pressure.
+        self.active_spilled = False
+        self.enforce_ram_budget()
 
     def store_extended(
         self, system_hash, snapshot, extended_token_ids, promoted,
@@ -781,12 +909,22 @@ class SystemKVManager:
             # promoted from disk). One async write per distinct system
             # prefix at creation; the grow path does NOT re-spill — a
             # restart promotes the stored prefix and re-grows cheaply.
+            spilled_ok = False
             if self.ssd_store is not None and not promoted:
-                self.ssd_store.enqueue_spill(
+                spilled_ok = self.ssd_store.enqueue_spill(
                     tuple(extended_token_ids), snapshot,
                     checkpoints=self.checkpoints,
                     meta=meta, kinds=kinds,
                 )
+            # The slot is SSD-covered if it came from a promote, or its
+            # write-through spill was accepted (not dropped on a full queue).
+            # A queue-full drop leaves it uncovered → evicted last (we can't
+            # cheaply re-promote what was never written).
+            self.active_spilled = bool(
+                self.ssd_store is not None and (promoted or spilled_ok)
+            )
+            # Cap the resident slot set (active + bag) — see __init__.
+            self.enforce_ram_budget()
 
     # ------------------------------------------------------------------
     # Stats (patches #7/#10/#13/#16 + perf-observability)
@@ -807,24 +945,6 @@ class SystemKVManager:
         Prometheus exporter and existing dashboards.
         """
 
-        def _entry_bytes(snap):
-            n = 0
-            if not snap:
-                return 0
-            for layer in snap:
-                if isinstance(layer, tuple) and len(layer) == 2:
-                    n += layer[0].nbytes + layer[1].nbytes
-                elif isinstance(layer, list):
-                    n += sum(a.nbytes for a in layer if a is not None)
-            return n
-
-        def _ckpt_bytes(ckpts):
-            n = 0
-            for cp in ckpts or []:
-                for st in cp["states"].values():
-                    n += sum(a.nbytes for a in st if a is not None)
-            return n
-
         if not (
             self.snapshot is not None
             or self.lru
@@ -833,9 +953,9 @@ class SystemKVManager:
         ):
             return None
 
-        active_bytes = _entry_bytes(self.snapshot) + _ckpt_bytes(self.checkpoints)
+        active_bytes = entry_bytes(self.snapshot) + ckpt_bytes(self.checkpoints)
         bag_bytes = sum(
-            _entry_bytes(e["snapshot"]) + _ckpt_bytes(e.get("checkpoints"))
+            entry_bytes(e["snapshot"]) + ckpt_bytes(e.get("checkpoints"))
             for e in self.lru.values()
         )
         total_bytes = active_bytes + bag_bytes
@@ -852,7 +972,7 @@ class SystemKVManager:
             slots_view.append({
                 "hash": slot_hash,
                 "tokens": entry["token_count"],
-                "memory_mb": round(_entry_bytes(entry["snapshot"]) / 1e6, 1),
+                "memory_mb": round(entry_bytes(entry["snapshot"]) / 1e6, 1),
                 "active": False,
             })
         result = {
