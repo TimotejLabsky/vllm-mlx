@@ -470,3 +470,70 @@ def test_rotating_state_only_restore_would_desync():
     bare = RotatingKVCache(max_size=window)
     bare.state = donor.state
     assert (bare.offset, bare._idx) != (donor.offset, donor._idx)
+
+
+# ---------------------------------------------------------------------------
+# RAM byte budget (patch: system-kv-ram-budget) — cap the resident slot set,
+# evict the LRU bag (never the in-use active slot), SSD-spilled slots first.
+# ---------------------------------------------------------------------------
+
+
+def test_ram_budget_zero_is_noop():
+    """Default (unset) budget == 0 == unbounded: storing distinct slots up to
+    capacity keeps them all — no byte-driven eviction, prior behavior."""
+    m = SystemKVManager()
+    assert m.ram_budget_bytes == 0
+    for i in range(4):  # == default capacity
+        m.store_extended(f"h{i}", _hybrid_snapshot(64),
+                         list(range(i * 100, i * 100 + 32)), promoted=False)
+    assert (1 if m.snapshot is not None else 0) + len(m.lru) == 4
+    assert m.evictions == 0
+
+
+def test_ram_budget_evicts_bag_keeps_active():
+    """A budget below the full slot set evicts oldest bag entries while the
+    in-use active slot is always retained."""
+    from vllm_mlx.system_kv import entry_bytes
+
+    m = SystemKVManager()
+    per = entry_bytes(_hybrid_snapshot(64))  # identical-shape slots
+    m.ram_budget_bytes = int(per * 2.4)  # fits active + 1 bag, not 3
+    for i in range(4):
+        m.store_extended(f"h{i}", _hybrid_snapshot(64),
+                         list(range(i * 100, i * 100 + 32)), promoted=False)
+    assert m.system_hash == "h3"          # most-recent is active
+    assert m.snapshot is not None         # active never evicted
+    resident = entry_bytes(m.snapshot) + sum(e["bytes"] for e in m.lru.values())
+    assert resident <= m.ram_budget_bytes
+    assert len(m.lru) <= 1
+    assert m.evictions >= 2
+
+
+def test_ram_budget_evicts_spilled_first():
+    """Among bag entries, SSD-spilled slots (cheap promote to recover) are
+    evicted before unspilled ones (which need a full cold prefill)."""
+    from collections import OrderedDict
+
+    m = SystemKVManager()
+    m.snapshot = None          # isolate: cap the bag alone (active_bytes == 0)
+    m.ram_budget_bytes = 120   # fits exactly one 100-byte bag entry
+    m.lru = OrderedDict()      # insertion order == LRU oldest -> newest
+    m.lru["sp1"] = {"snapshot": None, "bytes": 100, "spilled": True}
+    m.lru["un"] = {"snapshot": None, "bytes": 100, "spilled": False}
+    m.lru["sp2"] = {"snapshot": None, "bytes": 100, "spilled": True}
+    m.enforce_ram_budget()
+    assert "un" in m.lru                       # unspilled survivor kept
+    assert "sp1" not in m.lru and "sp2" not in m.lru
+    assert m.evictions == 2
+
+
+def test_ram_budget_keeps_oversized_active():
+    """If the active slot alone exceeds the budget and the bag is empty,
+    enforce keeps it (the in-flight request needs it) without crashing."""
+    m = SystemKVManager()
+    m.store_extended("solo", _hybrid_snapshot(64), list(range(32)),
+                     promoted=False)
+    m.ram_budget_bytes = 1  # smaller than any real slot
+    m.enforce_ram_budget()
+    assert m.snapshot is not None
+    assert len(m.lru) == 0
