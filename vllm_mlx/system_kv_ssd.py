@@ -90,12 +90,29 @@ class SystemKVSSDConfig:
     max_size_gb: float = 50.0
     max_entries: int = 64
     spill_queue_size: int = 16
+    # Cap on the bytes of snapshots queued-but-not-yet-written. The queue
+    # holds references to flattened (still-resident) mx arrays, so a backlog
+    # of multi-GB deep-context snapshots pins unified memory — the residual
+    # vector behind the Metal-abort class the defer-until-idle change
+    # (2026-06-12) otherwise addressed. A new spill that would push the queue
+    # over this cap is dropped (a sub-prefix is usually already on disk, so
+    # the loss costs at most one re-grow). 12 GB ≈ two big snapshots; one
+    # oversized spill is always admitted when the queue is empty so huge
+    # prefixes can still persist.
+    max_queued_gb: float = 12.0
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
+    # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
+    # the startup reconcile pass removes them.
+    tmp_stale_seconds: float = 300.0
 
     @property
     def max_size_bytes(self) -> int:
         return int(self.max_size_gb * _BYTES_PER_GB)
+
+    @property
+    def max_queued_bytes(self) -> int:
+        return int(self.max_queued_gb * _BYTES_PER_GB)
 
 
 def _snapshot_nbytes(snapshot: list) -> int:
@@ -224,6 +241,9 @@ class SystemKVSSDStore:
         self._stats = SystemKVSSDStats()
         self._lock = threading.Lock()
         self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
+        # Bytes currently queued-but-not-written (snapshot nbytes), kept under
+        # ``_lock`` — bounds the unified-memory pin held by the backlog.
+        self._queued_bytes = 0
         self._writer_stop = threading.Event()
         self._writer_thread: threading.Thread | None = None
         # Defer-until-idle (2026-06-12): multi-GB spills (an 80K-token 27B
@@ -241,12 +261,103 @@ class SystemKVSSDStore:
     def start_writer(self) -> None:
         if self._writer_thread is not None:
             return
+        self._reconcile()
         self._writer_stop.clear()
         self._writer_thread = threading.Thread(
             target=self._writer_loop, daemon=True, name="system-kv-ssd-writer"
         )
         self._writer_thread.start()
         logger.info("[system_kv_ssd] writer thread started (%s)", self._cache_dir)
+
+    def _reconcile(self) -> None:
+        """Startup housekeeping (runs once before the writer thread starts).
+
+        (a) Remove stale ``*.tmp`` dirs — interrupted writes from a SIGKILL
+            (llama-swap's grace is shorter than a multi-GB serialize) left
+            them behind.
+        (b) Reconcile the SQLite index against the on-disk ``data/`` dirs:
+            drop index rows whose dir is gone, delete dirs with no row.
+        (c) Backfill ``memory_bytes`` from the actual snapshot file size for
+            rows that disagree — entries written before the disk-byte cap fix
+            indexed only the snapshot's in-RAM bytes and excluded the
+            checkpoint tensors (~37% undercount observed live: 23.3 GB on
+            disk vs 16.9 GB indexed), so the cap never fired.
+
+        Best-effort: any per-entry failure is logged at debug and skipped so a
+        single bad row never blocks startup.
+        """
+        now = time.time()
+        # (a) stale tmp dirs
+        try:
+            for name in os.listdir(self._data_dir):
+                if not name.endswith(".tmp"):
+                    continue
+                p = os.path.join(self._data_dir, name)
+                try:
+                    stale = now - os.path.getmtime(p) > self._config.tmp_stale_seconds
+                except OSError:
+                    stale = True
+                if stale:
+                    shutil.rmtree(p, ignore_errors=True)
+        except FileNotFoundError:
+            pass
+        # (b)+(c) index <-> disk reconciliation
+        try:
+            indexed = {e["file_path"]: e for e in self._index.all_entries()}
+        except Exception:
+            logger.debug("[system_kv_ssd] reconcile: index read failed", exc_info=True)
+            return
+        on_disk: set[str] = set()
+        try:
+            for name in os.listdir(self._data_dir):
+                if name.endswith(".tmp"):
+                    continue
+                if os.path.isdir(os.path.join(self._data_dir, name)):
+                    on_disk.add(name)
+        except FileNotFoundError:
+            pass
+        # index rows whose data dir vanished -> drop the row
+        for fp, e in indexed.items():
+            if fp in on_disk:
+                continue
+            try:
+                self._index.delete_entry(_blob_to_tokens(e["tokens_blob"]))
+            except Exception:
+                logger.debug("[system_kv_ssd] reconcile: row drop failed", exc_info=True)
+        # data dirs with no index row -> orphan, remove
+        for fp in on_disk - set(indexed):
+            self._delete_entry(fp)
+        # backfill memory_bytes from the real snapshot file size
+        fixed = 0
+        for fp, e in indexed.items():
+            if fp not in on_disk:
+                continue
+            snap_path = os.path.join(self._data_dir, fp, _SNAPSHOT_FILE)
+            try:
+                actual = os.path.getsize(snap_path)
+            except OSError:
+                continue
+            if actual != e.get("memory_bytes"):
+                try:
+                    self._index.update_memory_bytes(
+                        _blob_to_tokens(e["tokens_blob"]), actual
+                    )
+                    fixed += 1
+                except Exception:
+                    logger.debug(
+                        "[system_kv_ssd] reconcile: byte backfill failed",
+                        exc_info=True,
+                    )
+        if fixed:
+            logger.info(
+                "[system_kv_ssd] reconcile: backfilled disk bytes for %d "
+                "entries in %s",
+                fixed,
+                self._cache_dir,
+            )
+        # The accounting may now exceed the cap (previously undercounted) —
+        # evict down to it before serving.
+        self._enforce_capacity()
 
     def _writer_loop(self) -> None:
         draining = False  # close() sets the poison pill; drain without waiting
@@ -278,6 +389,10 @@ class SystemKVSSDStore:
                             pass
             (tokens, tensors, layer_meta, ckpt_meta,
              snap_meta, kinds, nbytes) = item
+            # The snapshot is leaving the queue (about to be written and then
+            # dropped) — release its share of the pinned-byte budget.
+            with self._lock:
+                self._queued_bytes = max(0, self._queued_bytes - nbytes)
             try:
                 self._write_entry(
                     tokens, tensors, layer_meta, ckpt_meta,
@@ -300,7 +415,14 @@ class SystemKVSSDStore:
                 self._spill_queue.put(None, timeout=2.0)
             except queue.Full:
                 self._writer_stop.set()
-            self._writer_thread.join(timeout=10.0)
+            # Bounded below llama-swap's ~5 s SIGTERM->SIGKILL grace so the
+            # index close() (committing the SQLite rows of everything written
+            # this session) reliably runs before a kill. The resident working
+            # set is already on disk via idle-window write-through; this drain
+            # is a best-effort tail, not the persistence path, so a tight
+            # deadline trades a little tail-drain for a guaranteed index commit
+            # (interrupted writes are recovered by the next startup reconcile).
+            self._writer_thread.join(timeout=4.0)
             self._writer_stop.set()
             self._writer_thread = None
         try:
@@ -338,6 +460,28 @@ class SystemKVSSDStore:
             [list(m) if m else None for m in meta] if meta else None
         )
         nbytes = _snapshot_nbytes(snapshot)
+        # Byte-cap the backlog: drop if this spill would push the pinned bytes
+        # over the cap AND something is already queued (an empty queue always
+        # admits one spill, even an oversized one, so huge prefixes persist).
+        with self._lock:
+            over_budget = (
+                self._queued_bytes > 0
+                and self._queued_bytes + nbytes > self._config.max_queued_bytes
+            )
+            if not over_budget:
+                self._queued_bytes += nbytes
+        if over_budget:
+            with self._lock:
+                self._stats.spill_drops += 1
+            logger.warning(
+                "[system_kv_ssd] spill backlog at %.1f GB (cap %.1f GB), "
+                "dropping %d-token spill (%.1f MB)",
+                self._queued_bytes / _BYTES_PER_GB,
+                self._config.max_queued_gb,
+                len(tokens),
+                nbytes / 1e6,
+            )
+            return False
         try:
             self._spill_queue.put_nowait(
                 (tokens, tensors, layer_meta, ckpt_meta,
@@ -346,6 +490,7 @@ class SystemKVSSDStore:
             return True
         except queue.Full:
             with self._lock:
+                self._queued_bytes = max(0, self._queued_bytes - nbytes)
                 self._stats.spill_drops += 1
             logger.warning(
                 "[system_kv_ssd] spill queue full, dropping (%d tokens)", len(tokens)
@@ -398,10 +543,15 @@ class SystemKVSSDStore:
             shutil.rmtree(entry_dir)
         os.rename(tmp_dir, entry_dir)
 
+        # Index the ACTUAL on-disk size, not the snapshot's in-RAM nbytes:
+        # the safetensors file also holds the flattened partial-restore
+        # checkpoint tensors, which nbytes excludes — so indexing nbytes
+        # undercounts the footprint and the capacity cap never fires (live:
+        # 23.3 GB on disk vs 16.9 GB indexed on the 27B dir).
         self._index.insert_entry(
             tokens_key=tokens,
             file_path=entry_hash,
-            memory_bytes=nbytes,
+            memory_bytes=disk_bytes,
             num_tokens=len(tokens),
         )
         with self._lock:
