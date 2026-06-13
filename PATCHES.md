@@ -560,6 +560,23 @@ TOCTOU contract unchanged from patch #13: a worker holding an evicted snapshot r
 
 ---
 
+## 25. `patch: ssd-tier-hardening` — real-disk-byte cap, startup reconcile, queued-spill byte cap
+
+**Files:** `vllm_mlx/system_kv_ssd.py`, `vllm_mlx/ssd_cache.py`, `tests/test_system_kv_ssd.py`
+
+Three protections for the SSD persistence tier (patches #16/#19), all confirmed against the live 27B dir:
+
+- **Index the actual on-disk size, not the snapshot's in-RAM `nbytes`.** The safetensors file also holds the flattened partial-restore checkpoint tensors, which `nbytes` excludes — so the cap **under-counted** (~37% live: 23.3 GB on disk vs 16.9 GB indexed) and never fired. `_write_entry` now indexes `disk_bytes` (`os.path.getsize`).
+- **Startup reconcile** (`_reconcile`, runs once in `start_writer`): removes stale `*.tmp` dirs from interrupted writes (a SIGKILL mid multi-GB serialize leaves them); reconciles the SQLite index against the on-disk `data/` dirs (drops rows whose dir is gone, deletes orphan dirs); backfills `memory_bytes` from the real file size for rows written before the byte-cap fix. New `SSDIndex.update_memory_bytes` does a targeted UPDATE that **preserves LRU timestamps**. After reconcile, `_enforce_capacity` evicts down to the now-honest cap.
+- **Queued-spill byte cap** (`max_queued_gb`, default 12 GB): the spill queue holds references to flattened (still-resident) mx arrays, so a defer-until-idle backlog of deep-context snapshots pins unified memory — the residual vector behind the Metal-abort class the 2026-06-12 defer-until-idle change otherwise addressed. A spill that would push queued bytes over the cap is dropped (a sub-prefix is usually already on disk; the loss costs at most one re-grow); an **empty queue always admits one** spill so huge prefixes still persist. `_queued_bytes` is tracked under the existing lock and released when the writer pops an item.
+- **`close()` join 10 s → 4 s**: bounded below llama-swap's ~5 s SIGTERM→SIGKILL grace so the index commit reliably runs before a kill. The resident working set is already on disk via idle-window write-through, so the drain is a best-effort tail; interrupted writes are recovered by the next startup reconcile.
+
+**Verified:** 4 new unit tests (disk-byte accounting incl. checkpoints; queue byte cap drop + empty-admits-oversized; reconcile orphan-sweep + byte backfill). Full suite 2212 passed.
+
+**Upstreaming:** the disk-byte accounting and reconcile are general SSD-tier robustness; `ssd_cache.update_memory_bytes` is a small additive index method (PR-friendly).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
