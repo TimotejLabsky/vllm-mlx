@@ -434,6 +434,25 @@ class SSDIndex:
             )
             self._conn.commit()
 
+    def update_memory_bytes(
+        self, tokens_key: tuple[int, ...], memory_bytes: int
+    ) -> None:
+        """Correct an entry's memory_bytes without disturbing LRU order.
+
+        Used by the system-KV SSD store's startup reconcile to backfill the
+        true on-disk size onto entries written before that accounting fix
+        (it touches neither accessed_at nor created_at, so LRU ranking is
+        preserved). Targeted UPDATE rather than INSERT OR REPLACE, which
+        would reset the timestamps.
+        """
+        token_hash = _tokens_hash(tokens_key)
+        with self._db_lock:
+            self._conn.execute(
+                "UPDATE entries SET memory_bytes = ? WHERE token_hash = ?",
+                (memory_bytes, token_hash),
+            )
+            self._conn.commit()
+
     def all_entries(self) -> list[dict]:
         """Return all entries (for startup reconciliation)."""
         with self._db_lock:
