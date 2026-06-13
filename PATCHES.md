@@ -2,6 +2,10 @@
 
 This fork carries its patches on top of [`waybarrios/vllm-mlx@caa8838`](https://github.com/waybarrios/vllm-mlx/commit/caa8838) (2026-06-09; previous pins: `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
+> **2026-06-13 note — cherry-pick #23 + upstream convergence to handle at the next rebase.**
+> - Patch #23 cherry-picks upstream `527f457` (#606, `train(False)` the derived TextModel) ahead of rebasing — a large measured prefill/decode win our text route was silently missing. **Retire #23 when we rebase past `527f457`** (it collides on the one line).
+> - Other upstream commits since `caa8838` that touch our patch surface, to resolve at the next `git fetch upstream && git rebase`: **`59b43c4` (#576, "Fix hybrid cache snapshot aliasing")** re-does our patch #6/#21 in `engine/simple.py` (177 lines) — **reject wholesale** as with #540/#541; our meta_state-aware version is the superset. **`02b631b` (#607, per-layer quant overrides)** overlaps patch #21(a); **`90f759a` (#595, dispatch gemma4 text models)** overlaps #20/#21. **`b67edee` (#605, ssd-cache bf16 + QuantizedKVCache spill)** is in #16's territory but only touches the BatchedEngine `ssd_cache.py` tier, not our MLX-native `system_kv_ssd.py`. Verify before each is taken.
+
 > **2026-06-09 rebase note — upstream merged PR #540 (`caa8838`) and PR #563, plus #579/#594.**
 > - **`caa8838` (#540, SimpleEngine fail-fast admission) collides with our patch #15, which is the corrected port of the same PR.** Upstream merged it **with the env-var clobber bug intact** (validates `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION`, then unconditionally re-assigns `fail_fast` — `wait` is silently impossible upstream) and with `fail_fast` as default. As with the #541 rebase below, upstream's `engine/simple.py` changes were **rejected wholesale**; ours is a strict superset (env respected, `wait` default, third MLLM-text lock site, pre-stream 503 probe, lock-wait timer). `engine/simple.py` is byte-identical to the pre-rebase tree except for one restored upstream delta (next bullet). `server.py`/`base.py` resolved trivially (our side is a superset of upstream's non-stream-only 503 translation).
 > - **`53cfdb0` (#579, SpecPrefill `backbone_pct`)** — its `simple.py` hunks were re-applied in a dedicated `restore:` commit after the rebase (the wholesale rejection above would otherwise have dropped them while `cli.py`/`server.py`/`model_registry.py` threading came through, TypeError-ing at engine construction).
@@ -517,6 +521,20 @@ Long agentic sessions on quantized models hit **block-level repetition collapse*
 **Production incident (2026-06-12) → GENERATION-ONLY matching.** The first live session with whole-context matching corrupted repeated shell tool-calls: re-running a command from earlier in the conversation is a long verbatim repeat with **no sequence breakers inside bash text**, so the exponential penalty forced mid-command divergence (`...llama-swap-config.yaml | head -20` came out as `...llama-swap-defaultconfig.yaml | headdefault-20`). Fix (deliberate divergence from the original DRY): the processor records the prompt length on its first invocation and **matches only within the current generation** — re-emitting prompt content (prior commands, filenames, history) is legitimate agentic behavior, while the loops DRY exists to break repeat within one generation by definition. Deployment `allowed_length` also raised 3 → 16: within-generation echoes of identifiers/code lines up to ~16 tokens are normal in coding output; collapse loops repeat 50+-token blocks and still get a decisive penalty. Regression-tested (prompt-region repeats unpenalized; generation-internal repeats caught).
 
 **Upstreaming:** vLLM rejected/preferred not to merge DRY upstream; for vllm-mlx it's a natural fit (single-stream serving is where loops hurt most). PR-worthy.
+
+---
+
+## 23. `fix(text-model-from-vlm): eval() the derived TextModel` — cherry-pick of upstream #606
+
+**Files:** `vllm_mlx/text_model_from_vlm.py`
+
+Cherry-picks upstream [`527f457` (#606)](https://github.com/waybarrios/vllm-mlx/commit/527f457) ahead of our next rebase. `build_text_model` constructs a fresh mlx_lm TextModel for the MLLM→text route but left it in mlx's default `training=True`. Hybrid gated-delta layers (Qwen3.5/3.6 linear attention) select their compute path with `use_kernel = not self.training`, so **every gated-delta forward on our Qwen3.6-27B-4bit and 35B-A3B text routes ran the slow Python `for t in range(T)` recurrence instead of the Metal kernel** — a context-scaling prefill penalty plus a decode hit on every token of the primary coding workload AND the always-loaded HA voice model. `mlx_lm.load` / `mlx_vlm.load` both eval() their models, so the regular routes never hit this; this VLM→text path was the one that didn't.
+
+One line — `text_model.train(False)` — but placed AFTER `inject_mtp_support` (so it recurses into the injected `mtp` submodule) and BEFORE patch #21's warmup forward (so the warmup materializes lazy buffers on the *actual* kernel compute path), vs upstream's placement just before `return`. Numerically identical output; only the compute path changes.
+
+**Upstream-measured (Qwen3.6-35B-A3B 4-bit, M-series):** prefill ~2k 2.78→0.47 s, ~5k 6.92→1.13 s (≈6×); decode 116.8→133.8 tok/s (+15%). **Pending local A/B on the Studio 27B** (cold prefill tok/s, decode tok/s, T=0 warm-vs-cold byte-identity).
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream `527f457`** (the rebase will collide on this one line; drop ours). Unaffected: gpt-oss/gemma/GLM/Phi (no gated-delta); Qwen3-Next-80B / Qwen3-Coder-Next (loaded via `mlx_lm.load`, already eval()'d).
 
 ---
 
