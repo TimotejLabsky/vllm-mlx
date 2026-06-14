@@ -311,13 +311,10 @@ def build_text_model(
         else:
             logger.info("TextModel built without MTP")
 
-        # Put the derived TextModel in eval mode. mlx_lm.load / mlx_vlm.load both
-        # eval() their models (this is also what LM Studio's mlx-engine does), but
-        # this freshly-constructed TextModel defaults to training=True. Hybrid
-        # layers (Qwen3.5/3.6 gated-delta) select their compute path with
-        # `use_kernel = not self.training`, so in training mode prefill/decode fall
-        # to the slow Python recurrence instead of the Metal kernel.
-        text_model.train(False)
+        # NOTE: eval mode is set above (before the warmup forward) so the warmup
+        # runs on the kernel compute path. Upstream #606 (527f457) also sets it
+        # here just before return, but that is now redundant with the earlier
+        # call and would run after the warmup — removed on the a48c86c rebase.
 
         # Realize every array the model holds before it leaves the build
         # thread — including underscore-private module attributes such as
