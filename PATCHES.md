@@ -402,6 +402,8 @@ A batch of low-risk observability fixes + correctness guards from a multi-agent,
 
 **Verified:** all five files `py_compile` clean; the `mtp` guard and the bf16/`mtp` signature facts confirmed against the installed mlx_lm 0.31.3; instrumentation validated end-to-end on an M1 Pro with a local model (hit_rate / lock-wait / prompt-capture fields populate, bench reads nonzero cache stats). Perf A/Bs that need the production 27B/35B at scale run on the Mac Studio.
 
+**Follow-up (2026-06-14, `SystemKVManager.stats()` idle-enabled block).** `stats()` returned `None` whenever the manager was idle (no snapshot/hits/misses), so `/v1/status` reported `cache: null` before the first request even when the system-KV path was live — the exact blind spot that previously hid `VLLM_MLX_DISABLE_SYSTEM_KV` / a degraded route (a live 35B HA backend showed `cache: null` after 5.75 h up). Now `stats()` returns a **zeroed block carrying `enabled: True`** when idle, and `None` only when the kill switch genuinely disables the path (`is_safe() == False`); the active block also carries `enabled: True`. The zeroed block has no hit/miss/tokens_saved activity, so neither the `/v1/status` cache selection nor `metrics.py`'s activity-preferring scan lets it mask an active `memory_aware_cache` (both gate on those three fields — verified). Consumed by the `mac-studio-exporter` `llm_cache_enabled` gauge. 3 new tests (idle→enabled block; kill-switch→None; active→enabled); full suite 2215 passed.
+
 **Upstreaming:** the bench-metric-name fix, the `hit_rate` field, and the SpecPrefill `mtp` TypeError guard are clean, isolated bug fixes — all PR-worthy. The debug-capture flag and lock-wait timer are general-purpose observability.
 
 ---
