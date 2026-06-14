@@ -22,19 +22,6 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
-def _import_text_model_classes(model_type: str):
-    if model_type == "gemma4_text":
-        from mlx_lm.models.gemma4_text import Model, ModelArgs
-
-        return Model, ModelArgs
-
-    # qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
-    # (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
-    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
-
-    return TextModel, TextModelArgs
-
-
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
