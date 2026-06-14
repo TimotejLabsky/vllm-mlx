@@ -931,12 +931,22 @@ class SystemKVManager:
     # ------------------------------------------------------------------
 
     def stats(self):
-        """Assemble the ``system_kv_cache`` stats dict, or None when idle.
+        """Assemble the ``system_kv_cache`` stats dict, or None when disabled.
 
         System KV cache stats — patched to emit Prometheus-compatible
         fields (hits/misses/tokens_saved/entry_count) so metrics.py
         maps them onto the vllm_mlx_cache_* gauges. Broadened gate so
         misses are reported even before a snapshot is stored.
+
+        Idle-but-enabled emits a ZEROED block (not None) carrying
+        ``enabled: True`` — so ``/v1/status`` and the exporter can prove the
+        system-KV path is live BEFORE the first request, instead of the
+        ``cache: null`` blind spot that previously hid a disabled/degraded
+        route. Returns None only when the kill switch (``is_safe() == False``)
+        genuinely disables the path. The zeroed block has no hit/miss/
+        tokens_saved activity, so neither the ``/v1/status`` cache selection
+        nor metrics.py's activity-preferring scan will let it mask an active
+        ``memory_aware_cache`` (verified: both gate on those three fields).
 
         Multi-slot LRU note: active slot + bag entries are summed for
         the aggregate fields (memory_mb, current_memory_mb,
@@ -951,7 +961,26 @@ class SystemKVManager:
             or self.hits
             or self.misses
         ):
-            return None
+            if not self.is_safe():
+                return None
+            return {
+                "enabled": True,
+                "tokens": 0,
+                "hash": None,
+                "memory_mb": 0.0,
+                "current_memory_mb": 0.0,
+                "entry_count": 0,
+                "hits": 0,
+                "misses": 0,
+                "hit_rate": 0.0,
+                "tokens_saved": 0,
+                "partial_hits": 0,
+                "partial_tokens_saved": 0,
+                "checkpoints": 0,
+                "evictions": 0,
+                "capacity": self.capacity,
+                "slots": [],
+            }
 
         active_bytes = entry_bytes(self.snapshot) + ckpt_bytes(self.checkpoints)
         bag_bytes = sum(
@@ -976,6 +1005,7 @@ class SystemKVManager:
                 "active": False,
             })
         result = {
+            "enabled": True,
             # Legacy single-slot fields (describe ACTIVE slot):
             "tokens": self.token_count,
             "hash": self.system_hash,
