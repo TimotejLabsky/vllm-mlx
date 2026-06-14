@@ -22,50 +22,6 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
-# Text-model classes keyed by config ``model_type`` *prefix*, longest first.
-# A family has to cover its variants: Gemma 4 reports ``gemma4_text`` on some
-# checkpoints and ``gemma4_unified_text`` on others, and an exact match on the
-# former silently sent the latter to the generic fallback below.
-_TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
-    ("gemma4", "mlx_lm.models.gemma4_text", ("Model", "ModelArgs")),
-)
-
-# Fallback. qwen3_5.TextModel and TextModelArgs handle both dense and MoE
-# natively (MTPDecoderLayer auto-selects SparseMoeBlock when
-# args.num_experts > 0), which makes them a reasonable generic choice — but it
-# is a guess, and a wrong guess dies deep inside the constructor with an error
-# that names neither the model nor the class. Hence the logging either side.
-_DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
-
-
-def _import_text_model_classes(model_type: str):
-    """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
-    import importlib
-
-    module_name, (model_attr, args_attr) = _DEFAULT_TEXT_MODEL
-    matched = False
-    for prefix, family_module, (family_model, family_args) in sorted(
-        _TEXT_MODEL_FAMILIES, key=lambda f: len(f[0]), reverse=True
-    ):
-        if model_type.startswith(prefix):
-            module_name, model_attr, args_attr = (
-                family_module,
-                family_model,
-                family_args,
-            )
-            matched = True
-            break
-
-    if not matched:
-        logger.debug(
-            "No text-model family matches model_type=%r; falling back to %s",
-            model_type,
-            module_name,
-        )
-    module = importlib.import_module(module_name)
-    return getattr(module, model_attr), getattr(module, args_attr)
-
-
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
