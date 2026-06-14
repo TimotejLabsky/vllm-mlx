@@ -590,6 +590,20 @@ Three protections for the SSD persistence tier (patches #16/#19), all confirmed 
 
 ---
 
+## 26. `fix(qwen3-xml): parse bare <function=> without <tool_call> wrapper` — cherry-pick of upstream #597
+
+**Files:** `vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py`
+
+Cherry-picks upstream open PR [#597](https://github.com/waybarrios/vllm-mlx/pull/597) (commits `55f2296` + `03164f2`) — the backport of vLLM #26345, broadened. Under load (large system prompt + many tools) **Qwen3-Coder drops the outer `<tool_call></tool_call>` wrapper and emits only the inner `<function=NAME><parameter=…>…</function>` block.** The wrapper-gated `StreamingXMLToolCallParser` leaked these as raw text → `<function=Agent>` printed as prose followed by a hung 0-token subagent. Three coordinated changes: (1) buffer-wait on partial `<function=`/`<parameter=` tags (avoids text leak + expat "not well-formed" crash); (2) deferred commitment on bare `<function=Name>` — held until `<parameter=` opens or `</function>` closes, rolled back to content if prose char-data arrives (keeps `test_streaming_plain_text_is_not_misclassified` green); (3) implicit-wrapper close on `</function>` so sequential bare calls get independent ids.
+
+**Affects only the `qwen3_xml`/`qwen3.5`/`qwen3_coder` parser** (registered in `qwen3_xml_tool_parser.py`) — in our lineup that's **`Qwen3-Coder-Next-4bit`** (`--tool-call-parser qwen3_coder`). The hermes-parser Qwen3.6/3.5 routes (the opencode primary) are a different parser and unaffected.
+
+**Verified:** PR test plan 52 passed (incl. new bare-function + prose-safety streaming tests); full suite 2239 passed / 16 skipped; direct parse demo confirmed bare `<function=>` → `tools_called=True` and prose `<function=` stays content.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream `#597`** (the rebase will collide on `qwen3_xml_tool_parser.py`; drop ours).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
