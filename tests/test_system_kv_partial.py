@@ -537,3 +537,39 @@ def test_ram_budget_keeps_oversized_active():
     m.enforce_ram_budget()
     assert m.snapshot is not None
     assert len(m.lru) == 0
+
+
+# ---------------------------------------------------------------------------
+# Idle-but-enabled stats (c9 observability): /v1/status cache must not be null
+# before the first request when the system-KV path is live.
+# ---------------------------------------------------------------------------
+
+
+def test_stats_idle_emits_enabled_block():
+    """A fresh manager (no snapshot/hits/misses) reports an enabled, zeroed
+    block — not None — so the cache is provable as live pre-first-request."""
+    m = SystemKVManager()
+    s = m.stats()
+    assert s is not None
+    assert s["enabled"] is True
+    assert s["hits"] == 0 and s["misses"] == 0 and s["tokens_saved"] == 0
+    assert s["capacity"] == m.capacity
+    # Zero activity → must not mask an active cache in the selection logic.
+    assert not any(s.get(k) for k in ("hits", "misses", "tokens_saved"))
+
+
+def test_stats_idle_returns_none_when_kill_switch_set():
+    """With the kill switch set (is_safe() False) the path is genuinely off —
+    stats() returns None so no system_kv_cache block is emitted."""
+    m = SystemKVManager()
+    m._safe_cached = False  # simulate VLLM_MLX_DISABLE_SYSTEM_KV=1
+    assert m.stats() is None
+
+
+def test_stats_active_carries_enabled_flag():
+    """Once a snapshot is stored, the block still carries enabled=True."""
+    m = SystemKVManager()
+    m.store_extended("h", _hybrid_snapshot(32), list(range(16)), promoted=False)
+    s = m.stats()
+    assert s is not None and s["enabled"] is True
+    assert s["entry_count"] == 1
