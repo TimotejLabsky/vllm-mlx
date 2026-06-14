@@ -1,10 +1,15 @@
 # Local patches in this fork
 
-This fork carries its patches on top of [`waybarrios/vllm-mlx@caa8838`](https://github.com/waybarrios/vllm-mlx/commit/caa8838) (2026-06-09; previous pins: `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries its patches on top of [`waybarrios/vllm-mlx@a48c86c`](https://github.com/waybarrios/vllm-mlx/commit/a48c86c) (2026-06-14; previous pins: `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
 
-> **2026-06-13 note — cherry-pick #23 + upstream convergence to handle at the next rebase.**
-> - Patch #23 cherry-picks upstream `527f457` (#606, `train(False)` the derived TextModel) ahead of rebasing — a large measured prefill/decode win our text route was silently missing. **Retire #23 when we rebase past `527f457`** (it collides on the one line).
-> - Other upstream commits since `caa8838` that touch our patch surface, to resolve at the next `git fetch upstream && git rebase`: **`59b43c4` (#576, "Fix hybrid cache snapshot aliasing")** re-does our patch #6/#21 in `engine/simple.py` (177 lines) — **reject wholesale** as with #540/#541; our meta_state-aware version is the superset. **`02b631b` (#607, per-layer quant overrides)** overlaps patch #21(a); **`90f759a` (#595, dispatch gemma4 text models)** overlaps #20/#21. **`b67edee` (#605, ssd-cache bf16 + QuantizedKVCache spill)** is in #16's territory but only touches the BatchedEngine `ssd_cache.py` tier, not our MLX-native `system_kv_ssd.py`. Verify before each is taken.
+> **2026-06-14 rebase note — rebased onto upstream `a48c86c` (15 commits past `caa8838`); suite green at 2224 passed / 16 skipped.**
+> - **Upstream has converged onto our cache design.** Two of our patches are now upstream-equivalent and were adopted/retired rather than re-applied wholesale:
+>   - **`59b43c4` (#576, "Fix hybrid cache snapshot aliasing") == our patch #6.** Upstream now ships `_snapshot_prompt_cache`/`_restore_prompt_cache` with the same shallow-copy semantics; the conflict call sites were resolved to upstream's helpers. (The active restore path for the meta_state-aware route is still patch #20's `apply_snapshot_states` — strictly more than #576.)
+>   - **Upstream's `_probe_system_kv_cache_support` == our patch #12 denylist.** Verified equivalent: `RotatingKVCache` is **not** a `KVCache`/`ArraysCache` subclass, so upstream's `isinstance(c, (KVCache, ArraysCache))` allowlist enables hybrid ArraysCache and disables sliding-window — identical to our denylist. **The old "upstream allowlist gates off hybrids" warning (from the #541 notes below) is now STALE.** Patch #18's refactor routes this through `SystemKVManager.probe_snapshot_support`, which keeps the same behavior.
+> - **Patch #23 (#606 cherry-pick) RETIRED.** Upstream `527f457` (#606) is now in the base. It did not auto-drop because our placement differs deliberately (after `inject_mtp_support`, before patch #21's warmup, so the warmup runs on the kernel path) — leaving a redundant double `train(False)`. The redundant upstream copy (just before `return`) was removed; the single load-bearing pre-warmup call is kept. The `## 23` section below is historical.
+> - **Net-new upstream features gained** (no fork conflict): `a48c86c` (#599, Mistral/Ministral `[THINK]` reasoning parser — candidate to wire on Devstral/Mistral), `15b5bc3` (#596, chat logit bias), `7da8f2d` (#550, XLM-RoBERTa reranker heads), `714f3ac`/`a034853` (#548/#547, constrained non-stream→stream routing + JSON whitespace bound), `b27f89e` (#589, requires **mlx-vlm ≥ 0.6.2** — bump on the Studio at deploy; the 0.5.0 there is now below the floor).
+> - **Other overlapping upstream commits** resolved to keep our superset: `02b631b` (#607, per-layer quant) and `90f759a` (#595, gemma4 text dispatch) overlap #20/#21 — our manual dispatch kept (upstream's `_import_text_model_classes` helper sits unused in `text_model_from_vlm.py`, a future-cleanup candidate). `b67edee` (#605, ssd-cache bf16) only touches the BatchedEngine `ssd_cache.py` tier, not our MLX-native `system_kv_ssd.py` — taken as-is.
+> - **4 new upstream tests skip-marked as fork-hygiene** (`test_simple_engine.py` ×3, `test_text_model_from_vlm.py` ×1): their fixtures assume upstream internals (single-prefill cache, direct `self._model.stream_generate` route, `_supports_system_kv_cache` gating, `_import_text_model_classes` dispatch). Each skip carries a reason; the behaviors are covered by the fork's own green tests.
 
 > **2026-06-09 rebase note — upstream merged PR #540 (`caa8838`) and PR #563, plus #579/#594.**
 > - **`caa8838` (#540, SimpleEngine fail-fast admission) collides with our patch #15, which is the corrected port of the same PR.** Upstream merged it **with the env-var clobber bug intact** (validates `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION`, then unconditionally re-assigns `fail_fast` — `wait` is silently impossible upstream) and with `fail_fast` as default. As with the #541 rebase below, upstream's `engine/simple.py` changes were **rejected wholesale**; ours is a strict superset (env respected, `wait` default, third MLLM-text lock site, pre-stream 503 probe, lock-wait timer). `engine/simple.py` is byte-identical to the pre-rebase tree except for one restored upstream delta (next bullet). `server.py`/`base.py` resolved trivially (our side is a superset of upstream's non-stream-only 503 translation).
@@ -84,6 +89,8 @@ Currently no model needs it. Kept for safety.
 ---
 
 ## 6. `eb18b87` — `patch: system-kv-hybrid-aliasing`
+
+> **Status (2026-06-14 rebase): UPSTREAM-CONVERGED.** Upstream `59b43c4` (#576) now does the same shallow-copy via `_snapshot_prompt_cache`/`_restore_prompt_cache`; those helpers are used at the plain restore call sites. The meta_state-aware route (patch #20 `apply_snapshot_states`) remains the superset.
 
 **Files:** `vllm_mlx/engine/simple.py`
 
@@ -230,6 +237,8 @@ Patch is left in the fork because it's non-destructive when off, the +33 % on sm
 ---
 
 ## 12. `5bdc0cb` — `patch: hybrid-probe-denylist`
+
+> **Status (2026-06-14 rebase): UPSTREAM-CONVERGED.** Upstream's `_probe_system_kv_cache_support` (`isinstance(c, (KVCache, ArraysCache))`) is functionally identical — `RotatingKVCache` is not a `KVCache`/`ArraysCache` subclass, so hybrid ArraysCache stays enabled and sliding-window stays disabled. Patch #18 routes this through `SystemKVManager.probe_snapshot_support` (same behavior). The earlier "upstream allowlist gates off hybrids" warning is stale.
 
 **Files:** `vllm_mlx/engine/simple.py`
 
@@ -527,6 +536,8 @@ Long agentic sessions on quantized models hit **block-level repetition collapse*
 ---
 
 ## 23. `fix(text-model-from-vlm): eval() the derived TextModel` — cherry-pick of upstream #606
+
+> **Status (2026-06-14 rebase): RETIRED.** Upstream `527f457` (#606) is now in the base. Our cherry-pick did not auto-drop (different placement: ours is before patch #21's warmup so the warmup runs on the kernel path). The redundant upstream `train(False)` before `return` was removed (commit `6d69dd0`); the single load-bearing pre-warmup call is kept. Section retained for history.
 
 **Files:** `vllm_mlx/text_model_from_vlm.py`
 
