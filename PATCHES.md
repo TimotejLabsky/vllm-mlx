@@ -604,6 +604,22 @@ Cherry-picks upstream open PR [#597](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
+## 27. `f7499a9` — `patch: run-reasoning-parser-when-thinking-disabled`
+
+**Files:** `vllm_mlx/server.py` (`stream_chat_completion` gate + `_extract_reasoning_and_tool_calls`)
+
+When `enable_thinking=False`, the server **skipped the reasoning parser entirely** on both chat-completion paths (`stream_chat_completion` gated on `... and not _thinking_disabled(...)`; non-stream via `allow_reasoning=not _thinking_disabled(...)` in `_extract_reasoning_and_tool_calls`). That assumes thinking-off output carries no reasoning-protocol markers — **false for gemma-4.**
+
+**Root cause:** gemma-4's chat template *prefills* `<|channel>thought\n<channel|>` into the prompt when thinking is disabled (its native skip-thinking mechanism, template lines ~263-264). That prefill is echoed into the completion. With the parser skipped, the raw `<|channel>thought\n<channel|>` markers leaked into `content`. Home Assistant (hass_local_openai_llm) rejected the reply on the post-tool-result turn: *"Last content in chat log is not an AssistantContent … model not returning a valid response."* Qwen MoE/dense were unaffected — their thinking-off path emits no markers, so skipping the parser was harmless there.
+
+**Fix:** always run the reasoning parser when one is configured; when thinking is disabled, keep the cleaned content but **discard** the reasoning output (`reasoning = None` / `reasoning_text = None`). The `gemma4` reasoning parser already strips the empty-thought prefill correctly — unit-verified that both `extract_reasoning()` and token-by-token `extract_reasoning_streaming()` return clean content for `<|channel>thought\n<channel|>ANSWER`.
+
+**Safe across the lineup:** for models whose thinking-off output has no markers (Qwen `<think>` family, plain models), `extract_reasoning` returns the content unchanged, so running it is a no-op on content; only the now-suppressed reasoning differs. This makes gemma-4 (and any channel/prefill-style template) usable with thinking on **and** off — e.g. the HA `ha-gemma` route.
+
+**Upstreaming:** candidate — the skip-when-disabled optimization is incorrect for any template that prefills a reasoning frame; running the parser and dropping reasoning is the correct general behavior.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
