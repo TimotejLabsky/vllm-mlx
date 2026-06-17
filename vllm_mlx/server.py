@@ -2974,7 +2974,12 @@ def _extract_reasoning_and_tool_calls(
     reasoning_text = None
     text_for_tool_parse = output_text
 
-    if _reasoning_parser and allow_reasoning:
+    # Always run the reasoning parser when one is configured — even when
+    # thinking is disabled — so reasoning-protocol markers are stripped from
+    # content (e.g. gemma-4's echoed `<|channel>thought\n<channel|>` prefill
+    # under enable_thinking=False). When thinking is off we discard the
+    # reasoning text but keep the cleaned content.
+    if _reasoning_parser:
         reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
             output_text
         )
@@ -2991,6 +2996,8 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
+        if not allow_reasoning:
+            reasoning_text = None
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
@@ -6432,9 +6439,19 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            # Use reasoning parser if enabled (skip when enable_thinking=False
-            # is set either on the request or via the resolved chat template
-            # kwargs / server default).
+            # Always run the reasoning parser when one is configured — even
+            # when thinking is disabled. With enable_thinking=False some
+            # templates still emit reasoning-protocol markers (e.g. gemma-4's
+            # echoed `<|channel>thought\n<channel|>` prefill); the parser must
+            # run to strip them from content. We simply suppress the reasoning
+            # output in that case (see `reasoning = None` below). Skipping the
+            # parser entirely leaked the raw markers into content and broke
+            # downstream consumers (HA: "model not returning a valid response").
+            # NOTE (rebase onto d96458c): upstream #644 made parsers
+            # request-local, so this tests the per-request `reasoning_parser`
+            # built above rather than the module-global `_reasoning_parser`
+            # this patch originally referenced — the loop body below already
+            # calls the request-local instance.
             if reasoning_parser and delta_text:
                 previous_text = accumulated_text
                 accumulated_text += delta_text
@@ -6448,6 +6465,9 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                if _thinking_disabled(request, kwargs):
+                    # Thinking off: keep the cleaned content, drop reasoning.
+                    reasoning = None
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
                 )
