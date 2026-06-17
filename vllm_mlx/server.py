@@ -3021,6 +3021,10 @@ def _extract_reasoning_and_tool_calls(
             else:
                 text_for_tool_parse = ""
         if not allow_reasoning:
+            # Thinking off: don't surface reasoning, but fold reasoning-classified
+            # text back into content so markerless output (Qwen) isn't dropped.
+            if reasoning_text and not (text_for_tool_parse or "").strip():
+                text_for_tool_parse = reasoning_text
             reasoning_text = None
 
     # Skip tool parsing when the request defines no tools — otherwise the
@@ -6578,7 +6582,15 @@ async def stream_chat_completion(
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
                 if _thinking_disabled(request, kwargs):
-                    # Thinking off: keep the cleaned content, drop reasoning.
+                    # Thinking off: the parser still runs (to strip prefill
+                    # markers, e.g. gemma's `<|channel>thought<channel|>`), but
+                    # we must not surface a reasoning stream. Markerless output
+                    # (Qwen emits no <think> when thinking is off) gets routed to
+                    # `reasoning` by the streaming parser — fold it back into
+                    # content so it isn't lost. gemma keeps its answer in
+                    # content with an empty thought; folding is a no-op there.
+                    if reasoning:
+                        content = (content or "") + reasoning
                     reasoning = None
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
