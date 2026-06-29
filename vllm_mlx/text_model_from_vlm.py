@@ -277,16 +277,20 @@ def build_text_model(
         # Cherry-picked from upstream 527f457 (#606).
         text_model.train(False)
 
-        # Materialize every lazy init-time array — parameters AND ad-hoc
-        # module buffers (rope frequency tables etc.) that parameters()
-        # cannot enumerate — by running a one-token forward HERE, on the
-        # build thread. Lazy arrays pin to the stream of the thread that
-        # created them (thread-local since mlx_lm's generation_stream
-        # rework); without this warmup the first real forward happens on a
-        # generation worker thread and dies with "There is no
-        # Stream(gpu, N) in current thread" (observed on gemma-4, whose
-        # rope buffers are built at init — Qwen3.5 computes them per
-        # forward and never hit this).
+        # Run a one-token forward HERE, on the build thread, for two reasons
+        # that remain after upstream #614 (the authoritative array realize
+        # below took over lazy-buffer materialization):
+        #   1. Fail closed — if the freshly-built TextModel cannot actually
+        #      run a forward (a shape/dtype mismatch the name-coverage guard
+        #      cannot catch), refuse it now instead of crashing on the first
+        #      real request from a generation worker thread.
+        #   2. Warm the kernel compute path — train(False) above selects the
+        #      gated-delta Metal kernel; this forward compiles/warms it on the
+        #      build thread so the first real request isn't penalized.
+        # Comprehensive lazy-array realization (incl. private init buffers like
+        # gemma-4's RoPE._freqs that parameters() and a forward cannot reliably
+        # pin) is now done by the #614 module-walk eval below — we no longer
+        # lean on this forward for that.
         try:
             from mlx_lm.models.cache import make_prompt_cache
 
@@ -302,7 +306,8 @@ def build_text_model(
             return None
 
         if hasattr(text_model, "mtp") and text_model.mtp is not None:
-            mx.eval(text_model.mtp.parameters())
+            # mtp is a registered submodule, so its arrays are realized by the
+            # #614 module-walk eval below — no separate mtp.parameters() eval.
             num_mtp = text_config.get(
                 "mtp_num_hidden_layers",
                 text_config.get("num_nextn_predict_layers", 0),
@@ -316,6 +321,8 @@ def build_text_model(
         # here just before return, but that is now redundant with the earlier
         # call and would run after the warmup — removed on the a48c86c rebase.
 
+        # Authoritative lazy-array realize (upstream #614) — subsumes what the
+        # warmup forward above and the old explicit mtp-params eval realized.
         # Realize every array the model holds before it leaves the build
         # thread — including underscore-private module attributes such as
         # RoPE._freqs, which parameters() excludes. MLX lazy graphs are tagged
