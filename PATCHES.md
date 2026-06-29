@@ -634,7 +634,7 @@ When `enable_thinking=False`, the server **skipped the reasoning parser entirely
 
 ## 28. `fix(llm): realize lazy init-time arrays on the load thread (gpt-oss serialized-route stream crash)`
 
-**Files:** `vllm_mlx/models/llm.py` (`MLXLanguageModel.load`)
+**Files:** `vllm_mlx/models/llm.py` (`MLXLanguageModel.load`), `vllm_mlx/models/mllm.py` (`MLXMultimodalLM.load`)
 
 **Symptom:** every `/v1/chat/completions` to **gpt-oss-20b-MXFP4-Q4** returned HTTP 500. Traceback bottomed out in mlx-lm's `generate_step` at `mx.eval([c.state for c in prompt_cache])` with `RuntimeError: There is no Stream(gpu, 1) in current thread`. Surfaced while deploying the `0dd1157`/v0.4.0 rebase, but **pre-existing** — independent of that rebase (worker-thread generation code byte-identical) and independent of upstream #581 harmony rendering (crashed identically on the no-harmony fallback path and with `VLLM_MLX_DISABLE_SYSTEM_KV=1`).
 
@@ -643,6 +643,8 @@ When `enable_thinking=False`, the server **skipped the reasoning parser entirely
 This is the same class of bug as the gemma-4 RoPE crash — fixed for the VLM→text route by patch #21's warmup + upstream #614's module-walk realize in `build_text_model`. Plain `mlx_lm.load` models (gpt-oss et al.) never went through that path and so were unprotected.
 
 **Fix:** after `load_model_with_fallback`, walk `self.model.modules()` and `mx.eval` every `mx.array` value — realizing all init-time arrays on the load thread before any worker forward. Mirrors the #614 block. Harmless no-op for models whose arrays are already realized (verified: full suite 2293 passed / 29 skipped unchanged; Qwen unaffected).
+
+**Defensive parity (same patch):** `MLXMultimodalLM.load()` (the mlx-vlm path) gets the identical realize. Its multimodal generation runs on the *same* `to_thread` serialized worker (`_run_blocking_serialized`), so a future mlx-vlm model with a lazy init buffer would crash the same way. Current VLMs don't trip it — verified live that the guard doesn't regress them: GLM-4.6V vision (`"A yellow circle."` on a synthetic probe) and the VLM text route both return `finish_reason=stop`. The guard keeps both load paths symmetric with the LLM path. (The MLLM *text* route was already covered separately by `build_text_model`'s #614/#21 realize.)
 
 **Verified live on the Studio:** gpt-oss-20b returns clean completions on both the fallback path and the `#581` harmony-rendering path (`openai-harmony` installed) — `finish_reason=stop`. Investigated and **rejected** a `mlx_streams.py` change: with mlx-lm >= 0.31 `generation_stream` is already a cross-thread-safe `ThreadLocalStream`, so `bind_generation_streams` was not the culprit; the realize is the whole fix.
 
