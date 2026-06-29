@@ -632,6 +632,24 @@ When `enable_thinking=False`, the server **skipped the reasoning parser entirely
 
 ---
 
+## 28. `fix(llm): realize lazy init-time arrays on the load thread (gpt-oss serialized-route stream crash)`
+
+**Files:** `vllm_mlx/models/llm.py` (`MLXLanguageModel.load`)
+
+**Symptom:** every `/v1/chat/completions` to **gpt-oss-20b-MXFP4-Q4** returned HTTP 500. Traceback bottomed out in mlx-lm's `generate_step` at `mx.eval([c.state for c in prompt_cache])` with `RuntimeError: There is no Stream(gpu, 1) in current thread`. Surfaced while deploying the `0dd1157`/v0.4.0 rebase, but **pre-existing** — independent of that rebase (worker-thread generation code byte-identical) and independent of upstream #581 harmony rendering (crashed identically on the no-harmony fallback path and with `VLLM_MLX_DISABLE_SYSTEM_KV=1`).
+
+**Root cause:** MLX lazy graphs are tagged to the stream of the thread that *recorded* them, and (mlx-lm >= 0.31) generation runs on a SimpleEngine serialized **worker thread** (`_run_blocking_serialized` → `to_thread`), not the load thread. gpt-oss's attention **`sinks = mx.zeros((num_heads,))`** (`mlx_lm/models/gpt_oss.py`) is an *init-time* array created on the load thread and left lazy; the first worker-thread forward evaluates it off its home thread and dies. Qwen3.5/3.6 have no such init-time buffer (rope is computed per forward), so they never hit it — which is why only gpt-oss broke. Reproduced in isolation: a worker-thread `stream_generate` crashes before any realize and **succeeds after** `mx.eval`-ing the model's module arrays on the load thread.
+
+This is the same class of bug as the gemma-4 RoPE crash — fixed for the VLM→text route by patch #21's warmup + upstream #614's module-walk realize in `build_text_model`. Plain `mlx_lm.load` models (gpt-oss et al.) never went through that path and so were unprotected.
+
+**Fix:** after `load_model_with_fallback`, walk `self.model.modules()` and `mx.eval` every `mx.array` value — realizing all init-time arrays on the load thread before any worker forward. Mirrors the #614 block. Harmless no-op for models whose arrays are already realized (verified: full suite 2293 passed / 29 skipped unchanged; Qwen unaffected).
+
+**Verified live on the Studio:** gpt-oss-20b returns clean completions on both the fallback path and the `#581` harmony-rendering path (`openai-harmony` installed) — `finish_reason=stop`. Investigated and **rejected** a `mlx_streams.py` change: with mlx-lm >= 0.31 `generation_stream` is already a cross-thread-safe `ThreadLocalStream`, so `bind_generation_streams` was not the culprit; the realize is the whole fix.
+
+**Upstreaming:** candidate — mlx-lm's own `generate` realizes nothing at load time, so any embedding host that generates off the load thread is exposed; a load-time realize (or lazy-array warmup) belongs upstream.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
