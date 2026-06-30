@@ -1,6 +1,10 @@
 # Continuous batching × caching on hybrid models — findings & roadmap
 
-*Status: assessment, 2026-06-09 (code as of fork tip `b98ce50`, upstream base `caa8838`, mlx-lm 0.31.3). No implementation yet.*
+*Status: assessment 2026-06-09; **reassessed 2026-06-30** (fork tip `28765f3`,
+base v0.4.0 `0dd1157`, mlx-lm 0.31.3) — see [the 2026-06-30 update](#update-2026-06-30--the-blocker-moved)
+below. No implementation. Verdict unchanged (**don't port**), but the blocker
+has moved: the caching wall largely fell, and what's left is a motivation/risk
+call, not a feasibility one.*
 
 **Question answered:** what would it take to run BatchedEngine (`--continuous-batching`)
 without forfeiting the caching we rely on — especially on hybrid (attention + SSM)
@@ -15,6 +19,68 @@ four cache match paths require rewinding. The sound fix is checkpointing SSM
 state at boundaries during prefill — which is exactly what our system-KV cache
 already does at one boundary. Work items A–D below; B (port `SystemKVManager`
 to the batched path) is the best ROI if we ever need batching.
+
+---
+
+## Update 2026-06-30 — the blocker moved
+
+Reassessed after the v0.4.0 rebase. The "batching forfeits our cache" wall has
+largely fallen — but feasibility cuts the *wrong way*, so the verdict is still
+**don't port it.** The root-cause section below is unchanged and still accurate
+(the match-path gates still fire); what changed is everything around it.
+
+**What closed since 2026-06-09:**
+
+- **Items A + C's hard core is now built** in `vllm_mlx/system_kv.py` — an
+  engine-agnostic checkpoint engine: `classify_layers` (trim/ckpt/opaque),
+  `append_checkpoint` (the ladder, with geometric thinning), `select_restore_pos`
+  (nearest checkpoint ≤ match), `build_partial_restore_states` (slice attention
+  KV to `pos`, install the recurrent checkpoint, refuse opaque). These are pure
+  list-in/list-out functions, not coupled to SimpleEngine — exactly the "sound
+  general fix" this doc called a 1.5–2K-line, 2–3-week upstream job.
+- **Item C copy-on-store aliasing safety → upstream #576** ("Fix hybrid cache
+  snapshot aliasing"): `_dequantize_cache()` deep-copies non-quantized layers on
+  fetch (`memory_cache.py` ~`:586`).
+- **Item C memory accounting / LRU budget → upstream #620** ("honor MLX buffer
+  cache limit").
+- **Item D bf16 SSD crash → upstream #563 + #605 + #612** (snapshot on producer
+  thread, native QuantizedKVCache spill, preserve bf16 across quantized spill).
+  The "port the MLX-native safetensors approach into `ssd_cache.py`" side quest
+  is no longer needed.
+- **Injection seam confirmed.** The batched fetch→schedule→insert flow has a
+  clean hook: fetch at `scheduler.py:1826` parks the result on
+  `request.prompt_cache`; `_schedule_waiting` reads it at `:2024`;
+  `BatchGenerator.insert` at `:2080` passes `caches=[…]` into mlx-lm's
+  `_merge_caches`. A restored system-KV checkpoint can be dropped in at the
+  post-miss point. **Item B is now a small wiring job, not a rewrite.**
+
+**What did *not* move:** mlx-lm is still 0.31.3 — `ArraysCache.is_trimmable()`
+returns `False` and there is no `trim`. The two `has_non_trimmable` gates
+(`memory_cache.py:794` supersequence, `:888` LCP) still *skip* hybrid matches
+rather than fall back to a checkpoint restore. "Getting it working" = replacing
+those two skips with calls into `build_partial_restore_states` + the seam above.
+
+**Why it's still not worth porting:**
+
+1. **The single-stream port is strictly worse than today.** BatchedEngine at
+   batch=1 is a slower SimpleEngine (merge/scheduler overhead, zero concurrency
+   gain). The easy version buys nothing.
+2. **The version that helps — concurrent hybrid batching — rests on an
+   unverified mlx-lm internal we don't own:** whether `_merge_caches` /
+   `ArraysCache.merge` correctly batch a *restored mid-sequence* recurrent state
+   alongside differently-positioned sequences (the `left_padding` / `lengths` /
+   `make_mask` bookkeeping). That is item D's still-open "validate *concurrent*
+   hybrid batching," and it lives in mlx-lm 0.31.3, not this repo.
+   `ArraysCache.merge` copying into a fresh `[B, …]` array is encouraging but
+   unproven for mixed positions.
+3. **The ceiling is ~1.2× regardless** — the Studio measured MLX decode as *not*
+   memory-bound at 4-bit/8–35B (continuous batching 1.2× aggregate, spec/MTP
+   0.5–0.76×), on a workload that is effectively single-stream.
+
+**If batching is ever needed,** the de-risking order is: (1) a standalone mlx-lm
+spike proving `_merge_caches` handles a restored recurrent state in a concurrent
+batch; only then (2) the item-B wiring behind a flag + a Studio A/B. Until
+concurrency is routine, SimpleEngine + system-KV remains the deliberate choice.
 
 ---
 
@@ -76,7 +142,18 @@ prompt). Generalizing, in increasing order of effort:
 | **C** | **Multi-boundary checkpoints** in the prefix cache: SSM state every K tokens; hybrid-aware `_trim_cache_offset`; copy-on-store aliasing safety (the patch-#6 lesson — `MemoryAwarePrefixCache.store()` keeps live references and `fetch` returns them directly, unsafe for mutable `ArraysCache` state lists under concurrency); memory accounting (~40–50 MB per checkpoint on Qwen3-Next-class models → needs an LRU budget) | ~1.5–2K lines, 2–3 weeks | Full LCP/supersequence hits — the general agentic case |
 | **D** | Side quests: the batched SSD tier crashes on bf16 (numpy serializers; port the MLX-native safetensors approach from `vllm_mlx/system_kv_ssd.py` into `ssd_cache.py`); validate *concurrent* hybrid batching | small / unknown | Persistence + actual multi-user confidence |
 
+> **Status 2026-06-30** (see the [update above](#update-2026-06-30--the-blocker-moved)):
+> A+C's checkpoint engine is **built** in `system_kv.py`; C's aliasing/budget
+> prereqs **landed upstream** (#576, #620); D's bf16 SSD crash is **fixed
+> upstream** (#563/#605/#612). **B** collapses to wiring (injection seam at
+> `scheduler.py:2024`). The **only** still-open item is D's *concurrent
+> hybrid-batching validation* — and it's in mlx-lm internals, not this repo.
+
 ## Verdict
+
+*Refined 2026-06-30 — see the [update above](#update-2026-06-30--the-blocker-moved).
+Bullets 1–2 below are now mostly moot (the work got built/landed); bullet 3 is
+the governing one and is **reinforced**, not weakened.*
 
 - **C belongs upstream** — it touches the scheduler/cache core, and upstream PR
   creation is currently collaborator-restricted for us (we can only comment).
