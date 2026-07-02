@@ -1349,7 +1349,14 @@ class Scheduler:
         self.hybrid_kv = None
 
         if self.config.enable_prefix_cache and batched_system_kv_enabled():
-            self.hybrid_kv = BatchedSystemKV(model)
+            self.hybrid_kv = BatchedSystemKV(
+                model,
+                tokenizer=tokenizer,
+                # Defer-until-idle for SSD spills: heavy writes wait for the
+                # gaps between generations. Late-bound + getattr-guarded (the
+                # writer thread may probe before __init__ finishes).
+                idle_check=lambda: not getattr(self, "running", None),
+            )
             logger.info(
                 "[batched_system_kv] enabled: slots=%d ram_mb=%d "
                 "ckpt_interval=%d partial_min=%d — replaces memory-aware cache",
@@ -2079,6 +2086,12 @@ class Scheduler:
             else:
                 request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
+                # Fork patch #36: cold-tier probe (index only — the blob
+                # read happens on the executor in _schedule_waiting).
+                candidate = self.hybrid_kv.check_ssd(request.prompt_token_ids)
+                if candidate is not None:
+                    request.cache_hit_type = "ssd_pending"
+                    request._ssd_candidate = candidate
         elif self.block_aware_cache is not None:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
@@ -2294,6 +2307,8 @@ class Scheduler:
         # avoiding engine modifications.
         if self._ssd_tier is not None:
             self._try_promote_ssd_pending()
+        if self.hybrid_kv is not None and self.hybrid_kv.has_ssd:
+            self._try_promote_hybrid_ssd_pending()
 
         scheduled = []
 
@@ -3206,6 +3221,43 @@ class Scheduler:
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
 
+    def _try_promote_hybrid_ssd_pending(self) -> None:
+        """Fork patch #36: promote SSD candidates for waiting ssd_pending
+        requests. Runs on the executor thread from _schedule_waiting — the
+        blob read + array realize happen here, never on the event loop."""
+        for request in self.waiting:
+            if getattr(request, "cache_hit_type", None) != "ssd_pending":
+                continue
+            candidate = getattr(request, "_ssd_candidate", None)
+            request._ssd_candidate = None
+            result = None
+            if candidate is not None:
+                try:
+                    if self.hybrid_kv.promote_ssd(candidate):
+                        result = self.hybrid_kv.fetch(
+                            request.prompt_token_ids,
+                            request_id=request.request_id,
+                        )
+                except Exception:
+                    logger.debug(
+                        "[batched_system_kv] SSD promote failed "
+                        f"request={request.request_id[:12]}",
+                        exc_info=True,
+                    )
+            if result is not None:
+                cache, remaining, pos = result
+                request.cache_hit_type = "system_kv"
+                request.prompt_cache = cache
+                request.cached_tokens = pos
+                request.remaining_tokens = remaining
+                logger.info(
+                    f"[batched_system_kv] SSD promote request="
+                    f"{request.request_id[:12]} restored={pos} "
+                    f"remaining={len(remaining)}"
+                )
+            else:
+                request.cache_hit_type = "miss"
+
     def _capture_hybrid_checkpoints(self, prompt_responses) -> None:
         """Fork patch #34: at each segment boundary, extract the row's cache
         and checkpoint its recurrent-layer state at that absolute position.
@@ -3562,6 +3614,8 @@ class Scheduler:
 
         # Close SSD tier on reset
         self.close_ssd_tier()
+        if self.hybrid_kv is not None:
+            self.hybrid_kv.close()
 
     def deep_reset(self) -> None:
         """
