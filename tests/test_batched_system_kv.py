@@ -361,6 +361,90 @@ def test_stats_shape():
     assert s["memory_mb"] > 0
 
 
+# --------------------------------------------------------------- ssd tier
+
+
+def _make_ssd_cache(monkeypatch, tmp_path):
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    return BatchedSystemKV(
+        _FakeModel(), tokenizer=NS(name_or_path="unit/test-model")
+    )
+
+
+def test_ssd_disabled_without_env(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", raising=False)
+    kv = _make_cache()
+    assert kv.has_ssd is False
+    assert kv.check_ssd(TOKENS) is None
+
+
+def test_ssd_spill_and_promote_across_restart(monkeypatch, tmp_path):
+    """Full chain spills write-through; a fresh instance (restart) promotes
+    it from disk and restores bit-exactly."""
+    kv1 = _make_ssd_cache(monkeypatch, tmp_path)
+    assert kv1.has_ssd
+    kv1.note_scheduled("r1", 0)
+    kv1.capture_segment("r1", 448, _donor_at(448))
+    kv1.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv1.close()  # drain writer — simulates process exit
+
+    kv2 = _make_ssd_cache(monkeypatch, tmp_path)
+    assert kv2.stats()["entry_count"] == 0  # RAM is cold
+    candidate = kv2.check_ssd(TOKENS + [7, 8])
+    assert candidate is not None
+    assert kv2.promote_ssd(candidate) is True
+
+    result = kv2.fetch(TOKENS + [7, 8])
+    assert result is not None
+    cache, remaining, pos = result
+    assert pos == len(TOKENS)
+    assert remaining == [7, 8]
+    assert mx.array_equal(cache[1][0], mx.full((1, 4), float(len(TOKENS))))
+    assert kv2.stats()["ssd_promotes"] == 1
+
+
+def test_ssd_shared_prefix_promote_restores_at_checkpoint(monkeypatch, tmp_path):
+    """A divergent chain promotes via the shared-prefix index path and
+    restores at the checkpoint — partial restore works across restarts."""
+    kv1 = _make_ssd_cache(monkeypatch, tmp_path)
+    kv1.note_scheduled("r1", 0)
+    kv1.capture_segment("r1", 448, _donor_at(448))
+    kv1.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv1.close()
+
+    kv2 = _make_ssd_cache(monkeypatch, tmp_path)
+    divergent = TOKENS[:600] + [1, 2, 3, 4]
+    candidate = kv2.check_ssd(divergent)
+    assert candidate is not None
+    assert kv2.promote_ssd(candidate) is True
+
+    result = kv2.fetch(divergent)
+    assert result is not None
+    assert result[2] == 448
+
+
+def test_ssd_boundary_store_survives_restart(monkeypatch, tmp_path):
+    """An aborted request's prompt-boundary entry persists — abort
+    resilience holds ACROSS restarts, not just within a process."""
+    kv1 = _make_ssd_cache(monkeypatch, tmp_path)
+    prompt = TOKENS[:600]
+    kv1.note_scheduled("r1", 0)
+    kv1.capture_segment("r1", 448, _donor_at(448))
+    kv1.store_prompt_boundary("r1", prompt, _donor_at(600))
+    kv1.discard_pending("r1")  # abort — no final store
+    kv1.close()
+
+    kv2 = _make_ssd_cache(monkeypatch, tmp_path)
+    candidate = kv2.check_ssd(prompt + [55, 56])
+    assert candidate is not None
+    assert kv2.promote_ssd(candidate) is True
+    result = kv2.fetch(prompt + [55, 56])
+    assert result is not None
+    assert result[2] == 600
+
+
 # ------------------------------------------------------------ wiring level
 
 
@@ -546,6 +630,78 @@ def test_cleanup_finished_stores_into_hybrid_kv(monkeypatch):
         "req-1", [1, 2, 3, 4, 5], ["layer0"]
     )
     assert request._extracted_cache is None
+
+
+def test_add_request_marks_ssd_pending_on_miss(monkeypatch):
+    from vllm_mlx.request import Request, SamplingParams
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.hybrid_kv.fetch.return_value = None
+    scheduler.hybrid_kv.check_ssd.return_value = {"tokens": (1,), "file_path": "x"}
+
+    request = Request(
+        request_id="req-1",
+        prompt=list(range(600)),
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    scheduler.add_request(request)
+
+    assert request.cache_hit_type == "ssd_pending"
+    assert request._ssd_candidate == {"tokens": (1,), "file_path": "x"}
+
+
+def test_try_promote_hybrid_ssd_pending_restores_request(monkeypatch):
+    from vllm_mlx.request import Request, SamplingParams
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.hybrid_kv.has_ssd = True
+    scheduler.hybrid_kv.promote_ssd.return_value = True
+    scheduler.hybrid_kv.fetch.return_value = (["cache"], [42], 599)
+
+    request = Request(
+        request_id="req-1",
+        prompt="x",
+        sampling_params=SamplingParams(max_tokens=8),
+        prompt_token_ids=list(range(600)),
+        num_prompt_tokens=600,
+    )
+    request.cache_hit_type = "ssd_pending"
+    request._ssd_candidate = {"tokens": (1,), "file_path": "x"}
+    scheduler.waiting.append(request)
+
+    scheduler._try_promote_hybrid_ssd_pending()
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.prompt_cache == ["cache"]
+    assert request.cached_tokens == 599
+    assert request.remaining_tokens == [42]
+
+
+def test_try_promote_hybrid_ssd_pending_falls_back_to_miss(monkeypatch):
+    from vllm_mlx.request import Request, SamplingParams
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.hybrid_kv.has_ssd = True
+    scheduler.hybrid_kv.promote_ssd.return_value = False
+
+    request = Request(
+        request_id="req-1",
+        prompt="x",
+        sampling_params=SamplingParams(max_tokens=8),
+        prompt_token_ids=list(range(600)),
+        num_prompt_tokens=600,
+    )
+    request.cache_hit_type = "ssd_pending"
+    request._ssd_candidate = {"tokens": (1,), "file_path": "x"}
+    scheduler.waiting.append(request)
+
+    scheduler._try_promote_hybrid_ssd_pending()
+
+    assert request.cache_hit_type == "miss"
+    scheduler.hybrid_kv.fetch.assert_not_called()
 
 
 def test_get_stats_emits_system_kv_cache_block(monkeypatch):
