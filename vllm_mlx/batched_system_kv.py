@@ -198,9 +198,16 @@ class BatchedSystemKV:
         self.ckpt_interval = max(
             256, _env_int("VLLM_MLX_BATCHED_KV_CKPT_INTERVAL", 2048)
         )
-        # Length-aware co-batching guard budget (0 = disabled). See
-        # should_defer_cobatch below.
+        # Admission-gate budgets (0 = disabled). See should_defer_cobatch.
         self.pad_waste_mb = _env_int("VLLM_MLX_BATCHED_PAD_WASTE_MB", 0)
+        # Total padded-KV byte budget: effective concurrency floats on the
+        # request mix instead of a fixed --max-num-seqs (deep contexts
+        # serialize themselves, short ones batch up to the hard cap).
+        self.kv_budget_mb = _env_int("VLLM_MLX_BATCHED_KV_BUDGET_MB", 0)
+        # Ground-truth backstop: defer co-batching while MLX active memory
+        # exceeds this percentage of the device's recommended working set.
+        self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
+        self.admission_deferrals = 0
 
         self.hits = 0
         self.misses = 0
@@ -767,6 +774,7 @@ class BatchedSystemKV:
                 "boundary_stores": self.boundary_stores,
                 "ssd_promotes": self.ssd_promotes,
                 "grown_stores": self.grown_stores,
+                "admission_deferrals": self.admission_deferrals,
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
@@ -956,42 +964,84 @@ def insert_segmented(hybrid_kv: "BatchedSystemKV", batch_generator, request, tok
 
 
 def should_defer_cobatch(scheduler, request) -> bool:
-    """Length-aware co-batching guard (flip-enablement, PATCHES.md #39).
+    """Memory-aware admission gate (#39 pad-waste + #40 dynamic concurrency).
 
-    mlx-lm's BatchKVCache.merge right-justifies every row to the longest
-    chain in the batch, so admitting a request into a batch of very
-    different context lengths allocates padding ≈ sum(L_max − L_i) ×
-    bytes/token — a short request joining an 80K-token chain transiently
-    costs ~5 GB at 27B scale, on a box with a jetsam history. When
-    ``VLLM_MLX_BATCHED_PAD_WASTE_MB`` is set (> 0), defer admission while
-    the estimated waste exceeds the budget: brief FCFS queueing instead of
-    a memory spike. Inert by default and on a cold cache (no bytes/token
-    estimate yet).
+    Three independent, env-gated checks — any one defers admission (FCFS
+    queueing instead of a memory spike). Solo requests are never deferred,
+    so progress is always guaranteed. All inert by default.
+
+    1. **Pad waste** (``VLLM_MLX_BATCHED_PAD_WASTE_MB``): mlx-lm's
+       BatchKVCache.merge right-justifies every row to the longest chain,
+       so mixing very different context lengths allocates padding ≈
+       Σ(L_max − L_i) × bytes/token — a short request joining an 80K-token
+       chain transiently costs ~5 GB at 27B scale.
+    2. **Total padded-KV budget** (``VLLM_MLX_BATCHED_KV_BUDGET_MB``):
+       (B+1) × L_max × bytes/token vs the budget — the dynamic
+       ``max-num-seqs``: seats float on the live request mix (deep
+       contexts serialize themselves, short ones batch up to the hard
+       ``--max-num-seqs`` cap).
+    3. **Memory watermark** (``VLLM_MLX_BATCHED_MEM_WATERMARK_PCT``):
+       ground-truth backstop — defer while ``mx.get_active_memory()``
+       exceeds this percentage of the device's recommended working set
+       (catches pressure the estimates can't see: spill queue, cache
+       entries, other processes' share of unified memory).
+
+    Checks 1–2 use the bytes/token footprint learned from the newest cache
+    entry and are inert on a cold cache (the first request runs solo
+    anyway). Runs on the executor thread from ``_schedule_waiting``.
     """
     hybrid_kv = scheduler.hybrid_kv
-    budget_mb = hybrid_kv.pad_waste_mb
-    if budget_mb <= 0 or not scheduler.running:
+    if not scheduler.running:
         return False
+
+    reason = None
     bpt = hybrid_kv.bytes_per_token()
-    if bpt <= 0:
+    if bpt > 0 and (hybrid_kv.pad_waste_mb > 0 or hybrid_kv.kv_budget_mb > 0):
+        lengths = [
+            r.num_prompt_tokens + len(r.output_token_ids)
+            for r in scheduler.running.values()
+        ]
+        lengths.append(request.num_prompt_tokens)
+        l_max = max(lengths)
+        if hybrid_kv.pad_waste_mb > 0:
+            waste_mb = sum((l_max - li) for li in lengths) * bpt / (1024 * 1024)
+            if waste_mb > hybrid_kv.pad_waste_mb:
+                reason = (
+                    f"padded-KV waste ≈ {waste_mb:.0f} MB > "
+                    f"{hybrid_kv.pad_waste_mb} MB; lengths {sorted(lengths)}"
+                )
+        if reason is None and hybrid_kv.kv_budget_mb > 0:
+            total_mb = len(lengths) * l_max * bpt / (1024 * 1024)
+            if total_mb > hybrid_kv.kv_budget_mb:
+                reason = (
+                    f"padded-KV total ≈ {total_mb:.0f} MB > "
+                    f"{hybrid_kv.kv_budget_mb} MB at {len(lengths)} seats; "
+                    f"lengths {sorted(lengths)}"
+                )
+
+    if reason is None and hybrid_kv.mem_watermark_pct > 0:
+        try:
+            import mlx.core as mx
+
+            active = mx.get_active_memory()
+            ceiling = mx.device_info()["max_recommended_working_set_size"]
+            if ceiling > 0 and active > ceiling * hybrid_kv.mem_watermark_pct / 100:
+                reason = (
+                    f"active memory {active / 1e9:.1f} GB > "
+                    f"{hybrid_kv.mem_watermark_pct}% of "
+                    f"{ceiling / 1e9:.1f} GB working set"
+                )
+        except Exception:
+            pass
+
+    if reason is None:
         return False
-    lengths = [
-        r.num_prompt_tokens + len(r.output_token_ids)
-        for r in scheduler.running.values()
-    ]
-    lengths.append(request.num_prompt_tokens)
-    l_max = max(lengths)
-    waste_mb = sum((l_max - li) for li in lengths) * bpt / (1024 * 1024)
-    if waste_mb <= budget_mb:
-        return False
+    hybrid_kv.admission_deferrals += 1
     if not getattr(request, "_pad_defer_logged", False):
         request._pad_defer_logged = True
         logger.info(
-            "[batched_system_kv] deferring co-batch of request=%s "
-            "(padded-KV waste ≈ %.0f MB > budget %d MB; lengths %s)",
+            "[batched_system_kv] deferring co-batch of request=%s (%s)",
             request.request_id[:12],
-            waste_mb,
-            budget_mb,
-            sorted(lengths),
+            reason,
         )
     return True

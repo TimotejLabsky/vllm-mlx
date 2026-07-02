@@ -208,3 +208,49 @@ def test_stats_carry_type_and_new_counters():
     assert s["type"] == "batched_system_kv"
     for key in ("grown_stores", "boundary_stores", "ssd_promotes"):
         assert key in s
+
+
+# ------------------------------------------------- dynamic concurrency (#40)
+
+
+def test_kv_budget_defers_when_total_over(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_PAD_WASTE_MB", raising=False)
+    monkeypatch.setenv("VLLM_MLX_BATCHED_KV_BUDGET_MB", "1")
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+
+    # two seats at ~500K padded length blows a 1MB budget at test bytes/token
+    scheduler = _guard_scheduler(kv, [500_000])
+    assert bkv.should_defer_cobatch(scheduler, _req("c", 400_000)) is True
+    assert kv.admission_deferrals == 1
+    assert kv.stats()["admission_deferrals"] == 1
+
+    # short contexts fit the same budget -> seats float upward
+    scheduler = _guard_scheduler(kv, [500, 400, 300])
+    assert bkv.should_defer_cobatch(scheduler, _req("c2", 450)) is False
+
+
+def test_kv_budget_inert_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_KV_BUDGET_MB", raising=False)
+    monkeypatch.delenv("VLLM_MLX_BATCHED_PAD_WASTE_MB", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    scheduler = _guard_scheduler(kv, [500_000])
+    assert bkv.should_defer_cobatch(scheduler, _req("c", 400_000)) is False
+
+
+def test_memory_watermark_backstop(monkeypatch):
+    import mlx.core as mx
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", "90")
+    kv = BatchedSystemKV(_FakeModel())  # cold cache: watermark must still work
+    scheduler = _guard_scheduler(kv, [500])
+
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 95)
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": 100}
+    )
+    assert bkv.should_defer_cobatch(scheduler, _req("c", 100)) is True
+
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 50)
+    assert bkv.should_defer_cobatch(scheduler, _req("c2", 100)) is False
