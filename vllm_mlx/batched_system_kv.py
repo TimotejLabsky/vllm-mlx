@@ -198,6 +198,9 @@ class BatchedSystemKV:
         self.ckpt_interval = max(
             256, _env_int("VLLM_MLX_BATCHED_KV_CKPT_INTERVAL", 2048)
         )
+        # Length-aware co-batching guard budget (0 = disabled). See
+        # should_defer_cobatch below.
+        self.pad_waste_mb = _env_int("VLLM_MLX_BATCHED_PAD_WASTE_MB", 0)
 
         self.hits = 0
         self.misses = 0
@@ -733,6 +736,18 @@ class BatchedSystemKV:
         )
         return fresh, remaining, pos
 
+    def bytes_per_token(self) -> float:
+        """Per-token KV footprint learned from the newest resident entry
+        (≈200 KB/token on a 27B-4bit). 0.0 until an entry exists — the
+        co-batching guard stays inert on a cold cache, which is fine: the
+        first request runs solo anyway."""
+        with self._lock:
+            for entry in reversed(self._entries.values()):
+                n = len(entry["tokens"])
+                if n > 0:
+                    return entry["bytes"] / n
+        return 0.0
+
     # ---------------------------------------------------------------- stats
 
     def stats(self) -> dict:
@@ -740,6 +755,7 @@ class BatchedSystemKV:
             total = self.hits + self.misses
             mem = sum(e["bytes"] for e in self._entries.values())
             return {
+                "type": "batched_system_kv",  # bench-serve cache provenance
                 "enabled": True,
                 "hits": self.hits,
                 "misses": self.misses,
@@ -937,3 +953,45 @@ def insert_segmented(hybrid_kv: "BatchedSystemKV", batch_generator, request, tok
         [hybrid_kv.split_segments(tokens)],
         **insert_kwargs,
     )
+
+
+def should_defer_cobatch(scheduler, request) -> bool:
+    """Length-aware co-batching guard (flip-enablement, PATCHES.md #39).
+
+    mlx-lm's BatchKVCache.merge right-justifies every row to the longest
+    chain in the batch, so admitting a request into a batch of very
+    different context lengths allocates padding ≈ sum(L_max − L_i) ×
+    bytes/token — a short request joining an 80K-token chain transiently
+    costs ~5 GB at 27B scale, on a box with a jetsam history. When
+    ``VLLM_MLX_BATCHED_PAD_WASTE_MB`` is set (> 0), defer admission while
+    the estimated waste exceeds the budget: brief FCFS queueing instead of
+    a memory spike. Inert by default and on a cold cache (no bytes/token
+    estimate yet).
+    """
+    hybrid_kv = scheduler.hybrid_kv
+    budget_mb = hybrid_kv.pad_waste_mb
+    if budget_mb <= 0 or not scheduler.running:
+        return False
+    bpt = hybrid_kv.bytes_per_token()
+    if bpt <= 0:
+        return False
+    lengths = [
+        r.num_prompt_tokens + len(r.output_token_ids)
+        for r in scheduler.running.values()
+    ]
+    lengths.append(request.num_prompt_tokens)
+    l_max = max(lengths)
+    waste_mb = sum((l_max - li) for li in lengths) * bpt / (1024 * 1024)
+    if waste_mb <= budget_mb:
+        return False
+    if not getattr(request, "_pad_defer_logged", False):
+        request._pad_defer_logged = True
+        logger.info(
+            "[batched_system_kv] deferring co-batch of request=%s "
+            "(padded-KV waste ≈ %.0f MB > budget %d MB; lengths %s)",
+            request.request_id[:12],
+            waste_mb,
+            budget_mb,
+            sorted(lengths),
+        )
+    return True
