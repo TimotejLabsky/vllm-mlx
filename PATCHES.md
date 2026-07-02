@@ -733,6 +733,34 @@ Fix, in `_schedule_waiting`: build the request's own `make_sampler(temp, top_p, 
 
 ---
 
+## 34. `patch: batched-system-kv` — hybrid-safe checkpoint prefix cache for the batched LLM scheduler
+
+**Files:** `vllm_mlx/batched_system_kv.py` (new), `vllm_mlx/scheduler.py`, `tests/test_batched_system_kv.py` (new)
+
+The **item-B port** from `docs/fork/continuous-batching-hybrid-caching.md`, closing the "batching forfeits our cache" objection. The default batched prefix cache (`MemoryAwarePrefixCache`) gets **zero hits on hybrids** — its supersequence/LCP paths need rewind, recurrent `ArraysCache` state can't rewind, and the `has_non_trimmable` gates correctly skip — so every Qwen3.5/3.6-class request under `--continuous-batching` paid full prefill (measured 2026-05-09: 4 identical 7.7K-token requests → `hits=0 misses=4`).
+
+**Design** — reuses the engine-agnostic checkpoint engine (`system_kv.py`, #19/#21) unchanged:
+
+- *Capture:* `_schedule_waiting` inserts via `insert_segments` with the prompt split at `VLLM_MLX_BATCHED_KV_CKPT_INTERVAL` (default 2048) boundaries; the generator stops exactly there. `step()` watches `end_of_segment` prompt responses and `_capture_hybrid_checkpoints` extracts the row (`BatchGenerator.extract_cache`, same executor thread), keeps only the recurrent-layer states (`capture_checkpoint_states`, eval'd off the batch views), and appends to the request's ladder (`append_checkpoint`, geometric thinning). mlx-lm's own last-token split means every insert also yields a free checkpoint at prompt-boundary−1 — exactly what an identical re-send needs.
+- *Store:* on finish, the full snapshot (state+meta+`classify_layers` kinds) + the ladder become an LRU entry (`VLLM_MLX_SYSTEM_KV_SLOTS`=4, `VLLM_MLX_SYSTEM_KV_RAM_MB` budget, same envs as the SimpleEngine stack). **Identical-token chains replace their older entry with ladders merged** — otherwise an exact re-send (which prefills only the kickoff token) stores a duplicate whose one checkpoint sits above the usable cap and shadows the rich original in the LCP scan (found by the e2e concurrent scenario, not by unit tests).
+- *Fetch (`add_request`):* token LCP over entries → `select_restore_pos` (nearest checkpoint ≤ divergence; attention KV slices to any position; `d == donor_len` fast path for pure extensions) → `build_partial_restore_states` → fresh `make_prompt_cache` + `apply_snapshot_states` → `request.prompt_cache`/`remaining_tokens`, flowing into `BatchGenerator.insert(caches=…)` per the seam. **A hit seeds the new request's ladder with the donor's checkpoints ≤ restore-pos** — the restored request continues the same chain, so its eventual entry stays divergence-restorable.
+- *Off by default*, enabled per-model via `VLLM_MLX_BATCHED_SYSTEM_KV=1`; when active it **replaces** the memory-aware cache on this scheduler (double-storing wastes RAM; the replaced paths were hybrid-dead anyway). Stats surface under the existing `system_kv_cache` key — `/v1/status` + Prometheus pick them up with zero changes (#7/#17 plumbing).
+
+**Verified (2026-07-02, M1 Pro, real `Qwen3.5-0.8B-8bit` — same qwen3_5 hybrid family as the production 27B/35B):**
+- *Gate spike* (recorded under #29): snapshot-restored mid-sequence hybrid caches merge **bit-identically** into concurrent batches in mlx-lm 0.31.3, incl. mid-flight insertion (9/9 rows, T=0).
+- *End-to-end against the real Scheduler+BatchGenerator:* cold MISS→store; identical re-send **HIT at N−1** (599/600 saved); divergent chain (shared 450) **partial HIT** at the 256-token checkpoint; **two restored requests decoding concurrently in one batch** — all outputs byte-identical to a cache-disabled control run.
+- 20 unit/wiring tests (real `KVCache`+`ArraysCache` slice/apply semantics; ladder inheritance; duplicate-chain merge; LRU eviction; floor; pure-attention any-position restore; cross-thread-realized fetch; scheduler init/fetch/insert_segments/capture/store/stats hooks). Full suite green.
+- **Studio A/B finding (2026-07-02, real 27B):** the first live run exposed a cross-thread hazard the single-threaded dev e2e could not see — `fetch()` (event-loop thread) sliced trim-layer KV **lazily**; the first executor-thread step evaluated the slices and hit the MLX stream/thread mismatch (patch #28's crash class), which `engine_core` self-healed by switching to model-thread stepping while the request **silently re-prefilled cold** (32 s "warm" re-send despite a logged restore; divergent restores then worked only because stepping had moved to the model thread). Fix folded in: `fetch()` now `mx.eval`s the restored states on its own thread before handing them over — concrete buffers cross threads safely, and the restored copy detaches from the donor snapshot. Fourth instance of this class in the fork (#21/#28/#29/#34): **any MLX arrays created on one thread and consumed on another must be realized on the creating thread.**
+- **Second live finding (gpt-oss batched smoke, same day):** sliding-window models (gpt-oss, gemma text) carry `RotatingKVCache` — ckpt-class like recurrent layers but with **tuple** states, and `capture_segment`'s realize loop only unpacked **lists** (deltanet `ArraysCache`). Rotating checkpoint states stayed lazy on the executor stream; `fetch`'s cross-thread eval then raised "no Stream(gpu, 2)" — streaming requests died pre-first-token, non-stream 500'd, and only on the long-prompt shape (short prompts stayed under `partial_min`, so fetch never ran). One-line fix (`isinstance(st, (list, tuple))`, matching `store()`); regression test with real `RotatingKVCache` round-trip + cross-thread eval.
+
+**Not in v1 (deliberate):** no SSD tier (the batched `ssd_cache.py` cold tier stays memory-aware-only; our `system_kv_ssd.py` store is SimpleEngine-wired), no grow-on-HIT re-store of unfinished chains (entries only at request end), completion-region checkpoints (ladder covers prefill positions; divergence inside a prior completion restores at the last prompt-side checkpoint). Each is an incremental follow-up if the Studio A/B shows the gap matters.
+
+**Deployment intent:** Studio A/B behind the env on the 27B route with `--continuous-batching --text-only` (#30) before any llama-swap change; SimpleEngine + system-KV remains the default until concurrent traffic is routine ([[speculative-decoding-dead-on-mseries]] measured the ~1.2× aggregate ceiling — this port buys *non-blocking concurrency*, not throughput).
+
+**Upstreaming:** the strongest batched-path candidate — upstream has no hybrid prefix-cache story at all; the module is self-contained and the scheduler hooks are ~60 lines.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
