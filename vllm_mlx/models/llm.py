@@ -102,29 +102,13 @@ class MLXLanguageModel:
                 tokenizer_config=tokenizer_config,
             )
 
-            # Realize every lazy init-time array the model holds, on THIS (load)
-            # thread, before generation ever runs on a serialized worker thread.
-            # MLX lazy graphs are tagged to the stream of the thread that
-            # recorded them; an init-time array created here but first evaluated
-            # on a worker dies with "There is no Stream(gpu, N) in current
-            # thread". gpt-oss hit this: its attention `sinks = mx.zeros(...)`
-            # (mlx_lm/models/gpt_oss.py) stays lazy after load and the first
-            # SimpleEngine serialized-worker forward crashed on it (Qwen has no
-            # such init buffer, so it dodged it). mlx_vlm's build_text_model
-            # already realizes arrays for the VLM->text route (patch #21 +
-            # upstream #614); the plain mlx-lm load path needs the same. Harmless
-            # no-op for models whose arrays are already realized. See PATCHES.md #28.
-            import mlx.core as mx
+            # Realize lazy init-time arrays on THIS (load) thread before
+            # generation runs on a serialized worker thread (gpt-oss's
+            # attention `sinks` crashed there). See vllm_mlx/lazy_realize.py
+            # and PATCHES.md #28.
+            from ..lazy_realize import realize_module_arrays
 
-            if hasattr(self.model, "modules"):
-                mx.eval(
-                    [
-                        v
-                        for module in self.model.modules()
-                        for v in module.values()
-                        if isinstance(v, mx.array)
-                    ]
-                )
+            realize_module_arrays(self.model)
 
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
