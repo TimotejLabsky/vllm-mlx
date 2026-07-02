@@ -1,0 +1,710 @@
+# SPDX-License-Identifier: Apache-2.0
+"""SSD persistence for the SimpleEngine system-KV snapshot (fork patch #16).
+
+The SimpleEngine system-prefix KV cache (patches #4/#6/#9/#12/#13) lives
+entirely in the serving process. Whenever vllm-mlx exits — TTL eviction,
+llama-swap model swap, manual restart, OOM — every snapshot is lost and the
+next request pays a full cold prefill (~25 s on a 4 K-token dense prompt,
+~70 s on a 13 K-token MoE workload). This module persists snapshots to NVMe
+so the next process can promote a stored prefix (~100 ms–1.5 s disk read)
+instead of recomputing it. ~100×–300× speedup vs cold prefill.
+
+Why a dedicated store instead of reusing ``ssd_cache.SSDCacheTier``:
+the existing tier serializes via numpy (``np.array(layer.keys)``), which
+**raises** on MLX ``bfloat16`` arrays (``Item size 2 ... does not match
+dtype B item size 1``). Our snapshots are unquantized (bf16 KV) and hybrid
+(bf16 KV layers interleaved with possibly-f32 recurrent ``ArraysCache``
+state), so a numpy/float32 bridge cannot round-trip them losslessly. MLX
+safetensors (``mx.save_safetensors`` / ``mx.load``) preserves every array's
+dtype exactly with zero bookkeeping, so this store uses it for the snapshot
+data while reusing the tested ``SSDIndex`` (SQLite, prefix-searchable) for
+metadata.
+
+Snapshot shape (matches ``SimpleEngine._system_kv_snapshot``):
+``list[ tuple(keys, values) | list[mx.array] ]`` — a 2-tuple per ``KVCache``
+layer (``c.state``), a list per ``ArraysCache`` layer.
+
+Thread-safety: spills run on a background writer thread (non-blocking for
+the engine). Promotes (``read_entry``) run synchronously on the caller's
+thread — the engine calls them from inside its serialized generation worker,
+which is already off the event loop.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import shutil
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .ssd_cache import SSDIndex, _blob_to_tokens, _tokens_hash
+
+logger = logging.getLogger(__name__)
+
+_BYTES_PER_GB = 1024 * 1024 * 1024
+_SNAPSHOT_FILE = "snapshot.safetensors"
+_META_FILE = "meta.json"
+
+
+@dataclass
+class SystemKVSSDStats:
+    """Counters for the system-KV SSD store. Surfaced via get_stats()."""
+
+    spill_count: int = 0
+    spill_bytes: int = 0
+    spill_drops: int = 0
+    promote_count: int = 0
+    promote_bytes: int = 0
+    promote_latency_sum: float = 0.0
+    promote_misses: int = 0
+    read_failures: int = 0
+    evictions: int = 0
+
+    def to_dict(self) -> dict:
+        avg_ms = (
+            (self.promote_latency_sum / self.promote_count * 1000.0)
+            if self.promote_count
+            else 0.0
+        )
+        return {
+            "spill_count": self.spill_count,
+            "spill_bytes": self.spill_bytes,
+            "spill_drops": self.spill_drops,
+            "promote_count": self.promote_count,
+            "promote_bytes": self.promote_bytes,
+            "avg_promote_latency_ms": round(avg_ms, 2),
+            "promote_misses": self.promote_misses,
+            "read_failures": self.read_failures,
+            "evictions": self.evictions,
+        }
+
+
+@dataclass
+class SystemKVSSDConfig:
+    cache_dir: str
+    max_size_gb: float = 50.0
+    max_entries: int = 64
+    spill_queue_size: int = 16
+    # Cap on the bytes of snapshots queued-but-not-yet-written. The queue
+    # holds references to flattened (still-resident) mx arrays, so a backlog
+    # of multi-GB deep-context snapshots pins unified memory — the residual
+    # vector behind the Metal-abort class the defer-until-idle change
+    # (2026-06-12) otherwise addressed. A new spill that would push the queue
+    # over this cap is dropped (a sub-prefix is usually already on disk, so
+    # the loss costs at most one re-grow). 12 GB ≈ two big snapshots; one
+    # oversized spill is always admitted when the queue is empty so huge
+    # prefixes can still persist.
+    max_queued_gb: float = 12.0
+    dir_permissions: int = 0o700
+    file_permissions: int = 0o600
+    # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
+    # the startup reconcile pass removes them.
+    tmp_stale_seconds: float = 300.0
+
+    @property
+    def max_size_bytes(self) -> int:
+        return int(self.max_size_gb * _BYTES_PER_GB)
+
+    @property
+    def max_queued_bytes(self) -> int:
+        return int(self.max_queued_gb * _BYTES_PER_GB)
+
+
+def _snapshot_nbytes(snapshot: list) -> int:
+    total = 0
+    for st in snapshot:
+        if isinstance(st, tuple):
+            for a in st:
+                total += int(getattr(a, "nbytes", 0))
+        else:
+            for a in st:
+                total += int(getattr(a, "nbytes", 0))
+    return total
+
+
+def flatten_snapshot(snapshot: list) -> tuple[dict, list[dict]]:
+    """Flatten a snapshot into an mx-array dict + per-layer metadata.
+
+    KVCache layers (tuple state) -> ``l{i}_k`` / ``l{i}_v``.
+    ArraysCache layers (list state) -> ``l{i}_s{j}`` for j in range(n).
+    """
+    tensors: dict[str, Any] = {}
+    layer_meta: list[dict] = []
+    for i, st in enumerate(snapshot):
+        if isinstance(st, tuple):
+            if len(st) != 2:
+                raise ValueError(
+                    f"unexpected KV state arity {len(st)} at layer {i}"
+                )
+            tensors[f"l{i}_k"] = st[0]
+            tensors[f"l{i}_v"] = st[1]
+            layer_meta.append({"i": i, "kind": "kv"})
+        elif isinstance(st, list):
+            for j, a in enumerate(st):
+                tensors[f"l{i}_s{j}"] = a
+            layer_meta.append({"i": i, "kind": "arrays", "n": len(st)})
+        else:
+            raise ValueError(
+                f"unexpected snapshot layer type {type(st).__name__} at layer {i}"
+            )
+    return tensors, layer_meta
+
+
+def unflatten_snapshot(tensors: dict, layer_meta: list[dict]) -> list:
+    """Rebuild a snapshot from an mx-array dict + per-layer metadata.
+
+    Inverse of ``flatten_snapshot``. Returns the same shape the engine
+    restores via ``cache[i].state = saved_state`` (tuple for KV, list for
+    ArraysCache). Dtypes are whatever ``mx.load`` returned — i.e. the exact
+    dtypes captured at spill time.
+    """
+    snapshot: list = []
+    for lm in layer_meta:
+        i = lm["i"]
+        if lm["kind"] == "kv":
+            snapshot.append((tensors[f"l{i}_k"], tensors[f"l{i}_v"]))
+        elif lm["kind"] == "arrays":
+            snapshot.append([tensors[f"l{i}_s{j}"] for j in range(lm["n"])])
+        else:
+            raise ValueError(f"unknown layer kind {lm['kind']!r} at layer {i}")
+    return snapshot
+
+
+def flatten_checkpoints(checkpoints: list | None) -> tuple[dict, list[dict]]:
+    """Flatten partial-restore checkpoints (format v2/v3).
+
+    Checkpoint ``n``'s state for layer ``i``, array ``j`` becomes tensor key
+    ``c{n}_l{i}_s{j}``; metadata records position, per-layer array counts,
+    layer state kind (list vs tuple — Rotating sliding-window states are
+    tuples), and the layer's ``meta_state`` (JSON-able tuple of strings) so
+    ``unflatten_checkpoints`` rebuilds the
+    ``{"pos", "states": {i: state}, "metas": {i: meta|None}}`` shape exactly.
+    """
+    tensors: dict[str, Any] = {}
+    ckpt_meta: list[dict] = []
+    for n, cp in enumerate(checkpoints or []):
+        layers = []
+        cp_metas = cp.get("metas") or {}
+        for i, st in sorted(cp["states"].items()):
+            seq = st if isinstance(st, list) else list(st)
+            for j, a in enumerate(seq):
+                tensors[f"c{n}_l{i}_s{j}"] = a
+            m = cp_metas.get(i)
+            layers.append({
+                "i": i,
+                "n": len(seq),
+                "tuple": not isinstance(st, list),
+                "meta": list(m) if m else None,
+            })
+        ckpt_meta.append({"pos": cp["pos"], "layers": layers})
+    return tensors, ckpt_meta
+
+
+def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
+    """Inverse of ``flatten_checkpoints``. Missing meta (format v1 entries)
+    is handled by the caller passing ``[]``. ``meta_state`` values are
+    restored to tuples of strings (the mlx-lm convention).
+    """
+    checkpoints: list = []
+    for n, cm in enumerate(ckpt_meta or []):
+        states = {}
+        metas = {}
+        for lm in cm["layers"]:
+            i = lm["i"]
+            seq = [tensors[f"c{n}_l{i}_s{j}"] for j in range(lm["n"])]
+            states[i] = tuple(seq) if lm.get("tuple") else seq
+            m = lm.get("meta")
+            metas[i] = tuple(m) if m else None
+        checkpoints.append({"pos": cm["pos"], "states": states, "metas": metas})
+    return checkpoints
+
+
+class SystemKVSSDStore:
+    """NVMe-backed persistence for SimpleEngine system-KV snapshots."""
+
+    def __init__(
+        self,
+        config: SystemKVSSDConfig,
+        idle_check=None,
+    ) -> None:
+        self._config = config
+        self._cache_dir = config.cache_dir
+        self._data_dir = os.path.join(self._cache_dir, "data")
+        os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
+        os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+        self._index = SSDIndex(self._cache_dir)
+        self._stats = SystemKVSSDStats()
+        self._lock = threading.Lock()
+        self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
+        # Bytes currently queued-but-not-written (snapshot nbytes), kept under
+        # ``_lock`` — bounds the unified-memory pin held by the backlog.
+        self._queued_bytes = 0
+        self._writer_stop = threading.Event()
+        self._writer_thread: threading.Thread | None = None
+        # Defer-until-idle (2026-06-12): multi-GB spills (an 80K-token 27B
+        # snapshot is ~5 GB) used to serialize + write WHILE the next
+        # generation ran — unified-memory spikes and I/O on the writer
+        # thread degraded decode and contributed to a Metal abort under
+        # tight memory. When ``idle_check`` (a callable returning True when
+        # no generation is in flight) is provided, the writer holds heavy
+        # work until the engine is idle; queued spills drain in the gaps
+        # between turns and on close().
+        self._idle_check = idle_check
+
+    # ---- writer lifecycle -------------------------------------------------
+
+    def start_writer(self) -> None:
+        if self._writer_thread is not None:
+            return
+        self._reconcile()
+        self._writer_stop.clear()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="system-kv-ssd-writer"
+        )
+        self._writer_thread.start()
+        logger.info("[system_kv_ssd] writer thread started (%s)", self._cache_dir)
+
+    def _reconcile(self) -> None:
+        """Startup housekeeping (runs once before the writer thread starts).
+
+        (a) Remove stale ``*.tmp`` dirs — interrupted writes from a SIGKILL
+            (llama-swap's grace is shorter than a multi-GB serialize) left
+            them behind.
+        (b) Reconcile the SQLite index against the on-disk ``data/`` dirs:
+            drop index rows whose dir is gone, delete dirs with no row.
+        (c) Backfill ``memory_bytes`` from the actual snapshot file size for
+            rows that disagree — entries written before the disk-byte cap fix
+            indexed only the snapshot's in-RAM bytes and excluded the
+            checkpoint tensors (~37% undercount observed live: 23.3 GB on
+            disk vs 16.9 GB indexed), so the cap never fired.
+
+        Best-effort: any per-entry failure is logged at debug and skipped so a
+        single bad row never blocks startup.
+        """
+        now = time.time()
+        # (a) stale tmp dirs
+        try:
+            for name in os.listdir(self._data_dir):
+                if not name.endswith(".tmp"):
+                    continue
+                p = os.path.join(self._data_dir, name)
+                try:
+                    stale = now - os.path.getmtime(p) > self._config.tmp_stale_seconds
+                except OSError:
+                    stale = True
+                if stale:
+                    shutil.rmtree(p, ignore_errors=True)
+        except FileNotFoundError:
+            pass
+        # (b)+(c) index <-> disk reconciliation
+        try:
+            indexed = {e["file_path"]: e for e in self._index.all_entries()}
+        except Exception:
+            logger.debug("[system_kv_ssd] reconcile: index read failed", exc_info=True)
+            return
+        on_disk: set[str] = set()
+        try:
+            for name in os.listdir(self._data_dir):
+                if name.endswith(".tmp"):
+                    continue
+                if os.path.isdir(os.path.join(self._data_dir, name)):
+                    on_disk.add(name)
+        except FileNotFoundError:
+            pass
+        # index rows whose data dir vanished -> drop the row
+        for fp, e in indexed.items():
+            if fp in on_disk:
+                continue
+            try:
+                self._index.delete_entry(_blob_to_tokens(e["tokens_blob"]))
+            except Exception:
+                logger.debug("[system_kv_ssd] reconcile: row drop failed", exc_info=True)
+        # data dirs with no index row -> orphan, remove
+        for fp in on_disk - set(indexed):
+            self._delete_entry(fp)
+        # backfill memory_bytes from the real snapshot file size
+        fixed = 0
+        for fp, e in indexed.items():
+            if fp not in on_disk:
+                continue
+            snap_path = os.path.join(self._data_dir, fp, _SNAPSHOT_FILE)
+            try:
+                actual = os.path.getsize(snap_path)
+            except OSError:
+                continue
+            if actual != e.get("memory_bytes"):
+                try:
+                    self._index.update_memory_bytes(
+                        _blob_to_tokens(e["tokens_blob"]), actual
+                    )
+                    fixed += 1
+                except Exception:
+                    logger.debug(
+                        "[system_kv_ssd] reconcile: byte backfill failed",
+                        exc_info=True,
+                    )
+        if fixed:
+            logger.info(
+                "[system_kv_ssd] reconcile: backfilled disk bytes for %d "
+                "entries in %s",
+                fixed,
+                self._cache_dir,
+            )
+        # The accounting may now exceed the cap (previously undercounted) —
+        # evict down to it before serving.
+        self._enforce_capacity()
+
+    def _writer_loop(self) -> None:
+        draining = False  # close() sets the poison pill; drain without waiting
+        while not self._writer_stop.is_set():
+            try:
+                item = self._spill_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:  # poison pill
+                break
+            # Wait for an idle window before the heavy serialization —
+            # unless we're draining at shutdown (idle never comes then).
+            if self._idle_check is not None and not draining:
+                while not self._writer_stop.is_set():
+                    try:
+                        if self._idle_check():
+                            break
+                    except Exception:
+                        break
+                    time.sleep(1.0)
+                    # If close() queued the pill behind this item, switch to
+                    # drain mode so shutdown isn't blocked by a busy engine.
+                    if not self._spill_queue.empty():
+                        try:
+                            if self._spill_queue.queue[-1] is None:  # type: ignore[attr-defined]
+                                draining = True
+                                break
+                        except Exception:
+                            pass
+            (tokens, tensors, layer_meta, ckpt_meta,
+             snap_meta, kinds, nbytes) = item
+            # The snapshot is leaving the queue (about to be written and then
+            # dropped) — release its share of the pinned-byte budget.
+            with self._lock:
+                self._queued_bytes = max(0, self._queued_bytes - nbytes)
+            try:
+                self._write_entry(
+                    tokens, tensors, layer_meta, ckpt_meta,
+                    snap_meta, kinds, nbytes,
+                )
+            except Exception:
+                logger.exception(
+                    "[system_kv_ssd] failed to write entry (%d tokens)", len(tokens)
+                )
+
+    def close(self) -> None:
+        """Drain pending spills, stop the writer, close the index. Idempotent.
+
+        The poison pill is enqueued WITHOUT setting the stop flag first, so the
+        writer drains everything already queued (write-through spills from the
+        session) before exiting on the pill — they aren't lost on shutdown.
+        """
+        if self._writer_thread is not None:
+            try:
+                self._spill_queue.put(None, timeout=2.0)
+            except queue.Full:
+                self._writer_stop.set()
+            # Bounded below llama-swap's ~5 s SIGTERM->SIGKILL grace so the
+            # index close() (committing the SQLite rows of everything written
+            # this session) reliably runs before a kill. The resident working
+            # set is already on disk via idle-window write-through; this drain
+            # is a best-effort tail, not the persistence path, so a tight
+            # deadline trades a little tail-drain for a guaranteed index commit
+            # (interrupted writes are recovered by the next startup reconcile).
+            self._writer_thread.join(timeout=4.0)
+            self._writer_stop.set()
+            self._writer_thread = None
+        try:
+            self._index.close()
+        except Exception:
+            logger.debug("[system_kv_ssd] index close failed", exc_info=True)
+
+    # ---- spill ------------------------------------------------------------
+
+    def enqueue_spill(
+        self,
+        tokens: tuple[int, ...],
+        snapshot: list,
+        checkpoints: list | None = None,
+        meta: list | None = None,
+        kinds: list | None = None,
+    ) -> bool:
+        """Queue a snapshot (+ partial-restore checkpoints + per-layer
+        meta_state/kinds) for async write-through. False if dropped.
+
+        Flattening (cheap, no copy — mx arrays are reference-held) happens on
+        the caller's thread so the snapshot reference can't drift before the
+        writer runs; the actual disk write is on the writer thread.
+        """
+        try:
+            tensors, layer_meta = flatten_snapshot(snapshot)
+            ckpt_tensors, ckpt_meta = flatten_checkpoints(checkpoints)
+            tensors.update(ckpt_tensors)
+        except Exception:
+            logger.exception("[system_kv_ssd] flatten failed; skipping spill")
+            return False
+        # meta_state values are tuples of strings (mlx-lm convention) —
+        # JSON-encode as lists, restored to tuples in read_entry.
+        snap_meta_json = (
+            [list(m) if m else None for m in meta] if meta else None
+        )
+        nbytes = _snapshot_nbytes(snapshot)
+        # Byte-cap the backlog: drop if this spill would push the pinned bytes
+        # over the cap AND something is already queued (an empty queue always
+        # admits one spill, even an oversized one, so huge prefixes persist).
+        with self._lock:
+            over_budget = (
+                self._queued_bytes > 0
+                and self._queued_bytes + nbytes > self._config.max_queued_bytes
+            )
+            if not over_budget:
+                self._queued_bytes += nbytes
+        if over_budget:
+            with self._lock:
+                self._stats.spill_drops += 1
+            logger.warning(
+                "[system_kv_ssd] spill backlog at %.1f GB (cap %.1f GB), "
+                "dropping %d-token spill (%.1f MB)",
+                self._queued_bytes / _BYTES_PER_GB,
+                self._config.max_queued_gb,
+                len(tokens),
+                nbytes / 1e6,
+            )
+            return False
+        try:
+            self._spill_queue.put_nowait(
+                (tokens, tensors, layer_meta, ckpt_meta,
+                 snap_meta_json, kinds, nbytes)
+            )
+            return True
+        except queue.Full:
+            with self._lock:
+                self._queued_bytes = max(0, self._queued_bytes - nbytes)
+                self._stats.spill_drops += 1
+            logger.warning(
+                "[system_kv_ssd] spill queue full, dropping (%d tokens)", len(tokens)
+            )
+            return False
+
+    def _write_entry(
+        self,
+        tokens: tuple[int, ...],
+        tensors: dict,
+        layer_meta: list[dict],
+        ckpt_meta: list[dict],
+        snap_meta: list | None,
+        kinds: list | None,
+        nbytes: int,
+    ) -> None:
+        import mlx.core as mx
+
+        entry_hash = _tokens_hash(tokens)
+        entry_dir = os.path.join(self._data_dir, entry_hash)
+        tmp_dir = entry_dir + ".tmp"
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, mode=self._config.dir_permissions, exist_ok=True)
+
+        snap_path = os.path.join(tmp_dir, _SNAPSHOT_FILE)
+        # mx.save_safetensors requires contiguous, evaluated arrays.
+        mx.eval(list(tensors.values()))
+        mx.save_safetensors(snap_path, tensors)
+        os.chmod(snap_path, self._config.file_permissions)
+
+        meta_path = os.path.join(tmp_dir, _META_FILE)
+        with open(meta_path, "w") as f:
+            json.dump(
+                {
+                    "format": 3,
+                    "layers": layer_meta,
+                    "num_tokens": len(tokens),
+                    "checkpoints": ckpt_meta,
+                    "meta": snap_meta,
+                    "kinds": kinds,
+                },
+                f,
+            )
+        os.chmod(meta_path, self._config.file_permissions)
+
+        disk_bytes = os.path.getsize(snap_path)
+
+        if os.path.exists(entry_dir):
+            shutil.rmtree(entry_dir)
+        os.rename(tmp_dir, entry_dir)
+
+        # Index the ACTUAL on-disk size, not the snapshot's in-RAM nbytes:
+        # the safetensors file also holds the flattened partial-restore
+        # checkpoint tensors, which nbytes excludes — so indexing nbytes
+        # undercounts the footprint and the capacity cap never fires (live:
+        # 23.3 GB on disk vs 16.9 GB indexed on the 27B dir).
+        self._index.insert_entry(
+            tokens_key=tokens,
+            file_path=entry_hash,
+            memory_bytes=disk_bytes,
+            num_tokens=len(tokens),
+        )
+        with self._lock:
+            self._stats.spill_count += 1
+            self._stats.spill_bytes += disk_bytes
+        logger.info(
+            "[system_kv_ssd] spilled %d-token snapshot (%.1f MB on disk)",
+            len(tokens),
+            disk_bytes / 1e6,
+        )
+        self._enforce_capacity()
+
+    def _enforce_capacity(self) -> None:
+        cfg = self._config
+        try:
+            while (
+                self._index.get_total_bytes() > cfg.max_size_bytes
+                or self._index.get_entry_count() > cfg.max_entries
+            ):
+                victims = self._index.get_lru(limit=1)
+                if not victims:
+                    break
+                v = victims[0]
+                self._delete_entry(v["file_path"])
+                self._index.delete_entry(_blob_to_tokens(v["tokens_blob"]))
+                with self._lock:
+                    self._stats.evictions += 1
+        except Exception:
+            logger.debug("[system_kv_ssd] capacity enforcement failed", exc_info=True)
+
+    def _delete_entry(self, file_path: str) -> None:
+        entry_dir = os.path.join(self._data_dir, file_path)
+        if os.path.isdir(entry_dir):
+            shutil.rmtree(entry_dir, ignore_errors=True)
+
+    # ---- promote ----------------------------------------------------------
+
+    def lookup_prefix(self, tokens: tuple[int, ...]) -> dict | None:
+        """Longest stored entry whose tokens are a prefix of ``tokens``."""
+        results = self._index.lookup_prefix(tokens)
+        if results:
+            return results[0]  # sorted num_tokens DESC
+        return None
+
+    def lookup_shared(
+        self, tokens: tuple[int, ...], limit: int = 4
+    ) -> list[dict]:
+        """Stored entries that SHARE a prefix with ``tokens`` without being
+        one (divergent chains — same system prompt, different history).
+
+        Returns candidates with ``common_len`` (token-level divergence
+        point), sorted by common_len descending. The caller combines this
+        with each entry's checkpoint positions (``read_meta``) to pick the
+        best partial-restore source.
+        """
+        return self._index.lookup_shared_prefix(tokens, limit=limit)
+
+    def read_meta(self, file_path: str) -> dict | None:
+        """Read just an entry's meta.json (cheap — no tensor I/O).
+
+        Format v1 entries (pre-checkpoint) come back with an empty
+        ``checkpoints`` list.
+        """
+        meta_path = os.path.join(self._data_dir, file_path, _META_FILE)
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            meta.setdefault("checkpoints", [])
+            return meta
+        except Exception:
+            return None
+
+    def read_entry(self, tokens: tuple[int, ...], file_path: str) -> dict | None:
+        """Load an entry from disk. Returns ``{"snapshot": list,
+        "checkpoints": list, "meta": list | None, "kinds": list | None}``
+        or None on failure.
+
+        Synchronous (safetensors read + dtype-exact mx.load). Quarantines and
+        de-indexes a corrupt entry so it isn't retried. Format v1/v2 entries
+        load with ``checkpoints == []`` / ``meta is None`` / ``kinds is
+        None`` — correct for every model that could have written them
+        (Rotating models could not cache before format v3).
+        """
+        import mlx.core as mx
+
+        entry_dir = os.path.join(self._data_dir, file_path)
+        snap_path = os.path.join(entry_dir, _SNAPSHOT_FILE)
+        meta_path = os.path.join(entry_dir, _META_FILE)
+        t0 = time.time()
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            tensors = mx.load(snap_path)
+            snapshot = unflatten_snapshot(tensors, meta["layers"])
+            checkpoints = unflatten_checkpoints(
+                tensors, meta.get("checkpoints", [])
+            )
+            snap_meta_raw = meta.get("meta")
+            snap_meta = (
+                [tuple(m) if m else None for m in snap_meta_raw]
+                if snap_meta_raw
+                else None
+            )
+            snap_kinds = meta.get("kinds")
+            mx.eval([a for st in snapshot for a in st])
+            mx.eval([
+                a
+                for cp in checkpoints
+                for st in cp["states"].values()
+                for a in st
+            ])
+        except Exception as e:
+            logger.warning("[system_kv_ssd] corrupt entry %s: %s", file_path, e)
+            self._quarantine(tokens, file_path)
+            with self._lock:
+                self._stats.read_failures += 1
+            return None
+        dt = time.time() - t0
+        nbytes = _snapshot_nbytes(snapshot)
+        self._index.touch(tokens)
+        with self._lock:
+            self._stats.promote_count += 1
+            self._stats.promote_bytes += nbytes
+            self._stats.promote_latency_sum += dt
+        logger.info(
+            "[system_kv_ssd] promoted %d-token snapshot "
+            "(%.1f MB, %d checkpoints, %.0f ms)",
+            len(tokens),
+            nbytes / 1e6,
+            len(checkpoints),
+            dt * 1000.0,
+        )
+        return {
+            "snapshot": snapshot,
+            "checkpoints": checkpoints,
+            "meta": snap_meta,
+            "kinds": snap_kinds,
+        }
+
+    def _quarantine(self, tokens: tuple[int, ...], file_path: str) -> None:
+        try:
+            self._index.delete_entry(tokens)
+        except Exception:
+            pass
+        self._delete_entry(file_path)
+
+    # ---- stats ------------------------------------------------------------
+
+    def get_stats(self) -> dict:
+        d = self._stats.to_dict()
+        try:
+            d["entry_count"] = self._index.get_entry_count()
+            d["total_bytes"] = self._index.get_total_bytes()
+        except Exception:
+            pass
+        return d

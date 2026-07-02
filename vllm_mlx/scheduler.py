@@ -22,6 +22,7 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from . import batched_system_kv as _batched_kv
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -1188,8 +1189,19 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_tier: Optional[SSDCacheTier] = None
+        # Hybrid-safe checkpoint prefix cache (batched_system_kv.py).
+        # When enabled it REPLACES the other prefix caches here.
+        self.hybrid_kv = None
 
         if self.config.enable_prefix_cache:
+            # idle_check is late-bound + getattr-guarded (the SSD writer
+            # thread may probe before __init__ finishes).
+            self.hybrid_kv = _batched_kv.maybe_create(
+                model,
+                tokenizer,
+                idle_check=lambda: not getattr(self, "running", None),
+            )
+        if self.config.enable_prefix_cache and self.hybrid_kv is None:
             if self.config.use_paged_cache:
                 # Use paged cache for memory efficiency
                 self.paged_cache_manager = PagedCacheManager(
@@ -1787,7 +1799,9 @@ class Scheduler:
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
         # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        if self.hybrid_kv is not None:
+            _batched_kv.fetch_for_request(self.hybrid_kv, request)
+        elif self.block_aware_cache is not None:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
@@ -1955,6 +1969,9 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
+        if self.hybrid_kv is not None:
+            # Drop the in-flight checkpoint ladder.
+            self.hybrid_kv.discard_pending(request_id)
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -1993,6 +2010,8 @@ class Scheduler:
         # avoiding engine modifications.
         if self._ssd_tier is not None:
             self._try_promote_ssd_pending()
+        if self.hybrid_kv is not None and self.hybrid_kv.has_ssd:
+            self._try_promote_hybrid_ssd_pending()
 
         scheduled = []
 
@@ -2076,11 +2095,16 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+            def _do_insert(toks):
+                if self.hybrid_kv is not None:
+                    return _batched_kv.insert_segmented(
+                        self.hybrid_kv, self.batch_generator, request,
+                        toks, insert_kwargs,
+                    )
+                return self.batch_generator.insert([toks], **insert_kwargs)
+
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    **insert_kwargs,
-                )
+                uids = _do_insert(tokens_to_process)
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -2093,10 +2117,7 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
-                    uids = self.batch_generator.insert(
-                        [tokens_to_process],
-                        **insert_kwargs,
-                    )
+                    uids = _do_insert(tokens_to_process)
                 else:
                     raise
 
@@ -2254,7 +2275,10 @@ class Scheduler:
 
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids:
-                if self.block_aware_cache is not None:
+                if self.hybrid_kv is not None:
+                    _batched_kv.store_finished(self.hybrid_kv, request_id, request)
+
+                elif self.block_aware_cache is not None:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
@@ -2488,6 +2512,12 @@ class Scheduler:
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
 
+    def _try_promote_hybrid_ssd_pending(self) -> None:
+        _batched_kv.promote_ssd_pending(self)
+
+    def _capture_hybrid_checkpoints(self, prompt_responses) -> None:
+        _batched_kv.capture_checkpoints(self, prompt_responses)
+
     def step(self, max_retries: int = 1) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
@@ -2527,9 +2557,13 @@ class Scheduler:
                     # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
                     # older versions returned a flat list.
                     if isinstance(result, tuple):
-                        responses = result[1]  # generation_responses only
+                        prompt_responses, responses = result
                     else:
-                        responses = result
+                        prompt_responses, responses = [], result
+
+                    # Snapshot recurrent state at segment boundaries.
+                    if self.hybrid_kv is not None and prompt_responses:
+                        self._capture_hybrid_checkpoints(prompt_responses)
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
@@ -2721,7 +2755,9 @@ class Scheduler:
             pass
 
         # Include cache stats
-        if self.block_aware_cache is not None:
+        if self.hybrid_kv is not None:
+            stats["system_kv_cache"] = self.hybrid_kv.stats()
+        elif self.block_aware_cache is not None:
             stats["paged_cache"] = self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
@@ -2731,6 +2767,8 @@ class Scheduler:
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics."""
+        if self.hybrid_kv is not None:
+            return self.hybrid_kv.stats()
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
@@ -2781,6 +2819,8 @@ class Scheduler:
 
         # Close SSD tier on reset
         self.close_ssd_tier()
+        if self.hybrid_kv is not None:
+            self.hybrid_kv.close()
 
     def deep_reset(self) -> None:
         """
