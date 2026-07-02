@@ -1669,8 +1669,10 @@ class Scheduler:
             # If we have an existing generator with requests, we need to drain it first
             if self.batch_generator is not None and self.running:
                 logger.warning(
-                    "Sampling parameters changed with active requests. "
-                    "New requests will use new parameters after current batch completes."
+                    "Sampling parameters changed with active requests; "
+                    "keeping the current generator. Requests still sample "
+                    "with their own per-request sampler (patch #33) — only "
+                    "the fallback sampler/stop tokens refresh when idle."
                 )
                 return
 
@@ -2174,6 +2176,7 @@ class Scheduler:
             # any caller-supplied extras (e.g. JSON schema constrained
             # decoding).
             rep_penalty = request.sampling_params.repetition_penalty
+            pres_penalty = request.sampling_params.presence_penalty
             extra_lp = request.sampling_params.logits_processors or []
             combined_lp: list = []
             if rep_penalty and rep_penalty != 1.0:
@@ -2184,6 +2187,14 @@ class Scheduler:
                     f"[rep_penalty] request={request.request_id[:12]} "
                     f"penalty={rep_penalty}"
                 )
+            if pres_penalty:
+                combined_lp.extend(
+                    make_logits_processors(presence_penalty=pres_penalty)
+                )
+                logger.info(
+                    f"[pres_penalty] request={request.request_id[:12]} "
+                    f"penalty={pres_penalty}"
+                )
             if extra_lp:
                 combined_lp.extend(extra_lp)
                 logger.info(
@@ -2191,6 +2202,18 @@ class Scheduler:
                     f"extra_processors={len(extra_lp)}"
                 )
             lp = combined_lp
+
+            # Per-request sampler (fork patch #33): the generator-level
+            # fallback sampler carries only the FIRST request's
+            # (temperature, top_p, min_p) — top_k was dropped entirely and
+            # mid-batch requests inherited a stale sampler. mlx-lm applies
+            # per-sequence samplers row-wise, so each request gets its own.
+            sampler = make_sampler(
+                temp=request.sampling_params.temperature,
+                top_p=request.sampling_params.top_p,
+                min_p=request.sampling_params.min_p,
+                top_k=request.sampling_params.top_k or 0,
+            )
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
@@ -2202,6 +2225,7 @@ class Scheduler:
                 # Always pass logits_processors (even empty list) so that
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
+                "samplers": [sampler],
             }
             try:
                 uids = self.batch_generator.insert(
