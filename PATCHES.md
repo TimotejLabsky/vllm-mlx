@@ -668,6 +668,20 @@ Fix: extract #28's module-walk `mx.eval` into fork-owned `vllm_mlx/lazy_realize.
 
 ---
 
+## 30. `patch: batched-text-only` — thread `--text-only` into BatchedEngine
+
+**Files:** `vllm_mlx/engine/batched.py`, `vllm_mlx/server.py`, `tests/test_batched_engine_mllm_config.py`
+
+BatchedEngine parity series (#29–#33). `force_text_only` previously reached only the SimpleEngine constructor (`server.py`); under `--continuous-batching` the flag was silently ignored and any checkpoint that classifies MLLM (vision weights present — Qwen3.6-27B, gemma-4) routed **all** requests, text included, through `MLLMScheduler`/`MLLMBatchGenerator`. BatchedEngine has no per-request text split and no `build_text_model` route, so that path forfeits the LLM scheduler (worker-thread stepping, the prefix cache the #33 system-KV port targets, per-sequence `caches=` injection).
+
+Fix: `BatchedEngine.__init__` takes `force_text_only` with SimpleEngine's exact precedence — `(force_mllm or is_mllm_model(...)) and not force_text_only` — and `server.py` forwards it in the batched branch. With the flag, the model loads via `load_model_with_fallback` (mlx_lm `strict=False` discards `vision_tower.*`) and text serves on the LLM scheduler.
+
+**Verified:** routing unit test (auto-detect / text-only / text-only-beats-force-mllm / force-mllm). Suite file green.
+
+**Upstreaming:** trivial parity fix, PR-worthy alongside the flag's existing SimpleEngine documentation.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
