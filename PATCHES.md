@@ -698,6 +698,25 @@ Two behavior notes: (a) the scheduler passes no `all_tokens` into `insert()`, so
 
 ---
 
+## 32. `patch: batched-stop-strings` — enforce stop strings under `--continuous-batching`
+
+**Files:** `vllm_mlx/stop_strings.py` (new), `vllm_mlx/engine/batched.py`, `tests/test_batched_stop_strings.py` (new)
+
+BatchedEngine parity series (#29–#33). The batched schedulers only honor stop **token ids** (`sampling_params.stop_token_ids` → `BatchGenerator` stop machinery); `sampling_params.stop` — where the server puts API stop params AND tool-parser stop strings (`server.py` merges both into `chat_kwargs["stop"]`) — was **never read** on either batched path. Under `--continuous-batching`, stop strings silently ran through to `max_tokens`.
+
+Fix: fork-owned `vllm_mlx/stop_strings.py` with two helpers, wired at the engine layer in `batched.py` (all four paths: LLM/MLLM × generate/stream):
+
+- `StopStringScanner` (streaming): bounded-tail scan — patch #17's discipline, O(len(new_text)) per chunk, `max(len(stop))-1` chars carried across chunk boundaries. On a hit the final chunk is **cut at the earliest match start** and the underlying request is aborted via `abort_request` (frees the batch slot instead of decoding to `max_tokens`). This is deliberately *stricter* than SimpleEngine, which finishes at chunk granularity and can leak stop text into the last chunk — the cut matches OpenAI semantics (stop sequence not returned).
+- `truncate_at_stop` (non-stream): earliest-match truncation of the complete text. Runs **before** `clean_output_text` — stop strings are frequently special tokens (`<|im_end|>`) that cleaning strips, which would blind the scan (caught by the test suite during development).
+
+Residual gap (documented, not a regression): text preceding a stop match that was already emitted in an *earlier* chunk cannot be unsent; stop markers are normally single tokens so the window is one chunk.
+
+**Verified:** 9 new tests — scanner unit level (within-chunk / spanning-chunks / single-char / inactive), earliest-of-multiple truncation, and wiring level (stream cut + abort called + post-stop chunk suppressed; passthrough when no stop; non-stream truncation; both LLM and MLLM branches). Batched suites green.
+
+**Upstreaming:** strong candidate — upstream's batched path has the same hole; the helper module is dependency-free.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
