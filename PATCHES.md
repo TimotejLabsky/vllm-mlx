@@ -791,6 +791,22 @@ Patch #34's cache was RAM-only: every llama-swap TTL eviction, model swap, or re
 
 ---
 
+## 37. `patch: batched-kv-grow-on-hit` — segmented snapshots kill the per-turn O(context) store copy
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `tests/test_batched_system_kv.py`, `tests/test_batched_system_kv_threading.py`
+
+The last economic gap vs SimpleEngine: its grow-on-HIT re-snapshot is reference-rebinding (~free), while #34 stored a **full materialized copy of the whole chain at every request end** — multi-GB per turn at deep context (an 80K-token 27B chain ≈ 5 GB of memcpy + transient double-residency per turn, plus the same again for the boundary store and the SSD re-serialize).
+
+**Design — segment lists.** Trim-layer (plain KV) entry state becomes a list of `(keys, values)` segments; ckpt-class layers (recurrent/rotating — fixed-size) copy whole as before. `fetch` records the donor entry per request (`_restore_source`); `store`/`store_prompt_boundary` then build the new entry as **donor segments by reference + one O(delta) evaluated slice** of the finished row (`_build_snapshot`). The boundary→final sequence cascades the linkage (the boundary entry absorbs the donor and becomes the final store's donor), so the original cold arrays flow through a whole session untouched — #35's prefix subsumption becomes literal segment reuse. Restore assembles `[:pos]` with whole-segment references + one lazy concat (`_slice_segments`), evaluated on the fetch thread as before — same single materialization the unsegmented slice paid, and the pure-extension single-segment case now passes donor arrays through zero-copy. Segment lists consolidate to one array past 16 pieces (one O(chain) concat per ~16 turns, amortized). **Grown entries skip the SSD re-spill** — SimpleEngine's policy (#16): a restart promotes the stored prefix and re-grows cheaply.
+
+Bounds honesty: a *divergent* grow from a single-segment (cold) donor slices that segment at the divergence — an O(common-prefix) copy once; thereafter the chain is segmented and subsequent grows are O(delta). Budget accounting counts shared segments in full for every holder (conservative overcount → earlier eviction, the safe direction). Token-identical prefixes guarantee state validity for reuse (KV at position i is a function of the token prefix only), which also keeps the grow correct when a restored insert had to retry cacheless.
+
+**Verified:** 4 new unit tests (donor arrays shared **by identity** + O(delta) tail segment; divergent grow reuses exactly the common prefix with restore values equal to a straight-stored control across the segment seam; boundary→final cascade preserves the original array through two grows; grown entries don't re-spill) + a threaded lifecycle test (grow on the executor, seam restore consumed cross-thread). Real-model e2e (0.8B) byte-identical through re-send/divergent/concurrent grow paths. Full suite 2362 passed / 0 failed. New `grown_stores` stats counter.
+
+**Upstreaming:** rides with the #34–#36 series.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
