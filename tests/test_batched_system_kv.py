@@ -204,6 +204,54 @@ def test_duplicate_chain_store_replaces_and_merges_ladders():
     assert [cp["pos"] for cp in entry["checkpoints"]] == [256, 512]
 
 
+def test_prompt_boundary_store_keeps_pending_and_final_store_absorbs():
+    """The boundary store copies the ladder (generation still owns it) and
+    the finished chain absorbs the boundary entry via prefix subsumption —
+    one entry at the end, carrying the merged ladder."""
+    kv = _make_cache()
+    prompt = TOKENS[:600]
+    kv.note_scheduled("r1", 0)
+    kv.capture_segment("r1", 448, _donor_at(448))
+
+    assert kv.store_prompt_boundary("r1", prompt, _donor_at(600)) is True
+    assert kv.stats()["entry_count"] == 1
+    assert [cp["pos"] for cp in kv._pending["r1"]] == [448]  # not popped
+
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.stats()["entry_count"] == 1  # boundary entry absorbed
+    entry = next(iter(kv._entries.values()))
+    assert entry["tokens"] == TOKENS
+    assert 448 in [cp["pos"] for cp in entry["checkpoints"]]
+    assert "r1" not in kv._pending
+
+
+def test_prompt_boundary_entry_serves_aborted_chain():
+    """An aborted request (no final store) still leaves its prompt prefill
+    behind — the point of the feature."""
+    kv = _make_cache()
+    prompt = TOKENS[:600]
+    kv.note_scheduled("r1", 0)
+    kv.capture_segment("r1", 448, _donor_at(448))
+    kv.store_prompt_boundary("r1", prompt, _donor_at(600))
+    kv.discard_pending("r1")  # abort path
+
+    result = kv.fetch(prompt + [55, 56, 57, 58])
+    assert result is not None
+    _, remaining, pos = result
+    assert pos == 600
+    assert remaining == [55, 56, 57, 58]
+    assert kv.stats()["boundary_stores"] == 1
+
+
+def test_prompt_boundary_store_skipped_below_min_new_content():
+    """A near-full restore adds nothing worth an entry — the donor already
+    covers the chain."""
+    kv = _make_cache()
+    kv.note_scheduled("r1", 590)
+    assert kv.store_prompt_boundary("r1", TOKENS[:600], _donor_at(600)) is False
+    assert kv.stats()["entry_count"] == 0
+
+
 def test_discard_pending_on_abort():
     kv = _make_cache()
     kv.note_scheduled("r1", 0)
@@ -409,6 +457,67 @@ def test_capture_hybrid_checkpoints_extracts_at_segment_end(monkeypatch):
     scheduler.hybrid_kv.capture_segment.assert_called_once_with(
         "req-1", 256, cache_list
     )
+    scheduler.hybrid_kv.store_prompt_boundary.assert_not_called()
+
+
+def test_capture_hybrid_checkpoints_boundary_store_at_end_of_prompt(monkeypatch):
+    """The end_of_prompt response also persists the prompt-boundary entry
+    (patch #35 abort resilience)."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.request import Request, SamplingParams
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.uid_to_request_id[11] = "req-1"
+    request = Request(
+        request_id="req-1",
+        prompt="x",
+        sampling_params=SamplingParams(max_tokens=8),
+        prompt_token_ids=list(range(600)),
+        num_prompt_tokens=600,
+    )
+    scheduler.requests["req-1"] = request
+    cache_list = ["layer0"]
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.extract_cache.return_value = {
+        11: (cache_list, [1, 2, 3])
+    }
+
+    scheduler._capture_hybrid_checkpoints(
+        [SimpleNamespace(uid=11, end_of_segment=True, end_of_prompt=True,
+                         progress=(600, 600))]
+    )
+
+    scheduler.hybrid_kv.capture_segment.assert_called_once_with(
+        "req-1", 600, cache_list
+    )
+    scheduler.hybrid_kv.store_prompt_boundary.assert_called_once_with(
+        "req-1", request.prompt_token_ids, cache_list
+    )
+
+
+def test_boundary_store_skipped_under_concurrent_load(monkeypatch):
+    """Under a concurrent burst the boundary snapshot's cost lands inside
+    the busy step loop (bench-measured TTFT inflation at conc=4) — solo
+    requests only; concurrent chains still store at finish."""
+    from types import SimpleNamespace
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.uid_to_request_id[11] = "req-1"
+    scheduler.running["req-1"] = object()
+    scheduler.running["req-2"] = object()
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.extract_cache.return_value = {11: (["l0"], [1])}
+
+    scheduler._capture_hybrid_checkpoints(
+        [SimpleNamespace(uid=11, end_of_segment=True, end_of_prompt=True,
+                         progress=(600, 600))]
+    )
+
+    scheduler.hybrid_kv.capture_segment.assert_called_once()
+    scheduler.hybrid_kv.store_prompt_boundary.assert_not_called()
 
 
 def test_cleanup_finished_stores_into_hybrid_kv(monkeypatch):

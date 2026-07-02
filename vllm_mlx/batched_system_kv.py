@@ -102,6 +102,7 @@ class BatchedSystemKV:
         self.tokens_saved = 0
         self.partial_tokens_saved = 0
         self.evictions = 0
+        self.boundary_stores = 0
 
     # ------------------------------------------------------------- schedule
 
@@ -176,17 +177,12 @@ class BatchedSystemKV:
 
     # ---------------------------------------------------------------- store
 
-    def store(self, request_id: str, tokens: list, cache_list) -> bool:
-        """Store the finished request's full snapshot + its checkpoint ladder."""
+    def _snapshot_cache_list(self, cache_list):
+        """(kinds, snapshot, metas) with per-layer eval on the CALLING thread
+        (the executor) — patch-#6 aliasing discipline + the realize contract."""
         import mlx.core as mx
 
-        try:
-            kinds = classify_layers(cache_list)
-        except Exception:
-            logger.debug("[batched_system_kv] store classify failed", exc_info=True)
-            self.discard_pending(request_id)
-            return False
-
+        kinds = classify_layers(cache_list)
         snapshot = []
         for c in cache_list:
             st = c.state
@@ -195,46 +191,100 @@ class BatchedSystemKV:
             # discipline: avoid one deferred lazy-eval spike later).
             items = st if isinstance(st, (list, tuple)) else [st]
             mx.eval([a for a in items if a is not None and hasattr(a, "ndim")])
-        metas = capture_snapshot_meta(cache_list)
+        return kinds, snapshot, capture_snapshot_meta(cache_list)
+
+    def _insert_entry_locked(self, tokens_list, kinds, snapshot, metas, checkpoints):
+        """Insert an entry, absorbing every existing entry whose tokens are a
+        (proper or equal) PREFIX of the new chain: their ladders merge in
+        (same token chain => their checkpoint states are valid here) and the
+        subsumed entries drop. Covers both the identical-re-send shadowing
+        case (found by the e2e concurrent scenario) and prompt-boundary
+        entries being replaced by their finished chain."""
+        absorbed = [
+            k
+            for k, e in self._entries.items()
+            if len(e["tokens"]) <= len(tokens_list)
+            and tokens_list[: len(e["tokens"])] == e["tokens"]
+        ]
+        if absorbed:
+            merged = {}
+            for k in absorbed:
+                for cp in self._entries.pop(k)["checkpoints"]:
+                    merged[cp["pos"]] = cp
+            for cp in checkpoints:
+                merged[cp["pos"]] = cp
+            checkpoints = [merged[p] for p in sorted(merged)]
+            while len(checkpoints) > max(1, self.ckpt_capacity):
+                tail = checkpoints[-1]
+                checkpoints = checkpoints[:-1][::2] + [tail]
+        entry = {
+            "tokens": tokens_list,
+            "snapshot": snapshot,
+            "metas": metas,
+            "kinds": kinds,
+            "checkpoints": checkpoints,
+            "bytes": entry_bytes(snapshot) + ckpt_bytes(checkpoints),
+        }
+        self._entry_seq += 1
+        self._entries[self._entry_seq] = entry
+        self._enforce_budgets_locked()
+        return entry
+
+    def store(self, request_id: str, tokens: list, cache_list) -> bool:
+        """Store the finished request's full snapshot + its checkpoint ladder."""
+        try:
+            kinds, snapshot, metas = self._snapshot_cache_list(cache_list)
+        except Exception:
+            logger.debug("[batched_system_kv] store classify failed", exc_info=True)
+            self.discard_pending(request_id)
+            return False
 
         tokens_list = list(tokens)
         with self._lock:
             checkpoints = self._pending.pop(request_id, [])
             self._base_pos.pop(request_id, None)
-            # A re-run of an identical chain REPLACES the older entry,
-            # merging ladders — otherwise a duplicate with a poorer ladder
-            # (e.g. an exact re-send that only prefilled the kickoff token)
-            # shadows the checkpoint-rich original in the LCP scan and
-            # burns a slot (found by the e2e concurrent scenario).
-            dup_key = next(
-                (
-                    k
-                    for k, e in self._entries.items()
-                    if e["tokens"] == tokens_list
-                ),
-                None,
+            self._insert_entry_locked(
+                tokens_list, kinds, snapshot, metas, checkpoints
             )
-            if dup_key is not None:
-                old = self._entries.pop(dup_key)
-                merged = {cp["pos"]: cp for cp in old["checkpoints"]}
-                for cp in checkpoints:
-                    merged[cp["pos"]] = cp
-                checkpoints = [merged[p] for p in sorted(merged)]
-                while len(checkpoints) > max(1, self.ckpt_capacity):
-                    tail = checkpoints[-1]
-                    checkpoints = checkpoints[:-1][::2] + [tail]
-            nbytes = entry_bytes(snapshot) + ckpt_bytes(checkpoints)
-            entry = {
-                "tokens": tokens_list,
-                "snapshot": snapshot,
-                "metas": metas,
-                "kinds": kinds,
-                "checkpoints": checkpoints,
-                "bytes": nbytes,
-            }
-            self._entry_seq += 1
-            self._entries[self._entry_seq] = entry
-            self._enforce_budgets_locked()
+        return True
+
+    def store_prompt_boundary(self, request_id: str, tokens: list, cache_list) -> bool:
+        """Store an entry at the END-OF-PROMPT boundary, mid-request.
+
+        Called from the scheduler's end_of_prompt capture (executor thread)
+        so that an aborted/cancelled request — routine for agent clients —
+        still leaves its prompt prefill behind as a warm entry. The pending
+        ladder is COPIED, not popped: generation continues and the final
+        ``store`` still owns it (the finished chain then absorbs this entry
+        via prefix subsumption).
+
+        Skipped when the request added less than ``partial_min`` new tokens
+        beyond its restored prefix — the donor entry already covers the
+        chain, and a near-duplicate would only burn RAM.
+        """
+        tokens_list = list(tokens)
+        with self._lock:
+            new_content = len(tokens_list) - self._base_pos.get(request_id, 0)
+        if new_content < self.partial_min:
+            return False
+        try:
+            kinds, snapshot, metas = self._snapshot_cache_list(cache_list)
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] boundary snapshot failed", exc_info=True
+            )
+            return False
+        with self._lock:
+            checkpoints = list(self._pending.get(request_id, []))
+            self._insert_entry_locked(
+                tokens_list, kinds, snapshot, metas, checkpoints
+            )
+            self.boundary_stores += 1
+        logger.info(
+            "[batched_system_kv] prompt-boundary store request=%s tokens=%d",
+            request_id[:12],
+            len(tokens_list),
+        )
         return True
 
     def _enforce_budgets_locked(self) -> None:
@@ -376,6 +426,7 @@ class BatchedSystemKV:
                 "tokens_saved": self.tokens_saved,
                 "partial_tokens_saved": self.partial_tokens_saved,
                 "evictions": self.evictions,
+                "boundary_stores": self.boundary_stores,
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
