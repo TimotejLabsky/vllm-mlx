@@ -1349,6 +1349,29 @@ class BatchedEngine(BaseEngine):
             return self._engine.clear_runtime_caches()
         return None
 
+    def raise_if_serialized_busy(self, request_id: str = "stream") -> None:
+        """Pre-stream admission probe (flip-enablement): the server's
+        _probe_engine_busy calls this via getattr before SSE headers go
+        out, so a queue-capped batched engine can 503 streaming requests
+        cleanly (same seam SimpleEngine's fail_fast admission uses).
+        SIGNATURE CONTRACT: the server passes the request id positionally
+        (SimpleEngine's signature) — missing that parameter 500'd every
+        streaming request in production while non-stream worked (canary
+        day-one incident). No-op when the cap is unset or the LLM
+        scheduler is absent."""
+        engine = self._engine
+        scheduler = getattr(engine, "scheduler", None) if engine else None
+        if scheduler is None:
+            return
+        cap = getattr(scheduler, "queue_cap", 0)
+        if cap > 0 and len(scheduler.waiting) >= cap:
+            from .base import EngineBusy
+
+            scheduler.queue_rejections += 1
+            raise EngineBusy(
+                f"batched queue at capacity ({len(scheduler.waiting)}/{cap} waiting)"
+            )
+
     async def abort_request(self, request_id: str) -> bool:
         """Abort an active or queued batched request by request ID."""
         if self._mllm_scheduler is not None:

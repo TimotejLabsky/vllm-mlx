@@ -12,6 +12,7 @@ The scheduler follows vLLM's design with:
 """
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1399,6 +1400,18 @@ class Scheduler:
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
 
+        # Overload shedding (flip-enablement): cap the waiting queue and
+        # raise EngineBusy past it — the server already translates that to
+        # a retryable 503 on every path. 0 (default) = unbounded, the
+        # upstream behavior.
+        try:
+            self.queue_cap = int(
+                os.environ.get("VLLM_MLX_BATCHED_MAX_QUEUE", "0") or 0
+            )
+        except ValueError:
+            self.queue_cap = 0
+        self.queue_rejections = 0
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -1897,6 +1910,15 @@ class Scheduler:
         if request.request_id in self.requests:
             raise ValueError(f"Request {request.request_id} already exists")
 
+        if self.queue_cap > 0 and len(self.waiting) >= self.queue_cap:
+            from .engine.base import EngineBusy
+
+            self.queue_rejections += 1
+            raise EngineBusy(
+                f"batched queue at capacity ({len(self.waiting)}/"
+                f"{self.queue_cap} waiting)"
+            )
+
         # Tokenize if needed
         if request.prompt_token_ids is None:
             if isinstance(request.prompt, str):
@@ -2138,6 +2160,17 @@ class Scheduler:
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
+
+            # Length-aware co-batching guard (fork flip-enablement): defer
+            # rather than pay the padded-KV spike of mixing very different
+            # context lengths. FCFS order preserved (appendleft + break).
+            if (
+                self.hybrid_kv is not None
+                and self.running
+                and _batched_kv.should_defer_cobatch(self, request)
+            ):
+                self.waiting.appendleft(request)
+                break
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -3244,6 +3277,9 @@ class Scheduler:
                 stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
         except Exception:
             pass
+
+        stats["queue_cap"] = self.queue_cap
+        stats["queue_rejections"] = self.queue_rejections
 
         # Include cache stats
         if self.hybrid_kv is not None:

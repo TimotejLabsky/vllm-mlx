@@ -3738,6 +3738,10 @@ async def status():
     return {
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
+        # bench-serve provenance: auto_detect_runtime reads this top-level
+        # field; both engines emit engine_type in get_stats but the status
+        # payload previously dropped it.
+        "engine_type": stats.get("engine_type", ""),
         "residency": lifecycle,
         "embedding": _embedding_status(),
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
