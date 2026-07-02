@@ -1371,25 +1371,12 @@ class MLXMultimodalLM:
             self.config = load_config(self.model_name)
 
             # Realize lazy init-time arrays on THIS (load) thread — defensive
-            # parity with the plain-LLM path (patch #28) and build_text_model
-            # (#614/#21). SimpleEngine runs MLLM generation on a serialized
-            # worker thread (asyncio.to_thread); an init-time array left lazy
-            # after load (cf. gpt-oss's attention `sinks`) would crash there with
-            # "There is no Stream(gpu, N) in current thread" on its first
-            # off-load-thread eval. Current VLMs don't trip this, but the guard
-            # keeps the VLM path symmetric with the LLM path. Harmless no-op when
-            # the arrays are already realized. See PATCHES.md #28.
-            import mlx.core as mx
+            # parity with the plain-LLM path; SimpleEngine runs MLLM generation
+            # on a serialized worker thread. See vllm_mlx/lazy_realize.py and
+            # PATCHES.md #28.
+            from ..lazy_realize import realize_module_arrays
 
-            if hasattr(self.model, "modules"):
-                mx.eval(
-                    [
-                        v
-                        for module in self.model.modules()
-                        for v in module.values()
-                        if isinstance(v, mx.array)
-                    ]
-                )
+            realize_module_arrays(self.model)
 
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
