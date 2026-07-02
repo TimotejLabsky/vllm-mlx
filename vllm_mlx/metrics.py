@@ -280,6 +280,11 @@ class MetricsCollector:
                 "Entries promoted from the SSD cold tier since startup.",
                 registry=registry,
             ),
+            "cache_admission_deferrals": Gauge(
+                "vllm_mlx_cache_admission_deferrals",
+                "Co-batch admissions deferred by the memory-aware gate.",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -510,6 +515,9 @@ class MetricsCollector:
             )
             self._prom["cache_ssd_promotes"].set(
                 _coerce_float(cache_stats.get("ssd_promotes", 0))
+            )
+            self._prom["cache_admission_deferrals"].set(
+                _coerce_float(cache_stats.get("admission_deferrals", 0))
             )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024
