@@ -838,6 +838,26 @@ The three safety rails identified for flipping a production route to `--continuo
 
 ---
 
+## 40. `patch: batched-dynamic-concurrency` — seats float on a KV-byte budget, not a fixed count
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `vllm_mlx/metrics.py`, `tests/test_batched_flip_enablement.py`
+
+`--max-num-seqs` is a crude proxy for the real constraint: three deep-context sequences are ~15 GB of padded KV while eight short ones are ~2 GB. This extends #39's admission gate into three independent, env-gated checks (any one defers; solo requests are never deferred, so progress is guaranteed; all inert by default):
+
+1. **Pad waste** (#39, unchanged): Σ(L_max−L_i) × bytes/token vs `VLLM_MLX_BATCHED_PAD_WASTE_MB` — the mixing penalty.
+2. **Total padded-KV budget** (`VLLM_MLX_BATCHED_KV_BUDGET_MB`): (B+1) × L_max × bytes/token vs the budget — **the dynamic max-num-seqs**. Effective concurrency floats on the live request mix: deep contexts serialize themselves, short ones batch up to the hard `--max-num-seqs` cap (which becomes a generous upper bound, e.g. 8, instead of the safety limit).
+3. **Memory watermark** (`VLLM_MLX_BATCHED_MEM_WATERMARK_PCT`): ground-truth backstop — defer while `mx.get_active_memory()` exceeds the percentage of the device's recommended working set. Works on a cold cache (no bytes/token needed) and catches pressure the estimates can't see (spill queue backlog, cache entries, other processes' unified-memory share).
+
+Checks 1–2 use the bytes/token footprint learned from the newest cache entry (≈200 KB/token on the 27B-4bit). New `admission_deferrals` counter + `vllm_mlx_cache_admission_deferrals` gauge for the soak.
+
+**Verified:** 6 new tests (budget defers over-total / floats seats upward on short contexts / inert by default; watermark defers above and admits below, cold-cache capable; counter + stats). Full suite 2375 passed / 0 failed. Live validation in the deploy revalidation (budget sized to force 2-seat serialization of 4 concurrent 5.4K requests, then floating back up).
+
+**Canary flip config (updated):** `--continuous-batching --text-only --max-num-seqs 8` + `VLLM_MLX_BATCHED_SYSTEM_KV=1`, `VLLM_MLX_SYSTEM_KV_RAM_MB=6144`, `VLLM_MLX_BATCHED_KV_BUDGET_MB=8192`, `VLLM_MLX_BATCHED_PAD_WASTE_MB=4096`, `VLLM_MLX_BATCHED_MEM_WATERMARK_PCT=85`, `VLLM_MLX_BATCHED_MAX_QUEUE=8`, SSD envs as deployed.
+
+**Upstreaming:** rides with the #34-series branch; the watermark check is the most upstream-general piece.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
