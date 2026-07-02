@@ -652,6 +652,22 @@ This is the same class of bug as the gemma-4 RoPE crash — fixed for the VLM→
 
 ---
 
+## 29. `patch: batched-lazy-realize` — realize lazy init-time arrays on the batched LLM load path
+
+**Files:** `vllm_mlx/lazy_realize.py` (new), `vllm_mlx/engine/batched.py`, `vllm_mlx/models/llm.py`, `vllm_mlx/models/mllm.py`, `tests/test_lazy_realize.py` (new)
+
+First of the **BatchedEngine parity series (#29–#33)** toward parallel-request serving. The gate that unblocked the series: a 2026-07-02 spike on `Qwen3.5-0.8B-8bit` (same qwen3_5 hybrid family as the production 27B/35B) proved mlx-lm 0.31.3's `BatchGenerator` merges a **snapshot-restored mid-sequence hybrid cache** (attention KV at offset p>0 + recurrent `ArraysCache` state, round-tripped through `classify_layers`/`apply_snapshot_states`) **bit-identically** into a concurrent batch — including insertion mid-flight into an already-decoding batch (9/9 rows identical to single-stream references, T=0). That closes the `continuous-batching-hybrid-caching.md` doc's last open item (D, concurrent recurrent-merge validation).
+
+**This patch:** BatchedEngine's LLM path loads via `load_model_with_fallback` on the event-loop thread (the issue-#407 inline load) but steps the model on the engine-core executor thread. Patch #28's realize only covered `MLXLanguageModel`/`MLXMultimodalLM`, both bypassed here — so a gpt-oss-style lazy init-time array (attention `sinks`) makes the **first batched step** die with "There is no Stream(gpu, N) in current thread", and the engine limps through `engine_core`'s stream-error self-heal (`_is_stream_thread_error` → model-thread stepping + cache recovery) instead of starting clean.
+
+Fix: extract #28's module-walk `mx.eval` into fork-owned `vllm_mlx/lazy_realize.py::realize_module_arrays` and call it in `_prepare_llm_model` immediately after load (before `apply_compile`). `models/llm.py` / `models/mllm.py` now delegate to the helper — pure code motion there, and it shrinks our diff in those upstream-owned files (same containment rationale as #18).
+
+**Verified:** 3 new tests (cross-thread evaluability of a private lazy buffer after the direct call; no-`modules()` no-op; `_prepare_llm_model` wiring end-to-end with a monkeypatched loader). Engine suites green.
+
+**Upstreaming:** pairs with #28's candidate — the batched LLM load path is upstream's own gap; the self-heal in `engine_core` masks rather than prevents it.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
