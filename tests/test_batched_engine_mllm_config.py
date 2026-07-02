@@ -331,3 +331,24 @@ def test_start_mllm_forwards_ssd_cache_fields(monkeypatch):
     )
     assert captured["config_kwargs"]["ssd_cache_dir"] == "/tmp/ssd-kv"
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 42.0
+
+
+def test_force_text_only_routes_to_llm_scheduler(monkeypatch):
+    """force_text_only must override MLLM classification (and force_mllm),
+    matching SimpleEngine's precedence — otherwise a vision-weight hybrid
+    (Qwen3.6-27B) routes ALL requests through MLLMScheduler and the LLM
+    scheduler's caching/batching never applies. PATCHES.md #30."""
+    import vllm_mlx.engine.batched as batched_mod
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    monkeypatch.setattr(batched_mod, "is_mllm_model", lambda name: True)
+
+    assert BatchedEngine(model_name="fake-vlm")._is_mllm is True
+    assert BatchedEngine(model_name="fake-vlm", force_text_only=True)._is_mllm is False
+    assert (
+        BatchedEngine(
+            model_name="fake-vlm", force_mllm=True, force_text_only=True
+        )._is_mllm
+        is False
+    )
+    assert BatchedEngine(model_name="fake-vlm", force_mllm=True)._is_mllm is True

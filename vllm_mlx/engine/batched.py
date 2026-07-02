@@ -196,6 +196,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        force_text_only: bool = False,
         gpu_memory_utilization: float = 0.90,
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
@@ -211,6 +212,12 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            force_text_only: Force the LLM (text) scheduler path even when
+                the config/checkpoint classify as MLLM. Without it a
+                vision-weight-carrying model routes ALL requests (text
+                included) through MLLMScheduler — there is no per-request
+                text split on this engine. Mutually exclusive with
+                force_mllm (force_text_only wins, matching SimpleEngine).
             gpu_memory_utilization: Fraction of device memory for Metal allocation
                 limit and emergency threshold (0.0-1.0, default 0.90)
             default_mllm_draft: Enable the configured assistant drafter unless a
@@ -226,7 +233,9 @@ class BatchedEngine(BaseEngine):
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
         self._default_mllm_draft = default_mllm_draft
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = (
+            force_mllm or is_mllm_model(model_name)
+        ) and not force_text_only
 
         self._model = None
         self._processor = None  # For MLLM
