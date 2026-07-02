@@ -761,6 +761,20 @@ The **item-B port** from `docs/fork/continuous-batching-hybrid-caching.md`, clos
 
 ---
 
+## 35. `patch: batched-kv-prompt-boundary-store` — abort resilience for the batched cache
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `vllm_mlx/scheduler.py`, `tests/test_batched_system_kv.py`, `tests/test_batched_system_kv_threading.py`
+
+Patch #34 stored entries only at request **end** — an aborted request (client disconnects and agent cancels are routine in opencode) lost its entire prompt prefill: the pending ladder was discarded and no entry existed. Now the scheduler's `end_of_prompt` capture (where the row's cache is already being extracted for the boundary checkpoint) also calls `store_prompt_boundary`: the full prompt-position snapshot becomes an entry **mid-request**, so a cancel after prefill still leaves a warm prefix.
+
+Mechanics: the boundary store *copies* the pending ladder (generation continues; the final `store` still owns it). Entry insertion is generalized to **prefix subsumption**: a new entry absorbs every existing entry whose tokens are a (proper or equal) prefix of its chain — ladders merge in (same token chain ⇒ checkpoint states valid), subsumed entries drop. That covers both the old identical-re-send dedup case and the boundary entry being replaced by its own finished chain (steady state stays one entry per chain). Guard: skipped when the request added `< partial_min` new tokens beyond its restored prefix (a near-full re-send would only duplicate the donor). Runs on the executor thread — the realize contract from #34's live findings holds by construction, and the cross-thread harness pins it.
+
+**Verified:** 4 new unit tests (ladder kept + absorbed-on-finish; aborted chain served; below-floor skip; wiring at `end_of_prompt` incl. not-called on mid-segment responses) + a threaded lifecycle test (boundary store on the stream-bound executor, abort, fetch on main, consume on executor). Suite green. New `boundary_stores` counter in `system_kv_cache` stats.
+
+**Upstreaming:** rides with #34.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
