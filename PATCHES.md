@@ -682,6 +682,22 @@ Fix: `BatchedEngine.__init__` takes `force_text_only` with SimpleEngine's exact 
 
 ---
 
+## 31. `patch: batched-dry-sampler` — DRY rides the batched per-sequence processor chain
+
+**Files:** `vllm_mlx/engine/batched.py`, `tests/test_batched_dry.py` (new)
+
+BatchedEngine parity series (#29–#33). The `dry_*` request fields (patch #22) reached `BatchedEngine.chat`/`stream_chat` in `**kwargs` and **silently vanished** — never popped into `SamplingParams`, never forwarded to either scheduler. mlx-lm's `BatchGenerator.insert()` already takes per-sequence `logits_processors` and applies each row's chain to that row's logit slice, and the LLM scheduler already threads `sampling_params.logits_processors` through (`scheduler.py` `_schedule_waiting`); the MLLM scheduler carries per-request processors too. Only the pop-and-build was missing.
+
+Fix: `_merge_dry_processor(kwargs)` in `batched.py` pops the `dry_*` kwargs + external `logits_processors` once, before the MLLM/LLM branch in `generate()`/`stream_generate()` (which `chat`/`stream_chat` delegate to), builds `DRYLogitsProcessor` via the same `build_dry_processor` env-default resolution as SimpleEngine, and passes the merged list to both branches. One fresh processor instance per request = per-sequence state isolation in the batch.
+
+Two behavior notes: (a) the scheduler passes no `all_tokens` into `insert()`, so the batched token context contains only *generated* tokens — DRY's generation-only matching (the 2026-06-12 incident fix) holds by construction; (b) the batched MTP patches (`patches/qwen3_next_mtp.py`/`qwen3_5_mtp.py`) never run logits processors during draft acceptance (verified by grep), so DRY + `--enable-mtp` on this engine would be silently bypassed — same "don't combine" guidance as SimpleEngine, now noted in the helper docstring.
+
+**Verified:** 6 new tests pinning all four entry paths (LLM/MLLM × generate/stream) plus off-by-default and external-processor coexistence. DRY + engine suites green.
+
+**Upstreaming:** rides with #22 if that ever goes; the helper is fork-shaped (env defaults).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
