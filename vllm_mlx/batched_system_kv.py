@@ -762,3 +762,178 @@ class BatchedSystemKV:
                     else {}
                 ),
             }
+
+
+# ---------------------------------------------------------------------------
+# Scheduler seam (fork patches #33–#37).
+#
+# The bodies of the scheduler's fork hooks live HERE so upstream churn in
+# vllm_mlx/scheduler.py stays away from fork logic — the same containment
+# pattern patch #18 proved for engine/simple.py. Scheduler methods are
+# one-line delegators into these functions; behavior is pinned by the
+# scheduler-level wiring tests (pure code motion, zero test edits).
+# ---------------------------------------------------------------------------
+
+
+def maybe_create(model: Any, tokenizer: Any, idle_check=None):
+    """Construct the cache when enabled — the scheduler __init__ hook."""
+    if not batched_system_kv_enabled():
+        return None
+    kv = BatchedSystemKV(model, tokenizer=tokenizer, idle_check=idle_check)
+    logger.info(
+        "[batched_system_kv] enabled: slots=%d ram_mb=%d "
+        "ckpt_interval=%d partial_min=%d — replaces memory-aware cache",
+        kv.slots,
+        kv.ram_mb,
+        kv.ckpt_interval,
+        kv.partial_min,
+    )
+    return kv
+
+
+def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
+    """add_request hook: hybrid-safe checkpoint restore (#34) with the
+    index-only SSD cold-tier probe on miss (#36 — the blob read happens on
+    the executor via promote_ssd_pending)."""
+    result = hybrid_kv.fetch(
+        request.prompt_token_ids, request_id=request.request_id
+    )
+    if result is not None:
+        cache, remaining, pos = result
+        request.cache_hit_type = "system_kv"
+        request.prompt_cache = cache
+        request.cached_tokens = pos
+        request.remaining_tokens = remaining
+    else:
+        request.cache_hit_type = "miss"
+        request.remaining_tokens = request.prompt_token_ids
+        candidate = hybrid_kv.check_ssd(request.prompt_token_ids)
+        if candidate is not None:
+            request.cache_hit_type = "ssd_pending"
+            request._ssd_candidate = candidate
+
+
+def promote_ssd_pending(scheduler) -> None:
+    """_schedule_waiting hook (#36): promote SSD candidates for waiting
+    ssd_pending requests. Runs on the executor thread — the blob read +
+    array realize happen here, never on the event loop."""
+    hybrid_kv = scheduler.hybrid_kv
+    for request in scheduler.waiting:
+        if getattr(request, "cache_hit_type", None) != "ssd_pending":
+            continue
+        candidate = getattr(request, "_ssd_candidate", None)
+        request._ssd_candidate = None
+        result = None
+        if candidate is not None:
+            try:
+                if hybrid_kv.promote_ssd(candidate):
+                    result = hybrid_kv.fetch(
+                        request.prompt_token_ids,
+                        request_id=request.request_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "[batched_system_kv] SSD promote failed "
+                    f"request={request.request_id[:12]}",
+                    exc_info=True,
+                )
+        if result is not None:
+            cache, remaining, pos = result
+            request.cache_hit_type = "system_kv"
+            request.prompt_cache = cache
+            request.cached_tokens = pos
+            request.remaining_tokens = remaining
+            logger.info(
+                f"[batched_system_kv] SSD promote request="
+                f"{request.request_id[:12]} restored={pos} "
+                f"remaining={len(remaining)}"
+            )
+        else:
+            request.cache_hit_type = "miss"
+
+
+def capture_checkpoints(scheduler, prompt_responses) -> None:
+    """step() hook (#34/#35): at each segment boundary, extract the row's
+    cache and checkpoint its recurrent-layer state at that absolute
+    position; at end_of_prompt, persist the prompt-boundary entry for
+    abort resilience.
+
+    Runs on the scheduler executor thread (same thread as the generation
+    step), so extract_cache is safe. Only the ckpt-class layer states are
+    kept from mid-prefill extractions; the attention-KV views are dropped.
+    The boundary store is SOLO-REQUEST ONLY: under a concurrent burst the
+    ~500MB snapshot materialization per boundary lands inside the busy
+    step loop and measurably inflates batch TTFT (Studio bench:
+    0.37s -> ~1.7s at conc=4); concurrent chains still store at finish.
+    """
+    hybrid_kv = scheduler.hybrid_kv
+    for pr in prompt_responses:
+        if not getattr(pr, "end_of_segment", False):
+            continue
+        request_id = scheduler.uid_to_request_id.get(pr.uid)
+        if request_id is None:
+            continue
+        try:
+            extracted = scheduler.batch_generator.extract_cache([pr.uid])
+            entry = extracted.get(pr.uid)
+            if not entry:
+                continue
+            progress = getattr(pr, "progress", None)
+            processed = (
+                progress[0] if isinstance(progress, tuple) else int(progress or 0)
+            )
+            hybrid_kv.capture_segment(request_id, processed, entry[0])
+            if getattr(pr, "end_of_prompt", False) and len(scheduler.running) <= 1:
+                request = scheduler.requests.get(request_id)
+                if request is not None and request.prompt_token_ids:
+                    hybrid_kv.store_prompt_boundary(
+                        request_id,
+                        request.prompt_token_ids,
+                        entry[0],
+                    )
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] checkpoint capture failed "
+                f"request={request_id[:12]}",
+                exc_info=True,
+            )
+
+
+def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> None:
+    """_cleanup_finished hook (#34/#37): store the finished chain (grows
+    from its donor when possible) and release the extraction reference."""
+    if getattr(request, "_extracted_cache", None) is not None:
+        try:
+            full_token_sequence = list(request.prompt_token_ids) + list(
+                request.output_token_ids
+            )
+            stored = hybrid_kv.store(
+                request_id,
+                full_token_sequence,
+                request._extracted_cache,
+            )
+            logger.info(
+                f"[batched_system_kv] store request={request_id[:12]} "
+                f"tokens={len(full_token_sequence)} stored={stored}"
+            )
+            # Release: the cache holds its own snapshot refs.
+            request._extracted_cache = None
+        except Exception:
+            logger.debug(
+                f"[batched_system_kv] store failed {request_id}",
+                exc_info=True,
+            )
+            hybrid_kv.discard_pending(request_id)
+    else:
+        hybrid_kv.discard_pending(request_id)
+
+
+def insert_segmented(hybrid_kv: "BatchedSystemKV", batch_generator, request, tokens, insert_kwargs):
+    """_schedule_waiting insert hook (#34): split the prompt at checkpoint
+    boundaries so the generator stops there (insert_segments) and
+    capture_checkpoints can snapshot recurrent state."""
+    hybrid_kv.note_scheduled(request.request_id, request.cached_tokens)
+    return batch_generator.insert_segments(
+        [hybrid_kv.split_segments(tokens)],
+        **insert_kwargs,
+    )
