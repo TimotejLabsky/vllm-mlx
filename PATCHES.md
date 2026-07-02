@@ -775,6 +775,22 @@ Mechanics: the boundary store *copies* the pending ladder (generation continues;
 
 ---
 
+## 36. `patch: batched-kv-ssd-tier` — the batched cache survives restarts and model swaps
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `vllm_mlx/scheduler.py`, `tests/test_batched_system_kv.py`, `tests/test_batched_system_kv_threading.py`
+
+Patch #34's cache was RAM-only: every llama-swap TTL eviction, model swap, or restart threw away all warm entries and the next request paid a full cold prefill (~32 s on the 27B) — the exact gap patch #16 closed for SimpleEngine (26–28× faster recovery). This wires the **same store module** (`system_kv_ssd.SystemKVSSDStore` — MLX-native safetensors, dtype-exact bf16, SQLite prefix index, checkpoint format v3, defer-until-idle writer, reconcile-on-start, #25 hardening) into `BatchedSystemKV`:
+
+- *Spill:* write-through on every entry insert — full chains AND #35's prompt-boundary entries (abort resilience now holds **across restarts**). The post-subsumption entry spills, so the richest merged ladder is what persists.
+- *Promote:* two-stage, mirroring the scheduler's existing `ssd_pending` pattern so **blob I/O never touches the event loop** — `check_ssd` in `add_request` is index-only (SQLite + tiny json; full-prefix via `lookup_prefix`, divergent via `lookup_shared`), then `_try_promote_hybrid_ssd_pending` in `_schedule_waiting` (executor thread) does `read_entry` → RAM entry → normal `fetch` restore. `read_entry` realizes loaded arrays on the calling thread, so the cross-thread realize contract holds by construction — pinned by a threaded lifecycle test (spill on executor → restart → promote on executor → fetch on main → consume on executor).
+- *Config:* same envs as SimpleEngine (`VLLM_MLX_SSD_SYSTEM_KV_DIR`/`_GB`) — one llama-swap env block serves either engine. Per-model subdir is `batched-<slug>` (tokenizer-derived), deliberately distinct from SimpleEngine's model-name subdir: the store is single-writer and the two engines must never share a directory. `idle_check` = scheduler-running probe (heavy spills wait for gaps between generations, the 2026-06-12 lesson). Writer closes on scheduler `reset()`/`deep_reset()` (shutdown path only — cache-error recovery doesn't reset, verified).
+
+**Verified:** 4 SSD unit tests (restart round-trip bit-exact incl. recurrent state; divergent shared-prefix promote restoring at a checkpoint; boundary-entry restart resilience; env-off no-op), 3 scheduler wiring tests (miss→`ssd_pending` marker; promote→restore fields; failed-promote→cold fallback with no fetch), 1 threaded lifecycle test. Full suite 2356 passed / 0 failed.
+
+**Upstreaming:** rides with #34/#35; the store module itself is unchanged.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
