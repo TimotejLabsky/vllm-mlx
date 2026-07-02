@@ -3231,6 +3231,25 @@ class Scheduler:
                     progress[0] if isinstance(progress, tuple) else int(progress or 0)
                 )
                 self.hybrid_kv.capture_segment(request_id, processed, entry[0])
+                if getattr(pr, "end_of_prompt", False) and len(self.running) <= 1:
+                    # Fork patch #35: persist the prompt prefill NOW so an
+                    # aborted/cancelled request (routine for agent clients)
+                    # still leaves a warm entry. The finished chain later
+                    # absorbs this entry via prefix subsumption.
+                    # Solo requests only: under a concurrent burst the
+                    # ~500MB snapshot materialization per boundary (plus
+                    # possible eviction clear_cache) lands inside the busy
+                    # step loop and measurably inflates batch TTFT (Studio
+                    # bench: 0.37s -> ~1.7s at conc=4). The single-agent
+                    # flow — the abort-resilience target — keeps full
+                    # protection; concurrent chains still store at finish.
+                    request = self.requests.get(request_id)
+                    if request is not None and request.prompt_token_ids:
+                        self.hybrid_kv.store_prompt_boundary(
+                            request_id,
+                            request.prompt_token_ids,
+                            entry[0],
+                        )
             except Exception:
                 logger.debug(
                     "[batched_system_kv] checkpoint capture failed "
