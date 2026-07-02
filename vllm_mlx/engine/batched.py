@@ -25,6 +25,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..stop_strings import StopStringScanner, truncate_at_stop
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -957,12 +958,17 @@ class BatchedEngine(BaseEngine):
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
+            # Stop STRINGS are token-id-blind in the batched schedulers;
+            # enforce them here (fork patch #32). Truncate BEFORE
+            # clean_output_text — stop strings are often special tokens
+            # (<|im_end|>) that cleaning would strip from the scan.
+            text, stop_hit = truncate_at_stop(output.output_text, stop)
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=clean_output_text(text),
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
-                finish_reason=output.finish_reason,
+                finish_reason="stop" if stop_hit else output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
                 specprefill_outcome=getattr(output, "specprefill_outcome", None),
@@ -988,14 +994,16 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        # Truncate BEFORE clean_output_text — stop strings are often special
+        # tokens (<|im_end|>) that cleaning would strip from the scan.
+        text, stop_hit = truncate_at_stop(output.output_text, stop)
 
         return GenerationOutput(
-            text=text,
+            text=clean_output_text(text),
             tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
-            finish_reason=output.finish_reason,
+            finish_reason="stop" if stop_hit else output.finish_reason,
             mtp_drafts=output.mtp_drafts,
             mtp_accepted=output.mtp_accepted,
         )
@@ -1059,18 +1067,26 @@ class BatchedEngine(BaseEngine):
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
+            # Stop STRINGS are token-id-blind in the batched schedulers;
+            # enforce them here (fork patch #32).
+            scanner = StopStringScanner(stop)
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                new_text, stop_hit = scanner.scan(output.new_text)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
-                    new_text=output.new_text,
+                    new_text=new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
-                    finished=output.finished,
-                    finish_reason=output.finish_reason,
+                    finished=output.finished or stop_hit,
+                    finish_reason="stop" if stop_hit else output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
                     specprefill_outcome=getattr(output, "specprefill_outcome", None),
                 )
+                if stop_hit:
+                    if not output.finished:
+                        await self.abort_request(request_id)
+                    break
             return
 
         # Use LLM engine for text-only
@@ -1095,19 +1111,25 @@ class BatchedEngine(BaseEngine):
             prefix_boundary=prefix_boundary,
         )
 
+        scanner = StopStringScanner(stop)
         async for output in self._engine.stream_outputs(request_id):
             text = clean_output_text(output.output_text)
+            new_text, stop_hit = scanner.scan(output.new_text)
 
             yield GenerationOutput(
                 text=text,
-                new_text=output.new_text,
+                new_text=new_text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
-                finished=output.finished,
-                finish_reason=output.finish_reason,
+                finished=output.finished or stop_hit,
+                finish_reason="stop" if stop_hit else output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
             )
+            if stop_hit:
+                if not output.finished:
+                    await self.abort_request(request_id)
+                break
 
     async def chat(
         self,
