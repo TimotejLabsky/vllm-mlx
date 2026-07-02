@@ -161,6 +161,35 @@ def test_ssd_promote_lifecycle_across_threads(monkeypatch, tmp_path):
     kv2.close()
 
 
+def test_grow_on_hit_lifecycle_across_threads():
+    """Grown stores reuse donor segments captured on the executor; the
+    assembled restore (segment concat across the donor/delta seam) must
+    stay consumable through the full thread shape (patch #37)."""
+    kv = BatchedSystemKV(_HybridModel())
+    with StreamBoundWorker() as w:
+        w.run(lambda: kv.note_scheduled("r1", 0))
+        w.run(lambda: kv.capture_segment("r1", 448, _hybrid_donor(448)))
+        w.run(lambda: kv.store("r1", TOKENS, _hybrid_donor(len(TOKENS))))
+
+        grown = TOKENS + [7, 8, 9]
+        assert kv.fetch(grown[:-1], request_id="r2") is not None  # main thread
+        w.run(lambda: kv.store("r2", grown, _hybrid_donor(len(grown))))
+        assert kv.grown_stores == 1
+
+        # restore across the donor/delta segment seam, consume on executor
+        result = kv.fetch(grown + [99])
+        assert result is not None
+        cache, _, pos = result
+        assert pos == len(grown)
+        w.run(lambda: _consume(cache))
+
+        # divergent restore from the segmented entry (checkpoint + seam)
+        result = kv.fetch(TOKENS[:600] + [1, 2, 3])
+        assert result is not None
+        assert result[2] == 448
+        w.run(lambda: _consume(result[0]))
+
+
 def test_inherited_ladder_survives_thread_roundtrip():
     """Donor-ladder inheritance hands checkpoint state captured on the
     executor to a NEW request's pending ladder via fetch (main thread); the
