@@ -112,6 +112,25 @@ def test_exact_resend_fast_path_across_threads():
         w.run(lambda: _consume(cache))
 
 
+def test_prompt_boundary_store_lifecycle_across_threads():
+    """Boundary store happens mid-request on the executor (patch #35);
+    its entry must restore cleanly on the main thread and be consumable
+    back on the executor."""
+    kv = BatchedSystemKV(_HybridModel())
+    prompt = TOKENS[:600]
+    with StreamBoundWorker() as w:
+        w.run(lambda: kv.note_scheduled("r1", 0))
+        w.run(lambda: kv.capture_segment("r1", 448, _hybrid_donor(448)))
+        w.run(lambda: kv.store_prompt_boundary("r1", prompt, _hybrid_donor(600)))
+        kv.discard_pending("r1")  # abort — no final store
+
+        result = kv.fetch(prompt + [55, 56, 57])
+        assert result is not None
+        cache, _, pos = result
+        assert pos == 600
+        w.run(lambda: _consume(cache))
+
+
 def test_inherited_ladder_survives_thread_roundtrip():
     """Donor-ladder inheritance hands checkpoint state captured on the
     executor to a NEW request's pending ladder via fetch (main thread); the
