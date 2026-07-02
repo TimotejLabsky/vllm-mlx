@@ -820,6 +820,24 @@ Bounds honesty: a *divergent* grow from a single-segment (cold) donor slices tha
 
 ---
 
+## 39. `patch: batched-flip-enablement` — co-batching guard, queue-cap 503, observability completion
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `vllm_mlx/scheduler.py`, `vllm_mlx/engine/batched.py`, `vllm_mlx/metrics.py`, `vllm_mlx/server.py`, `tests/test_batched_flip_enablement.py` (new)
+
+The three safety rails identified for flipping a production route to `--continuous-batching` (batch-of-guards patch, #17 precedent). All inert by default.
+
+- **Length-aware co-batching guard** (`VLLM_MLX_BATCHED_PAD_WASTE_MB`, 0 = off). mlx-lm's `BatchKVCache.merge` right-justifies every row to the longest chain in the batch, so admitting a short request beside an 80K-token chain transiently allocates ~5 GB of padded KV at 27B scale — on the box with the jetsam history. `should_defer_cobatch` (fork-owned seam) estimates waste = Σ(L_max−L_i) × bytes/token — the per-token footprint *learned from the newest cache entry* (≈200 KB/token on the 27B-4bit), so no per-model config — and defers admission (`appendleft` + break, FCFS preserved) while over budget: brief queueing instead of a memory spike. Inert on a cold cache (first request runs solo anyway); logs once per deferred request.
+- **Queue-cap overload shedding** (`VLLM_MLX_BATCHED_MAX_QUEUE`, 0 = unbounded/upstream). `Scheduler.add_request` raises `EngineBusy` past the cap → the server's existing translation returns retryable 503s on non-stream paths, and a new `BatchedEngine.raise_if_serialized_busy` lets the server's **pre-stream probe** (the same `getattr` seam SimpleEngine's #15 admission uses) reject streaming requests before SSE headers. `queue_cap`/`queue_rejections` in scheduler stats.
+- **Observability completion:** `grown_stores` / `boundary_stores` / `ssd_promotes` become Prometheus gauges (`vllm_mlx_cache_*`, additive `metrics.py` block per the #7 precedent); `/v1/status` now carries the top-level `engine_type` bench-serve's `auto_detect_runtime` reads (both engines emit it in `get_stats`, the payload dropped it); the cache stats block carries `type: batched_system_kv` for the bench's cache label. Fixes the empty `Runtime: engine= cache=` provenance line in stored bench results.
+
+**Verified:** 10 new tests (guard: inert-by-default / cold-cache / no-running, defers extreme mixes + logs once, admits similar lengths, scheduler FCFS defer wiring; cap: reject-over-capacity + counter, unbounded default, pre-stream probe raise/no-op; stats type+counters). Full suite 2372 passed / 0 failed. Live 503 + gauge checks in the deploy revalidation.
+
+**Deployment intent (the canary flip config):** `--continuous-batching --text-only --max-num-seqs 3` + `VLLM_MLX_BATCHED_SYSTEM_KV=1`, `VLLM_MLX_SYSTEM_KV_RAM_MB=6144`, `VLLM_MLX_BATCHED_PAD_WASTE_MB=4096`, `VLLM_MLX_BATCHED_MAX_QUEUE=8`, SSD envs as deployed.
+
+**Upstreaming:** the queue cap and the status `engine_type` field are clean candidates; the guard is fork-shaped (depends on the #34 cache for its bytes/token estimate).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:

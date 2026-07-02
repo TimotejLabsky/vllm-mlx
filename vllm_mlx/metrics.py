@@ -271,6 +271,21 @@ class MetricsCollector:
                 "Prompt tokens restored via partial-prefix restore.",
                 registry=registry,
             ),
+            "cache_grown_stores": Gauge(
+                "vllm_mlx_cache_grown_stores",
+                "Cache stores that reused donor segments (grow-on-hit).",
+                registry=registry,
+            ),
+            "cache_boundary_stores": Gauge(
+                "vllm_mlx_cache_boundary_stores",
+                "Prompt-boundary cache stores (abort resilience).",
+                registry=registry,
+            ),
+            "cache_ssd_promotes": Gauge(
+                "vllm_mlx_cache_ssd_promotes",
+                "Entries promoted from the SSD cold tier since startup.",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -497,6 +512,15 @@ class MetricsCollector:
             )
             self._prom["cache_partial_tokens_saved"].set(
                 _coerce_float(cache_stats.get("partial_tokens_saved", 0))
+            )
+            self._prom["cache_grown_stores"].set(
+                _coerce_float(cache_stats.get("grown_stores", 0))
+            )
+            self._prom["cache_boundary_stores"].set(
+                _coerce_float(cache_stats.get("boundary_stores", 0))
+            )
+            self._prom["cache_ssd_promotes"].set(
+                _coerce_float(cache_stats.get("ssd_promotes", 0))
             )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024
