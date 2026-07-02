@@ -3506,6 +3506,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            force_text_only=force_text_only,
             gpu_memory_utilization=gpu_memory_utilization,
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
