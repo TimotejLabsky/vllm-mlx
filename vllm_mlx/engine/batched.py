@@ -551,6 +551,16 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # Realize lazy init-time arrays on THIS (load) thread. The batched LLM
+        # path loads here (event loop) but steps on the engine-core executor
+        # thread; a still-lazy init array (gpt-oss `sinks`) would crash the
+        # first step and force engine_core's stream-error self-heal cycle
+        # (model-thread stepping + cache recovery) instead of a clean start.
+        # See vllm_mlx/lazy_realize.py and PATCHES.md #28/#29.
+        from ..lazy_realize import realize_module_arrays
+
+        realize_module_arrays(self._model)
+
         # --compile: wrap forward pass with mx.compile for fused Metal kernels.
         # See vllm_mlx/compile.py (ported from upstream PR #270).
         if getattr(self, "_compile_on_start", False):
