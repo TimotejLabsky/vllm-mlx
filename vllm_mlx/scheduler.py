@@ -23,6 +23,7 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .batched_system_kv import BatchedSystemKV, batched_system_kv_enabled
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -1327,8 +1328,23 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_tier: Optional[SSDCacheTier] = None
+        # Fork patch #34: hybrid-safe checkpoint cache. When enabled it
+        # REPLACES the other prefix caches on this scheduler (double-storing
+        # every entry would waste RAM; the memory-aware match paths are
+        # gated off for hybrids anyway).
+        self.hybrid_kv = None
 
-        if self.config.enable_prefix_cache:
+        if self.config.enable_prefix_cache and batched_system_kv_enabled():
+            self.hybrid_kv = BatchedSystemKV(model)
+            logger.info(
+                "[batched_system_kv] enabled: slots=%d ram_mb=%d "
+                "ckpt_interval=%d partial_min=%d — replaces memory-aware cache",
+                self.hybrid_kv.slots,
+                self.hybrid_kv.ram_mb,
+                self.hybrid_kv.ckpt_interval,
+                self.hybrid_kv.partial_min,
+            )
+        elif self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
                 # Use paged cache for memory efficiency
                 self.paged_cache_manager = PagedCacheManager(
@@ -1906,7 +1922,21 @@ class Scheduler:
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
         # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        if self.hybrid_kv is not None:
+            # Fork patch #34: hybrid-safe checkpoint restore.
+            result = self.hybrid_kv.fetch(
+                request.prompt_token_ids, request_id=request.request_id
+            )
+            if result is not None:
+                cache, remaining, pos = result
+                request.cache_hit_type = "system_kv"
+                request.prompt_cache = cache
+                request.cached_tokens = pos
+                request.remaining_tokens = remaining
+            else:
+                request.cache_hit_type = "miss"
+                request.remaining_tokens = request.prompt_token_ids
+        elif self.block_aware_cache is not None:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
@@ -2074,6 +2104,9 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
             request._extracted_cache = None
+        if self.hybrid_kv is not None:
+            # Drop the in-flight checkpoint ladder (fork patch #34).
+            self.hybrid_kv.discard_pending(request_id)
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -2238,11 +2271,23 @@ class Scheduler:
                 "logits_processors": [lp] if lp else [[]],
                 "samplers": [sampler],
             }
+
+            def _do_insert(toks):
+                # Fork patch #34: split the prompt at checkpoint boundaries
+                # so the generator stops there (insert_segments) and
+                # _capture_hybrid_checkpoints can snapshot recurrent state.
+                if self.hybrid_kv is not None:
+                    self.hybrid_kv.note_scheduled(
+                        request.request_id, request.cached_tokens
+                    )
+                    return self.batch_generator.insert_segments(
+                        [self.hybrid_kv.split_segments(toks)],
+                        **insert_kwargs,
+                    )
+                return self.batch_generator.insert([toks], **insert_kwargs)
+
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    **insert_kwargs,
-                )
+                uids = _do_insert(tokens_to_process)
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -2255,10 +2300,7 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
-                    uids = self.batch_generator.insert(
-                        [tokens_to_process],
-                        **insert_kwargs,
-                    )
+                    uids = _do_insert(tokens_to_process)
                 else:
                     raise
 
@@ -2740,7 +2782,34 @@ class Scheduler:
 
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids:
-                if self.block_aware_cache is not None:
+                if self.hybrid_kv is not None:
+                    # Fork patch #34: store full snapshot + checkpoint ladder.
+                    if getattr(request, "_extracted_cache", None) is not None:
+                        try:
+                            full_token_sequence = list(
+                                request.prompt_token_ids
+                            ) + list(request.output_token_ids)
+                            stored = self.hybrid_kv.store(
+                                request_id,
+                                full_token_sequence,
+                                request._extracted_cache,
+                            )
+                            logger.info(
+                                f"[batched_system_kv] store request={request_id[:12]} "
+                                f"tokens={len(full_token_sequence)} stored={stored}"
+                            )
+                            # Release: the cache holds its own snapshot refs.
+                            request._extracted_cache = None
+                        except Exception:
+                            logger.debug(
+                                f"[batched_system_kv] store failed {request_id}",
+                                exc_info=True,
+                            )
+                            self.hybrid_kv.discard_pending(request_id)
+                    else:
+                        self.hybrid_kv.discard_pending(request_id)
+
+                elif self.block_aware_cache is not None:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
@@ -2974,6 +3043,38 @@ class Scheduler:
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
 
+    def _capture_hybrid_checkpoints(self, prompt_responses) -> None:
+        """Fork patch #34: at each segment boundary, extract the row's cache
+        and checkpoint its recurrent-layer state at that absolute position.
+
+        Runs on the scheduler executor thread (same thread as the
+        generation step), so extract_cache is safe. Only the ckpt-class
+        layer states are kept; the extraction's attention-KV views are
+        dropped immediately.
+        """
+        for pr in prompt_responses:
+            if not getattr(pr, "end_of_segment", False):
+                continue
+            request_id = self.uid_to_request_id.get(pr.uid)
+            if request_id is None:
+                continue
+            try:
+                extracted = self.batch_generator.extract_cache([pr.uid])
+                entry = extracted.get(pr.uid)
+                if not entry:
+                    continue
+                progress = getattr(pr, "progress", None)
+                processed = (
+                    progress[0] if isinstance(progress, tuple) else int(progress or 0)
+                )
+                self.hybrid_kv.capture_segment(request_id, processed, entry[0])
+            except Exception:
+                logger.debug(
+                    "[batched_system_kv] checkpoint capture failed "
+                    f"request={request_id[:12]}",
+                    exc_info=True,
+                )
+
     def step(self, max_retries: int = 1) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
@@ -3013,9 +3114,14 @@ class Scheduler:
                     # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
                     # older versions returned a flat list.
                     if isinstance(result, tuple):
-                        responses = result[1]  # generation_responses only
+                        prompt_responses, responses = result
                     else:
-                        responses = result
+                        prompt_responses, responses = [], result
+
+                    # Fork patch #34: snapshot recurrent state at segment
+                    # boundaries (positions set by split_segments).
+                    if self.hybrid_kv is not None and prompt_responses:
+                        self._capture_hybrid_checkpoints(prompt_responses)
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
@@ -3208,7 +3314,11 @@ class Scheduler:
             pass
 
         # Include cache stats
-        if self.block_aware_cache is not None:
+        if self.hybrid_kv is not None:
+            # Same key the SimpleEngine stack uses — /v1/status and
+            # metrics.py already scan "system_kv_cache" (patches #7/#17).
+            stats["system_kv_cache"] = self.hybrid_kv.stats()
+        elif self.block_aware_cache is not None:
             stats["paged_cache"] = self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
@@ -3218,6 +3328,8 @@ class Scheduler:
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics."""
+        if self.hybrid_kv is not None:
+            return self.hybrid_kv.stats()
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
