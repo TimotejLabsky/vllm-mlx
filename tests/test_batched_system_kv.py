@@ -361,6 +361,111 @@ def test_stats_shape():
     assert s["memory_mb"] > 0
 
 
+# ------------------------------------------------------------ grow-on-HIT
+
+
+def test_grown_store_shares_donor_arrays():
+    """A chain that continues its donor must reference the donor's trim
+    segments (zero copy for the shared prefix) instead of re-materializing
+    the whole context — SimpleEngine's grow-on-HIT economics (patch #37)."""
+    kv = _make_cache()
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    donor_k = next(iter(kv._entries.values()))["snapshot"][0][0][0]
+
+    assert kv.fetch(TOKENS + [7, 8], request_id="r2") is not None
+    grown_tokens = TOKENS + [7, 8, 9, 10]
+    kv.store("r2", grown_tokens, _donor_at(len(grown_tokens)))
+
+    assert kv.stats()["grown_stores"] == 1
+    assert kv.stats()["entry_count"] == 1  # donor absorbed
+    entry = next(iter(kv._entries.values()))
+    segments = entry["snapshot"][0]
+    assert len(segments) == 2
+    assert segments[0][0] is donor_k  # shared BY REFERENCE, not copied
+    assert segments[1][0].shape[2] == 4  # O(delta) slice only
+
+    # The segmented entry restores correctly at a checkpoint-free position
+    # (pure attention slice across segment boundary).
+    result = kv.fetch(grown_tokens + [99])
+    assert result is not None
+    cache, remaining, pos = result
+    assert pos == len(grown_tokens)
+    assert cache[0].offset == len(grown_tokens)
+
+
+def test_grow_after_divergent_restore_reuses_prefix_only():
+    """A divergent hit grows from the donor's common prefix: whole donor
+    segments by reference up to the divergence, then the new delta."""
+    kv = _make_cache()
+    kv.note_scheduled("r1", 0)
+    kv.capture_segment("r1", 448, _donor_at(448))
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+
+    divergent = TOKENS[:600] + [1, 2, 3, 4]
+    assert kv.fetch(divergent, request_id="r2") is not None  # restores at 448
+    kv.store("r2", divergent, _donor_at(len(divergent)))
+
+    assert kv.stats()["grown_stores"] == 1
+    assert kv.stats()["entry_count"] == 2  # divergent chain != prefix, no absorb
+    grown = next(
+        e for e in kv._entries.values() if e["tokens"] == divergent
+    )
+    segments = grown["snapshot"][0]
+    # prefix reuse bounded by the common prefix (600), delta covers the rest
+    assert sum(k.shape[2] for k, _ in segments) == len(divergent)
+    assert segments[-1][0].shape[2] == len(divergent) - 600
+
+    result = kv.fetch(divergent + [55])
+    assert result is not None
+    assert result[2] == len(divergent)
+    # KV content across the segment seam must match a straight donor
+    control = _donor_at(len(divergent))
+    assert mx.array_equal(result[0][0].state[0], control[0].state[0])
+
+
+def test_boundary_final_grow_cascade():
+    """fetch -> boundary store (absorbs donor) -> final store must cascade
+    the donor linkage so the final store still grows (from the boundary
+    entry), sharing arrays end to end."""
+    kv = _make_cache()
+    kv.store("r1", TOKENS[:400], _donor_at(400))
+    donor_k = next(iter(kv._entries.values()))["snapshot"][0][0][0]
+
+    assert kv.fetch(TOKENS, request_id="r3") is not None  # restore at 400
+    kv.note_scheduled("r3", 400)
+    # prompt boundary at 700: 300 new tokens >= partial_min -> stored + grown
+    assert kv.store_prompt_boundary("r3", TOKENS[:700], _donor_at(700)) is True
+    kv.store("r3", TOKENS, _donor_at(len(TOKENS)))
+
+    assert kv.stats()["grown_stores"] == 2  # boundary grew AND final grew
+    assert kv.stats()["entry_count"] == 1
+    entry = next(iter(kv._entries.values()))
+    segments = entry["snapshot"][0]
+    assert segments[0][0] is donor_k  # original donor array survives the cascade
+    assert [k.shape[2] for k, _ in segments] == [400, 300, 100]
+    assert sum(k.shape[2] for k, _ in segments) == len(TOKENS)
+
+
+def test_grown_entries_skip_spill(monkeypatch, tmp_path):
+    """Grown entries don't re-spill (SimpleEngine policy: the stored prefix
+    promotes on restart and re-grows cheaply)."""
+    import os
+
+    kv = _make_ssd_cache(monkeypatch, tmp_path)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.fetch(TOKENS + [7, 8], request_id="r2") is not None
+    kv.store("r2", TOKENS + [7, 8, 9], _donor_at(len(TOKENS) + 3))
+    kv.close()  # drain writer
+
+    data_dir = None
+    for root, dirs, _files in os.walk(tmp_path):
+        if root.endswith("/data"):
+            data_dir = root
+            break
+    assert data_dir is not None
+    assert len(os.listdir(data_dir)) == 1  # only the original chain spilled
+
+
 # --------------------------------------------------------------- ssd tier
 
 
