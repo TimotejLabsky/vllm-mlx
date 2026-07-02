@@ -1,10 +1,42 @@
 # Continuous batching × caching on hybrid models — findings & roadmap
 
-*Status: assessment 2026-06-09; **reassessed 2026-06-30** (fork tip `28765f3`,
-base v0.4.0 `0dd1157`, mlx-lm 0.31.3) — see [the 2026-06-30 update](#update-2026-06-30--the-blocker-moved)
-below. No implementation. Verdict unchanged (**don't port**), but the blocker
-has moved: the caching wall largely fell, and what's left is a motivation/risk
-call, not a feasibility one.*
+*Status: assessment 2026-06-09; reassessed 2026-06-30; **IMPLEMENTED
+2026-07-02** — item B is now built as **patch #34** (`batched_system_kv.py`,
+with the Tier-1 parity series #29–#33 alongside). See
+[the 2026-07-02 update](#update-2026-07-02--implemented) below. The historical
+analysis is retained; the "don't port" verdict is superseded for the
+*feasibility* half (built, e2e-verified bit-identical) while the *motivation*
+half still governs deployment: off by default until concurrent traffic is
+routine and the Studio A/B passes.*
+
+---
+
+## Update 2026-07-02 — implemented
+
+The gate this doc demanded — "a standalone mlx-lm spike proving
+`_merge_caches` handles a restored recurrent state in a concurrent batch" —
+**PASSED** on `Qwen3.5-0.8B-8bit` (the production qwen3_5 hybrid family):
+snapshot-restored mid-sequence hybrid caches merge **bit-identically**, incl.
+insertion mid-flight into a decoding batch. mlx-lm 0.31.3's merge handles
+this *by design*: `BatchKVCache.merge` right-justifies each row by its own
+offset into the mask's `left_padding`; `ArraysCache.merge` stacks recurrent
+state position-agnostically.
+
+Item B then landed as **patch #34**: checkpoint capture at
+`insert_segments` boundaries during prefill, LRU snapshot entries at request
+end, LCP + `select_restore_pos`/`build_partial_restore_states` on fetch,
+injected at the `request.prompt_cache` → `insert(caches=…)` seam this doc
+identified. E2E on the real scheduler: exact re-send HIT at N−1, divergent
+chain HIT at the nearest checkpoint, two restored requests decoding
+concurrently — all byte-identical to a cache-disabled control. Enabled via
+`VLLM_MLX_BATCHED_SYSTEM_KV=1`; the Tier-1 gaps found during the port
+(stop strings unenforced, per-request sampling dropped, DRY no-op, lazy
+realize bypass, no `--text-only` on batched) are patches #29–#33.
+
+Work items below: **A/B/C prompt-side = done** (#34 covers exact-resend,
+prefix growth, and LCP via checkpoints); **D = the merge validation passed**,
+the batched SSD tier remains memory-aware-only (our `system_kv_ssd.py` is
+SimpleEngine-wired — port on demand).
 
 **Question answered:** what would it take to run BatchedEngine (`--continuous-batching`)
 without forfeiting the caching we rely on — especially on hybrid (attention + SSM)
