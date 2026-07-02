@@ -717,6 +717,22 @@ Residual gap (documented, not a regression): text preceding a stop match that wa
 
 ---
 
+## 33. `patch: batched-per-request-sampling` — per-request samplers on the batched LLM path
+
+**Files:** `vllm_mlx/scheduler.py`, `tests/test_batched_per_request_sampling.py` (new)
+
+BatchedEngine parity series (#29–#33). The LLM scheduler built ONE `make_sampler(temp, top_p, min_p)` per `BatchGenerator` from the **first** request's params: `top_k` was dropped entirely, `presence_penalty` never became a processor, and a request whose params differed from the running batch either sampled with stale settings (mid-batch) or forced a generator recreation (idle). mlx-lm's `BatchGenerator.insert()` accepts per-sequence `samplers=` and applies them row-wise (`generate.py` `_step` loops rows, falling back to the shared sampler only where a row has none).
+
+Fix, in `_schedule_waiting`: build the request's own `make_sampler(temp, top_p, min_p, top_k)` and pass `samplers=[sampler]` on insert; convert `presence_penalty` to a `make_logits_processors(presence_penalty=…)` entry in the same per-request chain that already carried `repetition_penalty`. `_ensure_batch_generator`'s recreate-when-idle dance is kept (it still refreshes the fallback sampler + stop tokens, and a test pins the close-on-replace discipline), but its mid-batch warning is rewritten — per-request samplers now apply immediately regardless.
+
+**Residual gap (documented):** per-request `stop_token_ids` still bake into the generator at creation (both before and after this patch — recreation only triggers on sampler-param changes). A per-sequence `SequenceStateMachine` on insert would close it; deferred since stop ids are constant per deployment (tokenizer EOS + parser). Note the per-row sampler loop in mlx-lm is Python-level — negligible at our `max_num_seqs`, worth knowing at 32+.
+
+**Verified:** 3 new tests (sampler kwargs incl. top_k captured + `samplers=` on insert; presence_penalty→processor; empty-chain default preserved). Scheduler suites green.
+
+**Upstreaming:** strong candidate — upstream's batched path drops `top_k`/`presence_penalty` today.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
