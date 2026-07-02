@@ -807,6 +807,19 @@ Bounds honesty: a *divergent* grow from a single-segment (cold) donor slices tha
 
 ---
 
+## 38. `refactor: scheduler-seam extraction` + upstreaming branches + gemma verification (hygiene round)
+
+**Files:** `vllm_mlx/scheduler.py`, `vllm_mlx/batched_system_kv.py` (extraction); branches `fix/batched-stop-strings`, `fix/batched-per-request-sampling`, `feat/batched-system-kv` (upstreaming prep)
+
+- **Scheduler-seam extraction (`0e7b298`)** — the #18 containment pattern applied to `scheduler.py`: the bodies of the fork's system-KV hooks (init, add_request fetch + SSD probe, ssd-pending promote, checkpoint capture + boundary store, cleanup store, segmented insert) moved into fork-owned `batched_system_kv.py`; scheduler keeps one-line delegators. **−139 net lines** from upstream's churniest batched file. Pure code motion: full suite green with zero test edits (the #18 oracle).
+- **Upstreaming branches cut and pushed**, based on `upstream/main` (`0dd1157`), each with its feature tests passing against upstream code, ready the day PR access opens:
+  - [`fix/batched-stop-strings`](https://github.com/TimotejLabsky/vllm-mlx/tree/fix/batched-stop-strings) — #32, 11 tests, zero fork leakage (verified no DRY/#31 references).
+  - [`fix/batched-per-request-sampling`](https://github.com/TimotejLabsky/vllm-mlx/tree/fix/batched-per-request-sampling) — #33, 3 tests, fork-internal comments reworded.
+  - [`feat/batched-system-kv`](https://github.com/TimotejLabsky/vllm-mlx/tree/feat/batched-system-kv) — the #34–#37 series as one assembled feature (checkpoint engine `system_kv.py`, SSD store `system_kv_ssd.py`, `ssd_cache.py` additive index methods, `batched_system_kv.py`, stream harness, thin scheduler seam) — **80 tests green on upstream+seam**.
+- **Gemma sliding-window verified under batched** (closing the last unverified architecture): mlx-lm `gemma4_text.make_cache` uses `RotatingKVCache(keep=0)` — the merge-supported variant — and the live Studio smoke on `gemma-4-26B-A4B-it-qat-4bit` (`--continuous-batching --text-only` + cache env) passed: warm TTFT 82 ms, 66 tok/s, both concurrent requests restored, grow-on-HIT active, zero errors.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
