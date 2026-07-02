@@ -813,6 +813,50 @@ class BatchedEngine(BaseEngine):
                 prepared.append(msg)
         return prepared
 
+    def _merge_dry_processor(self, kwargs: dict) -> list | None:
+        """Pop the dry_* request kwargs and external logits_processors and
+        return the merged per-request processor list (None when empty).
+
+        Mirrors SimpleEngine's DRY wiring (PATCHES.md #22): request values
+        override VLLM_MLX_DRY_* env defaults; multiplier <= 0 keeps it off.
+        The batched token context starts empty (the scheduler passes no
+        all_tokens into BatchGenerator.insert), so DRY's generation-only
+        matching holds by construction. NOTE: batched MTP acceptance does
+        not re-run per-token processors, so don't combine DRY with
+        --enable-mtp on this engine.
+        """
+        external = kwargs.pop("logits_processors", None)
+        dry_kwargs = {
+            "multiplier": kwargs.pop("dry_multiplier", None),
+            "base": kwargs.pop("dry_base", None),
+            "allowed_length": kwargs.pop("dry_allowed_length", None),
+            "window": kwargs.pop("dry_range", None),
+            "sequence_breakers": kwargs.pop("dry_sequence_breakers", None),
+        }
+        processors = list(external or [])
+        try:
+            from ..dry_sampler import build_dry_processor
+
+            tokenizer = self.tokenizer
+            tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+            dry_proc = build_dry_processor(tokenizer, **dry_kwargs)
+            if dry_proc is not None:
+                processors.append(dry_proc)
+                logger.info(
+                    "DRY sampler active (batched): multiplier=%.2f base=%.2f "
+                    "allowed=%d window=%d breakers=%d",
+                    dry_proc.multiplier,
+                    dry_proc.base,
+                    dry_proc.allowed_length,
+                    dry_proc.window,
+                    len(dry_proc.breaker_ids),
+                )
+        except Exception:
+            logger.warning(
+                "DRY sampler setup failed; continuing without", exc_info=True
+            )
+        return processors or None
+
     async def generate(
         self,
         prompt: str,
@@ -845,6 +889,10 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Pop DRY kwargs + external processors BEFORE branching so both the
+        # MLLM and LLM paths consume them (fork patch #22/#31).
+        logits_processors = self._merge_dry_processor(kwargs)
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -861,7 +909,7 @@ class BatchedEngine(BaseEngine):
                 min_p=kwargs.pop("min_p", 0.0),
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
-                logits_processors=kwargs.pop("logits_processors", None),
+                logits_processors=logits_processors,
             )
 
             return GenerationOutput(
@@ -886,7 +934,7 @@ class BatchedEngine(BaseEngine):
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
-            logits_processors=kwargs.pop("logits_processors", None),
+            logits_processors=logits_processors,
         )
 
         output = await self._engine.generate(
@@ -936,6 +984,10 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Pop DRY kwargs + external processors BEFORE branching so both the
+        # MLLM and LLM paths consume them (fork patch #22/#31).
+        logits_processors = self._merge_dry_processor(kwargs)
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -950,7 +1002,7 @@ class BatchedEngine(BaseEngine):
                 min_p=kwargs.pop("min_p", 0.0),
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
-                logits_processors=kwargs.pop("logits_processors", None),
+                logits_processors=logits_processors,
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -978,7 +1030,7 @@ class BatchedEngine(BaseEngine):
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
-            logits_processors=kwargs.pop("logits_processors", None),
+            logits_processors=logits_processors,
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
