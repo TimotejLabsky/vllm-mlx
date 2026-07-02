@@ -34,6 +34,7 @@ checkpoint capture; keep aligned with ``prefill_step_size``).
 
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from typing import Any, Optional
@@ -67,6 +68,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _model_slug(tokenizer: Any) -> str:
+    """Stable per-model subdir name for the SSD store, derived from the
+    tokenizer (the scheduler doesn't know the model name). HF-cache snapshot
+    paths reduce to their ``models--org--name`` segment so the slug survives
+    revision updates; anything else is sanitized wholesale."""
+    name = str(getattr(tokenizer, "name_or_path", "") or "")
+    m = re.search(r"models--([A-Za-z0-9._-]+--[A-Za-z0-9._-]+)", name)
+    if m:
+        name = m.group(1)
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("_")
+    return name or "model"
+
+
 class BatchedSystemKV:
     """LRU of hybrid-safe snapshot entries + per-request checkpoint ladders.
 
@@ -78,7 +92,7 @@ class BatchedSystemKV:
     ``make_prompt_cache`` objects, so nothing aliases the running batch.
     """
 
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, tokenizer: Any = None, idle_check=None):
         self._model = model
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, dict] = OrderedDict()
@@ -103,6 +117,54 @@ class BatchedSystemKV:
         self.partial_tokens_saved = 0
         self.evictions = 0
         self.boundary_stores = 0
+        self.ssd_promotes = 0
+
+        # SSD persistence (fork patch #36) — same store module, format, and
+        # envs as the SimpleEngine tier (patch #16/#19/#25), so one llama-swap
+        # env block works for either engine. Per-model subdir keeps capacity
+        # accounting per model; the slug deliberately differs from
+        # SimpleEngine's (tokenizer-derived vs model-name) so the two engines
+        # never share a directory — the store is single-writer.
+        self._ssd = None
+        ssd_base = os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_DIR")
+        if ssd_base:
+            try:
+                from .system_kv_ssd import SystemKVSSDConfig, SystemKVSSDStore
+
+                max_gb = float(
+                    os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_GB", "50") or 50
+                )
+                cache_dir = os.path.join(
+                    ssd_base, "batched-" + _model_slug(tokenizer)
+                )
+                self._ssd = SystemKVSSDStore(
+                    SystemKVSSDConfig(cache_dir=cache_dir, max_size_gb=max_gb),
+                    idle_check=idle_check,
+                )
+                self._ssd.start_writer()
+                logger.info(
+                    "[batched_system_kv] SSD persistence enabled: %s (cap %.0f GB)",
+                    cache_dir,
+                    max_gb,
+                )
+            except Exception:
+                logger.warning(
+                    "[batched_system_kv] SSD init failed; disabled", exc_info=True
+                )
+                self._ssd = None
+
+    @property
+    def has_ssd(self) -> bool:
+        return self._ssd is not None
+
+    def close(self) -> None:
+        """Drain and close the SSD writer (scheduler reset/shutdown)."""
+        if self._ssd is not None:
+            try:
+                self._ssd.close()
+            except Exception:
+                logger.debug("[batched_system_kv] SSD close failed", exc_info=True)
+            self._ssd = None
 
     # ------------------------------------------------------------- schedule
 
@@ -243,9 +305,10 @@ class BatchedSystemKV:
         with self._lock:
             checkpoints = self._pending.pop(request_id, [])
             self._base_pos.pop(request_id, None)
-            self._insert_entry_locked(
+            entry = self._insert_entry_locked(
                 tokens_list, kinds, snapshot, metas, checkpoints
             )
+        self._spill(tokens_list, entry)
         return True
 
     def store_prompt_boundary(self, request_id: str, tokens: list, cache_list) -> bool:
@@ -276,15 +339,84 @@ class BatchedSystemKV:
             return False
         with self._lock:
             checkpoints = list(self._pending.get(request_id, []))
-            self._insert_entry_locked(
+            entry = self._insert_entry_locked(
                 tokens_list, kinds, snapshot, metas, checkpoints
             )
             self.boundary_stores += 1
+        # Write-through: the boundary entry is exactly what a restart must
+        # recover (the agent prompt prefill), so it spills too.
+        self._spill(tokens_list, entry)
         logger.info(
             "[batched_system_kv] prompt-boundary store request=%s tokens=%d",
             request_id[:12],
             len(tokens_list),
         )
+        return True
+
+    def _spill(self, tokens_list: list, entry: dict) -> None:
+        """Async write-through of an entry (post-subsumption: richest ladder)."""
+        if self._ssd is None:
+            return
+        try:
+            self._ssd.enqueue_spill(
+                tuple(tokens_list),
+                entry["snapshot"],
+                checkpoints=entry["checkpoints"],
+                meta=entry["metas"],
+                kinds=entry["kinds"],
+            )
+        except Exception:
+            logger.debug("[batched_system_kv] spill enqueue failed", exc_info=True)
+
+    # ------------------------------------------------------------- ssd tier
+
+    def check_ssd(self, tokens: list) -> Optional[dict]:
+        """Index-level probe only (event-loop safe, no blob I/O): a
+        full-prefix or shared-prefix SSD candidate, or None. The blob read
+        happens on the executor via ``promote_ssd`` — the scheduler's
+        ``ssd_pending`` pattern keeps disk reads out of ``add_request``.
+        """
+        if self._ssd is None:
+            return None
+        toks = tuple(tokens)
+        try:
+            row = self._ssd.lookup_prefix(toks)
+            if row is not None and row.get("num_tokens", 0) >= self.partial_min:
+                return {
+                    "tokens": toks[: row["num_tokens"]],
+                    "file_path": row["file_path"],
+                }
+            for row in self._ssd.lookup_shared(toks):
+                if row.get("common_len", 0) >= self.partial_min:
+                    return {
+                        "tokens": tuple(row["tokens"]),
+                        "file_path": row["file_path"],
+                    }
+        except Exception:
+            logger.debug("[batched_system_kv] check_ssd failed", exc_info=True)
+        return None
+
+    def promote_ssd(self, candidate: dict) -> bool:
+        """Load an SSD candidate into the RAM LRU (EXECUTOR thread — the
+        store realizes loaded arrays on the calling thread, which keeps the
+        cross-thread realize contract). A follow-up ``fetch`` then restores
+        through the normal path."""
+        if self._ssd is None:
+            return False
+        entry = self._ssd.read_entry(
+            tuple(candidate["tokens"]), candidate["file_path"]
+        )
+        if entry is None:
+            return False
+        with self._lock:
+            self._insert_entry_locked(
+                list(candidate["tokens"]),
+                entry["kinds"],
+                entry["snapshot"],
+                entry["meta"],
+                entry["checkpoints"],
+            )
+            self.ssd_promotes += 1
         return True
 
     def _enforce_budgets_locked(self) -> None:
@@ -427,9 +559,15 @@ class BatchedSystemKV:
                 "partial_tokens_saved": self.partial_tokens_saved,
                 "evictions": self.evictions,
                 "boundary_stores": self.boundary_stores,
+                "ssd_promotes": self.ssd_promotes,
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
                 "current_memory_mb": mem / (1024 * 1024),
                 "checkpoint_interval": self.ckpt_interval,
+                **(
+                    {"ssd": self._ssd.get_stats()}
+                    if self._ssd is not None
+                    else {}
+                ),
             }

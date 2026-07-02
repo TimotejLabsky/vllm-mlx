@@ -131,6 +131,36 @@ def test_prompt_boundary_store_lifecycle_across_threads():
         w.run(lambda: _consume(cache))
 
 
+def test_ssd_promote_lifecycle_across_threads(monkeypatch, tmp_path):
+    """SSD promote runs on the executor (patch #36); the promoted entry's
+    arrays must be consumable from fetch (main) and merge (executor) — the
+    realize-on-load inside read_entry is what makes this hold."""
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    tok = NS(name_or_path="unit/threaded-model")
+
+    kv1 = BatchedSystemKV(_HybridModel(), tokenizer=tok)
+    with StreamBoundWorker() as w:
+        w.run(lambda: kv1.note_scheduled("r1", 0))
+        w.run(lambda: kv1.capture_segment("r1", 448, _hybrid_donor(448)))
+        w.run(lambda: kv1.store("r1", TOKENS, _hybrid_donor(len(TOKENS))))
+    kv1.close()  # restart
+
+    kv2 = BatchedSystemKV(_HybridModel(), tokenizer=tok)
+    with StreamBoundWorker() as w:
+        candidate = kv2.check_ssd(TOKENS[:600] + [1, 2, 3])  # event loop
+        assert candidate is not None
+        assert w.run(lambda: kv2.promote_ssd(candidate)) is True  # executor
+
+        result = kv2.fetch(TOKENS[:600] + [1, 2, 3])  # event loop
+        assert result is not None
+        cache, _, pos = result
+        assert pos == 448
+        w.run(lambda: _consume(cache))  # executor merge
+    kv2.close()
+
+
 def test_inherited_ladder_survives_thread_roundtrip():
     """Donor-ladder inheritance hands checkpoint state captured on the
     executor to a NEW request's pending ladder via fetch (main thread); the
