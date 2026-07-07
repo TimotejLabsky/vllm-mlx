@@ -211,3 +211,38 @@ class TestMalformedXML:
         )
         result = parser.extract_tool_calls(text)
         assert result.tools_called
+
+
+class TestEmptyToolWrapper:
+    """Bare <tool_call></tool_call> wrappers must not leak as content (upstream #497 subset)."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "<tool_call></tool_call>",
+            "<tool_call>\n</tool_call>",
+            "<tool_call></>",
+            "<tool_call/>",
+            "  <tool_call>  </tool_call>  ",
+        ],
+    )
+    def test_non_streaming_wrapper_suppressed(self, parser, text):
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        assert result.tool_calls == []
+        assert result.content == ""
+
+    def test_streaming_wrapper_suppressed(self, parser):
+        text = "<tool_call></tool_call>"
+        assert parser.extract_tool_calls_streaming("", text, text) is None
+
+    def test_nonempty_wrapper_still_parses(self, parser):
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
