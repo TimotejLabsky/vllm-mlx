@@ -923,6 +923,20 @@ Cherry-picks upstream open PR [#552](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
+## 45. `fix(simple): keep media-bearing MLLM requests on the owner thread` — cherry-pick of upstream #551
+
+**Files:** `vllm_mlx/engine/simple.py` (one condition), `tests/test_simple_engine_mllm_media_thread.py` (new)
+
+Cherry-picks upstream open PR [#551](https://github.com/waybarrios/vllm-mlx/pull/551) (Thump604). The MLLM stream_chat routing condition `self._text_model is None and not has_media_content(messages)` sent **media-bearing requests with a TextModel present** (the Qwen3.6 case: text route built, user sends an image) through `_run_blocking_serialized` → `mlx_vlm.stream_chat` on a foreign worker thread — the [#535](https://github.com/waybarrios/vllm-mlx/issues/535) `Stream(gpu, N)` crash shape. Flipped to `has_media_content(messages) or self._text_model is None`: media always stays on the current thread. This is the **runtime thread-affinity** facet that patches #21/#28's load-time realizes don't cover.
+
+Low urgency for us (VLM traffic runs through the separate vlm-server script; this only bites images sent to a Qwen3.6 SimpleEngine via vllm_mlx) — taken as cheap insurance. Note: our branch body already satisfies the upstream owner's blocking request on #551 (it uses `_acquire_generation_slot` from patch #15, not the raw lock).
+
+**Conflict surface:** the one-line flip; the PR's surrounding-context drift against our patch #15 block was resolved by hand.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #551** (collaborator-approved, owner requested the admission-slot change we already have; author stale since 2026-06-11).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
