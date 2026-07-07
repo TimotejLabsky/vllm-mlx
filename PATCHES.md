@@ -937,6 +937,18 @@ Low urgency for us (VLM traffic runs through the separate vlm-server script; thi
 
 ---
 
+## 46. `fix(qwen3-xml): suppress empty tool-call wrappers` — subset of upstream #497
+
+**Files:** `vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py`, `tests/test_qwen3_xml_parser.py`
+
+Ports **only the `_is_empty_tool_wrapper` guard** from upstream open PR [#497](https://github.com/waybarrios/vllm-mlx/pull/497) (kylejeske). Under load, Qwen3-Coder occasionally emits a bare `<tool_call></tool_call>` (or `<tool_call/>`, `<tool_call></>`). Non-streaming `extract_tool_calls` found no tool calls and fell back to `content=model_output` — **the literal wrapper markup leaked to the client as assistant content** on our `qwen3_coder` models (Qwen3-Coder-Next, Ornith). The guard returns empty content with a warning log; streaming gets the matching early-return (it already suppressed the markup end-to-end, this just short-circuits + logs).
+
+**Deliberately NOT taken from #497:** the scheduler.py/server.py "post-tool cumulative-text" piece — it's under unaddressed owner CHANGES-REQUESTED upstream (O(n²) per-chunk `list()` copy, full `model_dump()` per stream), collides with our scheduler finalization block (#34-series) and patch #27's streaming loop, and its symptom is unconfirmed on our SimpleEngine routes. Re-evaluate when it merges upstream in a reworked form.
+
+**Status:** the guard is byte-compatible with #497's version — auto-collapses if #497 ever merges as-is; otherwise ours to keep.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
