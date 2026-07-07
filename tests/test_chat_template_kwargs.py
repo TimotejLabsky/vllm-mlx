@@ -583,3 +583,112 @@ async def test_stream_anthropic_flushes_truncated_deepseek_v4_dsml(
 
     assert text == truncated
     assert events[-1]["type"] == "message_stop"
+
+# Explicit-marker guard on the Anthropic/Responses STREAMING paths (patch #27
+# follow-up, logic from upstream #610): with thinking disabled the reasoning
+# parser stays off until the model emits an explicit reasoning marker (Gemma 4
+# opens <|channel>thought regardless of the template kwarg); from that point
+# deltas are parsed so raw markers don't leak, and parsed reasoning is
+# suppressed — only cleaned content is emitted.
+
+_GEMMA_DELTAS = (
+    "<|channel>thought\n",
+    "Let me think.",
+    "<channel|>",
+    "The answer is 42.",
+)
+
+
+def _gemma_parser():
+    from vllm_mlx.reasoning.gemma4_parser import Gemma4ReasoningParser
+
+    return Gemma4ReasoningParser()
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_strips_markers_when_thinking_disabled():
+    async def fake_stream_chat(messages, **kwargs):
+        for piece in _GEMMA_DELTAS:
+            yield SimpleNamespace(new_text=piece, prompt_tokens=4, completion_tokens=1)
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    msgs = [{"role": "user", "content": "What is the answer?"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model", max_tokens=8, messages=msgs
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=msgs,
+        chat_kwargs={"chat_template_kwargs": {"enable_thinking": False}},
+        response_format=None,
+        json_logits_processor=None,
+    )
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _gemma_parser(), "test-model"
+    try:
+        body = "".join(
+            [
+                c
+                async for c in srv._stream_anthropic_messages(
+                    engine, openai_request, anthropic_request, prepared
+                )
+            ]
+        )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    # Raw markers and the thought text must not reach the text block.
+    assert "<|channel>" not in body and "<channel|>" not in body
+    assert "Let me think." not in body
+    # Thinking was disabled — no thinking block, only cleaned content.
+    assert "thinking_delta" not in body
+    assert "The answer is 42." in body
+    assert '"type": "text_delta"' in body
+
+
+@pytest.mark.anyio
+async def test_stream_responses_strips_markers_when_thinking_disabled():
+    async def fake_stream_chat(messages, **kwargs):
+        for i, piece in enumerate(_GEMMA_DELTAS):
+            yield SimpleNamespace(
+                new_text=piece,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+                finish_reason="stop" if i == len(_GEMMA_DELTAS) - 1 else None,
+            )
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    request = srv.ResponsesRequest(
+        model="test-model", input="What is the answer?", stream=True
+    )
+    chat_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="What is the answer?")],
+        max_tokens=8,
+    )
+    msgs = [{"role": "user", "content": "What is the answer?"}]
+    chat_kwargs = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _gemma_parser(), "test-model"
+    try:
+        with patch.object(
+            srv,
+            "_prepare_streaming_responses_request",
+            return_value=(engine, chat_request, msgs, chat_kwargs),
+        ):
+            body = "".join(
+                [c async for c in srv._stream_responses_request(request)]
+            )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    # Raw markers and the thought text must not reach the output_text stream.
+    assert "<|channel>" not in body and "<channel|>" not in body
+    assert "Let me think." not in body
+    # Thinking was disabled — no reasoning item, only cleaned content.
+    assert "reasoning_text.delta" not in body
+    assert "The answer is 42." in body
