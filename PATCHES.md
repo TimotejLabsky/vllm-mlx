@@ -874,6 +874,20 @@ Cherry-picks upstream open PR [#626](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
+## 42. `fix(mistral-parser): parse the [ARGS]-marker tool format` — cherry-pick of upstream #631
+
+**Files:** `vllm_mlx/tool_parsers/mistral_tool_parser.py`, `tests/test_tool_parsers.py`
+
+Cherry-picks upstream open PR [#631](https://github.com/waybarrios/vllm-mlx/pull/631) (mabaeyens). Dec-2025 Mistral tokenizers (Ministral 3, **Devstral Small 2** — which we serve with `--tool-call-parser mistral`) emit `[TOOL_CALLS]name[ARGS]{json}`. The parser had no `[ARGS]` awareness: non-streaming parsed the function name as `get_weather[ARGS]` (matches no tool → call dropped); streaming re-classified deltas by leading punctuation and appended JSON fragments to the name. **Devstral Small 2 tool calling was fully broken on our tree.** The fix adds an `[ARGS]`-gated branch (older `[TOOL_CALLS]name{...}` and JSON-array formats untouched) plus persistent `_args_started`/`_name_buffer` streaming state with a `reset()` override chaining `super().reset()` (framework calls `reset()` at stream start — no cross-request leak). Mistral-Small-3.2-2506 predates the marker and is unaffected.
+
+**Known pre-existing limitation (not introduced here):** the streamed tool-call `id` may be omitted on the first delta when the name spans multiple deltas before `[ARGS]`.
+
+**Conflict surface:** zero — no fork patches touch `mistral_tool_parser.py`.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #631** (opened 2026-07-06, MERGEABLE, no reviews yet).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
