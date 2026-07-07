@@ -860,6 +860,69 @@ Checks 1–2 use the bytes/token footprint learned from the newest cache entry (
 
 ---
 
+## 41. `patch: embedding-truncation-from-config` — cherry-pick of upstream #626
+
+**Files:** `vllm_mlx/utils/truncation.py` (new), `vllm_mlx/embedding.py`, `vllm_mlx/rerank.py`, `vllm_mlx/utils/__init__.py`, `tests/test_truncation.py` (new), `tests/test_embeddings.py`, `tests/test_rerank.py`
+
+Cherry-picks upstream open PR [#626](https://github.com/waybarrios/vllm-mlx/pull/626) (brandy975). `EmbeddingEngine.embed()` hard-coded `max_length=512` with `truncation=True` — **every embedding request for Qwen3-Embedding-4B (native 32k) was silently truncated at 512 tokens**, degrading all RAG embeddings on the exact `--embedding-model` path we deploy. The PR adds `resolve_max_length(config, tokenizer, *, cap, default)`: `config.max_position_embeddings` → `tokenizer.model_max_length` → default 512, clamped to `cap=8192`, with bool/int/≤0/HF-1e30-sentinel guards. Same fix wired into the reranker (which we don't currently serve — harmless).
+
+**Deployment note:** the effective embedding window becomes **8192, not 32k** (the PR's cap). Chunks between 8k and 32k tokens still truncate; irrelevant for our RAG chunk sizes. `padding=True` pads to the longest actual sequence in the batch, so short inputs cost nothing extra.
+
+**Conflict surface:** zero — `embedding.py`/`rerank.py`/`utils/__init__.py` carried no fork patches (verified byte-identical to upstream's "before" side).
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #626** if/when it merges (MERGEABLE, no reviews yet as of 2026-07-07).
+
+---
+
+## 42. `fix(mistral-parser): parse the [ARGS]-marker tool format` — cherry-pick of upstream #631
+
+**Files:** `vllm_mlx/tool_parsers/mistral_tool_parser.py`, `tests/test_tool_parsers.py`
+
+Cherry-picks upstream open PR [#631](https://github.com/waybarrios/vllm-mlx/pull/631) (mabaeyens). Dec-2025 Mistral tokenizers (Ministral 3, **Devstral Small 2** — which we serve with `--tool-call-parser mistral`) emit `[TOOL_CALLS]name[ARGS]{json}`. The parser had no `[ARGS]` awareness: non-streaming parsed the function name as `get_weather[ARGS]` (matches no tool → call dropped); streaming re-classified deltas by leading punctuation and appended JSON fragments to the name. **Devstral Small 2 tool calling was fully broken on our tree.** The fix adds an `[ARGS]`-gated branch (older `[TOOL_CALLS]name{...}` and JSON-array formats untouched) plus persistent `_args_started`/`_name_buffer` streaming state with a `reset()` override chaining `super().reset()` (framework calls `reset()` at stream start — no cross-request leak). Mistral-Small-3.2-2506 predates the marker and is unaffected.
+
+**Known pre-existing limitation (not introduced here):** the streamed tool-call `id` may be omitted on the first delta when the name spans multiple deltas before `[ARGS]`.
+
+**Conflict surface:** zero — no fork patches touch `mistral_tool_parser.py`.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #631** (opened 2026-07-06, MERGEABLE, no reviews yet).
+
+---
+
+## 43. `fix(gpt-oss): plumb harmony tool calls through to response` — cherry-pick of upstream #562
+
+**Files:** `vllm_mlx/server.py`, `vllm_mlx/tool_parsers/harmony_tool_parser.py`, `vllm_mlx/api/utils.py`, `tests/test_harmony_parsers.py`, `tests/test_server.py`
+
+Cherry-picks upstream open PR [#562](https://github.com/waybarrios/vllm-mlx/pull/562) (CBribiescas, head `98d4f83` incl. the owner-review fix). **gpt-oss-20b tool calling was broken on our tree** — `--tool-call-parser harmony` returned no `tool_calls`; arguments came back glued into `content` with `finish_reason: "stop"`. Two independent layers, both fixed:
+
+1. **server.py `_extract_reasoning_and_tool_calls`:** when harmony reasoning was extracted but there was no `<|channel|>final` block (i.e. *every* gpt-oss tool call — the model jumps from analysis straight to `commentary to=functions.*`), the tool-parser input was blanked to `""`. Now preserves raw `output_text` for the parser, gated on `request.tools` (without tools the parser is skipped and raw harmony tokens would leak into content — the owner's flagged regression, fixed in `98d4f83`).
+2. **harmony_tool_parser.py:** `_COMMENTARY_BLOCK_PATTERN` hard-required a `<|call|>` terminator, which is consumed as a stop sequence and never appears in `output.text`. Now also matches at EOS (named `terminator` group; `matched_at_eos` drops silently-truncated JSON instead of emitting raw-args garbage).
+
+Plus a defensive `clean_output_text` bypass for commentary tool blocks in `api/utils.py` (load-bearing on the streaming-Responses/Anthropic paths).
+
+**Hand-merge note:** the server.py hunk collided with patch #27's `if not allow_reasoning:` fold block (inserted right after the replaced line). Resolution: PR's tools-gated assignment first, #27's fold kept after it — they compose (when raw output is preserved, the fold's empty-content condition doesn't fire; with tools absent, #27 semantics unchanged).
+
+**Conflict surface:** only that one server.py region; `harmony_tool_parser.py`/`api/utils.py` carried no fork patches.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #562** (MERGEABLE; collaborator-approved, owner re-review pending; PR self-closed/reopened once for staleness, so upstream timing is uncertain).
+
+---
+
+## 44. `patch: engine-core-idle-backoff` — cherry-pick of upstream #552 + abort symmetry
+
+**Files:** `vllm_mlx/engine_core.py`, `tests/test_engine_core_idle_polling.py` (new)
+
+Cherry-picks upstream open PR [#552](https://github.com/waybarrios/vllm-mlx/pull/552) (Thump604) — the clean implementation of [Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) (adaptive idle polling) this file's future-work list was waiting for. The batched `_engine_loop` busy-waited at `step_interval` (~1 kHz) when the scheduler was empty — wasted CPU/power on the always-on Studio now that Qwen3.6-27B runs `--continuous-batching` in production. The PR adds `EngineConfig.idle_step_interval` (100 ms), an `asyncio.Event` set by `add_request()` and awaited via `_wait_for_idle_or_request()` — idle wakes immediately on new work, otherwise polls at 10 Hz instead of 1 kHz. The active-generation path is untouched.
+
+**Two fork additions on top of the PR** (both from the owner's blocking review of #552, unaddressed upstream):
+- `abort_request()` also sets the event (symmetry — an abort re-evaluates scheduler state promptly instead of finishing the backoff window).
+- Real event-path tests: the PR's own tests only exercised the `_request_event = None` fallback; added `test_wait_for_idle_returns_immediately_when_event_fires` (event at 50 ms under a 5 s timeout must return <1 s and clear the event) and `test_abort_request_wakes_idle_engine_loop`.
+
+**Conflict surface:** none — every hunk anchored verbatim; the fork's engine_core patches (worker-thread stepping, #29 stream self-heal) live in the `has_requests()` branch, orthogonal to the idle else-branch.
+
+**Status:** TEMPORARY cherry-pick for the PR's portion — **retire on the next rebase past upstream #552** (collaborator-approved but owner requested tests+benchmarks and the author has been stale ~4 weeks; our two additions are exactly what the owner asked for, so fold them into the upstream discussion if it revives). The abort-symmetry + tests additions are ours to keep if upstream merges without them.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
@@ -874,7 +937,7 @@ Open upstream PRs/issues worth tracking — not yet applied here, with the reaso
 
 - **[Issue #502](https://github.com/waybarrios/vllm-mlx/issues/502) — DFlash speculative decoding for Qwen 3.5 / 3.6.** External block-diffusion draft model + verification against the target. Different shape from native MTP. Not implemented yet upstream; if it lands as a distinct backend, evaluate against our 27B-4bit dense + 35B-A3B MoE workloads.
 
-- **[Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) — adaptive idle polling.** 1 kHz step loop when scheduler is empty is wasted CPU. Not throughput-relevant on a dedicated Mac Studio, but worth picking up if a clean PR lands.
+- **[Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) — adaptive idle polling. PICKED UP 2026-07-07 as patch #44** (cherry-pick of PR #552 + abort symmetry + real event tests — see above).
 
 PRs evaluated and rejected for our workload:
 
