@@ -907,6 +907,22 @@ Plus a defensive `clean_output_text` bypass for commentary tool blocks in `api/u
 
 ---
 
+## 44. `patch: engine-core-idle-backoff` — cherry-pick of upstream #552 + abort symmetry
+
+**Files:** `vllm_mlx/engine_core.py`, `tests/test_engine_core_idle_polling.py` (new)
+
+Cherry-picks upstream open PR [#552](https://github.com/waybarrios/vllm-mlx/pull/552) (Thump604) — the clean implementation of [Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) (adaptive idle polling) this file's future-work list was waiting for. The batched `_engine_loop` busy-waited at `step_interval` (~1 kHz) when the scheduler was empty — wasted CPU/power on the always-on Studio now that Qwen3.6-27B runs `--continuous-batching` in production. The PR adds `EngineConfig.idle_step_interval` (100 ms), an `asyncio.Event` set by `add_request()` and awaited via `_wait_for_idle_or_request()` — idle wakes immediately on new work, otherwise polls at 10 Hz instead of 1 kHz. The active-generation path is untouched.
+
+**Two fork additions on top of the PR** (both from the owner's blocking review of #552, unaddressed upstream):
+- `abort_request()` also sets the event (symmetry — an abort re-evaluates scheduler state promptly instead of finishing the backoff window).
+- Real event-path tests: the PR's own tests only exercised the `_request_event = None` fallback; added `test_wait_for_idle_returns_immediately_when_event_fires` (event at 50 ms under a 5 s timeout must return <1 s and clear the event) and `test_abort_request_wakes_idle_engine_loop`.
+
+**Conflict surface:** none — every hunk anchored verbatim; the fork's engine_core patches (worker-thread stepping, #29 stream self-heal) live in the `has_requests()` branch, orthogonal to the idle else-branch.
+
+**Status:** TEMPORARY cherry-pick for the PR's portion — **retire on the next rebase past upstream #552** (collaborator-approved but owner requested tests+benchmarks and the author has been stale ~4 weeks; our two additions are exactly what the owner asked for, so fold them into the upstream discussion if it revives). The abort-symmetry + tests additions are ours to keep if upstream merges without them.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
@@ -921,7 +937,7 @@ Open upstream PRs/issues worth tracking — not yet applied here, with the reaso
 
 - **[Issue #502](https://github.com/waybarrios/vllm-mlx/issues/502) — DFlash speculative decoding for Qwen 3.5 / 3.6.** External block-diffusion draft model + verification against the target. Different shape from native MTP. Not implemented yet upstream; if it lands as a distinct backend, evaluate against our 27B-4bit dense + 35B-A3B MoE workloads.
 
-- **[Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) — adaptive idle polling.** 1 kHz step loop when scheduler is empty is wasted CPU. Not throughput-relevant on a dedicated Mac Studio, but worth picking up if a clean PR lands.
+- **[Issue #508](https://github.com/waybarrios/vllm-mlx/issues/508) — adaptive idle polling. PICKED UP 2026-07-07 as patch #44** (cherry-pick of PR #552 + abort symmetry + real event tests — see above).
 
 PRs evaluated and rejected for our workload:
 
