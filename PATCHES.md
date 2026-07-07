@@ -630,6 +630,8 @@ When `enable_thinking=False`, the server **skipped the reasoning parser entirely
 
 **Upstreaming:** candidate — the skip-when-disabled optimization is incorrect for any template that prefills a reasoning frame; running the parser and dropping reasoning is the correct general behavior.
 
+> **2026-07-07 follow-up (patch #47): Anthropic-messages + Responses STREAMING paths.** This patch only fixed the non-stream and chat-completion-streaming paths; `_stream_anthropic_messages` and `_stream_responses_request` kept their `not _thinking_disabled(...)` gates, so gemma-4/gpt-oss markers still leaked there when thinking was off. Closed by patch #47 (see below) using upstream #610's latch design rather than this patch's fold (those two paths route reasoning-branch deltas past the tool parser, so an unconditional always-run would have broken thinking-off tool streaming).
+
 ---
 
 ## 28. `fix(llm): realize lazy init-time arrays on the load thread (gpt-oss serialized-route stream crash)`
@@ -946,6 +948,20 @@ Ports **only the `_is_empty_tool_wrapper` guard** from upstream open PR [#497](h
 **Deliberately NOT taken from #497:** the scheduler.py/server.py "post-tool cumulative-text" piece — it's under unaddressed owner CHANGES-REQUESTED upstream (O(n²) per-chunk `list()` copy, full `model_dump()` per stream), collides with our scheduler finalization block (#34-series) and patch #27's streaming loop, and its symptom is unconfirmed on our SimpleEngine routes. Re-evaluate when it merges upstream in a reworked form.
 
 **Status:** the guard is byte-compatible with #497's version — auto-collapses if #497 ever merges as-is; otherwise ours to keep.
+
+---
+
+## 47. `fix(reasoning): strip markers on Anthropic/Responses streaming when thinking disabled` — patch #27 follow-up
+
+**Files:** `vllm_mlx/server.py`, `tests/test_chat_template_kwargs.py`
+
+Closes the two streaming gaps patch #27 left open: `_stream_anthropic_messages` and `_stream_responses_request` still skipped the reasoning parser entirely when thinking was disabled, so gemma-4's echoed `<|channel>thought\n<channel|>` prefill (and gpt-oss channel markers) leaked raw into the text stream on those two APIs.
+
+**Design: upstream [#610](https://github.com/waybarrios/vllm-mlx/pull/610)'s explicit-marker latch, not patch #27's fold.** On these two paths the reasoning branch `continue`s past the tool parser, so unconditionally running the parser (patch #27 style) would have routed *all* thinking-off deltas away from tool streaming — a regression for markerless models (Qwen + tools + thinking off). The latch keeps the parser off until an explicit reasoning marker appears in the accumulated raw text (`_explicit_reasoning_markers_present`, checking the active parser's `start_token`/`end_token`); markerless streams keep the old code path untouched, marker-emitting streams get parsed from that point on with reasoning suppressed (thinking was disabled — only cleaned content is emitted, no thinking block/reasoning item is started). The three server.py hunks are taken verbatim from #610 (they anchored cleanly); its simple.py/non-stream/chat-completion hunks were **not** taken — patches #21/#27 supersede those (see the #610 assessment in Future work).
+
+**Tests:** #610's Anthropic streaming test ported as-is + a fork-written equivalent for the Responses path (gemma-4 delta sequence with `enable_thinking=False`: no raw markers, no thought text, no thinking block/reasoning item, cleaned content present). #610's non-stream and chat-completion tests were NOT ported — they assert suppress-thought semantics where patch #27 deliberately folds (documented divergence).
+
+**Status:** the three hunks are byte-equivalent to #610's — they auto-collapse when #610 merges (it's collaborator-approved with owner participation, so likely soon). At that rebase, also adopt #610's `mllm_scheduler.py` + `utils/tokenizer.py` refactors and reject its simple.py hunks per the standing policy.
 
 ---
 
