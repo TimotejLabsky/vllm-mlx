@@ -888,6 +888,25 @@ Cherry-picks upstream open PR [#631](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
+## 43. `fix(gpt-oss): plumb harmony tool calls through to response` — cherry-pick of upstream #562
+
+**Files:** `vllm_mlx/server.py`, `vllm_mlx/tool_parsers/harmony_tool_parser.py`, `vllm_mlx/api/utils.py`, `tests/test_harmony_parsers.py`, `tests/test_server.py`
+
+Cherry-picks upstream open PR [#562](https://github.com/waybarrios/vllm-mlx/pull/562) (CBribiescas, head `98d4f83` incl. the owner-review fix). **gpt-oss-20b tool calling was broken on our tree** — `--tool-call-parser harmony` returned no `tool_calls`; arguments came back glued into `content` with `finish_reason: "stop"`. Two independent layers, both fixed:
+
+1. **server.py `_extract_reasoning_and_tool_calls`:** when harmony reasoning was extracted but there was no `<|channel|>final` block (i.e. *every* gpt-oss tool call — the model jumps from analysis straight to `commentary to=functions.*`), the tool-parser input was blanked to `""`. Now preserves raw `output_text` for the parser, gated on `request.tools` (without tools the parser is skipped and raw harmony tokens would leak into content — the owner's flagged regression, fixed in `98d4f83`).
+2. **harmony_tool_parser.py:** `_COMMENTARY_BLOCK_PATTERN` hard-required a `<|call|>` terminator, which is consumed as a stop sequence and never appears in `output.text`. Now also matches at EOS (named `terminator` group; `matched_at_eos` drops silently-truncated JSON instead of emitting raw-args garbage).
+
+Plus a defensive `clean_output_text` bypass for commentary tool blocks in `api/utils.py` (load-bearing on the streaming-Responses/Anthropic paths).
+
+**Hand-merge note:** the server.py hunk collided with patch #27's `if not allow_reasoning:` fold block (inserted right after the replaced line). Resolution: PR's tools-gated assignment first, #27's fold kept after it — they compose (when raw output is preserved, the fold's empty-content condition doesn't fire; with tools absent, #27 semantics unchanged).
+
+**Conflict surface:** only that one server.py region; `harmony_tool_parser.py`/`api/utils.py` carried no fork patches.
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #562** (MERGEABLE; collaborator-approved, owner re-review pending; PR self-closed/reopened once for staleness, so upstream timing is uncertain).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
