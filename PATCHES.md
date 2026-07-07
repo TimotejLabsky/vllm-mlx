@@ -860,6 +860,20 @@ Checks 1–2 use the bytes/token footprint learned from the newest cache entry (
 
 ---
 
+## 41. `patch: embedding-truncation-from-config` — cherry-pick of upstream #626
+
+**Files:** `vllm_mlx/utils/truncation.py` (new), `vllm_mlx/embedding.py`, `vllm_mlx/rerank.py`, `vllm_mlx/utils/__init__.py`, `tests/test_truncation.py` (new), `tests/test_embeddings.py`, `tests/test_rerank.py`
+
+Cherry-picks upstream open PR [#626](https://github.com/waybarrios/vllm-mlx/pull/626) (brandy975). `EmbeddingEngine.embed()` hard-coded `max_length=512` with `truncation=True` — **every embedding request for Qwen3-Embedding-4B (native 32k) was silently truncated at 512 tokens**, degrading all RAG embeddings on the exact `--embedding-model` path we deploy. The PR adds `resolve_max_length(config, tokenizer, *, cap, default)`: `config.max_position_embeddings` → `tokenizer.model_max_length` → default 512, clamped to `cap=8192`, with bool/int/≤0/HF-1e30-sentinel guards. Same fix wired into the reranker (which we don't currently serve — harmless).
+
+**Deployment note:** the effective embedding window becomes **8192, not 32k** (the PR's cap). Chunks between 8k and 32k tokens still truncate; irrelevant for our RAG chunk sizes. `padding=True` pads to the longest actual sequence in the batch, so short inputs cost nothing extra.
+
+**Conflict surface:** zero — `embedding.py`/`rerank.py`/`utils/__init__.py` carried no fork patches (verified byte-identical to upstream's "before" side).
+
+**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #626** if/when it merges (MERGEABLE, no reviews yet as of 2026-07-07).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
