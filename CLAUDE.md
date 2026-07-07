@@ -11,9 +11,14 @@ feature branch — read this before changing anything.
   same commit as any patch change.
 - [`docs/fork/`](docs/fork/) — fork design docs and investigations:
   - [`continuous-batching-hybrid-caching.md`](docs/fork/continuous-batching-hybrid-caching.md)
-    — why BatchedEngine's prefix cache gets zero hits on hybrid (attention+SSM)
-    models and what a fix would take. **We deliberately run SimpleEngine +
-    system-KV**; don't "helpfully" switch to `--continuous-batching`.
+    — why BatchedEngine's stock prefix cache gets zero hits on hybrid
+    (attention+SSM) models, and the 2026-07-02 update: the fork built its own
+    hybrid-safe batched cache (patches #29–#40, `batched_system_kv.py`).
+    **Engine choice is deliberate per model**: Qwen3.6-27B runs
+    `--continuous-batching --text-only` in production (since 2026-07-02);
+    everything else runs SimpleEngine + system-KV. Don't "helpfully" flip a
+    model's engine — the llama-swap config in `personal-infratructure` is the
+    source of truth.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
 - Consumer side (deploy config, llama-swap, model lineup) lives in the
@@ -32,11 +37,15 @@ feature branch — read this before changing anything.
   (precedent: #541, #579 — see the rebase notes at the top of PATCHES.md).
 - The system-KV cache stack lives in `vllm_mlx/system_kv.py` (+
   `system_kv_ssd.py`), extracted from `engine/simple.py` precisely to shrink the
-  rebase conflict surface (PATCHES.md #18). Keep new system-KV logic there.
+  rebase conflict surface (PATCHES.md #18); the batched equivalent lives in
+  `vllm_mlx/batched_system_kv.py` behind one-line scheduler delegators
+  (PATCHES.md #38). Keep new cache logic in those fork-owned modules.
 - Tests assert **fork semantics**, not upstream's (e.g. default admission is
   `wait`, denylist probe instead of allowlist). The full suite must stay green:
   `.venv/bin/python -m pytest tests/`.
-- Upstream PR creation is collaborator-restricted for us; feedback goes via PR
-  comments. Keep fix branches ready (e.g. `fix/admission-env-respected`).
+- Upstream accepts external fork PRs again (verified 2026-07-07 — recent PRs
+  are all cross-repo; the earlier collaborator restriction has lifted). Keep
+  upstreaming branches ready and rebased (e.g. `fix/batched-stop-strings`,
+  `fix/batched-per-request-sampling`, `feat/batched-system-kv`).
 - Touch upstream-owned files (README.md, docs/ outside `docs/fork/`) as little
   as possible — every line is future rebase conflict surface.
