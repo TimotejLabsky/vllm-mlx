@@ -2599,6 +2599,12 @@ class Scheduler:
         # Process pending aborts FIRST (in executor thread, safe for MLX)
         self._process_pending_aborts()
 
+        # Fork patch #48: shed snapshot RAM while over the memory watermark —
+        # per-step so it fires MID-prefill, where the #40 admission gate
+        # cannot see a solo deep-context ramp.
+        if self.hybrid_kv is not None:
+            _batched_kv.maybe_relieve_pressure(self)
+
         for attempt in range(max_retries + 1):
             try:
                 # Schedule waiting requests
