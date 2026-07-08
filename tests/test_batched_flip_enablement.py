@@ -206,7 +206,13 @@ def test_stats_carry_type_and_new_counters():
     kv = BatchedSystemKV(_FakeModel())
     s = kv.stats()
     assert s["type"] == "batched_system_kv"
-    for key in ("grown_stores", "boundary_stores", "ssd_promotes"):
+    for key in (
+        "grown_stores",
+        "boundary_stores",
+        "ssd_promotes",
+        "pressure_evictions",
+        "pressure_skipped_stores",
+    ):
         assert key in s
 
 
@@ -254,3 +260,170 @@ def test_memory_watermark_backstop(monkeypatch):
 
     monkeypatch.setattr(mx, "get_active_memory", lambda: 50)
     assert bkv.should_defer_cobatch(scheduler, _req("c2", 100)) is False
+
+
+# --------------------------------------------------- pressure relief (#48)
+
+
+DISJOINT = list(range(5000, 5800))  # no shared prefix with TOKENS
+
+
+def _mb(n):
+    return n * 1024 * 1024
+
+
+def _watermarked(monkeypatch, active_mb, ceiling_mb=100):
+    """A cache with the watermark at 90% of a ``ceiling_mb`` ceiling and a
+    mocked allocator: returns ``(kv, mem)`` where ``mem['active']`` /
+    ``mem['peak']`` (bytes) can be mutated between calls. reset_peak
+    collapses peak to active, mirroring the real semantics."""
+    import mlx.core as mx
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", "90")
+    mem = {"active": _mb(active_mb), "peak": _mb(active_mb)}
+    monkeypatch.setattr(mx, "get_active_memory", lambda: mem["active"])
+    monkeypatch.setattr(mx, "get_peak_memory", lambda: mem["peak"])
+    monkeypatch.setattr(
+        mx, "reset_peak_memory", lambda: mem.__setitem__("peak", mem["active"])
+    )
+    monkeypatch.setattr(
+        mx,
+        "device_info",
+        lambda: {"max_recommended_working_set_size": _mb(ceiling_mb)},
+    )
+    return BatchedSystemKV(_FakeModel()), mem
+
+
+def test_relief_inert_without_watermark(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.relieve_pressure() == 0
+    assert kv.stats()["entry_count"] == 1
+    assert kv.pressure_evictions == 0
+
+
+def test_relief_needs_a_peak_spike(monkeypatch):
+    # active and peak both under the 90 MB threshold -> nothing happens
+    kv, mem = _watermarked(monkeypatch, active_mb=50)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.relieve_pressure() == 0
+    assert kv.stats()["entry_count"] == 1
+
+
+def test_relief_triggers_on_intra_step_peak(monkeypatch):
+    """The 2026-07-09 live finding: prefill-chunk transients spike PAST the
+    threshold and are freed before the inter-chunk check — the trigger
+    must be the peak since the last check, not instantaneous active."""
+    kv, mem = _watermarked(monkeypatch, active_mb=50)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+
+    mem["peak"] = _mb(95)  # a chunk spiked over; active already back at 50
+    assert kv.relieve_pressure() == 1  # active <= threshold stops after one
+    assert kv.pressure_evictions == 1
+    assert kv.stats()["entry_count"] == 1
+    # LRU-first: the older TOKENS entry went, the newer chain survives
+    assert next(iter(kv._entries.values()))["tokens"] == DISJOINT
+    assert kv.stats()["evictions"] == 1  # counted in the existing gauge too
+    assert mem["peak"] == mem["active"]  # window reset for the next step
+
+
+def test_relief_empties_bag_under_sustained_pressure(monkeypatch):
+    kv, mem = _watermarked(monkeypatch, active_mb=50)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+
+    mem["active"] = _mb(95)
+    mem["peak"] = _mb(96)
+    assert kv.relieve_pressure() == 2  # active never clears -> whole bag
+    assert kv.stats()["entry_count"] == 0
+    assert kv.stats()["pressure_evictions"] == 2
+
+
+def test_boundary_store_skipped_under_pressure(monkeypatch):
+    kv, mem = _watermarked(monkeypatch, active_mb=95)
+    assert kv.store_prompt_boundary("r1", TOKENS, _donor_at(len(TOKENS))) is False
+    assert kv.boundary_stores == 0
+    assert kv.stats()["entry_count"] == 0
+    assert kv.stats()["pressure_skipped_stores"] == 1
+
+
+def test_final_store_skipped_under_pressure_without_donor(monkeypatch):
+    kv, mem = _watermarked(monkeypatch, active_mb=95)
+    assert kv.store("r1", TOKENS, _donor_at(len(TOKENS))) is False
+    assert kv.stats()["entry_count"] == 0
+    assert kv.stats()["pressure_skipped_stores"] == 1
+
+
+def test_final_store_skipped_when_the_copy_would_overshoot(monkeypatch):
+    """The 2026-07-09 live finding (second half): a deep final store passed
+    the instantaneous gate at 48.9 GB — after the batch KV was freed — and
+    then materialized a 7 GB copy. The gate must price the copy in."""
+    kv, mem = _watermarked(monkeypatch, active_mb=5, ceiling_mb=10)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))  # seeds bytes/token
+    bpt = kv.bytes_per_token()
+    assert bpt > 0
+
+    # a chain whose snapshot alone crosses the 9 MB threshold from 5 MB
+    need = int(_mb(5) / bpt)
+    big = list(range(100_000, 100_000 + need))
+    assert kv.store("rbig", big, _donor_at(need)) is False
+    assert kv.stats()["pressure_skipped_stores"] == 1
+    assert kv.stats()["entry_count"] == 1  # the seed entry is untouched
+
+
+def test_overshoot_gate_survives_an_emptied_bag(monkeypatch):
+    """Live 2026-07-09 round-2 finding: relief evicts the WHOLE bag mid-
+    prefill, so the deep final store that follows priced itself against a
+    bytes/token of 0 and landed a 7 GB copy. The estimate must persist."""
+    kv, mem = _watermarked(monkeypatch, active_mb=5, ceiling_mb=10)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    # learned at INSERT, not lazily on read — a serial workload never reads
+    # bytes/token before relief empties the bag (live round 3)
+    assert kv._bpt_hint > 0
+    bpt = kv.bytes_per_token()
+
+    mem["peak"] = _mb(15)
+    mem["active"] = _mb(9.5)  # stays over -> relief empties the bag
+    assert kv.relieve_pressure() == 1
+    assert kv.stats()["entry_count"] == 0
+
+    mem["active"] = _mb(5)  # batch KV freed; instantaneous gate would pass
+    mem["peak"] = _mb(5)
+    need = int(_mb(5) / bpt)
+    big = list(range(100_000, 100_000 + need))
+    assert kv.store("rbig", big, _donor_at(need)) is False  # hint held
+    assert kv.stats()["pressure_skipped_stores"] == 1
+
+
+def test_final_store_grows_under_pressure_with_donor(monkeypatch):
+    # seed + restore while clear; pressure arrives before the final store
+    kv, mem = _watermarked(monkeypatch, active_mb=50)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.fetch(TOKENS + [7, 8], request_id="r2") is not None
+
+    mem["active"] = _mb(95)
+    grown_tokens = TOKENS + [7, 8, 9, 10]
+    assert kv.store("r2", grown_tokens, _donor_at(len(grown_tokens))) is True
+    assert kv.stats()["grown_stores"] == 1  # O(delta), safe at peak
+    assert kv.stats()["pressure_skipped_stores"] == 0
+
+
+def test_step_hook_wiring_and_none_safety():
+    bkv.maybe_relieve_pressure(SimpleNamespace(hybrid_kv=None))  # no-op
+
+    kv = MagicMock()
+    bkv.maybe_relieve_pressure(SimpleNamespace(hybrid_kv=kv))
+    kv.relieve_pressure.assert_called_once()
+
+    kv.relieve_pressure.side_effect = RuntimeError("metal")
+    bkv.maybe_relieve_pressure(SimpleNamespace(hybrid_kv=kv))  # swallowed
+
+
+def test_scheduler_step_relieves_pressure(monkeypatch):
+    scheduler = _capped_scheduler(monkeypatch, None)
+    scheduler.hybrid_kv = MagicMock()
+    scheduler.hybrid_kv.has_ssd = False
+    scheduler.step()
+    scheduler.hybrid_kv.relieve_pressure.assert_called_once()
