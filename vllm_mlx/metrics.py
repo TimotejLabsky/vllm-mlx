@@ -291,6 +291,16 @@ class MetricsCollector:
                 "Co-batch admissions deferred by the memory-aware gate.",
                 registry=registry,
             ),
+            "cache_pressure_evictions": Gauge(
+                "vllm_mlx_cache_pressure_evictions",
+                "Snapshot entries evicted by memory-pressure relief.",
+                registry=registry,
+            ),
+            "cache_pressure_skipped_stores": Gauge(
+                "vllm_mlx_cache_pressure_skipped_stores",
+                "Cache stores skipped while over the memory watermark.",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -529,6 +539,12 @@ class MetricsCollector:
             )
             self._prom["cache_admission_deferrals"].set(
                 _coerce_float(cache_stats.get("admission_deferrals", 0))
+            )
+            self._prom["cache_pressure_evictions"].set(
+                _coerce_float(cache_stats.get("pressure_evictions", 0))
+            )
+            self._prom["cache_pressure_skipped_stores"].set(
+                _coerce_float(cache_stats.get("pressure_skipped_stores", 0))
             )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024

@@ -208,6 +208,12 @@ class BatchedSystemKV:
         # exceeds this percentage of the device's recommended working set.
         self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
         self.admission_deferrals = 0
+        # Memory-pressure relief (#48) — same watermark env as the admission
+        # gate; the ceiling is cached after the first Metal query.
+        self._ws_ceiling = None
+        self._bpt_hint = 0.0  # survives an emptied bag (see bytes_per_token)
+        self.pressure_evictions = 0
+        self.pressure_skipped_stores = 0
 
         self.hits = 0
         self.misses = 0
@@ -436,6 +442,11 @@ class BatchedSystemKV:
             "checkpoints": checkpoints,
             "bytes": _entry_nbytes(snapshot) + ckpt_bytes(checkpoints),
         }
+        if tokens_list:
+            # Learn bytes/token AT insert — a lazily-learned hint misses the
+            # serial workload where relief empties the bag before anything
+            # reads it (live 2026-07-09 round 3).
+            self._bpt_hint = entry["bytes"] / len(tokens_list)
         self._entry_seq += 1
         self._entries[self._entry_seq] = entry
         self._enforce_budgets_locked()
@@ -448,6 +459,23 @@ class BatchedSystemKV:
         grown entries do NOT re-spill — SimpleEngine's policy: a restart
         promotes the stored prefix and re-grows cheaply."""
         tokens_list = list(tokens)
+        if (
+            self.under_pressure() or self._store_would_overshoot(tokens_list)
+        ) and not self._may_grow(request_id, tokens_list):
+            # A non-grown store materializes a full-chain snapshot copy
+            # (multi-GB at deep context) — the copy itself is the spike, so
+            # the gate prices it in (#48 crash math). Skip it; the SSD tier
+            # keeps restart recovery and the next completed turn stores
+            # normally.
+            self.pressure_skipped_stores += 1
+            self.discard_pending(request_id)
+            logger.info(
+                "[batched_system_kv] skipping store under memory pressure "
+                "request=%s tokens=%d",
+                request_id[:12],
+                len(tokens_list),
+            )
+            return False
         try:
             kinds, snapshot, metas, grown = self._build_snapshot(
                 request_id, tokens_list, cache_list
@@ -488,6 +516,13 @@ class BatchedSystemKV:
         with self._lock:
             new_content = len(tokens_list) - self._base_pos.get(request_id, 0)
         if new_content < self.partial_min:
+            return False
+        if self.under_pressure() or self._store_would_overshoot(tokens_list):
+            # Boundary stores land at the WORST moment — the end of a deep
+            # prefill IS the observed crash peak (#48) — and they are pure
+            # abort insurance. Skip; the final store covers the finished
+            # chain, and grown boundary deltas can be re-prefilled.
+            self.pressure_skipped_stores += 1
             return False
         try:
             kinds, snapshot, metas, grown = self._build_snapshot(
@@ -745,15 +780,167 @@ class BatchedSystemKV:
 
     def bytes_per_token(self) -> float:
         """Per-token KV footprint learned from the newest resident entry
-        (≈200 KB/token on a 27B-4bit). 0.0 until an entry exists — the
-        co-batching guard stays inert on a cold cache, which is fine: the
-        first request runs solo anyway."""
+        (≈200 KB/token on a 27B-4bit). 0.0 until an entry has EVER been
+        inserted — the guards stay inert on a genuinely cold cache (the
+        first request runs solo anyway). The estimate is learned at insert
+        time and persists after the bag empties: pressure relief evicts
+        the whole bag exactly when the next deep store arrives (live
+        2026-07-09 rounds 2–3 — the 94K store priced itself against a 0
+        estimate and landed a 7 GB copy), so an empty bag must not disarm
+        the overshoot gate."""
         with self._lock:
             for entry in reversed(self._entries.values()):
                 n = len(entry["tokens"])
                 if n > 0:
                     return entry["bytes"] / n
-        return 0.0
+            return self._bpt_hint
+
+    # ------------------------------------------------- memory pressure (#48)
+
+    def _threshold_bytes(self) -> Optional[float]:
+        """Watermark threshold in bytes, or None when disabled/unavailable.
+
+        The ceiling (the device's recommended working set — tracks the
+        raised ``iogpu.wired_limit_mb`` on the Studio) is cached after the
+        first Metal query: this runs once per scheduler step once the
+        relief hook is wired."""
+        if self.mem_watermark_pct <= 0:
+            return None
+        try:
+            import mlx.core as mx
+
+            if self._ws_ceiling is None:
+                self._ws_ceiling = mx.device_info()[
+                    "max_recommended_working_set_size"
+                ]
+            if not self._ws_ceiling or self._ws_ceiling <= 0:
+                return None
+            return self._ws_ceiling * self.mem_watermark_pct / 100
+        except Exception:
+            return None
+
+    def watermark_status(self) -> tuple:
+        """``(over, active_bytes, ceiling_bytes)`` against the watermark.
+        ``(False, 0, 0)`` when the watermark env is unset or Metal is
+        unavailable."""
+        threshold = self._threshold_bytes()
+        if threshold is None:
+            return False, 0, 0
+        try:
+            import mlx.core as mx
+
+            active = mx.get_active_memory()
+            return active > threshold, active, self._ws_ceiling
+        except Exception:
+            return False, 0, 0
+
+    def under_pressure(self) -> bool:
+        return self.watermark_status()[0]
+
+    def _store_would_overshoot(self, tokens_list: list) -> bool:
+        """Would materializing a full snapshot of this chain push active
+        memory over the watermark? The live 2026-07-09 deploy smoke: a
+        94K-token final store passed the instantaneous-active gate at
+        48.9 GB (the batch KV had just been freed) and then materialized
+        a 7 GB copy — the store itself IS the spike, so the gate must
+        price it in (entry size ≈ tokens × learned bytes/token). Inert on
+        a cold cache (no bytes/token estimate) and when the watermark is
+        unset."""
+        threshold = self._threshold_bytes()
+        if threshold is None:
+            return False
+        bpt = self.bytes_per_token()
+        if bpt <= 0:
+            return False
+        try:
+            import mlx.core as mx
+
+            return mx.get_active_memory() + len(tokens_list) * bpt > threshold
+        except Exception:
+            return False
+
+    def relieve_pressure(self) -> int:
+        """Evict resident snapshot entries when the PEAK memory since the
+        last check crossed the watermark.
+
+        Peak, not instantaneous active: the step hook runs BETWEEN prefill
+        chunks, exactly where each chunk's attention transients (multi-GB
+        at deep context) have just been freed — the live 2026-07-09 deploy
+        smoke proved a 94K-token prefill peaks at 59.6 GB intra-chunk
+        while every inter-chunk active reading sits just UNDER the
+        threshold, so an active-based trigger never fires.
+        ``get_peak_memory`` is read and reset each call, making the window
+        "since the previous scheduler step" (side effect: the peak gauge
+        in scheduler stats becomes peak-since-last-step on watermark-armed
+        routes — the recent transient max, which is the number that
+        actually kills the process).
+
+        The bag is pure cache: non-grown entries reached SSD via
+        write-through and grown entries re-grow from their spilled prefix,
+        so dropping entries costs at most a re-prefill of recent deltas —
+        against what this prevents: Metal "Insufficient Memory" inside a
+        command-buffer completion handler is an uncatchable SIGABRT (the
+        2026-07-08 canary crashes). LRU-first, the entire bag if needed;
+        eviction stops early once instantaneous active is back under the
+        threshold. The MLX buffer cache is cleared after each drop so
+        freed buffers actually leave the process before the next chunk."""
+        threshold = self._threshold_bytes()
+        if threshold is None:
+            return 0
+        try:
+            import mlx.core as mx
+
+            peak = mx.get_peak_memory()
+            mx.reset_peak_memory()
+            if peak <= threshold:
+                return 0
+
+            evicted = 0
+            while True:
+                with self._lock:
+                    if not self._entries:
+                        break
+                    self._entries.popitem(last=False)
+                    self.evictions += 1
+                    self.pressure_evictions += 1
+                evicted += 1
+                mx.clear_cache()
+                if mx.get_active_memory() <= threshold:
+                    break
+            if evicted:
+                logger.warning(
+                    "[batched_system_kv] memory pressure: evicted %d "
+                    "snapshot entr%s (peak %.1f GB since last step, "
+                    "watermark %d%% of %.1f GB)",
+                    evicted,
+                    "y" if evicted == 1 else "ies",
+                    peak / 1e9,
+                    self.mem_watermark_pct,
+                    (self._ws_ceiling or 0) / 1e9,
+                )
+            return evicted
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] pressure relief failed", exc_info=True
+            )
+            return 0
+
+    def _may_grow(self, request_id: str, tokens_list: list) -> bool:
+        """Cheap pre-check of #37's grow path: is the request's donor entry
+        still resident with a usable common prefix? (kinds are confirmed
+        later by ``_build_snapshot``; a rare mismatch there just falls back
+        to the full copy.)"""
+        with self._lock:
+            donor_key = self._restore_source.get(request_id)
+            donor = (
+                self._entries.get(donor_key) if donor_key is not None else None
+            )
+            if donor is None:
+                return False
+            return (
+                common_prefix_len(tokens_list, donor["tokens"])
+                >= self.partial_min
+            )
 
     # ---------------------------------------------------------------- stats
 
@@ -775,6 +962,8 @@ class BatchedSystemKV:
                 "ssd_promotes": self.ssd_promotes,
                 "grown_stores": self.grown_stores,
                 "admission_deferrals": self.admission_deferrals,
+                "pressure_evictions": self.pressure_evictions,
+                "pressure_skipped_stores": self.pressure_skipped_stores,
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
@@ -963,6 +1152,29 @@ def insert_segmented(hybrid_kv: "BatchedSystemKV", batch_generator, request, tok
     )
 
 
+def maybe_relieve_pressure(scheduler) -> None:
+    """Step-loop hook (fork patch #48): shed snapshot RAM while the device
+    is over the memory watermark.
+
+    #40's watermark only gates NEW co-batch admissions — the 2026-07-08
+    canary crashes were a SOLO deep-context prefill ramping ~20 GB/min
+    from a sub-watermark baseline straight past the wired limit, with the
+    snapshot bag holding ~5.5 GB of copies the whole way up. This runs
+    once per scheduler step, so it fires MID-prefill (each step processes
+    one prompt chunk) and returns that headroom before the ramp peaks.
+    Same env gate as the admission watermark; inert when unset, and a
+    single sub-watermark memory read per step otherwise."""
+    hybrid_kv = scheduler.hybrid_kv
+    if hybrid_kv is None:
+        return
+    try:
+        hybrid_kv.relieve_pressure()
+    except Exception:
+        logger.debug(
+            "[batched_system_kv] pressure relief failed", exc_info=True
+        )
+
+
 def should_defer_cobatch(scheduler, request) -> bool:
     """Memory-aware admission gate (#39 pad-waste + #40 dynamic concurrency).
 
@@ -1020,19 +1232,13 @@ def should_defer_cobatch(scheduler, request) -> bool:
                 )
 
     if reason is None and hybrid_kv.mem_watermark_pct > 0:
-        try:
-            import mlx.core as mx
-
-            active = mx.get_active_memory()
-            ceiling = mx.device_info()["max_recommended_working_set_size"]
-            if ceiling > 0 and active > ceiling * hybrid_kv.mem_watermark_pct / 100:
-                reason = (
-                    f"active memory {active / 1e9:.1f} GB > "
-                    f"{hybrid_kv.mem_watermark_pct}% of "
-                    f"{ceiling / 1e9:.1f} GB working set"
-                )
-        except Exception:
-            pass
+        over, active, ceiling = hybrid_kv.watermark_status()
+        if over:
+            reason = (
+                f"active memory {active / 1e9:.1f} GB > "
+                f"{hybrid_kv.mem_watermark_pct}% of "
+                f"{ceiling / 1e9:.1f} GB working set"
+            )
 
     if reason is None:
         return False
