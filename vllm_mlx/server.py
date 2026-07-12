@@ -165,7 +165,7 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, suspend_cancellation
+from .engine.base import EngineBusy, PromptTooLong, suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -1083,6 +1083,15 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
         status_code=503,
+        detail={"error": exc.code, "message": str(exc)},
+    ) from exc
+
+
+def _raise_prompt_too_long(exc: PromptTooLong) -> None:
+    """Translate prompt-ceiling rejections (fork #50) into HTTP 400 — the
+    request can never succeed, so it must not look retryable."""
+    raise HTTPException(
+        status_code=400,
         detail={"error": exc.code, "message": str(exc)},
     ) from exc
 
@@ -5328,6 +5337,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except EngineBusy as exc:
                 tracker.finish(result="busy")
                 _raise_engine_busy(exc)
+            except PromptTooLong as exc:
+                tracker.finish(result="error")
+                _raise_prompt_too_long(exc)
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -5570,6 +5582,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
+        except PromptTooLong as exc:
+            tracker.finish(result="error")
+            _raise_prompt_too_long(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -5997,6 +6012,9 @@ async def create_anthropic_message(
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
+        except PromptTooLong as exc:
+            tracker.finish(result="error")
+            _raise_prompt_too_long(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
