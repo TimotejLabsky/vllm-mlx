@@ -2889,10 +2889,9 @@ class Scheduler:
         # Clear caches
         self.clear_runtime_caches()
 
-        # Close SSD tier on reset
+        # Close SSD tier(s) on reset — close_ssd_tier also drains the
+        # batched cache's writer (#49)
         self.close_ssd_tier()
-        if self.hybrid_kv is not None:
-            self.hybrid_kv.close()
 
     def deep_reset(self) -> None:
         """
@@ -2955,11 +2954,18 @@ class Scheduler:
             logger.info("[clear_prefix_cache] prefix cache cleared")
 
     def close_ssd_tier(self) -> None:
-        """Shut down the SSD cache tier if present."""
+        """Shut down the SSD cache tier(s) if present.
+
+        Fork (#49): the batched system-KV cache owns its OWN SSD writer
+        (patch #36, same store/format) — drain it on the same lifecycle so
+        spills queued at engine stop (every llama-swap model swap) flush
+        instead of dying with the process. Both closes are idempotent."""
         if self._ssd_tier is not None:
             self._ssd_tier.close()
             self._ssd_tier = None
             logger.info("SSD cache tier closed")
+        if self.hybrid_kv is not None:
+            self.hybrid_kv.close()
 
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
