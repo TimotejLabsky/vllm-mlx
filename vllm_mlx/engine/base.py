@@ -48,6 +48,21 @@ class EngineBusy(RuntimeError):
     code = "text_generation_busy"
 
 
+class PromptTooLong(ValueError):
+    """Raised at admission when the prompt exceeds the route's configured
+    token ceiling (``VLLM_MLX_MAX_PROMPT_TOKENS``, fork patch #50).
+
+    The server translates this into HTTP 400 ``error=prompt_too_long`` —
+    unlike :class:`EngineBusy`, the request can never succeed, so it must
+    not look retryable. Exists because a prompt past the measured memory
+    envelope (the 45GB-weight class OOMs near 160K context) kills the whole
+    process with an uncatchable Metal abort; gateway caps protect gateway
+    traffic, this protects direct-to-server requests.
+    """
+
+    code = "prompt_too_long"
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""
