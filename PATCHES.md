@@ -991,6 +991,22 @@ Three env-gated changes, all under the existing `VLLM_MLX_BATCHED_MEM_WATERMARK_
 
 ---
 
+## 49. `patch: ssd-close-on-stop` — cherry-pick of upstream #634 + batched-tier extension
+
+**Files:** `vllm_mlx/engine_core.py`, `vllm_mlx/scheduler.py`, `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/pyproject.toml` (dep exclusion), `tests/test_ssd_shutdown_wiring.py` (new), `tests/test_engine_core_thread_streams.py`, `tests/test_engine_core_idle_polling.py`
+
+Cherry-picks upstream open PR [#634](https://github.com/waybarrios/vllm-mlx/pull/634) (djacobsmeyer): `close_ssd_tier()` was only reachable from `Scheduler.reset()` — neither `EngineCore.stop()` nor `MLLMScheduler.stop()` ever closed the SSD tier, so every normal shutdown leaked the writer thread and silently dropped queued spills. **On our deployment this fires on every llama-swap model swap**, and since the 2026-07 fleet flip every route runs the batched SSD tier — in-flight spills at swap time were lost warm-restart entries. The engine_core.py hunks are verbatim #634 (auto-collapse at rebase); mllm_scheduler.py gets the `__init__` `_ssd_tier = None` + `stop()` close.
+
+**Fork extension:** `Scheduler.close_ssd_tier()` also drains the batched system-KV cache's own writer (`hybrid_kv.close()`, patch #36's tier) on the same lifecycle; `reset()`'s separate hybrid close folds into it.
+
+**Also folded in (upstream [#633](https://github.com/waybarrios/vllm-mlx/pull/633) intel):** `mlx-vlm != 0.6.4` in pyproject — 0.6.4 re-sanitizes already-converted Qwen3.5 weights (corrupt output; Blaizzy/mlx-vlm#1521). The Studio venv is on 0.6.3 (safe); this prevents an accidental upgrade. Kills the "0.6.4+ might fix ministral3" hope recorded 2026-07-07 — moot anyway, the fleet is `--text-only`.
+
+**Verified:** 13 tests — #634's suite ported (writer joined + tier cleared on both engines' stop, queued spill flushed not dropped, no-op without tier, `_ssd_tier` exists pre-first-request) + fork extras (engine stop drains the batched writer; `close_ssd_tier` covers both tiers; no-op safety). Two test fakes gained `close_ssd_tier` no-ops. Full suite 2433 passed / 0 failed.
+
+**Upstreaming:** collapses automatically when #634 merges; the batched-tier extension rides with the #34-series branch.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
