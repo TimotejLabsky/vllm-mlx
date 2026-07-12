@@ -14,11 +14,12 @@ feature branch — read this before changing anything.
     — why BatchedEngine's stock prefix cache gets zero hits on hybrid
     (attention+SSM) models, and the 2026-07-02 update: the fork built its own
     hybrid-safe batched cache (patches #29–#40, `batched_system_kv.py`).
-    **Engine choice is deliberate per model**: Qwen3.6-27B runs
-    `--continuous-batching --text-only` in production (since 2026-07-02);
-    everything else runs SimpleEngine + system-KV. Don't "helpfully" flip a
-    model's engine — the llama-swap config in `personal-infratructure` is the
-    source of truth.
+    **Since 2026-07-09 the ENTIRE text fleet runs BatchedEngine**
+    (`--continuous-batching --text-only` + batched system-KV + patch-#48
+    memory-pressure relief on all 19 llama-swap text routes; only the vision
+    routes and the embedding route remain on other paths). Engine changes are
+    still deliberate — the llama-swap config in `personal-infratructure` is
+    the source of truth; don't flip routes without a measured reason.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
 - Consumer side (deploy config, llama-swap, model lineup) lives in the
