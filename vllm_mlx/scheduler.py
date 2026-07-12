@@ -1401,6 +1401,19 @@ class Scheduler:
             self.queue_cap = 0
         self.queue_rejections = 0
 
+        # Prompt-token ceiling (fork #50): reject prompts past the route's
+        # measured envelope with a non-retryable 400 instead of letting an
+        # oversized prefill OOM the process (uncatchable Metal abort on the
+        # 45GB-weight class near 160K ctx). 0 (default) = off. The gateway
+        # caps protect gateway traffic; this catches direct requests.
+        try:
+            self.max_prompt_tokens = int(
+                os.environ.get("VLLM_MLX_MAX_PROMPT_TOKENS", "0") or 0
+            )
+        except ValueError:
+            self.max_prompt_tokens = 0
+        self.prompt_rejections = 0
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -1929,6 +1942,19 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Prompt-token ceiling (fork #50) — BEFORE the cache fetch, so a
+        # rejected request never triggers a multi-GB snapshot restore.
+        if self.max_prompt_tokens > 0:
+            n = request.num_prompt_tokens or len(request.prompt_token_ids or [])
+            if n > self.max_prompt_tokens:
+                from .engine.base import PromptTooLong
+
+                self.prompt_rejections += 1
+                raise PromptTooLong(
+                    f"prompt is {n} tokens; this route accepts at most "
+                    f"{self.max_prompt_tokens} (VLLM_MLX_MAX_PROMPT_TOKENS)"
+                )
 
         # Check prefix cache for cached KV state
         if self.hybrid_kv is not None:
@@ -3254,6 +3280,8 @@ class Scheduler:
 
         stats["queue_cap"] = self.queue_cap
         stats["queue_rejections"] = self.queue_rejections
+        stats["max_prompt_tokens"] = self.max_prompt_tokens
+        stats["prompt_rejections"] = self.prompt_rejections
 
         # Include cache stats
         if self.hybrid_kv is not None:

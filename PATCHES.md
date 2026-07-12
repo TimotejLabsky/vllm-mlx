@@ -1007,6 +1007,20 @@ Cherry-picks upstream open PR [#634](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
+## 50. `patch: prompt-token-ceiling` — non-retryable 400 for prompts past the measured envelope
+
+**Files:** `vllm_mlx/engine/base.py`, `vllm_mlx/scheduler.py`, `vllm_mlx/server.py`, `tests/test_batched_flip_enablement.py`
+
+The 2026-07 fleet ladder campaign found the 45GB-weight class (Qwen3-Next-80B / Coder-Next) dies with the uncatchable Metal OOM at ~160K context — and gateway caps (litellm/opencode/openclaw, set to the measured 144K) only protect gateway traffic. A raw request straight to llama-swap could still kill the process. `VLLM_MLX_MAX_PROMPT_TOKENS` (0/unset = off) now rejects oversized prompts at `Scheduler.add_request`, BEFORE the cache fetch (no multi-GB restore for a doomed request), with a new `PromptTooLong` → HTTP 400 `error=prompt_too_long` (contrast `EngineBusy`'s retryable 503 — this request can never succeed). `prompt_rejections` / `max_prompt_tokens` in scheduler stats. Deliberately a config-declared cap, not a memory-estimate heuristic: the killer term is per-chunk attention transients, which admission-time KV estimates cannot see (the #48 lesson), while the measured envelope is exact and already lives in the route config.
+
+**Verified:** 2 tests (rejects over-cap with counter + stats + not admitted; exact-cap admits; inert by default) + live e2e (0.6B with a tiny cap → 400 `prompt_too_long` on the wire; normal request unaffected). Full suite 2435 passed / 0 failed.
+
+**Deployment:** `VLLM_MLX_MAX_PROMPT_TOKENS=150000` on the two 45GB routes (below the 160K wall, above the 144K gateway caps so the gateway stays the UX limiter). Other routes are timeout-bound, not crash-bound — left unarmed.
+
+**Upstreaming:** generic and upstream-safe (env-gated, off by default) — good candidate alongside the queue cap.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
