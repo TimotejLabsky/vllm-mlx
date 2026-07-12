@@ -154,6 +154,35 @@ def test_queue_cap_unbounded_by_default(monkeypatch):
     assert scheduler.queue_rejections == 0
 
 
+# ------------------------------------------------- prompt ceiling (#50)
+
+
+def test_prompt_ceiling_rejects_oversized_with_400_class_error(monkeypatch):
+    from vllm_mlx.engine.base import PromptTooLong
+
+    monkeypatch.setenv("VLLM_MLX_MAX_PROMPT_TOKENS", "2")
+    scheduler = _capped_scheduler(monkeypatch, None)
+    with pytest.raises(PromptTooLong):
+        scheduler.add_request(_mk_request("big"))  # 3 tokens > cap 2
+    assert scheduler.prompt_rejections == 1
+    assert scheduler.get_stats()["prompt_rejections"] == 1
+    assert scheduler.get_stats()["max_prompt_tokens"] == 2
+    assert "big" not in scheduler.requests  # not admitted
+
+    monkeypatch.setenv("VLLM_MLX_MAX_PROMPT_TOKENS", "3")
+    scheduler2 = _capped_scheduler(monkeypatch, None)
+    scheduler2.add_request(_mk_request("fits"))  # 3 tokens == cap -> admitted
+    assert scheduler2.prompt_rejections == 0
+
+
+def test_prompt_ceiling_inert_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_MAX_PROMPT_TOKENS", raising=False)
+    scheduler = _capped_scheduler(monkeypatch, None)
+    scheduler.add_request(_mk_request("r1"))
+    assert scheduler.prompt_rejections == 0
+    assert scheduler.get_stats()["max_prompt_tokens"] == 0
+
+
 def test_engine_pre_stream_probe_raises_when_capped():
     from vllm_mlx.engine.batched import BatchedEngine
 
