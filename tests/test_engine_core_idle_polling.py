@@ -11,6 +11,9 @@ class _IdleScheduler:
     def _close_batch_generator(self):
         pass
 
+    def close_ssd_tier(self):
+        pass
+
 
 class _RequestCapturingScheduler:
     def __init__(self):
