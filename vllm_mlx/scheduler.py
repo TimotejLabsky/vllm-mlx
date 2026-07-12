@@ -3515,10 +3515,9 @@ class Scheduler:
         # Clear caches
         self.clear_runtime_caches()
 
-        # Close SSD tier on reset
+        # Close SSD tier(s) on reset — close_ssd_tier also drains the
+        # batched cache's writer (#49)
         self.close_ssd_tier()
-        if self.hybrid_kv is not None:
-            self.hybrid_kv.close()
 
     def deep_reset(self) -> None:
         """
@@ -3612,18 +3611,30 @@ class Scheduler:
         )
 
     def close_ssd_tier(self) -> None:
-        """Shut down and detach the SSD cache tier if present."""
+        """Shut down and detach the SSD cache tier(s) if present.
+
+        Upstream (#634) detaches the tier from the memory-aware cache and
+        re-checks identity before clearing; that body is kept as-is.
+
+        Fork (#49): the batched system-KV cache owns its OWN SSD writer
+        (patch #36, same store/format) — drain it on the same lifecycle so
+        spills queued at engine stop (every llama-swap model swap) flush
+        instead of dying with the process. Both closes are idempotent.
+        NOTE: upstream early-returns when there is no tier; the fork must not,
+        or hybrid_kv would never be drained on a batched-only route.
+        """
         tier = self._ssd_tier
-        if tier is None:
-            return
+        if tier is not None:
+            if self.memory_aware_cache is not None:
+                self.memory_aware_cache.set_ssd_tier(None)
 
-        if self.memory_aware_cache is not None:
-            self.memory_aware_cache.set_ssd_tier(None)
+            tier.close()
+            if self._ssd_tier is tier:
+                self._ssd_tier = None
+            logger.info("SSD cache tier closed")
 
-        tier.close()
-        if self._ssd_tier is tier:
-            self._ssd_tier = None
-        logger.info("SSD cache tier closed")
+        if self.hybrid_kv is not None:
+            self.hybrid_kv.close()
 
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
