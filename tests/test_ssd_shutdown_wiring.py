@@ -343,3 +343,71 @@ class TestSchedulerSSDTierLifecycle:
         assert scheduler._ssd_tier.started
         assert scheduler._ssd_tier.reconciled
         assert scheduler.memory_aware_cache._ssd_tier is scheduler._ssd_tier
+
+
+class TestSchedulerCloseSSDTierDrainsHybrid:
+    """Fork (#49): ``Scheduler.close_ssd_tier()`` covers BOTH tiers.
+
+    The batched system-KV cache owns its own SSD writer (patch #36). Upstream's
+    #634 only drains ``_ssd_tier``, and its body early-returns when that tier is
+    absent — which on a batched-only route would skip ``hybrid_kv`` entirely and
+    silently drop every spill queued at a llama-swap model swap.
+    """
+
+    def test_close_ssd_tier_closes_hybrid_kv(self):
+        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler(
+            MagicMock(),
+            _mock_tokenizer(),
+            SchedulerConfig(enable_prefix_cache=False),
+        )
+        hybrid = MagicMock()
+        scheduler.hybrid_kv = hybrid
+
+        scheduler.close_ssd_tier()
+
+        hybrid.close.assert_called_once()
+
+    def test_close_ssd_tier_drains_hybrid_even_with_no_ssd_tier(self):
+        """Guards the early-return regression specifically."""
+        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler(
+            MagicMock(),
+            _mock_tokenizer(),
+            SchedulerConfig(enable_prefix_cache=False),
+        )
+        scheduler._ssd_tier = None
+        hybrid = MagicMock()
+        scheduler.hybrid_kv = hybrid
+
+        scheduler.close_ssd_tier()
+
+        hybrid.close.assert_called_once()
+
+    def test_close_ssd_tier_noop_without_tiers(self):
+        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler(
+            MagicMock(),
+            _mock_tokenizer(),
+            SchedulerConfig(enable_prefix_cache=False),
+        )
+        scheduler.close_ssd_tier()  # must not raise
+
+
+class TestEngineStopDrainsBatchedSystemKVWriter:
+    """Fork (#49): the batched cache's own SSD writer must drain on stop."""
+
+    @pytest.mark.anyio
+    async def test_stop_closes_batched_system_kv_writer(self):
+        from vllm_mlx.engine_core import EngineCore
+
+        engine = EngineCore(MagicMock(), _mock_tokenizer())
+        hybrid = MagicMock()
+        engine.scheduler.hybrid_kv = hybrid
+
+        await engine.stop()
+
+        hybrid.close.assert_called()
