@@ -3505,6 +3505,18 @@ def get_usage(output: GenerationOutput) -> Usage:
     )
 
 
+@app.get("/")
+async def root():
+    """Minimal root endpoint.
+
+    llama-swap's startup preload (`hooks.on_startup.preload`) fires a
+    background ``GET /`` at each preloaded model and treats any status
+    >= 400 as a preload failure — without this route every config reload
+    logs a spurious ``failed to preload model ...: status 404``.
+    """
+    return {"service": "vllm-mlx", "model": _model_name}
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus scrape endpoint (disabled by default)."""

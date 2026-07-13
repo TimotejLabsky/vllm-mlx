@@ -1748,6 +1748,30 @@ class TestRateLimiterHTTPResponse:
         assert retry_after > 0
 
 
+class TestRootEndpoint:
+    """GET / must answer <400 for llama-swap's startup preload probe."""
+
+    @pytest.fixture
+    def client(self):
+        import vllm_mlx.server as server
+
+        return TestClient(server.app)
+
+    def test_root_returns_200_without_api_key(self, client):
+        """llama-swap's preload GET / carries no API key and no engine is needed."""
+        import vllm_mlx.server as server
+
+        original_key = server._api_key
+        server._api_key = "test-secret"
+        try:
+            response = client.get("/")
+        finally:
+            server._api_key = original_key
+
+        assert response.status_code == 200
+        assert response.json()["service"] == "vllm-mlx"
+
+
 class TestEndpointSecurityDependencies:
     """Test auth/rate-limit coverage on protected endpoints."""
 
