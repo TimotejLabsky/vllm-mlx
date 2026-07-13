@@ -89,6 +89,9 @@ def test_schedule_waiting_defers_and_preserves_fcfs(monkeypatch):
     scheduler.hybrid_kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
     scheduler.running["long"] = _req("long", 500_000)
     scheduler.batch_generator = MagicMock()
+    # keep this test on the learned-bpt path (a bare MagicMock floats to a
+    # nonsense 1.0-byte "measurement" that would out-rank the seeded entry)
+    scheduler.batch_generator.prompt_cache_nbytes = 0
 
     request = Request(
         request_id="short-1",
@@ -272,6 +275,72 @@ def test_kv_budget_inert_by_default(monkeypatch):
     kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
     scheduler = _guard_scheduler(kv, [500_000])
     assert bkv.should_defer_cobatch(scheduler, _req("c", 400_000)) is False
+
+
+def _guard_scheduler_with_generator(kv, running_lengths, cache_nbytes):
+    scheduler = _guard_scheduler(kv, running_lengths)
+    scheduler.batch_generator = SimpleNamespace(
+        prompt_cache_nbytes=cache_nbytes
+    )
+    return scheduler
+
+
+def test_kv_budget_uses_measured_bytes_on_cold_cache(monkeypatch):
+    """Ground-truth bpt from the live generator arms the gate even when the
+    snapshot bag has never learned an estimate (#52 upgrade — previously the
+    budget checks were blind until the first store completed)."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_PAD_WASTE_MB", raising=False)
+    monkeypatch.setenv("VLLM_MLX_BATCHED_KV_BUDGET_MB", "1")
+    kv = BatchedSystemKV(_FakeModel())  # cold: bytes_per_token() == 0
+    assert kv.bytes_per_token() == 0
+
+    # 100 MB of real KV over 100K running tokens ≈ 1 KB/token measured;
+    # two seats padded to 100K ≈ 200 MB >> the 1 MB budget
+    scheduler = _guard_scheduler_with_generator(
+        kv, [100_000], 100 * 1024 * 1024
+    )
+    assert bkv.should_defer_cobatch(scheduler, _req("c", 100_000)) is True
+    assert kv.admission_deferrals == 1
+
+    # an empty generator measurement falls back to (absent) learned bpt
+    scheduler = _guard_scheduler_with_generator(kv, [100_000], 0)
+    assert bkv.should_defer_cobatch(scheduler, _req("c2", 100_000)) is False
+
+
+def test_measured_bpt_helper_guards():
+    kv = BatchedSystemKV(_FakeModel())
+    # no batch_generator attribute (unit-test schedulers) -> 0.0
+    assert bkv._measured_bytes_per_token(_guard_scheduler(kv, [100])) == 0.0
+    # measurement raising -> 0.0
+
+    class _Boom:
+        @property
+        def prompt_cache_nbytes(self):
+            raise RuntimeError("mid-recreate")
+
+    scheduler = _guard_scheduler(kv, [100])
+    scheduler.batch_generator = _Boom()
+    assert bkv._measured_bytes_per_token(scheduler) == 0.0
+    # zero tracked tokens -> 0.0 (no divide)
+    scheduler = _guard_scheduler_with_generator(kv, [], 1024)
+    assert bkv._measured_bytes_per_token(scheduler) == 0.0
+
+
+def test_stats_expose_budget_and_utilization(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_MB", "1")
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    s = kv.stats()
+    assert s["max_memory_mb"] == 1.0
+    assert s["memory_utilization"] == pytest.approx(
+        s["current_memory_mb"] / 1.0
+    )
+
+    monkeypatch.delenv("VLLM_MLX_SYSTEM_KV_RAM_MB", raising=False)
+    unlimited = BatchedSystemKV(_FakeModel())
+    s = unlimited.stats()
+    assert s["max_memory_mb"] == 0.0
+    assert s["memory_utilization"] == 0.0
 
 
 def test_memory_watermark_backstop(monkeypatch):
