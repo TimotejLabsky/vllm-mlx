@@ -214,6 +214,7 @@ class BatchedSystemKV:
         self._bpt_hint = 0.0  # survives an emptied bag (see bytes_per_token)
         self.pressure_evictions = 0
         self.pressure_skipped_stores = 0
+        self.pressure_cache_clears = 0  # watermark breaches relieved (#53)
 
         self.hits = 0
         self.misses = 0
@@ -883,7 +884,15 @@ class BatchedSystemKV:
         2026-07-08 canary crashes). LRU-first, the entire bag if needed;
         eviction stops early once instantaneous active is back under the
         threshold. The MLX buffer cache is cleared after each drop so
-        freed buffers actually leave the process before the next chunk."""
+        freed buffers actually leave the process before the next chunk.
+
+        The buffer cache is dropped even when the bag is EMPTY (#53): the
+        2026-07-13 Coder-Next crash showed a 137K prefill surviving on a
+        fresh process (peak 52 GB, relief armed) and the identical repeat
+        prefill SIGABRTing — the first request's store was skipped under
+        pressure, so round two found an empty bag, took the no-op eviction
+        path, and ran against an allocator still holding round one's
+        multi-GB transient buffers as wired memory."""
         threshold = self._threshold_bytes()
         if threshold is None:
             return 0
@@ -894,6 +903,11 @@ class BatchedSystemKV:
             mx.reset_peak_memory()
             if peak <= threshold:
                 return 0
+
+            # over the watermark: return the allocator's cached buffers to
+            # Metal first — the only relief available on a bagless process
+            mx.clear_cache()
+            self.pressure_cache_clears += 1
 
             evicted = 0
             while True:
@@ -964,6 +978,7 @@ class BatchedSystemKV:
                 "admission_deferrals": self.admission_deferrals,
                 "pressure_evictions": self.pressure_evictions,
                 "pressure_skipped_stores": self.pressure_skipped_stores,
+                "pressure_cache_clears": self.pressure_cache_clears,
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
