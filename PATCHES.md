@@ -1033,6 +1033,20 @@ llama-swap v234's `hooks.on_startup.preload` fires a background `GET /` at each 
 
 ---
 
+## 52. `patch: measured-kv-admission` — ground-truth bytes/token for the #40 gate + budget stats keys
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `tests/test_batched_flip_enablement.py`
+
+The #39/#40 admission checks (pad-waste, total padded-KV budget) priced tokens with a bytes/token estimate learned from the newest cache snapshot — a proxy that is ABSENT on a cold process (gates inert until the first store completes, i.e. exactly when a fresh spawn serves its first deep request) and stale when a different-shaped chain warmed the bag. mlx-lm's `BatchGenerator.prompt_cache_nbytes` (verified in the installed 2026-07 wheel, deep-research 2026-07-03 recommendation) sums the actually-allocated cache arrays — right-justified padding, quantized layers, hybrid SSM state — across its unprocessed/prompt/generation stages. New `_measured_bytes_per_token(scheduler)` divides that by the running set's tracked tokens and both checks now prefer it, falling back to the learned estimate (then inert) when unavailable. Biases are conservative by construction (padding charged to logical tokens → defer sooner). Defer log lines carry `[bpt N KB/tok, measured|learned]` for soak attribution. Same commit: `stats()` gains `max_memory_mb` (= `VLLM_MLX_SYSTEM_KV_RAM_MB`) and `memory_utilization` — the keys mac-studio-exporter already decodes from `/v1/status → cache` (its `llm_cache_max_memory_mb` / `llm_cache_utilization` gauges read 0 on every batched route because the batched stats never carried them; no Go change needed).
+
+**Verified:** 3 new tests (cold-cache gate arms on measured bytes + falls back on empty measurement; helper guards — missing generator / raising property / zero tokens; stats expose budget + utilization, 0 when unlimited). One scaffolding fix: the FCFS test's bare `MagicMock` generator floats to a nonsense 1.0-byte measurement, pinned to `prompt_cache_nbytes = 0` to stay on the learned path. Full suite green.
+
+**Deployment:** no config change — the measured path arms itself wherever the #39/#40 rails are already set (all 19 batched routes).
+
+**Upstreaming:** fork-only (upstream has neither the admission gate nor the batched system-KV).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
