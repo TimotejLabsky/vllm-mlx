@@ -968,6 +968,14 @@ class BatchedSystemKV:
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),
                 "current_memory_mb": mem / (1024 * 1024),
+                # exporter compatibility: mac-studio-exporter reads these
+                # from /v1/status → cache; 0 budget = unlimited
+                "max_memory_mb": float(self.ram_mb),
+                "memory_utilization": (
+                    mem / (self.ram_mb * 1024 * 1024)
+                    if self.ram_mb > 0
+                    else 0.0
+                ),
                 "checkpoint_interval": self.ckpt_interval,
                 **(
                     {"ssd": self._ssd.get_stats()}
@@ -1175,6 +1183,47 @@ def maybe_relieve_pressure(scheduler) -> None:
         )
 
 
+def _measured_bytes_per_token(scheduler) -> float:
+    """Ground-truth per-token KV cost read from the live BatchGenerator.
+
+    ``BatchGenerator.prompt_cache_nbytes`` sums the actually-allocated
+    cache arrays (right-justified padding, quantized layers, hybrid SSM
+    state — everything the hardware is really paying for) across its
+    unprocessed/prompt/generation stages; dividing by the running set's
+    tracked token count yields bytes/token as measured, not as estimated
+    from the newest cache snapshot (#40's proxy, which is stale after a
+    model of different shape warmed the bag and ABSENT on a cold cache —
+    leaving the budget gates inert exactly when a fresh process serves
+    its first deep request). Two deliberate biases, both conservative
+    (over-price a token → defer sooner):
+
+    - the denominator uses per-row logical lengths, so when rows are
+      padded to the batch max the ratio charges the padding to the
+      logical tokens;
+    - scheduler bookkeeping can lag the generator by a step.
+
+    Returns 0.0 whenever the generator or the measurement is unavailable
+    (unit-test schedulers, generator mid-recreate) — callers fall back to
+    the learned-at-insert estimate.
+    """
+    gen = getattr(scheduler, "batch_generator", None)
+    if gen is None:
+        return 0.0
+    try:
+        measured = float(gen.prompt_cache_nbytes)
+    except Exception:
+        return 0.0
+    if measured <= 0:
+        return 0.0
+    total_tokens = sum(
+        r.num_prompt_tokens + len(r.output_token_ids)
+        for r in scheduler.running.values()
+    )
+    if total_tokens <= 0:
+        return 0.0
+    return measured / total_tokens
+
+
 def should_defer_cobatch(scheduler, request) -> bool:
     """Memory-aware admission gate (#39 pad-waste + #40 dynamic concurrency).
 
@@ -1198,16 +1247,24 @@ def should_defer_cobatch(scheduler, request) -> bool:
        (catches pressure the estimates can't see: spill queue, cache
        entries, other processes' share of unified memory).
 
-    Checks 1–2 use the bytes/token footprint learned from the newest cache
-    entry and are inert on a cold cache (the first request runs solo
-    anyway). Runs on the executor thread from ``_schedule_waiting``.
+    Checks 1–2 price tokens with ground-truth bytes/token measured from
+    the live BatchGenerator (``prompt_cache_nbytes`` over the running
+    set's tokens — see ``_measured_bytes_per_token``), falling back to
+    the footprint learned from the newest cache entry when no
+    measurement is available; with neither (genuinely cold process) they
+    are inert — the first request runs solo anyway. Runs on the executor
+    thread from ``_schedule_waiting``.
     """
     hybrid_kv = scheduler.hybrid_kv
     if not scheduler.running:
         return False
 
     reason = None
-    bpt = hybrid_kv.bytes_per_token()
+    bpt = _measured_bytes_per_token(scheduler)
+    bpt_source = "measured"
+    if bpt <= 0:
+        bpt = hybrid_kv.bytes_per_token()
+        bpt_source = "learned"
     if bpt > 0 and (hybrid_kv.pad_waste_mb > 0 or hybrid_kv.kv_budget_mb > 0):
         lengths = [
             r.num_prompt_tokens + len(r.output_token_ids)
@@ -1230,6 +1287,8 @@ def should_defer_cobatch(scheduler, request) -> bool:
                     f"{hybrid_kv.kv_budget_mb} MB at {len(lengths)} seats; "
                     f"lengths {sorted(lengths)}"
                 )
+        if reason is not None:
+            reason += f" [bpt {bpt / 1024:.1f} KB/tok, {bpt_source}]"
 
     if reason is None and hybrid_kv.mem_watermark_pct > 0:
         over, active, ceiling = hybrid_kv.watermark_status()
