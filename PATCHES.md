@@ -1021,6 +1021,18 @@ The 2026-07 fleet ladder campaign found the 45GB-weight class (Qwen3-Next-80B / 
 
 ---
 
+## 51. `patch: server-root-route` — GET / answers llama-swap's preload probe
+
+**Files:** `vllm_mlx/server.py`, `tests/test_server.py`
+
+llama-swap v234's `hooks.on_startup.preload` fires a background `GET /` at each preloaded model after the swap + health check and treats any status ≥400 as failure (`internal/server/api.go`, `startPreload`). Our FastAPI app served no `/` route, so **every config reload** logged a spurious `[ERROR] failed to preload model Qwen3.6-35B-A3B-4bit: status 404` (16 occurrences by 2026-07-13, tracking our deploy cadence) — noise that trains you to ignore real preload failures. New unauthenticated `GET /` returns `{"service": "vllm-mlx", "model": <name>}`; no engine access, safe before load completes.
+
+**Verified:** 1 test (200 without an API key even when auth is armed — the probe carries none); live check at deploy = config reload on the Studio produces no preload ERROR line.
+
+**Upstreaming:** trivially upstream-safe; anyone fronting vllm-mlx with llama-swap preload hits this.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
