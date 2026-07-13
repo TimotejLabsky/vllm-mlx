@@ -1047,6 +1047,20 @@ The #39/#40 admission checks (pad-waste, total padded-KV budget) priced tokens w
 
 ---
 
+## 53. `patch: relief-clears-buffer-cache` — pressure relief works on a bagless process
+
+**Files:** `vllm_mlx/batched_system_kv.py`, `tests/test_batched_flip_enablement.py`
+
+Found live 2026-07-13 during the needle-at-depth test: Coder-Next (45GB class) served a cold 137K prefill cleanly (relief armed, peak 52.0 GB, final store correctly skipped under pressure) — then SIGABRTed (`std::runtime_error` → terminate, the uncatchable Metal allocation failure) 7m55s into the **identical repeat prefill on the same process** (crash report `Python-2026-07-13-170236.ips`). Root cause: `relieve_pressure()` only called `mx.clear_cache()` *after evicting an entry*, so on an empty bag — exactly what pressure-skipped stores produce — a watermark breach took the no-op path while the allocator retained the first request's multi-GB transient buffers as wired memory, eating round two's headroom. Fix: on any watermark breach, drop the MLX buffer cache before (and regardless of) the eviction loop. New `pressure_cache_clears` counter in stats. Step-hook cost unchanged when under the watermark.
+
+**Verified:** 1 test (over-watermark + empty bag → clear_cache fires + counter; under-watermark → no clear). Live crash-recipe rerun on the Studio (repeat 137K cold prefill on one process) — see the deploy row. Full suite green.
+
+**Deployment:** no config; active wherever the watermark env is set (all batched routes).
+
+**Upstreaming:** fork-only (#48 relief is fork-only).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:

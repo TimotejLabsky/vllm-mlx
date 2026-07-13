@@ -439,6 +439,29 @@ def test_relief_empties_bag_under_sustained_pressure(monkeypatch):
     assert kv.stats()["pressure_evictions"] == 2
 
 
+def test_relief_clears_buffer_cache_on_empty_bag(monkeypatch):
+    """The 2026-07-13 Coder-Next crash: a repeat 137K prefill SIGABRTed on
+    a process whose bag was empty (the first store was skipped under
+    pressure) — relief took the no-op eviction path and never returned the
+    allocator's cached transients to Metal (#53)."""
+    import mlx.core as mx
+
+    kv, mem = _watermarked(monkeypatch, active_mb=50)
+    clears = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(1))
+
+    mem["peak"] = _mb(95)  # over watermark, bag empty
+    assert kv.relieve_pressure() == 0  # nothing to evict...
+    assert clears == [1]  # ...but the buffer cache was still dropped
+    assert kv.pressure_cache_clears == 1
+    assert kv.stats()["pressure_cache_clears"] == 1
+
+    # under the watermark: no clear (the step hook must stay ~free)
+    assert kv.relieve_pressure() == 0
+    assert clears == [1]
+    assert kv.pressure_cache_clears == 1
+
+
 def test_boundary_store_skipped_under_pressure(monkeypatch):
     kv, mem = _watermarked(monkeypatch, active_mb=95)
     assert kv.store_prompt_boundary("r1", TOKENS, _donor_at(len(TOKENS))) is False
