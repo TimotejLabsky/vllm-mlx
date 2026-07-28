@@ -10,6 +10,7 @@ directly from tokenizer.json.
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
 
@@ -26,6 +27,17 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     """Check if model needs tokenizer fallback."""
     model_lower = model_name.lower()
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
+
+
+def _hf_cached_file(repo_id: str, filename: str) -> Optional[Path]:
+    """Resolve ``filename`` of ``repo_id`` through the local HF cache only."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id, filename=filename)
+    except Exception:
+        return None
+    return Path(cached) if isinstance(cached, str) else None
 
 
 def collect_eos_token_ids(tokenizer, model_path=None) -> set:
@@ -68,7 +80,13 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     if model_path:
         for config_name in ("config.json", "generation_config.json"):
             config_path = Path(model_path) / config_name
-            if not config_path.exists():
+            if not config_path.exists() and "/" in str(model_path):
+                # name_or_path is usually the HF REPO ID, not a local dir —
+                # the local-path read silently skipped the EOS union on every
+                # llama-swap-launched model (the gemma multi-eos leak class).
+                # Resolve through the HF cache (fork patch #63).
+                config_path = _hf_cached_file(str(model_path), config_name)
+            if config_path is None or not config_path.exists():
                 continue
             try:
                 config_eos = json.loads(config_path.read_text()).get("eos_token_id")
