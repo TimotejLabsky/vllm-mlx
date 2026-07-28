@@ -28,6 +28,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
+from .memory_pressure import PressureManager
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -635,11 +636,39 @@ class MLLMBatchGenerator:
         if MLLMBatchGenerator._stream is None:
             MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
 
-        # Memory management
+        # Memory-pressure relief (#48/#53 discipline via the #59 seam).
+        # Same watermark env as the LLM branch; inert when unset.
+        watermark_pct = 0
+        try:
+            watermark_pct = int(
+                os.environ.get("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", "0") or 0
+            )
+        except ValueError:
+            pass
+        self._pressure = PressureManager(watermark_pct)
+        self.pressure_cache_clears = 0
+        self.pressure_evictions = 0
+        self.vision_encodes_deferred = 0  # bumped by the admission gate
+
+        # Memory management. Wire LESS than the full recommended working
+        # set (#53 lesson: a full wired limit keeps freed transients as
+        # wired memory, defeating relief's clear_cache). 100 restores the
+        # old behavior.
         self._old_wired_limit = None
         if mx.metal.is_available():
+            try:
+                wired_pct = int(
+                    os.environ.get("VLLM_MLX_MLLM_WIRED_LIMIT_PCT", "90") or 90
+                )
+            except ValueError:
+                wired_pct = 90
+            wired_pct = min(max(wired_pct, 1), 100)
             self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+                int(
+                    mx.device_info()["max_recommended_working_set_size"]
+                    * wired_pct
+                    / 100
+                )
             )
 
     def _normalize_chat_template_for_prefix_cache(self) -> None:
@@ -1194,6 +1223,10 @@ class MLLMBatchGenerator:
             # pool accumulates O(N²) memory without clearing.
             if chunk_count % 4 == 0:
                 mx.clear_cache()
+                # #48 mid-prefill relief: the whole batch prefill runs
+                # inside ONE scheduler step, so a step-level hook alone is
+                # blind exactly while the ramp builds.
+                self.maybe_relieve_pressure()
 
         # Last chunk — return logits for sampling
         last_chunk = input_ids[:, processed:]
@@ -1251,6 +1284,13 @@ class MLLMBatchGenerator:
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
+        # #48 bracket: the vision encode is ATOMIC (vision tower + full-
+        # length language transients in one forward, no chunk boundary for
+        # a hook to fire on) — the only control point is before it starts.
+        # Don't launch the ramp into an allocator already near the
+        # watermark; drop what relief can drop first.
+        self.maybe_relieve_pressure()
+
         output = self.model(input_ids, cache=cache, **kwargs)
         request.vision_encoded = True
 
@@ -1262,6 +1302,10 @@ class MLLMBatchGenerator:
         request.attention_mask = None
         request.image_grid_thw = None
         request.extra_kwargs.clear()
+
+        # Post-encode: return the ramp's transient buffers to Metal before
+        # the next row's encode stacks on top of them.
+        mx.clear_cache()
 
         # Handle LanguageModelOutput or plain tensor
         if hasattr(output, "logits"):
@@ -1461,6 +1505,9 @@ class MLLMBatchGenerator:
                                 )
                                 if chunk_count % 4 == 0:
                                     mx.clear_cache()
+                                    # #48 mid-prefill relief (see
+                                    # _run_chunked_text_prefill).
+                                    self.maybe_relieve_pressure()
                             # Last chunk — return logits
                             remaining = remaining[:, processed:]
                             logits = self.language_model(remaining, cache=request_cache)
@@ -1663,6 +1710,56 @@ class MLLMBatchGenerator:
             logits_processors=batch_logits_processors if has_any_lp else None,
             samplers=batch_samplers if has_any_sampler else None,
         )
+
+    # ------------------------------------------------------------------
+    # Memory-pressure relief (#48/#53 discipline on the MLLM branch)
+    # ------------------------------------------------------------------
+
+    def _pressure_drop_lru(self) -> bool:
+        """Drop one cache entry under pressure; False when nothing left.
+
+        Order: prefix-cache LRU entries first (an attached SSD tier spills
+        them instead of discarding), then the vision embedding cache in
+        one shot. Both are pure caches — dropping costs a re-prefill /
+        re-encode, against the uncatchable Metal SIGABRT relief prevents.
+        """
+        prefix_cache = self.prefix_cache
+        if prefix_cache is not None:
+            entries = getattr(prefix_cache, "_entries", None)
+            if entries:
+                before = len(entries)
+                prefix_cache._evict_lru()
+                if len(entries) < before:
+                    return True
+        vision_cache = getattr(self, "vision_cache", None)
+        if vision_cache is not None:
+            caches = (
+                getattr(vision_cache, "_pixel_cache", None),
+                getattr(vision_cache, "_pixel_only_cache", None),
+                getattr(vision_cache, "_encoding_cache", None),
+            )
+            if any(caches):
+                vision_cache.clear()
+                return True
+        return False
+
+    def maybe_relieve_pressure(self) -> int:
+        """#48-style relief pass; returns entries evicted. Inert when the
+        watermark env is unset. Called at the scheduler step head, on the
+        chunked-prefill clear cadence, and before each atomic vision
+        encode (the unchunkable ramp — the only control point is before
+        it starts)."""
+
+        def _count_clear() -> None:
+            self.pressure_cache_clears += 1
+
+        _, evicted = self._pressure.relieve(
+            self._pressure_drop_lru,
+            log_label="mllm_batch_generator",
+            on_cache_clear=_count_clear,
+        )
+        self.pressure_evictions += evicted
+        return evicted
 
     # ------------------------------------------------------------------
     # MRoPE rope-delta bookkeeping (glm4v / qwen3_vl families)
@@ -2871,9 +2968,13 @@ def install_chunked_prefill_mllm(
                 )
                 batch_gen._stats.prompt_time += time.perf_counter() - tic
 
-                # Periodic memory cleanup
+                # Periodic memory cleanup + #48 mid-prefill relief (the
+                # interleaved variant IS one chunk per step, but decode
+                # transients ride between chunks — same cadence as the
+                # canonical loops).
                 if partial["chunk_count"] % 4 == 0:
                     mx.clear_cache()
+                    batch_gen.maybe_relieve_pressure()
 
                 # Process any short pending requests inline so they
                 # don't wait for the entire long prefill to finish.
