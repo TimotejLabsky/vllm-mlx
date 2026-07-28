@@ -773,6 +773,11 @@ class MLLMScheduler:
         # `abort_request` and `MLLMBatchGenerator.schedule_removal`.
         if self.batch_generator is not None:
             self.batch_generator.process_pending_removals()
+            # #48 relief at the step head (decode-phase drift; the mid-
+            # prefill and pre-encode hooks live inside the generator —
+            # this branch runs a whole batch prefill within ONE step, so
+            # a step-level hook alone would be blind mid-ramp).
+            self.batch_generator.maybe_relieve_pressure()
 
         # Schedule waiting requests
         scheduled = self._schedule_waiting()
