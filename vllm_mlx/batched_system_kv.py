@@ -39,6 +39,8 @@ import threading
 from collections import OrderedDict
 from typing import Any, Optional
 
+from .memory_pressure import PressureManager
+
 from .system_kv import (
     append_checkpoint,
     apply_snapshot_states,
@@ -209,8 +211,10 @@ class BatchedSystemKV:
         self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
         self.admission_deferrals = 0
         # Memory-pressure relief (#48) — same watermark env as the admission
-        # gate; the ceiling is cached after the first Metal query.
-        self._ws_ceiling = None
+        # gate. Watermark math + relief loop live in the cache-agnostic
+        # PressureManager (memory_pressure.py, extracted for the MLLM branch);
+        # this bag contributes its LRU eviction and keeps the counters.
+        self._pressure = PressureManager(self.mem_watermark_pct)
         self._bpt_hint = 0.0  # survives an emptied bag (see bytes_per_token)
         self.pressure_evictions = 0
         self.pressure_skipped_stores = 0
@@ -799,44 +803,18 @@ class BatchedSystemKV:
     # ------------------------------------------------- memory pressure (#48)
 
     def _threshold_bytes(self) -> Optional[float]:
-        """Watermark threshold in bytes, or None when disabled/unavailable.
-
-        The ceiling (the device's recommended working set — tracks the
-        raised ``iogpu.wired_limit_mb`` on the Studio) is cached after the
-        first Metal query: this runs once per scheduler step once the
-        relief hook is wired."""
-        if self.mem_watermark_pct <= 0:
-            return None
-        try:
-            import mlx.core as mx
-
-            if self._ws_ceiling is None:
-                self._ws_ceiling = mx.device_info()[
-                    "max_recommended_working_set_size"
-                ]
-            if not self._ws_ceiling or self._ws_ceiling <= 0:
-                return None
-            return self._ws_ceiling * self.mem_watermark_pct / 100
-        except Exception:
-            return None
+        """Watermark threshold in bytes, or None when disabled/unavailable
+        (delegated — see memory_pressure.PressureManager)."""
+        return self._pressure.threshold_bytes()
 
     def watermark_status(self) -> tuple:
         """``(over, active_bytes, ceiling_bytes)`` against the watermark.
         ``(False, 0, 0)`` when the watermark env is unset or Metal is
         unavailable."""
-        threshold = self._threshold_bytes()
-        if threshold is None:
-            return False, 0, 0
-        try:
-            import mlx.core as mx
-
-            active = mx.get_active_memory()
-            return active > threshold, active, self._ws_ceiling
-        except Exception:
-            return False, 0, 0
+        return self._pressure.watermark_status()
 
     def under_pressure(self) -> bool:
-        return self.watermark_status()[0]
+        return self._pressure.under_pressure()
 
     def _store_would_overshoot(self, tokens_list: list) -> bool:
         """Would materializing a full snapshot of this chain push active
@@ -860,84 +838,40 @@ class BatchedSystemKV:
         except Exception:
             return False
 
-    def relieve_pressure(self) -> int:
-        """Evict resident snapshot entries when the PEAK memory since the
-        last check crossed the watermark.
-
-        Peak, not instantaneous active: the step hook runs BETWEEN prefill
-        chunks, exactly where each chunk's attention transients (multi-GB
-        at deep context) have just been freed — the live 2026-07-09 deploy
-        smoke proved a 94K-token prefill peaks at 59.6 GB intra-chunk
-        while every inter-chunk active reading sits just UNDER the
-        threshold, so an active-based trigger never fires.
-        ``get_peak_memory`` is read and reset each call, making the window
-        "since the previous scheduler step" (side effect: the peak gauge
-        in scheduler stats becomes peak-since-last-step on watermark-armed
-        routes — the recent transient max, which is the number that
-        actually kills the process).
+    def _drop_lru_entry(self) -> bool:
+        """Drop the least-recently-used snapshot entry; False when empty.
 
         The bag is pure cache: non-grown entries reached SSD via
         write-through and grown entries re-grow from their spilled prefix,
         so dropping entries costs at most a re-prefill of recent deltas —
-        against what this prevents: Metal "Insufficient Memory" inside a
+        against what relief prevents: Metal "Insufficient Memory" inside a
         command-buffer completion handler is an uncatchable SIGABRT (the
-        2026-07-08 canary crashes). LRU-first, the entire bag if needed;
-        eviction stops early once instantaneous active is back under the
-        threshold. The MLX buffer cache is cleared after each drop so
-        freed buffers actually leave the process before the next chunk.
+        2026-07-08 canary crashes)."""
+        with self._lock:
+            if not self._entries:
+                return False
+            self._entries.popitem(last=False)
+            self.evictions += 1
+            self.pressure_evictions += 1
+        return True
 
-        The buffer cache is dropped even when the bag is EMPTY (#53): the
-        2026-07-13 Coder-Next crash showed a 137K prefill surviving on a
-        fresh process (peak 52 GB, relief armed) and the identical repeat
-        prefill SIGABRTing — the first request's store was skipped under
-        pressure, so round two found an empty bag, took the no-op eviction
-        path, and ran against an allocator still holding round one's
-        multi-GB transient buffers as wired memory."""
-        threshold = self._threshold_bytes()
-        if threshold is None:
-            return 0
-        try:
-            import mlx.core as mx
+    def relieve_pressure(self) -> int:
+        """Evict resident snapshot entries when the PEAK memory since the
+        last check crossed the watermark.
 
-            peak = mx.get_peak_memory()
-            mx.reset_peak_memory()
-            if peak <= threshold:
-                return 0
-
-            # over the watermark: return the allocator's cached buffers to
-            # Metal first — the only relief available on a bagless process
-            mx.clear_cache()
+        The peak-trigger / clear-even-when-empty (#53) / LRU-until-under
+        discipline lives in ``memory_pressure.PressureManager.relieve``
+        (extracted for the batched MLLM branch); this bag contributes
+        ``_drop_lru_entry`` and keeps the counters."""
+        def _count_clear() -> None:
             self.pressure_cache_clears += 1
 
-            evicted = 0
-            while True:
-                with self._lock:
-                    if not self._entries:
-                        break
-                    self._entries.popitem(last=False)
-                    self.evictions += 1
-                    self.pressure_evictions += 1
-                evicted += 1
-                mx.clear_cache()
-                if mx.get_active_memory() <= threshold:
-                    break
-            if evicted:
-                logger.warning(
-                    "[batched_system_kv] memory pressure: evicted %d "
-                    "snapshot entr%s (peak %.1f GB since last step, "
-                    "watermark %d%% of %.1f GB)",
-                    evicted,
-                    "y" if evicted == 1 else "ies",
-                    peak / 1e9,
-                    self.mem_watermark_pct,
-                    (self._ws_ceiling or 0) / 1e9,
-                )
-            return evicted
-        except Exception:
-            logger.debug(
-                "[batched_system_kv] pressure relief failed", exc_info=True
-            )
-            return 0
+        _, evicted = self._pressure.relieve(
+            self._drop_lru_entry,
+            log_label="batched_system_kv",
+            on_cache_clear=_count_clear,
+        )
+        return evicted
 
     def _may_grow(self, request_id: str, tokens_list: list) -> bool:
         """Cheap pre-check of #37's grow path: is the request's donor entry
