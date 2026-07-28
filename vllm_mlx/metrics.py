@@ -301,6 +301,12 @@ class MetricsCollector:
                 "Cache stores skipped while over the memory watermark.",
                 registry=registry,
             ),
+            "cache_pressure_clears": Gauge(
+                "vllm_mlx_cache_pressure_clears",
+                "Watermark breaches relieved with an MLX buffer-cache drop "
+                "(#53 — fires even when the cache had nothing to evict).",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -545,6 +551,9 @@ class MetricsCollector:
             )
             self._prom["cache_pressure_skipped_stores"].set(
                 _coerce_float(cache_stats.get("pressure_skipped_stores", 0))
+            )
+            self._prom["cache_pressure_clears"].set(
+                _coerce_float(cache_stats.get("pressure_cache_clears", 0))
             )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024
