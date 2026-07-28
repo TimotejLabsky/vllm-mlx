@@ -160,6 +160,13 @@ class MLLMBatchRequest:
     cross_attention_states: Optional[Any] = None  # For models that use cross-attention
     encoder_outputs: Optional[Any] = None  # For encoder-decoder models
 
+    # Per-row MRoPE position delta captured at the end of this request's
+    # prefill (glm4v/qwen3_vl families; None for models without the
+    # mechanism). Shape [1, 1]. Re-broadcast into the shared language
+    # model before every batched decode step — the model itself keeps only
+    # ONE mutable `_rope_deltas`, which the most recent prefill overwrites.
+    rope_delta: Optional[Any] = None
+
     @property
     def has_media(self) -> bool:
         """True when the request carries any media input (images/videos/audio).
@@ -1336,6 +1343,9 @@ class MLLMBatchGenerator:
                     total_tokens = req.input_ids.size
                     remaining_count = len(remaining_ids)
 
+                    # Restored KV continues at cache offset — zero delta.
+                    self._arm_rope_state(continuation=True)
+
                     with mx.stream(MLLMBatchGenerator._stream):
                         step = self.prefill_step_size
                         if remaining_count <= step:
@@ -1394,6 +1404,7 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+                    self._capture_rope_delta(req)
                     req.vision_encoded = True
                     logger.debug(
                         f"Prefix cache hit for {req.request_id}: "
@@ -1416,6 +1427,9 @@ class MLLMBatchGenerator:
                         total_tokens,
                     )
 
+                    # Restored KV continues at cache offset — zero delta.
+                    self._arm_rope_state(continuation=True)
+
                     with mx.stream(MLLMBatchGenerator._stream):
                         logits = self.language_model(last_token, cache=request_cache)
                         if hasattr(logits, "logits"):
@@ -1429,6 +1443,7 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+                    self._capture_rope_delta(req)
                     req.vision_encoded = True
                     logger.debug(
                         f"Prefix cache exact hit for {req.request_id}: "
@@ -1441,6 +1456,11 @@ class MLLMBatchGenerator:
                         self.language_model,
                         max_kv_size=self.max_kv_size or None,
                     )
+
+                    # Fresh cache at offset 0 — force a clean get_rope_index
+                    # (a stale _position_ids from an earlier request would
+                    # otherwise be sliced into this row's prefill).
+                    self._arm_rope_state(continuation=False)
 
                     with mx.stream(MLLMBatchGenerator._stream):
                         # Text-only: chunked prefill with real progress tracking
@@ -1461,6 +1481,7 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+                    self._capture_rope_delta(req)
 
             except PrefillAbortedError:
                 aborted_requests.append(req)
@@ -1566,6 +1587,71 @@ class MLLMBatchGenerator:
             logits_processors=batch_logits_processors if has_any_lp else None,
             samplers=batch_samplers if has_any_sampler else None,
         )
+
+    # ------------------------------------------------------------------
+    # MRoPE rope-delta bookkeeping (glm4v / qwen3_vl families)
+    #
+    # These language models keep ONE mutable `_rope_deltas` (and
+    # `_position_ids`) instance attribute, set by whichever prefill ran
+    # last. Under continuous batching that state is shared across rows:
+    # request B's prefill overwrites the delta request A's decode needs,
+    # corrupting A's RoPE positions for the rest of its generation. The
+    # generator therefore captures the delta per request at prefill end
+    # and re-broadcasts the per-row stack before every decode step.
+    # Models without the attribute (gemma4, qwen3_5, ...) are untouched.
+    # ------------------------------------------------------------------
+
+    def _rope_delta_lm(self) -> Optional[Any]:
+        """The language model iff it tracks MRoPE rope deltas."""
+        lm = getattr(self, "language_model", None)
+        return lm if lm is not None and hasattr(lm, "_rope_deltas") else None
+
+    def _arm_rope_state(self, *, continuation: bool) -> None:
+        """Reset the shared LM's per-request MRoPE state before a
+        single-row prefill forward.
+
+        ``continuation=False`` (fresh cache at offset 0) clears both fields
+        so the model recomputes ``get_rope_index`` instead of slicing a
+        stale ``_position_ids`` from an earlier request. ``continuation=
+        True`` (restored prefix-cache KV or a resumed prefill chunk, cache
+        offset > 0) arms a zero delta so the decode-style position math
+        continues from the cache offset — the recompute branch would
+        restart positions at 0. Zero is correct there because only
+        text-only rows take restored/resumed paths (media rows always
+        prefill atomically) and text prompts have delta 0 by construction.
+        """
+        lm = self._rope_delta_lm()
+        if lm is None:
+            return
+        lm._rope_deltas = (
+            mx.zeros((1, 1), dtype=mx.int32) if continuation else None
+        )
+        if hasattr(lm, "_position_ids"):
+            lm._position_ids = None
+
+    def _capture_rope_delta(self, req: MLLMBatchRequest) -> None:
+        """Capture the LM's post-prefill rope delta onto the request."""
+        lm = self._rope_delta_lm()
+        if lm is not None:
+            req.rope_delta = lm._rope_deltas
+
+    def _arm_decode_rope_deltas(self, batch: "MLLMBatch") -> None:
+        """Broadcast per-row rope deltas into the LM before a decode step.
+
+        Row order is derived from ``batch.requests`` on every call, so
+        filter()/extend() churn can never desynchronize rows and deltas.
+        """
+        lm = self._rope_delta_lm()
+        if lm is None:
+            return
+        rows = []
+        for req in batch.requests:
+            delta = req.rope_delta
+            if delta is None:
+                rows.append(mx.zeros((1, 1), dtype=mx.int32))
+            else:
+                rows.append(mx.array(delta).reshape(-1)[:1].reshape(1, 1))
+        lm._rope_deltas = mx.concatenate(rows, axis=0)
 
     def _step(
         self,
@@ -1747,6 +1833,7 @@ class MLLMBatchGenerator:
                 list(req.output_tokens) + [token]
                 for req, token in zip(batch.requests, y_list)
             ]
+        self._arm_decode_rope_deltas(batch)
         batch.y, batch.logprobs = self._step(
             y[:, None],
             batch.cache,
@@ -2485,6 +2572,7 @@ def install_chunked_prefill_mllm(
             if batch.logits_processors
             else None
         )
+        batch_gen._arm_decode_rope_deltas(batch)
         batch.y, batch.logprobs = batch_gen._step(
             y[:, None],
             batch.cache,
@@ -2590,8 +2678,11 @@ def install_chunked_prefill_mllm(
             remaining_count = remaining.shape[1]
 
             if remaining_count > step:
-                # Process ONE chunk
+                # Process ONE chunk. Decode steps ran since the previous
+                # chunk and re-broadcast batch rope deltas — re-arm the
+                # single-row continuation state (cache offset > 0).
                 tic = time.perf_counter()
+                batch_gen._arm_rope_state(continuation=True)
                 batch_gen.language_model(remaining[:, :step], cache=partial["cache"])
                 _eval_prompt_cache(partial["cache"])
                 partial["remaining_ids"] = remaining[:, step:]
@@ -2616,7 +2707,7 @@ def install_chunked_prefill_mllm(
                     _budget = batch_gen._chunked_prefill_budget
                     short_reqs = []
                     for r in batch_gen.unprocessed_requests:
-                        if r.images or r.videos:
+                        if r.has_media:
                             continue
                         if r.input_ids is None:
                             try:
@@ -2645,8 +2736,9 @@ def install_chunked_prefill_mllm(
                     # Idle server — yield to event loop between chunks
                     return []
             else:
-                # Last chunk — finalize prefill
+                # Last chunk — finalize prefill (re-arm: see chunk branch).
                 tic = time.perf_counter()
+                batch_gen._arm_rope_state(continuation=True)
                 logits = batch_gen.language_model(remaining, cache=partial["cache"])
                 if hasattr(logits, "logits"):
                     logits = logits.logits
@@ -2878,9 +2970,12 @@ def install_chunked_prefill_mllm(
                     batch_gen.unprocessed_requests.remove(text_only_req)
                     text_only_req.vision_encoded = True
 
-                    # Process first chunk immediately
+                    # Process first chunk immediately. A prefix-cache hit
+                    # resumes at the restored offset (zero-delta
+                    # continuation); a miss starts at 0 (fresh rope index).
                     step = batch_gen._chunked_prefill_budget
                     tic = time.perf_counter()
+                    batch_gen._arm_rope_state(continuation=cached_count > 0)
                     batch_gen.language_model(remaining[:, :step], cache=request_cache)
                     _eval_prompt_cache(request_cache)
                     batch_gen._partial["remaining_ids"] = remaining[:, step:]
