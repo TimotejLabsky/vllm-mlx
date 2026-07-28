@@ -596,6 +596,8 @@ class MLLMBatchGenerator:
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_runtime_reason: Optional[str] = None,
+        default_video_fps: float = 0.0,
+        max_video_frames: int = 0,
     ):
         """
         Initialize MLLM batch generator.
@@ -664,6 +666,11 @@ class MLLMBatchGenerator:
 
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        # Video sampling knobs (0 = fall back to models/mllm defaults).
+        # Previously declared on MLLMSchedulerConfig but never plumbed —
+        # the preprocess hardcoded DEFAULT_FPS/MAX_FRAMES.
+        self.default_video_fps = default_video_fps
+        self.max_video_frames = max_video_frames
         self.prefill_step_size = prefill_step_size
 
         # Request management
@@ -1117,12 +1124,14 @@ class MLLMBatchGenerator:
                 MAX_FRAMES,
             )
 
+            fps = self.default_video_fps or DEFAULT_FPS
+            max_frames = self.max_video_frames or MAX_FRAMES
             for video in request.videos:
                 video_path = process_video_input(video)
                 frames = extract_video_frames_smart(
                     video_path,
-                    fps=DEFAULT_FPS,
-                    max_frames=MAX_FRAMES,
+                    fps=fps,
+                    max_frames=max_frames,
                 )
                 frame_paths = save_frames_to_temp(frames)
                 all_images.extend(frame_paths)
