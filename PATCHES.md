@@ -1192,6 +1192,23 @@ Fix: `MLLMScheduler` reads the same env (`queue_cap`, 0 = off), `add_request` ra
 
 ---
 
+## 62. `patch: mllm-prompt-token-ceiling` — 400 parity for the MLLM branch
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/request.py` (one field), `tests/test_mllm_prompt_ceiling.py` (new)
+
+Vision-series #9 (plan 2026-07-28). `VLLM_MLX_MAX_PROMPT_TOKENS` (#50) only existed on the LLM scheduler — the MLLM branch had no ceiling at all, and its `add_request` token count was computed under `except Exception: pass`, so any ceiling built on it could be **silently inert**. Two gates, same env:
+
+- **Text-estimate gate** (`MLLMScheduler.add_request`): load-bearing tokenize (failure now logs loudly instead of silently zeroing), breach raises `PromptTooLong` → existing server translation → non-retryable 400. Covers both sync and async entry (delegation).
+- **Media-aware gate** (`MLLMBatchGenerator._check_prompt_ceiling`, at preprocess end incl. the pixel-cache-hit path): the only point where the TRUE post-processor token count exists — vision placeholder tokens dominate multi-image prompts, so the text estimate badly under-counts. A breach there is mid-generator: it becomes an error response carrying the new `error_kind="prompt_too_long"` (`MLLMBatchResponse`/`RequestOutput` field), and `MLLMScheduler.generate` translates that back into a raised `PromptTooLong` — so **non-stream** callers still get a real 400.
+
+**Residuals (documented):** a stream that already sent SSE headers cannot become a 400 when the *media-aware* gate fires (error finish chunk instead) — same limitation as the LLM branch's #50; the pre-stream text-estimate probe extension (server-side token estimate before SSE) is deferred as a both-branches follow-up. Counters: `prompt_rejections` on both scheduler and generator (surfaced with #64).
+
+**Verified:** 11 new tests — add_request reject/admit/inert + loud-not-silent tokenizer failure; generator gate over/at/inert; `_error_kind_for` mapping; `generate()` translating `prompt_too_long` and passing through generic errors. Full suite green.
+
+**Upstreaming:** rides with #50 (fork-shaped envs); the `except: pass` fix is upstream-worthy on its own.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:

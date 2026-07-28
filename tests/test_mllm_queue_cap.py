@@ -24,6 +24,8 @@ def _bare_scheduler(queue_cap=0):
     sched.config = MLLMSchedulerConfig()
     sched.queue_cap = queue_cap
     sched.queue_rejections = 0
+    sched.max_prompt_tokens = 0
+    sched.prompt_rejections = 0
     sched.waiting = deque()
     sched.requests = {}
     sched.processor = SimpleNamespace(tokenizer=None)
