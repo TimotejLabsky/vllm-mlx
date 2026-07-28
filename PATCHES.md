@@ -1240,6 +1240,20 @@ Vision-series #11 (plan 2026-07-28). The #60–#63 rails were dark: `MLLMSchedul
 
 ---
 
+## 65. `patch: reject-media-on-text-only-routes` — honest 400 instead of silent image drop
+
+**Files:** `vllm_mlx/engine/base.py`, `vllm_mlx/server.py`, `vllm_mlx/engine/batched.py`, `tests/test_media_not_supported.py` (new)
+
+Vision-series #12 (plan 2026-07-28). On every `--text-only` route (the entire deployed fleet), a request with images/video/audio got its media **silently stripped** (`extract_multimodal_content` pulls the parts into side lists the batched LLM branch never reads) and was answered as text — a 200 with a hallucinated answer about an image the model never saw. No 400, no log.
+
+Fix: new `MediaNotSupported(ValueError)` (`code="media_not_supported"`, `PromptTooLong`'s non-retryable shape). Primary guard in `_prepare_chat_completion_invocation` and `_prepare_anthropic_invocation` — `has_media and not engine.is_mllm` → raise, pre-engine and pre-`StreamingResponse`, so **streams get a real 400 too**. The three `PromptTooLong` catch sites widen to the pair (both translate through the same 400 helper), plus dedicated catches on the two prep paths. Defense in depth: `BatchedEngine.generate`/`stream_generate` LLM branches raise instead of dropping media that somehow reaches them. (The Anthropic prep discards media even for MLLM engines — pre-existing, out of scope, now at least honest on text-only routes.)
+
+**Verified:** 7 new tests — exception shape; chat prep rejects on text-only / admits media-in-messages on MLLM / text passes; anthropic prep rejects; both engine branches raise. Full suite green.
+
+**Upstreaming:** strong candidate — upstream silently drops media the same way on every non-MLLM engine.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
