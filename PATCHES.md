@@ -1108,6 +1108,24 @@ Fix (phase A — correctness rail; composite media-hash keys are a later perf fo
 
 ---
 
+## 57. `patch: mllm-per-row-rope-deltas` — MRoPE correctness for batched decode (glm4v/qwen3_vl families)
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `tests/test_mllm_rope_deltas.py` (new)
+
+Vision-series #4 (plan 2026-07-28). **Correctness bug for the target VLM arches under continuous batching.** mlx-vlm's glm4v/glm4v_moe/qwen3_vl/qwen3_vl_moe language models keep ONE mutable `_rope_deltas` + `_position_ids` instance attribute, set by whichever prefill ran last (e.g. `glm4v/language.py` `:514-541`); the fork's `_step` called `language_model(tokens, cache=cache)` with no delta at all. Three contamination vectors:
+
+1. **Decode:** request B's prefill overwrites the delta request A's decode math needs (`delta = offsets + rope_deltas`) → wrong RoPE positions for A for the rest of its generation.
+2. **Fresh text prefill:** a stale `_position_ids` from an earlier image request gets **sliced into the new row's prefill** (the `self._position_ids is not None` shortcut in the models' prefill branch).
+3. **Restored/resumed forwards (prefix-cache hit, exact hit, resumed chunked-prefill chunks):** cache offset > 0 puts the model in its decode-style branch, which applies whatever stale delta is lying around; clearing to `None` instead would trigger the recompute branch and restart positions at 0 — equally wrong.
+
+Fix, generator-side only (no mlx-vlm patches): `MLLMBatchRequest.rope_delta` captured at each request's prefill end (`_capture_rope_delta`); `_arm_rope_state(continuation=…)` resets the shared state before every single-row prefill forward — `False` (fresh cache) forces a clean `get_rope_index`, `True` (restored KV / resumed chunk) arms a zero delta so positions continue from the cache offset (zero is correct there: only text rows take restored/resumed paths, and text prompts have delta 0); `_arm_decode_rope_deltas(batch)` re-broadcasts the per-row stack (None → 0) before every decode step in both `_next` and the chunked-prefill variant's `_generation_step`, deriving row order from `batch.requests` each step so `filter()`/`extend()` churn can't desynchronize. Models without the attribute (gemma4, qwen3_5 — the deployed fleet) are never touched, and the MTP path (qwen3_5-only) is unaffected. Also swept the last `images or videos` filter (chunked-prefill inline-short picker) onto `has_media` (#55 discipline).
+
+**Verified:** 9 new model-free tests (arm semantics fresh/continuation/plain-model; capture; batch-order stacking with zero default; restack-after-filter; `_next` wiring — fake LM records the delta visible at forward time: media row 37 + text row 0). Real-model divergent-offset byte-compare lands with the #58 correctness suite. Full suite green.
+
+**Upstreaming:** strong candidate — upstream's `MLLMBatchGenerator`-equivalent (their server drives `mlx_vlm.generate.ar` instead) is unaffected, but any consumer of these model classes with per-row batching hits this; the capture/re-broadcast pattern mirrors what mlx-vlm's own `ar.py:2058-2085` does internally.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
