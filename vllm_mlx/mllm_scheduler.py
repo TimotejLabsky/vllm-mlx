@@ -1354,6 +1354,12 @@ class MLLMScheduler:
             "total_completion_tokens": self.total_completion_tokens,
             "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
+            # Rail counters (#61-#63 parity with the LLM scheduler);
+            # steps_executed is upstream's (#749), above.
+            "queue_cap": self.queue_cap,
+            "queue_rejections": self.queue_rejections,
+            "max_prompt_tokens": self.max_prompt_tokens,
+            "prompt_rejections": self.prompt_rejections,
         }
 
         if self.batch_generator is not None:
@@ -1365,6 +1371,14 @@ class MLLMScheduler:
             if hasattr(self.batch_generator, "get_mtp_stats"):
                 stats["mtp"] = self.batch_generator.get_mtp_stats()
             stats["specprefill"] = self.batch_generator.get_specprefill_stats()
+            # Generator-side rail counters: the media-aware ceiling gate
+            # lives on the generator; fold its rejections into the total.
+            stats["prompt_rejections"] += getattr(
+                self.batch_generator, "prompt_rejections", 0
+            )
+            stats["vision_encodes_deferred"] = getattr(
+                self.batch_generator, "vision_encodes_deferred", 0
+            )
 
         # Include Metal memory stats
         try:
@@ -1381,7 +1395,19 @@ class MLLMScheduler:
 
         # KV prefix cache stats for /v1/status and monitoring UI.
         if self.batch_generator is not None:
-            prefix_stats = self.batch_generator.get_prefix_cache_stats()
+            prefix_stats = dict(self.batch_generator.get_prefix_cache_stats())
+            # Fold the pressure/admission counters into the cache block the
+            # Prometheus exporter reads (metrics.py picks the active cache
+            # dict — same keys the LLM branch's system_kv_cache carries).
+            prefix_stats["pressure_evictions"] = getattr(
+                self.batch_generator, "pressure_evictions", 0
+            )
+            prefix_stats["pressure_cache_clears"] = getattr(
+                self.batch_generator, "pressure_cache_clears", 0
+            )
+            prefix_stats["admission_deferrals"] = getattr(
+                self.batch_generator, "vision_encodes_deferred", 0
+            )
         else:
             prefix_stats = {
                 "hits": 0,
