@@ -638,6 +638,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         num_images: int = 0,
         num_audios: int = 0,
+        num_videos: int = 0,
         chat_template_kwargs: dict[str, Any] | None = None,
         enable_thinking: bool | None = None,
     ) -> str:
@@ -667,7 +668,7 @@ class BatchedEngine(BaseEngine):
         if template_applicator is not None:
             # Convert OpenAI image_url content parts to HuggingFace format
             # so the processor can insert the correct vision placeholder tokens.
-            if self._is_mllm and (num_images > 0 or num_audios > 0):
+            if self._is_mllm and (num_images > 0 or num_audios > 0 or num_videos > 0):
                 messages = self._prepare_mllm_messages(messages)
 
             # Per-request enable_thinking override; default: True unless coder model.
@@ -728,18 +729,21 @@ class BatchedEngine(BaseEngine):
     ) -> list[dict[str, Any]]:
         """Convert OpenAI-style multimodal content to HuggingFace format.
 
-        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
-        and ``{"type": "audio_url", "audio_url": {"url": ...}}`` while
-        HuggingFace processors expect ``{"type": "image"}`` / ``{"type": "audio"}``.
+        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``,
+        ``{"type": "video_url", "video_url": {"url": ...}}`` and
+        ``{"type": "audio_url", "audio_url": {"url": ...}}`` while HuggingFace
+        processors expect ``{"type": "image"}`` / ``{"type": "video"}`` /
+        ``{"type": "audio"}``.
 
         Args:
             messages: List of chat messages in OpenAI format. Each message is a
                 dict with at least ``role`` and ``content`` keys.
 
         Returns:
-            A new list of messages with ``image_url`` / ``audio_url`` parts
-            replaced by ``{"type": "image"}`` / ``{"type": "audio"}`` entries
-            for the HuggingFace processor.
+            A new list of messages with ``image_url`` / ``video_url`` /
+            ``audio_url`` parts replaced by ``{"type": "image"}`` /
+            ``{"type": "video"}`` / ``{"type": "audio"}`` entries for the
+            HuggingFace processor.
         """
         prepared = []
         for msg in messages:
@@ -751,6 +755,8 @@ class BatchedEngine(BaseEngine):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
+                    elif isinstance(part, dict) and part.get("type") == "video_url":
+                        new_content.append({"type": "video"})
                     elif isinstance(part, dict) and part.get("type") == "audio_url":
                         new_content.append({"type": "audio"})
                     elif isinstance(part, (dict | str)):
@@ -1077,6 +1083,7 @@ class BatchedEngine(BaseEngine):
             template_tools,
             num_images=len(all_images),
             num_audios=len(all_audios),
+            num_videos=len(all_videos),
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
@@ -1210,6 +1217,7 @@ class BatchedEngine(BaseEngine):
             template_tools,
             num_images=len(all_images),
             num_audios=len(all_audios),
+            num_videos=len(all_videos),
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
