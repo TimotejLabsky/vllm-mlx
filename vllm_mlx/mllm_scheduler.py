@@ -262,6 +262,17 @@ class MLLMScheduler:
             self.queue_cap = 0
         self.queue_rejections = 0
 
+        # Prompt ceiling (#50-parity): text-token estimate gate at
+        # add_request; the media-aware gate (true post-processor token
+        # count) lives in MLLMBatchGenerator._check_prompt_ceiling.
+        try:
+            self.max_prompt_tokens = int(
+                os.environ.get("VLLM_MLX_MAX_PROMPT_TOKENS", "0") or 0
+            )
+        except ValueError:
+            self.max_prompt_tokens = 0
+        self.prompt_rejections = 0
+
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer and generation_config.json."""
         stop_tokens = set()
@@ -460,9 +471,9 @@ class MLLMScheduler:
             sampling_params=sampling_params,
         )
 
-        # Estimate prompt token count for monitoring (text tokens only;
-        # vision tokens are added during prefill but this gives a useful
-        # approximation for the status endpoint).
+        # Text-token count: used for the status endpoint AND (load-bearing
+        # since #50-parity) the prompt ceiling below. Vision tokens are
+        # added during prefill — the media-aware second gate runs there.
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
@@ -471,7 +482,27 @@ class MLLMScheduler:
         try:
             request.num_prompt_tokens = len(tokenizer.encode(prompt))
         except Exception:
-            pass
+            # No longer silently zero: a broken tokenizer would disarm the
+            # ceiling without a trace.
+            logger.warning(
+                "Could not tokenize prompt for %s — prompt ceiling not "
+                "applied to this request",
+                request_id,
+                exc_info=True,
+            )
+
+        if (
+            self.max_prompt_tokens > 0
+            and request.num_prompt_tokens > self.max_prompt_tokens
+        ):
+            from .engine.base import PromptTooLong
+
+            self.prompt_rejections += 1
+            raise PromptTooLong(
+                f"prompt is {request.num_prompt_tokens} tokens (text-only "
+                f"estimate) > {self.max_prompt_tokens} "
+                f"(VLLM_MLX_MAX_PROMPT_TOKENS)"
+            )
 
         self.requests[request_id] = request
         self.waiting.append(request)
@@ -668,6 +699,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    error_kind=response.error_kind,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -1115,6 +1147,20 @@ class MLLMScheduler:
         # Cleanup
         if request_id in self.requests:
             del self.requests[request_id]
+
+        # Translate the media-aware ceiling breach (raised mid-generator,
+        # after prepare_inputs measured the TRUE token count) into the
+        # typed error so non-stream callers get a real 400.
+        if (
+            final_output.finish_reason == "error"
+            and getattr(final_output, "error_kind", None) == "prompt_too_long"
+        ):
+            from .engine.base import PromptTooLong
+
+            raise PromptTooLong(
+                "prompt exceeds VLLM_MLX_MAX_PROMPT_TOKENS "
+                "(media-aware token count measured at prefill)"
+            )
 
         return final_output
 
