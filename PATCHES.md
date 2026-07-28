@@ -1158,6 +1158,26 @@ Extraction: `memory_pressure.PressureManager` owns the watermark math (`threshol
 
 ---
 
+## 60. `patch: mllm-memory-pressure-relief` — the crash rail for the vision path
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_pressure_relief.py` (new)
+
+Vision-series #7 (plan 2026-07-28). The batched MLLM branch had **none** of the LLM branch's #48/#53 protection: no watermark hook anywhere, an unbounded atomic vision encode (full VLM forward — vision tower + full-length language attention transients, no chunk boundary for a hook to fire on), and a wired limit pinned to the FULL recommended working set (`set_wired_limit(max_recommended)` unconditionally), which is precisely the #53 failure mode — freed transients stay wired and starve the next ramp.
+
+Wiring (same `VLLM_MLX_BATCHED_MEM_WATERMARK_PCT` env; inert unset; all via the #59 `PressureManager` seam):
+- **Step head** (`MLLMScheduler.step`, after `process_pending_removals`): decode-phase drift. Step-level alone is blind mid-ramp — this branch runs the whole batch prefill inside ONE step (the #48 round-1 lesson), hence:
+- **Mid-prefill hooks** on the existing clear-every-4-chunks cadence in all three chunked loops (`_run_chunked_text_prefill`, the prefix-hit chunk loop, the interleaved chunked-prefill variant).
+- **Vision-encode bracket**: `maybe_relieve_pressure()` immediately before each atomic encode (don't launch the ramp into a hot allocator — the only control point is before it starts) + `mx.clear_cache()` after (return the ramp's transients before the next row's encode stacks on top). Deferring admission of media rows while hot lands with #62 (admission seats), where the defer decision mechanically belongs.
+- **Eviction providers**: prefix-cache LRU entries first (`MemoryAwarePrefixCache._evict_lru` — an attached SSD tier spills instead of discarding), then the vision embedding cache in one shot. Both pure caches.
+- **Wired limit**: `VLLM_MLX_MLLM_WIRED_LIMIT_PCT` (default **90**, was effectively 100) of the recommended working set; 100 restores old behavior. Only affects the MLLM branch — the deployed `--text-only` fleet never constructs this generator.
+- Counters: `pressure_cache_clears`, `pressure_evictions`, `vision_encodes_deferred` (bumped by #62); surfaced in stats/metrics with #63.
+
+**Verified:** 6 new tests (fake-allocator pattern from `test_batched_flip_enablement.py`): inert without watermark; no-op under; peak breach → clear counter + LRU eviction stopping once active recovers; #53 clear-on-empty-caches; vision cache dropped after prefix exhausted; step-head wiring order. Wired-limit change is exercised by the Studio e2e (pressure-burst gate in the deploy protocol). Full suite green.
+
+**Upstreaming:** fork-only (rides on #48/#53/#59).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
