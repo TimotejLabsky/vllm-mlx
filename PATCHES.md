@@ -1209,6 +1209,20 @@ Vision-series #9 (plan 2026-07-28). `VLLM_MLX_MAX_PROMPT_TOKENS` (#50) only exis
 
 ---
 
+## 63. `patch: mllm-admission-seats` — prefill_batch_size becomes load-bearing
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `tests/test_mllm_admission_seats.py` (new)
+
+Vision-series #10 (plan 2026-07-28). `prefill_batch_size` (default 4) was **dead config**: stored, used only to raise `completion_batch_size`, and never bounding anything — `_next` sliced by `completion_batch_size` (16), so up to 16 back-to-back ATOMIC vision encodes (each a full VLM forward with unbounded transients) could stack in one step. That multiplier is exactly what turns one survivable ramp into a Metal SIGABRT.
+
+Fix: `_select_prefill_batch()` — FCFS admission for a new prefill batch with two constraints on media rows: at most `prefill_batch_size` per batch start, and none co-admitted while the allocator is over the watermark (`should_defer_cobatch` spirit, #60's pressure seam; inert when the env is unset). The queue head is ALWAYS admitted (the LLM branch's "solo requests are never deferred" progress rule); text rows are unconstrained. The `num_active == 0` branch now consumes the queue **by uid** instead of by count, so deferred rows keep their place for the next step. Hot deferrals bump `vision_encodes_deferred` (#60's counter; surfaced with #64).
+
+**Verified:** 7 new tests — text unconstrained; budget clip; hot defers non-head media (text still admitted); head-always-admitted under pressure; empty; `_next` uid-consumption with deferred media staying queued in place (hot + budget variants). Full suite green.
+
+**Upstreaming:** the dead-config fix is upstream-worthy; the pressure deferral is fork-shaped.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
