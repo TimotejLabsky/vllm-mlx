@@ -60,11 +60,10 @@ class MLLMSchedulerConfig:
     vision_cache_size: int = 100
     # Default max tokens
     default_max_tokens: int = 256
-    # Default video FPS for frame extraction
+    # Default video FPS for frame extraction (plumbed into the batch
+    # generator's video preprocessing; 0 = models/mllm default)
     default_video_fps: float = 2.0
-    # KV cache memory limit (from --cache-memory-mb)
-    cache_memory_mb: Optional[int] = None
-    # Maximum video frames
+    # Maximum video frames (plumbed likewise)
     max_video_frames: int = 128
     # Enable MTP speculative decoding
     enable_mtp: bool = False
@@ -357,6 +356,8 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                default_video_fps=self.config.default_video_fps,
+                max_video_frames=self.config.max_video_frames,
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
