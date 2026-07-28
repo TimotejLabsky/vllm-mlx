@@ -1324,49 +1324,7 @@ class MLLMBatchGenerator:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
 
-                # Try prefix cache for all requests (text-only and multimodal).
-                # VLM forward writes the same KV state as language model forward
-                # for text tokens, so cached KV from a previous VLM run is valid.
-                # However, if the remaining (uncached) tokens contain image
-                # placeholders, we must fall back to VLM forward instead of
-                # running them through the language model alone.
-                cached_kv = None
-                remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
-                    input_ids_list = req.input_ids.reshape(-1).tolist()
-                    # Strip think suffix from lookup key so stored entries
-                    # (also stripped) match as clean PREFIX.
-                    S = self._think_suffix_len
-                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
-                    # Append think suffix back to remaining so the model
-                    # sees the full generation prompt (<think>\n).
-                    if cached_kv is not None and S > 0:
-                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
-
-                    # If remaining tokens contain image placeholders, the
-                    # language-model-only path cannot handle them — clear the
-                    # cache hit so we fall through to full VLM forward.
-                    if cached_kv is not None and remaining_ids:
-                        img_tok = getattr(
-                            getattr(self.model, "config", None),
-                            "image_token_index",
-                            None,
-                        )
-                        if img_tok is not None and img_tok in remaining_ids:
-                            cached_kv = None
-                            remaining_ids = None
-
-                # Detect empty RotatingKVCache in cached entry — if any sliding-window
-                # layer has keys=None (all entries trimmed), the cache is unusable.
-                # Fall through to full prefill instead of producing garbage.
-                if cached_kv is not None and self._has_empty_rotating_cache(cached_kv):
-                    logger.warning(
-                        f"Prefix cache hit for {req.request_id} has empty "
-                        f"RotatingKVCache layers — falling through to full prefill"
-                    )
-                    cached_kv = None
-                    remaining_ids = None
+                cached_kv, remaining_ids = self._prefix_cache_lookup(req)
 
                 if cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
@@ -1374,8 +1332,8 @@ class MLLMBatchGenerator:
                     request_cache = self._copy_prefix_cache(cached_kv)
                     self._trim_rotating_caches(request_cache)
                     remaining = mx.array(remaining_ids)[None, :]
-                    cached_count = len(input_ids_list) - len(remaining_ids)
-                    total_tokens = len(input_ids_list)
+                    cached_count = req.input_ids.size - len(remaining_ids)
+                    total_tokens = req.input_ids.size
                     remaining_count = len(remaining_ids)
 
                     with mx.stream(MLLMBatchGenerator._stream):
@@ -1452,7 +1410,7 @@ class MLLMBatchGenerator:
                     # stored entry).
                     request_cache = _trim_cache_offset(cached_kv, 1)
                     last_token = req.input_ids[:, -1:]
-                    total_tokens = len(input_ids_list)
+                    total_tokens = req.input_ids.size
                     self._prefill_progress[req.request_id] = (
                         total_tokens,
                         total_tokens,
@@ -1911,17 +1869,80 @@ class MLLMBatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
+    def _prefix_cache_lookup(
+        self, req: MLLMBatchRequest
+    ) -> Tuple[Optional[Any], Optional[List[int]]]:
+        """Fetch a prefix-cache entry for a text-only request.
+
+        Returns ``(cached_kv, remaining_ids)``; ``(None, None)`` on miss or
+        when the hit is unusable.
+
+        Media-bearing requests never touch the token-keyed cache: their KV
+        depends on pixel/audio content the placeholder token ids don't
+        encode, so a token match is not a content match. (Skipping the fetch
+        entirely also closes the exact-match hole where the remaining-ids
+        placeholder guard below never runs.)
+        """
+        if self.prefix_cache is None or req.input_ids is None or req.has_media:
+            return None, None
+
+        input_ids_list = req.input_ids.reshape(-1).tolist()
+        # Strip think suffix from lookup key so stored entries
+        # (also stripped) match as clean PREFIX.
+        S = self._think_suffix_len
+        lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+        cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+        # Append think suffix back to remaining so the model
+        # sees the full generation prompt (<think>\n).
+        if cached_kv is not None and S > 0:
+            remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+
+        # Defense in depth: if remaining tokens contain media placeholders
+        # (a text-classified request should never carry them), the
+        # language-model-only path cannot handle them — clear the hit so we
+        # fall through to VLM forward.
+        if cached_kv is not None and remaining_ids:
+            model_config = getattr(self.model, "config", None)
+            for attr in (
+                "image_token_index",
+                "image_token_id",
+                "video_token_index",
+                "video_token_id",
+            ):
+                media_tok = getattr(model_config, attr, None)
+                if media_tok is not None and media_tok in remaining_ids:
+                    return None, None
+
+        # Detect empty RotatingKVCache in cached entry — if any sliding-window
+        # layer has keys=None (all entries trimmed), the cache is unusable.
+        # Fall through to full prefill instead of producing garbage.
+        if cached_kv is not None and self._has_empty_rotating_cache(cached_kv):
+            logger.warning(
+                f"Prefix cache hit for {req.request_id} has empty "
+                f"RotatingKVCache layers — falling through to full prefill"
+            )
+            return None, None
+
+        return cached_kv, remaining_ids
+
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
     ) -> None:
         """Store KV caches for finished text-only requests into prefix cache.
 
         Must be called BEFORE batch.filter() so that indices are still valid.
+
+        Media-bearing requests are never stored: the prefix cache is keyed on
+        token ids alone, and a media prompt's KV depends on pixel/audio
+        content the placeholder tokens don't encode — two different images
+        that tokenize identically would alias each other's KV.
         """
         if self.prefix_cache is None or not end_indices:
             return
         for i in end_indices:
             req = batch.requests[i]
+            if req.has_media:
+                continue
             if req.input_ids is not None:
                 try:
                     extracted = batch.extract_cache(i)
