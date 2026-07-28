@@ -1061,6 +1061,20 @@ Found live 2026-07-13 during the needle-at-depth test: Coder-Next (45GB class) s
 
 ---
 
+## 54. `fix(mllm): clear_runtime_caches/reset target the generator's vision cache`
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_scheduler_runtime_caches.py` (new)
+
+First patch of the vision-support series (plan 2026-07-28). `MLLMScheduler.clear_runtime_caches()` and `reset()` dereferenced `self.vision_cache` — an attribute the scheduler **never sets** (the `VisionEmbeddingCache` lives on the batch generator, `mllm_batch_generator.py` `__init__`). Any batched MLLM engine 500'd with `AttributeError` on the cache-clear route (`server.py` → `BatchedEngine.clear_runtime_caches`), and `reset()` raised after closing the generator. Latent until now because the fleet runs `--text-only` (LLM branch); it fires the moment a vision route lands on BatchedEngine.
+
+Fix: both methods resolve the cache via `self.batch_generator.vision_cache` (guarded for the pre-`_ensure_batch_generator` state); `reset()` grabs the reference **before** closing and dropping the generator.
+
+**Verified:** 5 new model-free tests (recording-fake generator/caches): clear-with-generator (both flags true + clear() called), no-generator, generator-without-prefix-cache, reset clears vision cache + closes generator, reset without generator. Full suite green.
+
+**Upstreaming:** clean bug fix, PR-worthy — upstream has the identical dead dereference.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
