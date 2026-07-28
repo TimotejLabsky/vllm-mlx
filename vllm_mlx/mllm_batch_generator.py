@@ -272,6 +272,19 @@ class MLLMBatchResponse:
     from_draft: bool = False  # True when this response is an accepted MTP draft
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
+    # Machine-readable cause when finish_reason == "error" (e.g.
+    # "prompt_too_long") — lets the scheduler translate into typed errors.
+    error_kind: Optional[str] = None
+
+
+def _error_kind_for(exc: BaseException) -> Optional[str]:
+    """Map an exception from the prefill/preprocess paths to the
+    machine-readable ``error_kind`` carried on error responses."""
+    from .engine.base import PromptTooLong
+
+    if isinstance(exc, PromptTooLong):
+        return "prompt_too_long"
+    return None
 
 
 @dataclass
@@ -650,6 +663,18 @@ class MLLMBatchGenerator:
         self.pressure_evictions = 0
         self.vision_encodes_deferred = 0  # bumped by the admission gate
 
+        # Prompt ceiling (#50-parity), measured on the TRUE post-processor
+        # input_ids — vision placeholder tokens included, which for
+        # multi-image prompts dominate the text-only estimate the
+        # scheduler's add_request gate sees.
+        try:
+            self.max_prompt_tokens = int(
+                os.environ.get("VLLM_MLX_MAX_PROMPT_TOKENS", "0") or 0
+            )
+        except ValueError:
+            self.max_prompt_tokens = 0
+        self.prompt_rejections = 0
+
         # Memory management. Wire LESS than the full recommended working
         # set (#53 lesson: a full wired limit keeps freed transients as
         # wired memory, defeating relief's clear_cache). 100 restores the
@@ -1004,6 +1029,7 @@ class MLLMBatchGenerator:
                 f"Pixel cache HIT for request {request.request_id}: "
                 f"saved {cached_pixels.processing_time:.2f}s"
             )
+            self._check_prompt_ceiling(request)
             return
 
         # Cache miss - process images
@@ -1061,6 +1087,28 @@ class MLLMBatchGenerator:
             f"{request.input_ids.size if request.input_ids is not None else 0} tokens "
             f"({processing_time:.2f}s)"
         )
+
+        self._check_prompt_ceiling(request)
+
+    def _check_prompt_ceiling(self, request: MLLMBatchRequest) -> None:
+        """#50-parity gate on the true (media-aware) token count.
+
+        Runs at preprocess end — the only point where the actual vision
+        token count exists. Raises PromptTooLong; the preprocess error
+        paths mark the response ``error_kind="prompt_too_long"`` so
+        non-stream callers get a real 400.
+        """
+        if self.max_prompt_tokens <= 0 or request.input_ids is None:
+            return
+        n = int(request.input_ids.size)
+        if n > self.max_prompt_tokens:
+            from .engine.base import PromptTooLong
+
+            self.prompt_rejections += 1
+            raise PromptTooLong(
+                f"prompt is {n} tokens (media-aware) > "
+                f"{self.max_prompt_tokens} (VLLM_MLX_MAX_PROMPT_TOKENS)"
+            )
 
     @staticmethod
     def _copy_prefix_cache(cache_list):
@@ -1342,11 +1390,11 @@ class MLLMBatchGenerator:
                     f"Failed to preprocess request {req.request_id}: "
                     f"{type(e).__name__}: {e}"
                 )
-                failed_requests.append(req)
+                failed_requests.append((req, _error_kind_for(e)))
 
         # Remove failed requests from batch and create error responses
         if failed_requests:
-            for req in failed_requests:
+            for req, kind in failed_requests:
                 requests.remove(req)
                 self._pending_error_responses.append(
                     MLLMBatchResponse(
@@ -1355,6 +1403,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="error",
+                        error_kind=kind,
                     )
                 )
 
@@ -3174,6 +3223,7 @@ def install_chunked_prefill_mllm(
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            error_kind=_error_kind_for(e),
                         )
                     )
                     return _generation_step()
