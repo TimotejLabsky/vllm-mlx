@@ -210,6 +210,10 @@ class RequestOutput:
     # Status
     finished: bool = False
     finish_reason: Optional[str] = None
+    # Machine-readable cause for finish_reason == "error" (e.g.
+    # "prompt_too_long"), so engine callers can translate mid-generator
+    # failures into typed API errors.
+    error_kind: Optional[str] = None
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
