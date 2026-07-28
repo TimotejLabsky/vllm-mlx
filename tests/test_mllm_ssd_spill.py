@@ -91,7 +91,9 @@ def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
 
     assert len(tiers) == 1
     assert tiers[0].started and tiers[0].reconciled
-    assert tiers[0].config.cache_dir == str(tmp_path)
+    # Namespaced subdir ("mllm-v2"): pre-media-guard entries could carry
+    # image-aliased KV and must never promote back after an upgrade.
+    assert tiers[0].config.cache_dir == str(tmp_path / "mllm-v2")
     assert tiers[0].config.max_size_gb == 7.0
     assert len(set_calls) == 1
     assert set_calls[0] is tiers[0]

@@ -338,10 +338,15 @@ class MLLMScheduler:
             self._ssd_tier = None
             prefix_cache = getattr(self.batch_generator, "prefix_cache", None)
             if self.config.ssd_cache_dir is not None and prefix_cache is not None:
+                import os
+
                 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 
+                # Namespaced subdir (bumped with cache-format changes): entries
+                # written before the media-guard fix could carry image-aliased
+                # KV — they must never promote back after an upgrade.
                 ssd_config = SSDCacheConfig(
-                    cache_dir=self.config.ssd_cache_dir,
+                    cache_dir=os.path.join(self.config.ssd_cache_dir, "mllm-v2"),
                     max_size_gb=self.config.ssd_cache_max_gb,
                 )
                 self._ssd_tier = SSDCacheTier(ssd_config)
