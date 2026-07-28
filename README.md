@@ -15,6 +15,14 @@
 > (e.g. why we run SimpleEngine + system-KV instead of continuous batching).
 > See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
 >
+> **2026-07-28 — hardened batched vision serving** (PATCHES.md #54–#67):
+> the continuous-batching MLLM stack now carries the fork's full rail set —
+> image-safe prefix caching, per-row MRoPE correctness for glm4v/qwen3_vl
+> families (real-model byte-compare gates), memory-pressure relief with
+> vision-encode bracketing, queue cap / prompt ceiling / media limits with
+> honest 400s (text-only routes no longer silently drop images), and
+> stats/Prometheus parity.
+>
 > Upstream is [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx)
 > — for general use you almost certainly want that, not this fork.
 
