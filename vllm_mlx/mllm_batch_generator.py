@@ -2007,46 +2007,10 @@ class MLLMBatchGenerator:
 
                 # Media state is not represented in the token-only cache key,
                 # and supported Qwen routes also need request-local MRoPE
-                # deltas. Restrict shared prefix state to text-only requests.
-                cached_kv = None
-                remaining_ids = None
-                cached_last_logits = None
-                if self.prefix_cache is not None and is_text_only_prefix_cache_request(
-                    req
-                ):
-                    input_ids_list = req.input_ids.reshape(-1).tolist()
-                    fetch_auxiliary = getattr(
-                        self.prefix_cache, "fetch_exact_auxiliary", None
-                    )
-                    exact_aux = (
-                        fetch_auxiliary(input_ids_list)
-                        if callable(fetch_auxiliary)
-                        else None
-                    )
-                    if exact_aux is not None and "last_logits" in exact_aux:
-                        cached_kv, remaining_ids = self.prefix_cache.fetch(
-                            input_ids_list
-                        )
-                        cached_last_logits = exact_aux["last_logits"]
-                    else:
-                        # Ordinary rewindable caches retain historical prefix
-                        # matching by stripping the generated think suffix.
-                        S = self._think_suffix_len
-                        lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                        cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
-                        if cached_kv is not None and S > 0:
-                            remaining_ids = list(remaining_ids) + input_ids_list[-S:]
-
-                # Detect empty RotatingKVCache in cached entry — if any sliding-window
-                # layer has keys=None (all entries trimmed), the cache is unusable.
-                # Fall through to full prefill instead of producing garbage.
-                if cached_kv is not None and self._has_empty_rotating_cache(cached_kv):
-                    logger.warning(
-                        f"Prefix cache hit for {req.request_id} has empty "
-                        f"RotatingKVCache layers — falling through to full prefill"
-                    )
-                    cached_kv = None
-                    remaining_ids = None
+                # deltas. Shared prefix state is text-only (see the helper).
+                cached_kv, remaining_ids, cached_last_logits = (
+                    self._prefix_cache_lookup(req)
+                )
 
                 prepared_cache = None
                 if cached_kv is not None and cached_last_logits is not None:
@@ -2093,17 +2057,18 @@ class MLLMBatchGenerator:
                     all_logprobs.append(logprobs.squeeze(0))
                     per_request_caches.append(request_cache)
                     req.vision_encoded = True
+                    prompt_len = int(req.input_ids.size)
                     self._prefill_progress[req.request_id] = (
-                        len(input_ids_list),
-                        len(input_ids_list),
+                        prompt_len,
+                        prompt_len,
                     )
                 elif cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.
                     request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
-                    cached_count = len(input_ids_list) - len(remaining_ids)
-                    total_tokens = len(input_ids_list)
+                    cached_count = req.input_ids.size - len(remaining_ids)
+                    total_tokens = req.input_ids.size
                     remaining_count = len(remaining_ids)
 
                     with mx.stream(MLLMBatchGenerator._stream):
@@ -2201,7 +2166,7 @@ class MLLMBatchGenerator:
                     # The prepared cache is a safe recursive one-token rewind.
                     request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
-                    total_tokens = len(input_ids_list)
+                    total_tokens = req.input_ids.size
                     self._prefill_progress[req.request_id] = (
                         total_tokens,
                         total_tokens,
@@ -2788,17 +2753,95 @@ class MLLMBatchGenerator:
             )
         )
 
+    def _prefix_cache_lookup(
+        self, req: MLLMBatchRequest
+    ) -> Tuple[Optional[Any], Optional[List[int]], Optional[Any]]:
+        """Fetch a prefix-cache entry for a text-only request.
+
+        Returns ``(cached_kv, remaining_ids, cached_last_logits)``;
+        ``(None, None, None)`` on miss or when the hit is unusable.
+        ``cached_last_logits`` is set only on an exact hit that stored the
+        prompt's last logits (upstream #744's owned exact replay).
+
+        Media-bearing requests never touch the token-keyed cache: their KV
+        depends on pixel/audio content the placeholder token ids don't
+        encode, so a token match is not a content match. (Skipping the fetch
+        entirely also closes the exact-match hole where the remaining-ids
+        placeholder guard below never runs.)
+        """
+        if (
+            self.prefix_cache is None
+            or getattr(req, "has_media", False)
+            or not is_text_only_prefix_cache_request(req)
+        ):
+            return None, None, None
+
+        input_ids_list = req.input_ids.reshape(-1).tolist()
+        cached_last_logits = None
+        fetch_auxiliary = getattr(self.prefix_cache, "fetch_exact_auxiliary", None)
+        exact_aux = (
+            fetch_auxiliary(input_ids_list) if callable(fetch_auxiliary) else None
+        )
+        if exact_aux is not None and "last_logits" in exact_aux:
+            cached_kv, remaining_ids = self.prefix_cache.fetch(input_ids_list)
+            cached_last_logits = exact_aux["last_logits"]
+        else:
+            # Ordinary rewindable caches retain historical prefix matching by
+            # stripping the think suffix from the lookup key (stored entries
+            # are also stripped) and appending it back to remaining so the
+            # model sees the full generation prompt (<think>\n).
+            S = self._think_suffix_len
+            lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+            cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+            if cached_kv is not None and S > 0:
+                remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+
+        # Defense in depth: if remaining tokens contain media placeholders
+        # (a text-classified request should never carry them), the
+        # language-model-only path cannot handle them — clear the hit so we
+        # fall through to VLM forward.
+        if cached_kv is not None and remaining_ids:
+            model_config = getattr(self.model, "config", None)
+            for attr in (
+                "image_token_index",
+                "image_token_id",
+                "video_token_index",
+                "video_token_id",
+            ):
+                media_tok = getattr(model_config, attr, None)
+                if media_tok is not None and media_tok in remaining_ids:
+                    return None, None, None
+
+        # Detect empty RotatingKVCache in cached entry — if any sliding-window
+        # layer has keys=None (all entries trimmed), the cache is unusable.
+        # Fall through to full prefill instead of producing garbage.
+        if cached_kv is not None and self._has_empty_rotating_cache(cached_kv):
+            logger.warning(
+                f"Prefix cache hit for {req.request_id} has empty "
+                f"RotatingKVCache layers — falling through to full prefill"
+            )
+            return None, None, None
+
+        return cached_kv, remaining_ids, cached_last_logits
+
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
     ) -> None:
         """Store KV caches for finished text-only requests into prefix cache.
 
         Must be called BEFORE batch.filter() so that indices are still valid.
+
+        Media-bearing requests are never stored: the prefix cache is keyed on
+        token ids alone, and a media prompt's KV depends on pixel/audio
+        content the placeholder tokens don't encode — two different images
+        that tokenize identically would alias each other's KV.
         """
         if self.prefix_cache is None or not end_indices:
             return
         for i in end_indices:
             req = batch.requests[i]
+            if getattr(req, "has_media", False):
+                continue
             if is_text_only_prefix_cache_request(req):
                 self._discard_prefill_checkpoint(req.request_id)
                 try:
