@@ -1269,6 +1269,18 @@ Vision-series #13 (plan 2026-07-28). There was no images analog of `audio_limits
 
 ---
 
+## 67. `patch: mllm-eos-from-generation-config` — EOS union works for HF repo ids
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_eos_from_generation_config.py` (new)
+
+Vision-series #14, closing phase 1 (plan 2026-07-28). `MLLMScheduler._get_stop_tokens` read `generation_config.json` only from a **local path**, but `tokenizer.name_or_path` is usually the HF repo id (what llama-swap passes) — `gc_path.exists()` was always False and the multi-EOS union silently never happened. That's the gemma multi-eos leak class (`<turn|>` runs to `max_tokens`) on the exact branch the vision routes will use. Fix: repo-id-shaped paths (`owner/repo`) resolve through the HF cache via `try_to_load_from_cache` — the patch-#14 trick; local dirs unchanged; uncached repos fall back to the tokenizer's EOS as before. (Upstream PR #610's `collect_eos_token_ids` helper remains the planned rebase adoption — this is the minimal fork-side fix until it merges.)
+
+**Verified:** 4 new tests (local dir; repo id via fake HF cache incl. call contract; uncached repo fallback; no-slash name skips lookup). Full suite green.
+
+**Upstreaming:** superseded by PR #610 when it merges; PR-worthy standalone otherwise.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
