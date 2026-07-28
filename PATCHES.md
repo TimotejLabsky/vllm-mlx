@@ -1254,6 +1254,21 @@ Fix: new `MediaNotSupported(ValueError)` (`code="media_not_supported"`, `PromptT
 
 ---
 
+## 66. `patch: mllm-media-limits` — request-shape caps + dead-config wiring
+
+**Files:** `vllm_mlx/image_limits.py` (new), `vllm_mlx/server.py`, `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/engine/batched.py`, `tests/test_image_limits.py` (new), `tests/test_batched_engine_mllm_config.py`
+
+Vision-series #13 (plan 2026-07-28). There was no images analog of `audio_limits.py`: media item counts were unbounded (each image/video is an atomic vision-encode multiplier — #63 bounds per-step stacking, this bounds per-request shape), and inline `data:` payloads had **no size cap at all** (`MAX_IMAGE_SIZE` only guards remote downloads).
+
+- New `image_limits.py` (mirrors `audio_limits.py`): `VLLM_MLX_MAX_IMAGES_PER_REQUEST` (default 8), `VLLM_MLX_MAX_VIDEOS_PER_REQUEST` (2), `VLLM_MLX_MAX_AUDIO_PER_REQUEST` (4), `VLLM_MLX_MAX_IMAGE_MB` (20, matching the remote-download cap); 0 disables. Counts → 400 `too_much_media`, inline payload size → 413 `media_too_large`. Hooked in `_prepare_chat_messages` next to the SSRF check — pre-engine, pre-SSE.
+- **Dead-config wiring:** `MLLMSchedulerConfig.default_video_fps`/`max_video_frames` were declared but the preprocess hardcoded `DEFAULT_FPS`/`MAX_FRAMES` — now plumbed through `MLLMBatchGenerator` (0 = fall back to the models/mllm defaults). The duplicate `MLLMSchedulerConfig.cache_memory_mb` field (never read anywhere) is **deleted**; `--cache-memory-mb` keeps capping the MLLM prefix cache via `prefix_cache_memory_mb` (the one real consumer), and the engine's double-read of the same server field is gone.
+
+**Verified:** 12 new tests (count caps incl. cross-message accumulation, env override, 0-disables, video cap; 413 on oversized data URL; text untouched; video-knob plumb; dead-field absence) + the `_start_mllm` wiring test updated to pin the single-read contract. Full suite green.
+
+**Upstreaming:** limits are fork-shaped defaults; the dead-config cleanup is upstream-worthy.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
