@@ -230,6 +230,16 @@ class MLLMBatchRequest:
     cross_attention_states: Optional[Any] = None  # For models that use cross-attention
     encoder_outputs: Optional[Any] = None  # For encoder-decoder models
 
+    @property
+    def has_media(self) -> bool:
+        """True when the request carries any media input (images/videos/audio).
+
+        Audio counts as media: an audio-bearing request must take the full
+        VLM path — the language-model-only extend/interleave paths would
+        silently drop the audio.
+        """
+        return bool(self.images or self.videos or self.audio)
+
 
 @dataclass
 class MLLMBatchResponse:
@@ -1927,8 +1937,10 @@ class MLLMBatchGenerator:
         elif self.unprocessed_requests and getattr(
             self, "_allow_mid_batch_extend", True
         ):
+            # `has_media` (not images/videos) — audio counts as media, else an
+            # audio-only request joins the batch without encoding.
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [r for r in self.unprocessed_requests if not r.has_media],
                 self.completion_batch_size,
             )
 
@@ -3234,7 +3246,8 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos:
+                # `has_media`: audio is media too (fork fix ba9ba99).
+                if not r.has_media:
                     text_only_req = r
                     break
 
