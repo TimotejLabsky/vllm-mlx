@@ -1144,6 +1144,20 @@ Vision-series #5 (plan 2026-07-28). Slow-gated real-model suite (`RUN_SLOW_TESTS
 
 ---
 
+## 59. `refactor: memory-pressure-seam` — extract watermark/relief into a cache-agnostic module
+
+**Files:** `vllm_mlx/memory_pressure.py` (new), `vllm_mlx/batched_system_kv.py`
+
+Vision-series #6 (plan 2026-07-28), pure code motion — the #38 scheduler-seam precedent. The #48/#53 relief discipline (threshold from `max_recommended_working_set_size × VLLM_MLX_BATCHED_MEM_WATERMARK_PCT`, PEAK-since-last-check trigger, buffer-cache drop on any breach even with nothing to evict, LRU-evict-until-under with a clear after each drop) was welded to `BatchedSystemKV`'s snapshot bag, so the batched MLLM branch — whose cache is a `MemoryAwarePrefixCache` — had no way to reuse it.
+
+Extraction: `memory_pressure.PressureManager` owns the watermark math (`threshold_bytes`/`watermark_status`/`under_pressure`) and the relief loop (`relieve(drop_lru, log_label=…, on_cache_clear=…)`), generic over a `drop_lru() -> bool` provider. `BatchedSystemKV` constructs one, delegates the four methods, contributes `_drop_lru_entry()` (LRU pop + `evictions`/`pressure_evictions` counters under its lock), and counts `pressure_cache_clears` via the `on_cache_clear` hook — which fires at exactly the pre-extraction point, so even exception-path counter semantics are unchanged. Env parsing, counters, stats keys, and log lines are byte-identical.
+
+**Verified:** zero test edits — the #48/#53 relief suites (`test_batched_flip_enablement.py`), `test_batched_system_kv.py`, and the threading suite pass unmodified (76 tests). Full suite green.
+
+**Upstreaming:** fork-only (#48 relief is fork-only).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
