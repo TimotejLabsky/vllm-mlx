@@ -258,6 +258,17 @@ class MLLMScheduler:
         self._step_count = 0
         self._clear_cache_interval = 32
 
+        # Queue cap (#39-parity): same env as the LLM scheduler; 0 = off.
+        import os
+
+        try:
+            self.queue_cap = int(
+                os.environ.get("VLLM_MLX_BATCHED_MAX_QUEUE", "0") or 0
+            )
+        except ValueError:
+            self.queue_cap = 0
+        self.queue_rejections = 0
+
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer and generation_config.json."""
         stop_tokens = set()
@@ -441,6 +452,17 @@ class MLLMScheduler:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+
+        # Queue cap (#39-parity): reject before creating any state so the
+        # server can translate EngineBusy into a retryable 503.
+        if self.queue_cap > 0 and len(self.waiting) >= self.queue_cap:
+            from .engine.base import EngineBusy
+
+            self.queue_rejections += 1
+            raise EngineBusy(
+                f"mllm queue at capacity ({len(self.waiting)}/"
+                f"{self.queue_cap} waiting)"
+            )
 
         sampling_params = SamplingParams(
             max_tokens=max_tokens,

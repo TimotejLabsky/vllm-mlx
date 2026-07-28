@@ -1412,10 +1412,16 @@ class BatchedEngine(BaseEngine):
         SIGNATURE CONTRACT: the server passes the request id positionally
         (SimpleEngine's signature) — missing that parameter 500'd every
         streaming request in production while non-stream worked (canary
-        day-one incident). No-op when the cap is unset or the LLM
-        scheduler is absent."""
-        engine = self._engine
-        scheduler = getattr(engine, "scheduler", None) if engine else None
+        day-one incident). No-op when the cap is unset or no scheduler is
+        up. Covers BOTH stacks: the LLM scheduler and (previously missed —
+        streams on the MLLM branch could never 503 pre-SSE) the MLLM
+        scheduler."""
+        scheduler = None
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            scheduler = getattr(engine, "scheduler", None)
+        if scheduler is None:
+            scheduler = getattr(self, "_mllm_scheduler", None)
         if scheduler is None:
             return
         cap = getattr(scheduler, "queue_cap", 0)

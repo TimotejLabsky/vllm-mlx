@@ -1178,6 +1178,20 @@ Wiring (same `VLLM_MLX_BATCHED_MEM_WATERMARK_PCT` env; inert unset; all via the 
 
 ---
 
+## 61. `patch: mllm-queue-cap-and-stream-probe` — 503 parity for the MLLM branch
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/engine/batched.py`, `tests/test_mllm_queue_cap.py` (new)
+
+Vision-series #8 (plan 2026-07-28). `VLLM_MLX_BATCHED_MAX_QUEUE` was never read on the MLLM branch — `MLLMScheduler.add_request` appended unconditionally, so a flood filled the queue without bound. Worse, the pre-stream probe `raise_if_serialized_busy` returned early when `self._engine is None`, so a streaming request on an MLLM engine could **never** be rejected before SSE headers went out (the 503-before-stream seam existed only for the LLM stack).
+
+Fix: `MLLMScheduler` reads the same env (`queue_cap`, 0 = off), `add_request` raises `EngineBusy` (→ retryable 503 via the existing `server.py` translation) **before creating any request state** (`add_request_async` delegates, so both paths are covered); the probe falls through to `self._mllm_scheduler` when the LLM engine is absent, with identical cap semantics and the positional-`request_id` signature contract intact.
+
+**Verified:** 8 new tests — cap reject (+ counter, no stale state), admit-below, inert-unset, env parse at init, probe 503 on MLLM queue, probe no-op below cap / without schedulers, and the positional-signature regression pin (day-one-incident precedent). Full suite green.
+
+**Upstreaming:** the probe seam is fork-shaped; the queue cap itself would be a reasonable upstream PR alongside the LLM-side one.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
