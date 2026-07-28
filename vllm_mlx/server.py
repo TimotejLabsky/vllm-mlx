@@ -165,7 +165,12 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import EngineBusy, PromptTooLong, suspend_cancellation
+from .engine.base import (
+    EngineBusy,
+    MediaNotSupported,
+    PromptTooLong,
+    suspend_cancellation,
+)
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -804,6 +809,15 @@ def _prepare_chat_completion_invocation(
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
 
     if has_media:
+        # Text-only engines used to answer media requests with the media
+        # silently STRIPPED (a 200 about an image the model never saw).
+        # Reject before any engine work — this runs pre-StreamingResponse,
+        # so streams get a real 400 too.
+        if not getattr(engine, "is_mllm", False):
+            raise MediaNotSupported(
+                "this route serves a text-only engine; image/video/audio "
+                "content is not supported here"
+            )
         chat_kwargs["images"] = images if images else None
         chat_kwargs["videos"] = videos if videos else None
         video_fps = getattr(request, "video_fps", None)
@@ -898,7 +912,16 @@ def _prepare_anthropic_invocation(
     effective_max_tokens: int,
 ) -> PreparedChatInvocation:
     """Precompute messages, kwargs, and decoding constraints for Anthropic API."""
-    messages, _, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
+    messages, _, _, _, has_media = _prepare_chat_messages(
+        engine, openai_request.messages
+    )
+    if has_media and not getattr(engine, "is_mllm", False):
+        # Same guard as _prepare_chat_completion_invocation: never answer
+        # about media the text-only engine silently dropped.
+        raise MediaNotSupported(
+            "this route serves a text-only engine; image/video/audio "
+            "content is not supported here"
+        )
     response_format = openai_request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
@@ -1084,9 +1107,10 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     ) from exc
 
 
-def _raise_prompt_too_long(exc: PromptTooLong) -> None:
-    """Translate prompt-ceiling rejections (fork #50) into HTTP 400 — the
-    request can never succeed, so it must not look retryable."""
+def _raise_prompt_too_long(exc) -> None:
+    """Translate non-retryable admission rejections — prompt-ceiling (#50)
+    and media-on-text-only (vision series) — into HTTP 400 carrying the
+    exception's ``code``."""
     raise HTTPException(
         status_code=400,
         detail={"error": exc.code, "message": str(exc)},
@@ -5249,7 +5273,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except EngineBusy as exc:
                 tracker.finish(result="busy")
                 _raise_engine_busy(exc)
-            except PromptTooLong as exc:
+            except (MediaNotSupported, PromptTooLong) as exc:
                 tracker.finish(result="error")
                 _raise_prompt_too_long(exc)
             if output is None:
@@ -5459,6 +5483,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
+        except MediaNotSupported as exc:
+            tracker.finish(result="client_error")
+            _raise_prompt_too_long(exc)
 
         if request.stream:
             # Fork patch #15: pre-stream 503 admission probe. Upstream's
@@ -5494,7 +5521,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
-        except PromptTooLong as exc:
+        except (MediaNotSupported, PromptTooLong) as exc:
             tracker.finish(result="error")
             _raise_prompt_too_long(exc)
         if output is None:
@@ -5803,6 +5830,8 @@ def _prepare_anthropic_endpoint_invocation(
         )
     except UnsafeRemoteURLError as exc:
         _raise_remote_media_http_error(exc)
+    except MediaNotSupported as exc:
+        _raise_prompt_too_long(exc)
 
 
 @app.post(
@@ -5924,7 +5953,7 @@ async def create_anthropic_message(
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
-        except PromptTooLong as exc:
+        except (MediaNotSupported, PromptTooLong) as exc:
             tracker.finish(result="error")
             _raise_prompt_too_long(exc)
         if output is None:
