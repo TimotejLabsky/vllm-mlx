@@ -76,6 +76,21 @@ class PromptTooLong(ValueError):
     code = "prompt_too_long"
 
 
+class MediaNotSupported(ValueError):
+    """Raised at admission when a request carries media (images/videos/
+    audio) but the serving engine runs text-only (``--text-only`` or a
+    model without vision weights).
+
+    The server translates this into HTTP 400 ``error=media_not_supported``
+    — non-retryable, like :class:`PromptTooLong`. Exists because the
+    text-only paths previously STRIPPED media parts out of the messages
+    and answered the text alone: a 200 with a hallucinated answer about an
+    image the model never saw (vision series, plan 2026-07-28).
+    """
+
+    code = "media_not_supported"
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""

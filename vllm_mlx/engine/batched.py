@@ -934,7 +934,16 @@ class BatchedEngine(BaseEngine):
                 mtp_accepted=output.mtp_accepted,
             )
 
-        # Use LLM engine for text-only (non-MLLM models)
+        # Use LLM engine for text-only (non-MLLM models). Defense in depth
+        # behind the server-side guard: this branch used to silently DROP
+        # any media that reached it and answer the text alone.
+        if images or videos or audio:
+            from .base import MediaNotSupported
+
+            raise MediaNotSupported(
+                "text-only batched engine cannot serve image/video/audio input"
+            )
+
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -1040,7 +1049,15 @@ class BatchedEngine(BaseEngine):
                     break
             return
 
-        # Use LLM engine for text-only
+        # Use LLM engine for text-only. Defense in depth behind the
+        # server-side guard (see generate()).
+        if images or videos or audio:
+            from .base import MediaNotSupported
+
+            raise MediaNotSupported(
+                "text-only batched engine cannot serve image/video/audio input"
+            )
+
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
