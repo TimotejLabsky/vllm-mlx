@@ -171,6 +171,7 @@ from .engine.base import (
     PromptTooLong,
     suspend_cancellation,
 )
+from .image_limits import validate_media_shape
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -330,6 +331,7 @@ def _prepare_chat_messages(
 ) -> tuple[list[dict], list, list, list, bool]:
     """Normalize messages and collect media once for both stream/non-stream paths."""
     _validate_remote_media_urls(request_messages)
+    validate_media_shape(request_messages)
 
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
