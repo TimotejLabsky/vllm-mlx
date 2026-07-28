@@ -1915,6 +1915,51 @@ class MLLMBatchGenerator:
                 return True
         return False
 
+    def _select_prefill_batch(
+        self, candidates: List[MLLMBatchRequest]
+    ) -> Tuple[List[MLLMBatchRequest], int]:
+        """Admission for a new prefill batch; returns ``(selected,
+        deferred_hot_count)``.
+
+        FCFS with two constraints on media rows (each one is an ATOMIC
+        vision encode — full VLM forward, unbounded transients):
+
+        - at most ``prefill_batch_size`` media rows per batch start
+          (previously dead config: all 16 queue slots could stack
+          back-to-back atomic encodes in one step);
+        - none co-admitted while the allocator sits over the watermark
+          (``should_defer_cobatch`` spirit; inert when the env is unset).
+
+        The head of the queue is ALWAYS admitted — pressure or budget can
+        never starve the queue (the LLM branch's "solo requests are never
+        deferred" rule). Text rows are unconstrained. Deferred rows stay
+        queued in place for the next step.
+        """
+        if not candidates:
+            return [], 0
+        hot = self._pressure.under_pressure()
+        media_budget = max(1, int(self.prefill_batch_size or 1))
+        selected: List[MLLMBatchRequest] = []
+        media_taken = 0
+        deferred_hot = 0
+        for i, req in enumerate(candidates):
+            if not req.has_media:
+                selected.append(req)
+                continue
+            if i == 0:
+                # Progress guarantee: the head request always runs.
+                selected.append(req)
+                media_taken += 1
+                continue
+            if hot:
+                deferred_hot += 1
+                continue
+            if media_taken >= media_budget:
+                continue
+            selected.append(req)
+            media_taken += 1
+        return selected, deferred_hot
+
     def maybe_relieve_pressure(self) -> int:
         """#48-style relief pass; returns entries evicted. Inert when the
         watermark env is unset. Called at the scheduler step head, on the
@@ -2083,21 +2128,30 @@ class MLLMBatchGenerator:
         # Exception: text-only requests can be extended into an active batch
         # via the elif branch below (they skip vision encoding entirely).
         if num_active == 0:
-            requests = self._compatible_pending_requests(
+            # Two complementary filters, composed: upstream's compatibility
+            # filter (media shape) first, then the fork's admission-seat gate
+            # (#952dca5), which also defers hot-vision rows.
+            candidates = self._compatible_pending_requests(
                 self.unprocessed_requests, self.completion_batch_size
             )
+            requests, deferred_hot = self._select_prefill_batch(candidates)
+            if deferred_hot:
+                self.vision_encodes_deferred += deferred_hot
 
             if len(requests) == 0:
                 self.active_batch = None
                 return []
 
+            # Consume by uid, not by count — deferred media rows stay
+            # queued in place for the next step.
+            selected_uids = {r.uid for r in requests}
             try:
-                # Save count before _process_prompts which modifies
-                # `requests` in-place via .remove() for failed items.
-                requested_uids = {r.uid for r in requests}
+                # selected_uids is captured above, before _process_prompts
+                # mutates `requests` in place via .remove() for failed items —
+                # same guarantee upstream's local requested_uids provided.
                 new_batch = self._process_prompts(requests)
                 self.unprocessed_requests = [
-                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                    r for r in self.unprocessed_requests if r.uid not in selected_uids
                 ]
                 self.active_batch = new_batch
                 prompt_processing = True
@@ -2109,7 +2163,7 @@ class MLLMBatchGenerator:
                 )
                 # Remove failed requests to avoid infinite retry loop
                 self.unprocessed_requests = [
-                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                    r for r in self.unprocessed_requests if r.uid not in selected_uids
                 ]
                 for req in requests:
                     self._pending_error_responses.append(
