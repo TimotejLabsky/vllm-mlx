@@ -1682,7 +1682,9 @@ class TestBatchedMLLMConfigWiring:
         assert captured["config_kwargs"]["prefill_step_size"] == 256
         assert captured["config_kwargs"]["enable_prefix_cache"] is False
         assert captured["config_kwargs"]["use_memory_aware_cache"] is False
-        assert captured["config_kwargs"]["cache_memory_mb"] == 123
+        # The duplicate cache_memory_mb config field is gone (#66);
+        # --cache-memory-mb caps the prefix cache via one name.
+        assert "cache_memory_mb" not in captured["config_kwargs"]
         assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
 
 
