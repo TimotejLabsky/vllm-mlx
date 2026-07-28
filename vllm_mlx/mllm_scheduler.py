@@ -308,6 +308,21 @@ class MLLMScheduler:
             from pathlib import Path
 
             gc_path = Path(model_path) / "generation_config.json"
+            if not gc_path.exists() and "/" in str(model_path):
+                # name_or_path is usually the HF REPO ID, not a local dir —
+                # the local-path read silently skipped the EOS union on
+                # every llama-swap-launched model (the gemma multi-eos leak
+                # class). Resolve through the HF cache, the patch-#14 trick.
+                try:
+                    from huggingface_hub import try_to_load_from_cache
+
+                    cached = try_to_load_from_cache(
+                        str(model_path), filename="generation_config.json"
+                    )
+                    if isinstance(cached, str):
+                        gc_path = Path(cached)
+                except Exception:
+                    pass
             if gc_path.exists():
                 try:
                     gc = json.loads(gc_path.read_text())
