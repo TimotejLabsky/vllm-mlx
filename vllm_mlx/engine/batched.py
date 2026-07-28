@@ -1292,6 +1292,11 @@ class BatchedEngine(BaseEngine):
                 "batch_generator",
                 "mtp",
                 "requests",
+                "queue_cap",
+                "queue_rejections",
+                "max_prompt_tokens",
+                "prompt_rejections",
+                "vision_encodes_deferred",
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
