@@ -1126,6 +1126,24 @@ Fix, generator-side only (no mlx-vlm patches): `MLLMBatchRequest.rope_delta` cap
 
 ---
 
+## 58. `tests: vlm-batch-correctness` — real-model batched-decode gates for the VLM families
+
+**Files:** `tests/test_vlm_batch_correctness.py` (new)
+
+Vision-series #5 (plan 2026-07-28). Slow-gated real-model suite (`RUN_SLOW_TESTS=1 … -m slow --run-slow`, model via `VLM_TEST_MODEL`, default `Qwen2.5-VL-3B-Instruct-4bit` — same rope-delta family/outer-wrapper structure as the deploy targets). Three gates: **co-batched divergent images** (different sizes → different MRoPE deltas) byte-compare vs solo runs; **mid-decode text join** (both #57 non-decode vectors) strict-prefix compare; **multi-image smoke**.
+
+**Verified 2026-07-28 (M-series dev box, Qwen2.5-VL-3B-4bit):** all 3 green with #57 in place. Two A/B negative controls (arming monkeypatched out):
+
+- **Stale-`_position_ids` vector: PROVEN.** A text row joining an active image batch with a prompt long enough to reach the vision-position region diverges **from token 0** without the fix, and is byte-identical to its solo run with it. The suite's join test uses this exact discriminating scenario.
+- **Decode-delta clobber vector: benign on short smoke outputs.** With every row decoding under the last prefill's delta, outputs stayed identical at 24 tokens — a uniform Q-position shift leaves the decode continuation internally consistent and only pushes the prompt block "further away" (attention-decay/quality damage at range, not immediate corruption). The fix is still correct (matches mlx-vlm's own `ar.py` mechanism); the suite pins the mechanism (delta captured + rows re-broadcast) rather than reproducing that slow-burn vector.
+- **Comparison discipline:** batched and solo forwards run different Metal kernels (GEMM vs GEMV), so logits are not bit-identical and low-entropy continuations tie-flip late (observed at token 10 on a counting prompt). Cross-shape comparisons therefore gate on a strict 8-token prefix; the co-batch test's full byte-compare has been stable.
+
+**`patches/glm4v_moe_mllm.py` verdict: dead-but-faithful via our call path, KEPT for now.** The fork calls the outer `LanguageModel.__call__`, which always passes `position_ids` down (no 4-D mask on any fork path), so the patched inner fallback is unreachable — and the patch honors a provided `position_ids`, so it cannot corrupt. Removal is gated on this suite passing with `VLM_TEST_MODEL=mlx-community/GLM-4.6V-Flash-4bit` (Studio deploy step; no GLM-family checkpoint on the dev box). Same deploy step reruns with `Qwen3-VL-4B-Instruct-3bit`. Video stays in the manual Studio e2e protocol.
+
+**Upstreaming:** n/a (fork test infrastructure).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
