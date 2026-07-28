@@ -1090,6 +1090,24 @@ Vision-series #2 (plan 2026-07-28). Two holes in batched-MLLM media classificati
 
 ---
 
+## 56. `patch: mllm-prefix-cache-media-guard` — image-safe prefix caching (phase A)
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_prefix_cache_media.py` (new), `tests/test_mllm_ssd_spill.py`
+
+Vision-series #3 (plan 2026-07-28). **Live correctness bug on the batched MLLM path:** the prefix cache (`MemoryAwarePrefixCache`) is keyed on raw token ids, but a media prompt's KV depends on pixel/audio content the placeholder tokens don't encode. The store site (`_maybe_store_prefix_cache`) had **no media check at all** (its "text-only" docstring lied), and the fetch guard only inspected the *remaining* (uncached) ids for `image_token_index` — on an **exact match** `remaining_ids == []` and the guard never ran, and `video_token_index` was never checked. Net: two different images whose prompts tokenize identically could serve each other's vision KV; the SSD tier persisted such entries across restarts.
+
+Fix (phase A — correctness rail; composite media-hash keys are a later perf follow-up):
+- Media-bearing requests (`has_media`, from #55) **neither store nor fetch**. The fetch skip + think-suffix + placeholder-guard logic is extracted into `_prefix_cache_lookup()` (unit-testable; pure code motion otherwise).
+- The remaining-ids guard (now defense-in-depth) checks all of `image_token_index`/`image_token_id`/`video_token_index`/`video_token_id`.
+- The MLLM SSD tier writes to a **namespaced subdir** (`<ssd_dir>/mllm-v2`) so pre-fix aliased entries can never promote back after an upgrade.
+- Text-only requests are unaffected (store/fetch/think-suffix semantics unchanged; the chunked-prefill interleave sites only see `not has_media` rows since #55).
+
+**Verified:** 12 new model-free tests (media/audio never fetch nor store; exact-match hole closed; per-attr placeholder guard; think-suffix strip/restore preserved; text store/fetch unregressed; two-identical-prompts-different-images end-to-end guard) + SSD wiring test updated to pin the namespaced dir. Full suite green.
+
+**Upstreaming:** strong candidate — upstream's batched MLLM path has the identical aliasing bug (`mllm_cache.py`'s image-hash keying protects only the SimpleEngine path).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
