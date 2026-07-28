@@ -75,8 +75,10 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
 
     assert captured["config_kwargs"]["enable_prefix_cache"] is False
     assert captured["config_kwargs"]["use_memory_aware_cache"] is False
-    assert captured["config_kwargs"]["cache_memory_mb"] == 123
+    # --cache-memory-mb caps the prefix cache; the old duplicate
+    # cache_memory_mb config field was dead and is gone.
     assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
+    assert "cache_memory_mb" not in captured["config_kwargs"]
     # SSD fields default to (None, 10.0) when absent from SchedulerConfig.
     assert captured["config_kwargs"]["ssd_cache_dir"] is None
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 10.0
