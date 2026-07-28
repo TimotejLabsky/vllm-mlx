@@ -1075,6 +1075,21 @@ Fix: both methods resolve the cache via `self.batch_generator.vision_cache` (gua
 
 ---
 
+## 55. `fix(mllm): audio is media; convert video_url parts for the processor`
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/engine/batched.py`, `tests/test_mllm_media_classification.py` (new)
+
+Vision-series #2 (plan 2026-07-28). Two holes in batched-MLLM media classification, one class of bug:
+
+- **Audio-bearing requests were classified text-only** by the mid-batch-extend and chunked-prefill interleave filters (`not r.images and not r.videos`) — those paths prefill through `language_model` alone, silently dropping the audio. New `MLLMBatchRequest.has_media` property counts images, videos, AND audio; both filters use it. (Also the classification seam patch #56's cache guard builds on — an audio row misclassified as text would sail through a media-store filter.)
+- **`video_url` content parts were never converted** to the HuggingFace `{"type": "video"}` form: the `_prepare_mllm_messages` gate counted only `num_images`/`num_audios`, so a video-only request reached the processor with raw OpenAI parts and got no video placeholder tokens. `_apply_chat_template` gains `num_videos`, both `chat`/`stream_chat` call sites pass it, and the converter maps `video_url`.
+
+**Verified:** 9 new model-free tests (has_media semantics incl. empty-list edge; video_url/image_url/audio_url conversion; conversion-gate fires on video-only and stays off for pure text). Full suite green.
+
+**Upstreaming:** PR-worthy — upstream has both holes.
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
