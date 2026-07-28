@@ -1292,8 +1292,14 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        # The vision cache lives on the batch generator, not the scheduler.
+        vision_cache = (
+            getattr(self.batch_generator, "vision_cache", None)
+            if self.batch_generator is not None
+            else None
+        )
+        if vision_cache is not None:
+            vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1318,8 +1324,10 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            # Grab the vision cache before the generator is dropped — it lives
+            # on the generator, not the scheduler.
+            vision_cache = getattr(self.batch_generator, "vision_cache", None)
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()
+            if vision_cache is not None:
+                vision_cache.clear()
