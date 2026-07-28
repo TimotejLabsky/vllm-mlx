@@ -1223,6 +1223,23 @@ Fix: `_select_prefill_batch()` — FCFS admission for a new prefill batch with t
 
 ---
 
+## 64. `patch: mllm-stats-parity` — rail counters reach /v1/status and Prometheus
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/engine/batched.py`, `vllm_mlx/metrics.py`, `tests/test_mllm_stats_parity.py` (new)
+
+Vision-series #11 (plan 2026-07-28). The #60–#63 rails were dark: `MLLMScheduler.get_stats` exposed none of the new counters, the engine promote-list didn't copy them, and `pressure_cache_clears` (#53) was **never exported in metrics.py on either branch**.
+
+- Scheduler stats gain `steps_executed`, `queue_cap`, `queue_rejections`, `max_prompt_tokens`, `prompt_rejections` (scheduler gate + generator's media-aware gate summed), `vision_encodes_deferred`.
+- The pressure counters are folded into the `memory_aware_cache` block — the dict `metrics.py` selects as the active cache — with `vision_encodes_deferred` mapped onto the existing `admission_deferrals` key, so `vllm_mlx_cache_pressure_evictions` / `vllm_mlx_cache_admission_deferrals` light up on vision routes with zero exporter changes.
+- New gauge `vllm_mlx_cache_pressure_clears` reads `pressure_cache_clears` — covers BOTH branches (the LLM `system_kv_cache` block already carried the key; it just never had a gauge).
+- Engine promote-list copies the six scheduler keys so `/v1/status` shows them top-level.
+
+**Verified:** 3 new tests (scheduler keys incl. summed rejections; cache-block folding; engine promotion) + metrics suite green. Full suite green.
+
+**Upstreaming:** fork-only (fork counters).
+
+---
+
 ## Future work / prospects
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
