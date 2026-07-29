@@ -1283,6 +1283,11 @@ Vision-series #14, closing phase 1 (plan 2026-07-28). `MLLMScheduler._get_stop_t
 
 ## Future work / prospects
 
+Fork-side follow-ups:
+
+- **Prefix-cache media-key (vision phase B, plan P19; deferred 2026-07-29 per Tim).** Re-enable KV prefix caching for media-bearing requests on the batched MLLM path: prepend a fingerprint derived from the SHA-256 media content hash (already computed per request by `vision_embedding_cache.get/set_pixel_cache` and currently discarded) to the token key — prefix, not suffix, because `MemoryAwarePrefixCache` LCP-matches — and persist the row's `rope_delta` (#57) on the entry so a restored prefill decodes with the original delta. Bump the MLLM SSD namespace again on landing. **Trigger to pull it forward:** `memory_aware_cache` hits pinned at 0 on a vision route while the same image repeats (multi-turn-over-one-image traffic); one-shot different-image traffic gains nothing. Until then, phase A (#56) stands: media never store/fetch; the pixel cache still absorbs re-sent images' preprocessing.
+- **Pre-stream prompt-ceiling estimate (both branches, #62 residual):** `raise_if_serialized_busy(request_id, *, prompt_token_estimate=None)` + a cheap server-side text-token estimate in the three stream handlers, so oversized streaming prompts 400 before SSE headers instead of dying mid-stream. Applies equally to the LLM branch (#50 has the same gap).
+
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
 
 - **[PR #629](https://github.com/waybarrios/vllm-mlx/pull/629) — natural-stop `finish_reason="stop"` (2026-07-07 review).** Byte-identical to our patch #3 (`483b0e2`), independently rediscovered upstream (issue #628). **When it merges, patch #3 auto-retires at the rebase.** Worth a supporting comment with our production experience.
