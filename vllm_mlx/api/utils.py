@@ -570,6 +570,14 @@ def _checkpoint_has_vision_weights(name_or_path: str) -> bool:
                     or "mm_vision" in lk
                     or "audio_tower" in lk
                     or "audio_model" in lk
+                    # GLM-4V / Qwen-VL families name the vision module
+                    # ``model.visual.*`` — matched as a path SEGMENT so an
+                    # unrelated substring can't misfire. Missing this
+                    # misclassified GLM-4.6V-Flash as text-only and crashed
+                    # the LLM-fallback loader at startup (found live
+                    # 2026-07-29; the exact failure the old llama-swap
+                    # comment recorded).
+                    or "visual" in lk.split(".")
                 ):
                     return True
             return False  # confirmed: index has no vision/audio weights
