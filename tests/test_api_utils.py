@@ -763,3 +763,64 @@ class TestGptOssSpecialTokens:
         text = "<|channel|>analysis<|message|>Just thinking <|constrain|>something"
         result = clean_output_text(text)
         assert "<|constrain|>" not in result
+
+
+class TestCheckpointVisionWeightHeuristic:
+    """The DWQ-guard weight-name heuristic must recognize every vision
+    module naming convention our targets use. GLM-4V / Qwen-VL name theirs
+    ``model.visual.*`` — missing that misclassified GLM-4.6V-Flash as
+    text-only and crashed the LLM-fallback loader at startup (2026-07-29)."""
+
+    def _checkpoint(self, tmp_path, weight_names):
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Glm4vForConditionalGeneration"],
+                    "model_type": "glm4v",
+                    "vision_config": {},
+                }
+            )
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {n: "model.safetensors" for n in weight_names}})
+        )
+        return str(tmp_path)
+
+    def test_model_visual_names_classify_mllm(self, tmp_path):
+        from vllm_mlx.api.utils import is_mllm_model
+
+        path = self._checkpoint(
+            tmp_path,
+            ["model.visual.blocks.0.attn.qkv.weight", "model.language_model.norm.weight"],
+        )
+        assert is_mllm_model(path) is True
+
+    def test_vision_tower_names_classify_mllm(self, tmp_path):
+        from vllm_mlx.api.utils import is_mllm_model
+
+        path = self._checkpoint(
+            tmp_path,
+            ["vision_tower.blocks.0.mlp.weight", "model.layers.0.mlp.weight"],
+        )
+        assert is_mllm_model(path) is True
+
+    def test_text_only_weights_classify_llm(self, tmp_path):
+        """DWQ case: config claims VLM, checkpoint ships only text weights."""
+        from vllm_mlx.api.utils import is_mllm_model
+
+        path = self._checkpoint(
+            tmp_path,
+            ["model.layers.0.self_attn.q_proj.weight", "lm_head.weight"],
+        )
+        assert is_mllm_model(path) is False
+
+    def test_visual_substring_does_not_misfire(self, tmp_path):
+        """Segment match only: a weight named e.g. ``audiovisual_gate`` must
+        not flip a text checkpoint to MLLM."""
+        from vllm_mlx.api.utils import is_mllm_model
+
+        path = self._checkpoint(
+            tmp_path,
+            ["model.layers.0.audiovisual_gate.weight", "lm_head.weight"],
+        )
+        assert is_mllm_model(path) is False
