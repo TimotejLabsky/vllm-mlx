@@ -1236,6 +1236,8 @@ Vision-series #11 (plan 2026-07-28). The #60–#63 rails were dark: `MLLMSchedul
 
 **Verified:** 3 new tests (scheduler keys incl. summed rejections; cache-block folding; engine promotion) + metrics suite green. Full suite green.
 
+**Follow-up 2 (2026-07-29, found by the live GLM canary smoke):** `is_mllm_model`'s DWQ-guard weight heuristic (`_checkpoint_has_vision_weights`) only recognized `vision_tower`/`vision_model`/`mm_vision`/`audio_*` names — but the GLM-4V and Qwen-VL families name their vision module **`model.visual.*`**, so GLM-4.6V-Flash "positively confirmed" no vision weights, classified text-only, and crashed the LLM-fallback loader at startup (`Model type glm4v not supported` — the EXACT failure the llama-swap comment recorded; it wasn't stale after all, just mis-attributed). Fix: `visual` matched as a path segment (not substring, so `audiovisual_gate`-style names can't misfire). 4 regression tests incl. the DWQ text-only case. Both deploy targets were affected.
+
 **Follow-up (2026-07-29, found by the live e2e smoke):** `/v1/status` builds its own whitelisted payload and was still dropping the rail counters and the pixel-cache block even though `engine.get_stats()` and Prometheus carried them. The status payload now includes `queue_cap`/`queue_rejections`/`max_prompt_tokens`/`prompt_rejections`/`vision_encodes_deferred` (both branches, 0 when unarmed) and `vision_embedding_cache` (MLLM branch — the soak gauge for re-sent images under #56 phase A), and the engine promote-list copies `vision_embedding_cache`. Live-verified 14/14 on a real Qwen2.5-VL-3B server (see #58's e2e protocol).
 
 **Upstreaming:** fork-only (fork counters).
