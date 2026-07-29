@@ -485,14 +485,17 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
-        # Patch attention for BatchKVCache compatibility
+        # Patch attention for BatchKVCache compatibility. (The old
+        # glm4v_moe patch was retired 2026-07-29: mlx-vlm 0.6.2's outer
+        # LanguageModel.__call__ always passes position_ids down on our
+        # call paths, so the patched inner fallback was unreachable —
+        # verified live by the #58 suite + 14/14 server e2e on
+        # GLM-4.6V-Flash.)
         from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
         from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
-        from .patches.glm4v_moe_mllm import patch_glm4v_moe_for_batching
 
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
-        patch_glm4v_moe_for_batching()
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
