@@ -3985,6 +3985,14 @@ async def status():
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
         "num_waiting": stats.get("num_waiting", 0),
+        # Rail counters (#61-#63): queue cap / prompt ceiling / vision
+        # admission — the soak gauges for vision routes. Present on both
+        # branches (0 when a rail is unarmed or N/A).
+        "queue_cap": stats.get("queue_cap", 0),
+        "queue_rejections": stats.get("queue_rejections", 0),
+        "max_prompt_tokens": stats.get("max_prompt_tokens", 0),
+        "prompt_rejections": stats.get("prompt_rejections", 0),
+        "vision_encodes_deferred": stats.get("vision_encodes_deferred", 0),
         "total_requests_processed": stats.get("num_requests_processed", 0),
         "total_prompt_tokens": stats.get("total_prompt_tokens", 0),
         "total_completion_tokens": stats.get("total_completion_tokens", 0),
@@ -4015,6 +4023,10 @@ async def status():
             or stats.get("system_kv_cache"),
         ),
         "mtp": stats.get("mtp") or {"enabled": False},
+        # Pixel/preprocessing cache (MLLM branch only) — the layer that
+        # absorbs re-sent images while the KV prefix cache excludes media
+        # (#56 phase A).
+        "vision_embedding_cache": stats.get("vision_embedding_cache"),
         # Serialized-lock telemetry (waiters / busy_rejections / wait_*_ms): the
         # one TTFT component not derivable from cache hit/miss counts. Computed
         # in the engine's get_stats but previously dropped here.
