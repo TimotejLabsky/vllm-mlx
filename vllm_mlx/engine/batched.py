@@ -1307,6 +1307,7 @@ class BatchedEngine(BaseEngine):
                 "paged_cache",
                 "prefix_cache",
                 "batch_generator",
+                "vision_embedding_cache",
                 "mtp",
                 "requests",
                 "queue_cap",
