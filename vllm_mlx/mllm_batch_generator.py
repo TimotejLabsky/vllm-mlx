@@ -16,6 +16,7 @@ Architecture:
 3. Language model generation is batched using BatchKVCache (like LLM batching)
 """
 
+import inspect
 import logging
 import math
 import os
@@ -543,6 +544,18 @@ class MLLMBatchGenerator:
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
+
+        # mlx-vlm arch quirk (mistral3): Model.__call__ declares ``mask`` as
+        # a required positional (unused in the body) where every other arch
+        # makes it Optional — calling without it raises TypeError before the
+        # first vision token. Detect once; the encode call passes mask=None
+        # only when the parameter exists.
+        try:
+            self._model_call_takes_mask = "mask" in inspect.signature(
+                type(model).__call__
+            ).parameters
+        except (TypeError, ValueError):
+            self._model_call_takes_mask = False
 
         # Check if this is actually a VLM with separate language model
         self.is_vlm = hasattr(model, "language_model")
@@ -1451,6 +1464,8 @@ class MLLMBatchGenerator:
         # watermark; drop what relief can drop first.
         self.maybe_relieve_pressure()
 
+        if self._model_call_takes_mask:
+            kwargs.setdefault("mask", None)
         output = self.model(input_ids, cache=cache, **kwargs)
         request.vision_encoded = True
 
