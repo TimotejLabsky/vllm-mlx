@@ -1319,6 +1319,32 @@ arch) obsoletes it.
 
 ---
 
+## 69. `fix(mllm): pixel cache must copy extra_kwargs, not alias the request's dict`
+
+**Files:** `vllm_mlx/vision_embedding_cache.py`, `tests/test_vision_embedding_cache_aliasing.py` (new)
+
+Second find of the 2026-07-30 sweep, exposed by the same mistral3 run once #68
+let the encode proceed. `set_pixel_cache` stored the request's `extra_kwargs`
+dict **by reference**; `_run_vision_encoding` clears that dict after the encode
+(to release pixel buffers, issue #442 hygiene) — emptying the cached entry too.
+Every pixel-cache **HIT** then replayed the model call without the processor's
+arch-specific kwargs. Invisible on glm4v/qwen* (their processors leave
+`extra_kwargs` empty once `image_grid_thw` is popped), but mistral3 carries
+`image_sizes` there: the HIT path crashed patch_merger with `TypeError:
+'NoneType' object is not iterable` → same-image re-asks failed 100% on
+Devstral/Mistral-Small while the first ask succeeded.
+
+Fix: defensive `dict(extra_kwargs)` at store time (the HIT path already copies
+on read). One line plus a comment.
+
+**Verified:** 2 new tests (caller-side `clear()` leaves the stored entry
+intact; `None` stored as `{}`). Live: Devstral 14/14 e2e smoke incl. the
+same-image re-ask with `pixel_cache_hits=1`. Full suite green.
+
+**Upstreaming:** PR-worthy — upstream stores the same reference.
+
+---
+
 ## Future work / prospects
 
 Fork-side follow-ups:
