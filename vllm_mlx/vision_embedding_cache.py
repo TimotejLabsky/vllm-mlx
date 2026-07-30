@@ -245,12 +245,18 @@ class VisionEmbeddingCache:
             del self._pixel_cache[oldest_key]
             logger.debug(f"Pixel cache evicted: {oldest_key[:20]}...")
 
+        # Copy, don't alias: the caller keeps mutating its dict after the
+        # store — _run_vision_encoding() does extra_kwargs.clear() once the
+        # encode finishes, which emptied the cached entry too. Harmless for
+        # arches whose processors leave extra_kwargs empty (glm4v, qwen*),
+        # but mistral3 keeps image_sizes here and every pixel-cache HIT then
+        # re-ran the projector without it (TypeError in patch_merger).
         entry = PixelCacheEntry(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
             image_grid_thw=image_grid_thw,
-            extra_kwargs=extra_kwargs or {},
+            extra_kwargs=dict(extra_kwargs) if extra_kwargs else {},
             processing_time=processing_time,
         )
         self._pixel_cache[key] = entry
