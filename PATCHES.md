@@ -1285,6 +1285,40 @@ Vision-series #14, closing phase 1 (plan 2026-07-28). `MLLMScheduler._get_stop_t
 
 ---
 
+## 68. `fix(mllm): pass mask=None to arches whose Model.__call__ requires it (mistral3)`
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `tests/test_mllm_mask_kwarg.py` (new)
+
+Found 2026-07-30 during the fleet-wide vision test sweep (spare-port BatchedEngine
+runs on the Studio, one representative per arch family). mlx-vlm's **mistral3**
+`Model.__call__` declares `mask` as a **required positional** — and never uses it
+in the body — where every other shipped arch (glm4v, qwen3_5, qwen3_5_moe, gemma4,
+qwen3_vl, qwen3_vl_moe) makes it `Optional[...] = None`. `_run_vision_encoding`
+calls `self.model(input_ids, cache=cache, **kwargs)`, so every image request on a
+mistral3-family model (Devstral-Small-2, Mistral-Small-3.2) died in preprocessing
+with `TypeError: Model.__call__() missing 1 required positional argument: 'mask'`
+(surfaced to the client as HTTP 200, `finish_reason:"error"`, empty content —
+the error-kind contract, noted as a residual). Text requests on the same route
+were unaffected (they prefill through `language_model` directly).
+
+Fix: detect `"mask" in inspect.signature(type(model).__call__).parameters` once at
+generator init; the encode call does `kwargs.setdefault("mask", None)` only when
+the parameter exists. Arches without the parameter never see the kwarg (some lack
+`**kwargs` and would choke on it); an explicit mask in `extra_kwargs` wins.
+
+**Verified:** 4 new model-free tests (required-mask arch receives `mask=None`;
+no-mask arch never sees the kwarg; explicit mask not clobbered; init detection
+both ways). Live (Studio, Devstral-Small-2-24B-Instruct-2512-4bit): vision
+requests went from 100% failure to correct answers; the one remaining failure
+(pixel-cache HIT) was #69's aliasing bug — 14/14 e2e smoke with both fixes.
+Full suite green.
+
+**Upstreaming:** PR-worthy — upstream's MLLM batch path has the identical call;
+alternatively an mlx-vlm fix (make mistral3's `mask` optional like every other
+arch) obsoletes it.
+
+---
+
 ## Future work / prospects
 
 Fork-side follow-ups:
