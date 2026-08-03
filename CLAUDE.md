@@ -20,6 +20,11 @@ feature branch — read this before changing anything.
     routes and the embedding route remain on other paths). Engine changes are
     still deliberate — the llama-swap config in `personal-infratructure` is
     the source of truth; don't flip routes without a measured reason.
+  - [`prefix-caching-landscape-2026-08.md`](docs/fork/prefix-caching-landscape-2026-08.md)
+    — how vLLM/SGLang/LMCache/Marconi do prefix caching, why two of their three
+    optimisation axes are structurally N/A on a single-user unified-memory box
+    (offload tiers, cross-user sharing), and the one real gap in ours:
+    recency-only eviction. Verdict is instrument-first, don't build yet.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
   - [`vision-caching.md`](docs/fork/vision-caching.md) — which caches apply on
