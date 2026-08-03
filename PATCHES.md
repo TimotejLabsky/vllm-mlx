@@ -1,6 +1,13 @@
 # Local patches in this fork
 
-This fork carries its patches on top of [`waybarrios/vllm-mlx@0dd1157`](https://github.com/waybarrios/vllm-mlx/commit/0dd1157) (`v0.4.0`, 2026-06-29; previous pins: `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries its patches on top of [`waybarrios/vllm-mlx@d96458c`](https://github.com/waybarrios/vllm-mlx/commit/d96458c) (2026-08-01; previous pins: `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+
+> **2026-08-03 rebase note — rebased onto upstream `d96458c` (8 commits past `0dd1157`, which had been frozen since 2026-06-29); suite green at 2563 passed / 29 skipped / 26 deselected.** Policy this rebase, per Tim's call: **take the newer upstream version and fix forward if anything breaks** — so upstream wins on convergent code rather than the usual "keep our superset" default. 119 fork commits replayed, 2 auto-dropped as already-upstream, 4 conflicts.
+> - **Patches #70/#71 RETIRED — both are now in the base.** They were cherry-picks of upstream #667/#666 taken hours earlier the same day; the rebase dropped them as patch-equivalent (`f518827` skipped, `81128ca` dropped). The `## 70` / `## 71` sections below are historical. Net effect on the deployed box is nil — the code is identical, it just arrives from upstream now.
+> - **mlx-vlm floor `>=0.6.2,!=0.6.4` → `>=0.6.5` (upstream #674/#675), taken.** This reverses the "do not take blind" call recorded in the 2026-08-03 review section below, on new evidence: upstream's own comment is *"0.6.5+ fixes Qwen3.5 sanitize double-run"* — i.e. 0.6.5 fixes the exact re-sanitize bug that made **0.6.4** corrupt output on converted Qwen3.5 weights. The `!=0.6.4` exclusion is subsumed, not discarded. **The Studio was on 0.6.3 and must be upgraded at deploy** — and because the whole vision fleet rides mlx-vlm, this is the one change in this rebase that needs live vision verification, not just a green suite.
+> - **`94c008b` (#644, request-local Poolside parsers) — the predicted landmine, 3 of the 4 conflicts.** It refactors ~200 lines of `server.py` parser dispatch, replacing module-global `_reasoning_parser` / `_tool_parser_instance` with per-request instances built by `_build_reasoning_parser(engine)` / `_get_streaming_tool_parser(...)`. Our patches **#27** (`run-reasoning-parser-when-thinking-disabled`) and **#47** (`strip markers on Anthropic/Responses streaming`) both reached for the globals. Resolution in all three: **keep the fork's semantics** (always run the parser / latch on explicit markers when thinking is off, suppressing the reasoning output) but **bind to upstream's request-local instance**. #47's `global _tool_parser_instance` + `tool_parser = None` prelude was **dropped as superseded** — upstream's `_get_streaming_tool_parser` now supplies exactly what that prelude reached for. Three remaining `_reasoning_parser.` call sites were left alone after verifying they exist verbatim in `upstream/main` (non-streaming `_run_responses_request` / `_extract_reasoning_and_tool_calls`, where upstream still uses the global).
+> - **`52b617a` (#662, sampled concurrent MLLM decoding) — the other predicted landmine, and it did NOT conflict.** It rewrites ~491 lines of `mllm_batch_generator.py`, the file patches #56/#57/#60 live in, but git auto-merged every hunk. Because a clean auto-merge is *not* evidence of preserved semantics, the fork's MLLM stack was re-verified explicitly post-rebase: #57 per-row `rope_delta` (19 refs), #56 media guard (28 refs), #60 pressure relief (19 refs) all still wired, and `test_mllm_prefix_cache_media` / `test_mllm_pressure_relief` / `test_mllm_ssd_spill` / upstream's rewritten `test_mllm_continuous_batching` pass 71/71 together. **Residual risk: the real-model VLM gates (#58, `test_vlm_batch_correctness.py`) are `slow`-marked and cannot run off-Studio — they are the actual proof and must run there.**
+> - **Net-new upstream gained, inert for us:** `52b617a`/`d96458c` MTP work (MTP measured dead on M-series, no MTP route), `94c008b` Poolside parser (unserved model), `bb03785` test hygiene, `87ea13d` CI job registration.
 
 > **2026-06-29 rebase note — rebased onto upstream `0dd1157` (`v0.4.0`, 13 commits past `a48c86c`); suite green at 2293 passed / 29 skipped / 23 deselected.** Policy this rebase: keep all fork functionality; where upstream converged on a fix we already carry, take upstream's version *unless* it would regress a fork semantic.
 > - **Admission (#615) — upstream converged on our env-respecting fix; we keep our superset.** `9a75b07` (#615) fixes the env-var clobber bug the 2026-06-09 note flagged: the unconditional `self._generation_lock_admission = "fail_fast"` is now correctly indented into the invalid-input branch, so a valid `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait` survives. **The old "upstream merged with the env-clobber bug intact / `wait` is silently impossible upstream" warning (2026-06-09 note below) is now STALE.** Our patch #15 remains a strict superset — default `wait` (upstream defaults `fail_fast`) plus the third MLLM-text lock site, pre-stream 503 probe, and lock-wait timer — so per "keep our functionality" we keep ours (taking upstream wholesale would regress the `wait` default our tests assert). The rebase auto-merged upstream's now-fixed init block *alongside* ours (no textual conflict — different insertion point), producing a duplicate init block; the redundant upstream copy was removed and folded into patch #15. Net: one admission init block, `wait` default, env respected.
@@ -1345,7 +1352,9 @@ same-image re-ask with `pixel_cache_hits=1`. Full suite green.
 
 ---
 
-## 70. `fix(embeddings): release MLX buffers after each batch` — cherry-pick of upstream #667
+## 70. `fix(embeddings): release MLX buffers after each batch` — cherry-pick of upstream #667 — **RETIRED (in base as of `d96458c`)**
+
+> Auto-dropped at the 2026-08-03 rebase as patch-equivalent to upstream `6b41b1a`. Section retained for history; the fix is unchanged, it just comes from upstream now.
 
 **Files:** `vllm_mlx/embedding.py`, `tests/test_embeddings.py`
 
@@ -1361,7 +1370,9 @@ Cherry-pick of upstream [`6b41b1a`](https://github.com/waybarrios/vllm-mlx/commi
 
 ---
 
-## 71. `fix(server): preserve active streaming responses` — cherry-pick of upstream #666
+## 71. `fix(server): preserve active streaming responses` — cherry-pick of upstream #666 — **RETIRED (in base as of `d96458c`)**
+
+> Auto-dropped at the 2026-08-03 rebase as patch-equivalent to upstream `4a8d94b`. Section retained for history; the fix is unchanged, it just comes from upstream now.
 
 **Files:** `vllm_mlx/server.py`, `tests/test_server.py`
 
@@ -1389,6 +1400,8 @@ Fork-side follow-ups:
 - **Pre-stream prompt-ceiling estimate (both branches, #62 residual):** `raise_if_serialized_busy(request_id, *, prompt_token_estimate=None)` + a cheap server-side text-token estimate in the three stream handlers, so oversized streaming prompts 400 before SSE headers instead of dying mid-stream. Applies equally to the LLM branch (#50 has the same gap).
 
 ### Upstream review 2026-08-03 — the rest of `0dd1157..d96458c`
+
+> **SUPERSEDED the same day by the full rebase onto `d96458c`** (see the rebase note at the top). Everything below was written when the plan was cherry-picks only; all 8 commits are now in the base, including the mlx-vlm floor bump this section argued against. Kept for the reasoning, not as current policy.
 
 Upstream moved for the first time in a month (8 commits; base was frozen at
 `0dd1157` since 2026-06). Two were taken as patches #70/#71 above. The other six
