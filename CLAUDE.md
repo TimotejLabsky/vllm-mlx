@@ -22,6 +22,9 @@ feature branch — read this before changing anything.
     the source of truth; don't flip routes without a measured reason.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
+  - [`vision-caching.md`](docs/fork/vision-caching.md) — which caches apply on
+    vision routes (pixel cache ON, media-KV deliberately OFF until phase B,
+    text-KV ON), why, and the 2026-07-30 per-arch sweep verdicts.
 - Consumer side (deploy config, llama-swap, model lineup) lives in the
   `personal-infratructure` repo (`mac-studio/README.md` keeps a deployed-state
   table — update its top row on each deploy).
