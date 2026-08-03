@@ -1345,12 +1345,72 @@ same-image re-ask with `pixel_cache_hits=1`. Full suite green.
 
 ---
 
+## 70. `fix(embeddings): release MLX buffers after each batch` — cherry-pick of upstream #667
+
+**Files:** `vllm_mlx/embedding.py`, `tests/test_embeddings.py`
+
+Cherry-pick of upstream [`6b41b1a`](https://github.com/waybarrios/vllm-mlx/commit/6b41b1a) (#667, Yury Fediai). `/v1/embeddings` never called `mx.clear_cache()`, unlike every LLM path, so the MLX allocator pool retained every Metal buffer size it had ever seen. `EmbeddingEngine.embed` tokenizes with `padding=True`, so the sequence length — and therefore the requested buffer size — varies with the longest text in each batch; nearly every request asks for a size the pool has never seen and cannot reuse, so it only grows. Upstream measured ~70 MB retained per input text, taking a fresh process from 2.3 GB to 24 GB over 320 texts, and a week-old production process to 50 GB (49 GB of it IOAccelerator, nothing reclaimable). One `mx.clear_cache()` after `.tolist()` keeps the same run flat at ~3.5 GB with unchanged throughput (19.2 vs 19.1 texts/s).
+
+**Why it bites us specifically:** the embedding route is the one remaining fleet route that is *not* on BatchedEngine (see CLAUDE.md), so it never inherited the LLM paths' `clear_cache()` discipline, and llama-swap keeps it resident for long stretches — exactly the week-old-process shape upstream measured. This is an unbounded RSS leak on a box with a hard ~60 GB wired wall (see the `deep-research-2026-07` finding), on a route that competes for that wall with every model swap.
+
+**Conflict resolved:** `tests/test_embeddings.py` — upstream's new test landed on the same lines as our patch #41 (`embedding-truncation-from-config`) tests. Kept both; upstream's test was restyled to the fork's `patch.object(engine, "_ensure_loaded")` idiom instead of its `load`/`is_loaded` decorator pair, so it matches the surrounding file.
+
+**Verified:** full suite 2548 passed / 29 skipped / 0 failed.
+
+**Upstreaming:** already upstream — collapses automatically at the next rebase.
+
+---
+
+## 71. `fix(server): preserve active streaming responses` — cherry-pick of upstream #666
+
+**Files:** `vllm_mlx/server.py`, `tests/test_server.py`
+
+Cherry-pick of upstream [`4a8d94b`](https://github.com/waybarrios/vllm-mlx/commit/4a8d94b) (#666, Thump604). `_disconnect_guard` enforced `--timeout` as an **absolute wall-clock ceiling** on a streaming request: once elapsed time crossed it, the stream was killed regardless of whether the generator was still producing tokens. #666 reinterprets the same value as an **inactivity** bound — the clock resets on every chunk (`last_chunk_at`), and the `asyncio.wait` slice becomes `min(heartbeat_interval, _chunk_timeout - idle_seconds)` so the guard still wakes in time to fire. A stream that keeps producing output now runs to completion; a genuinely wedged one still dies.
+
+**Why it bites us specifically:** this is a live constraint on our deep-context fleet, not a theoretical one. The `context-envelope-27b` measurements recorded the 27B-8bit cold ceiling as **TIMEOUT-bound** — 112K OK at ~16 min TTFT, 128K "dies at `--timeout 1200`" — and the fleet ladder caps (27B-8bit 96K, 27B-4bit 112K, Coder/Next-80B 128K) were set against that ceiling. Under the old semantics a request had to fit *prefill plus its entire decode* inside one budget, so a 16-minute TTFT left only ~4 minutes of decode before a healthy stream was cut. Under inactivity semantics the bound applies to TTFT and to inter-token gaps separately, and decode length stops consuming the budget at all.
+
+**Consequence to re-measure before acting:** the recorded ceilings are now partly an artefact of the old guard. The 128K "death" at `--timeout 1200` should be re-run — if that was the guard rather than the hardware, the cap is loose. Note this does **not** relax the 45GB-class ~160K Metal-OOM wall (patch #50), which is a memory limit, not a time limit; the two ceilings are independent and only the timeout one moves.
+
+**Non-streaming path deliberately unchanged:** `_start_request_budget` / `_remaining_request_timeout` keep absolute-deadline semantics for non-streaming handlers, which is correct — a non-streaming request emits no progress signal, so an absolute bound is the only bound available.
+
+**Verified:** applied clean on both files. Full suite 2548 passed / 29 skipped / 0 failed (includes upstream's 3 new guard tests).
+
+**Upstreaming:** already upstream — collapses automatically at the next rebase.
+
+---
+
 ## Future work / prospects
 
 Fork-side follow-ups:
 
 - **Prefix-cache media-key (vision phase B, plan P19; deferred 2026-07-29 per Tim).** Re-enable KV prefix caching for media-bearing requests on the batched MLLM path: prepend a fingerprint derived from the SHA-256 media content hash (already computed per request by `vision_embedding_cache.get/set_pixel_cache` and currently discarded) to the token key — prefix, not suffix, because `MemoryAwarePrefixCache` LCP-matches — and persist the row's `rope_delta` (#57) on the entry so a restored prefill decodes with the original delta. Bump the MLLM SSD namespace again on landing. **Trigger to pull it forward:** `memory_aware_cache` hits pinned at 0 on a vision route while the same image repeats (multi-turn-over-one-image traffic); one-shot different-image traffic gains nothing. Until then, phase A (#56) stands: media never store/fetch; the pixel cache still absorbs re-sent images' preprocessing.
 - **Pre-stream prompt-ceiling estimate (both branches, #62 residual):** `raise_if_serialized_busy(request_id, *, prompt_token_estimate=None)` + a cheap server-side text-token estimate in the three stream handlers, so oversized streaming prompts 400 before SSE headers instead of dying mid-stream. Applies equally to the LLM branch (#50 has the same gap).
+
+### Upstream review 2026-08-03 — the rest of `0dd1157..d96458c`
+
+Upstream moved for the first time in a month (8 commits; base was frozen at
+`0dd1157` since 2026-06). Two were taken as patches #70/#71 above. The other six
+are **no-action**, recorded so the next review doesn't re-litigate them:
+
+- **`52b617a` feat(mtp): sampled concurrent MLLM decoding (#662)** — the big one
+  (679 lines, `mllm_batch_generator.py`). Inert for us: MTP/speculative decoding
+  was **measured dead on M-series** (0.5–0.76×, see `spec-decoding-dead-on-mseries`)
+  and we run no MTP route. It does churn the MLLM batch generator heavily, which
+  is patch #57's (`mllm-per-row-rope-deltas`) neighbourhood — **rebase landmine,
+  expect conflicts there next rebase.**
+- **`d96458c` Qwen MTP shard prefixes (#664)** — same reason; MTP-only.
+- **`87ea13d` + `f8c5b47` mlx-vlm floor 0.6.5 / drop 0.6.4 exclusion** — **do not
+  take blind.** We pin `!= 0.6.4` for a measured reason (corrupt re-sanitised
+  Qwen3.5 weights, patch #49); upstream now *requires* `>= 0.6.5`, which would
+  force an upgrade off the Studio's verified 0.6.3. Bumping the floor is a
+  deploy-time decision needing a re-verify of the vision fleet (the 6-arch sweep
+  in `vision-series-phase1`), not a doc-level cherry-pick. Deferred.
+- **`bb03785` drop duplicate cache-guard test (#655)** — a one-line assertion on
+  a test whose subject (`_supports_system_kv_cache` guard in `simple.py`) our
+  patch #12 denylist already supersedes. No value.
+- **`94c008b` request-local Poolside parser (#644)** — new vendor tool/reasoning
+  parser for a model we don't serve. It does refactor ~200 lines of `server.py`
+  parser dispatch — **second rebase landmine**, adjacent to patches #27/#46/#47.
 
 Open upstream PRs/issues worth tracking — not yet applied here, with the reasoning:
 
