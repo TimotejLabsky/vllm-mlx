@@ -1,6 +1,14 @@
 # Local patches in this fork
 
-This fork carries its patches on top of [`waybarrios/vllm-mlx@d96458c`](https://github.com/waybarrios/vllm-mlx/commit/d96458c) (2026-08-01; previous pins: `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries its patches on top of [`waybarrios/vllm-mlx@b998776`](https://github.com/waybarrios/vllm-mlx/commit/b998776) (2026-08-04; previous pins: `d96458c`, `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+
+> **2026-08-10 rebase note — rebased onto upstream `b998776` (2 commits past `d96458c`); suite green at 2586 passed / 29 skipped / 26 deselected.** Both new upstream commits are **our own two cherry-picks merging upstream**, so this rebase is almost entirely a retirement round: 120 fork commits replayed, 2 deliberately dropped, 3 conflicts.
+> - **Patches #42 (#631 mistral `[ARGS]`) and #43 (#562 gpt-oss harmony) RETIRED — both merged upstream and are now in the base** (`57e91a9`, `b998776`). They did **not** auto-drop: both PRs gained review hardening after we cherry-picked them, so the merged versions are strict supersets of ours. Dropped explicitly (`git rebase -i` → `drop`) and upstream's versions taken; `mistral_tool_parser.py` and `harmony_tool_parser.py` are now **byte-identical to `upstream/main`** (verified). The `## 42` / `## 43` sections below are historical.
+> - **What the merged versions gained over our cherry-picks (net-new hardening, now ours for free):** #631 added tool-name validation (`^[A-Za-z0-9_.-]+$`), **JSON-string-aware splitting** so a `[TOOL_CALLS]` marker inside a quoted argument value can no longer forge a second dispatchable call (a real injection vector our cherry-pick had), `[ARGS]`-vs-`{` boundary ordering so legacy calls whose JSON contains the literal `[ARGS]` still parse, a 256-char name-buffer overflow flush (withheld text is emitted as content instead of being silently lost on truncation), multi-call streaming with one id per call, and rejection of malformed-JSON args. #631 also **closes the known limitation** #42 recorded (missing streamed `id` when the name spans deltas) — the id now attaches to whichever delta first carries real content. #562 added a `<|channel|>` terminator to the commentary pattern (args can no longer glue into a later channel), streaming dedup by (name, arguments) with a `reset()` override, and completion on the final-channel transition rather than only `<|call|>`.
+> - **The one hand-merge, again in `server.py` `_extract_reasoning_and_tool_calls`.** Upstream's merged #562 replaced our cherry-pick's `text_for_tool_parse = output_text` with `_strip_harmony_analysis_blocks(output_text)` — strictly better, since reasoning text no longer reaches the generic tool-parser fallback. Resolution: **upstream's stripping branch kept, patch #27's `if not allow_reasoning:` fold-not-drop block re-applied after it** (same composition as the original hand-merge, which #43's section documents). Patch #47's `_explicit_reasoning_markers_present` helper collided only on placement with upstream's new `_strip_harmony_analysis_blocks` — both kept, they are independent.
+> - **`api/utils.py` checked, not regressed.** #43's section lists an `api/utils.py` `clean_output_text` commentary bypass, and upstream's merged #562 touches `tests/test_api_utils.py` but **not** `api/utils.py`. Verified our `api/utils.py` carries no harmony/commentary divergence from upstream and that upstream's new tests pass against it — the bypass was not needed in the merged design. 276 tool/harmony/api-utils tests pass.
+> - **Retirement audit of every remaining cherry-pick** (upstream PR state checked live this rebase): **#41/#626** (embedding truncation) OPEN, **#44/#552** (idle backoff) OPEN, **#45/#551** (MLLM media thread) OPEN, **#49/#634** (SSD close-on-stop) OPEN — all four still load-bearing, keep. **#46/#497** (empty tool-wrapper guard) is now **CLOSED upstream without merging** — see its updated status: it is permanently ours, no longer "retire on merge".
+> - **Net-new upstream gained:** nothing beyond the two retirements. Upstream added no other commits this window.
 
 > **2026-08-03 rebase note — rebased onto upstream `d96458c` (8 commits past `0dd1157`, which had been frozen since 2026-06-29); suite green at 2563 passed / 29 skipped / 26 deselected.** Policy this rebase, per Tim's call: **take the newer upstream version and fix forward if anything breaks** — so upstream wins on convergent code rather than the usual "keep our superset" default. 119 fork commits replayed, 2 auto-dropped as already-upstream, 4 conflicts.
 > - **Patches #70/#71 RETIRED — both are now in the base.** They were cherry-picks of upstream #667/#666 taken hours earlier the same day; the rebase dropped them as patch-equivalent (`f518827` skipped, `81128ca` dropped). The `## 70` / `## 71` sections below are historical. Net effect on the deployed box is nil — the code is identical, it just arrives from upstream now.
@@ -883,7 +891,9 @@ Cherry-picks upstream open PR [#626](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
-## 42. `fix(mistral-parser): parse the [ARGS]-marker tool format` — cherry-pick of upstream #631
+## 42. `fix(mistral-parser): parse the [ARGS]-marker tool format` — cherry-pick of upstream #631 — **RETIRED (in base as of `b998776`)**
+
+> **RETIRED on the 2026-08-10 rebase.** Upstream `57e91a9` (#631) merged into the base. Our cherry-pick did **not** auto-drop: the PR gained review hardening after we took it (head `98d4f83`), so upstream's merged version is a strict superset. Ours was dropped explicitly and `mistral_tool_parser.py` is now byte-identical to `upstream/main`. Net gain over what we carried: JSON-string-aware call splitting (closes a marker-in-arguments call-forging vector), tool-name validation, `[ARGS]`-vs-`{` boundary ordering, name-buffer overflow flush, malformed-args rejection, and multi-call streaming — which also **closes the known `id` limitation recorded below**. Section kept for history.
 
 **Files:** `vllm_mlx/tool_parsers/mistral_tool_parser.py`, `tests/test_tool_parsers.py`
 
@@ -893,11 +903,13 @@ Cherry-picks upstream open PR [#631](https://github.com/waybarrios/vllm-mlx/pull
 
 **Conflict surface:** zero — no fork patches touch `mistral_tool_parser.py`.
 
-**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #631** (opened 2026-07-06, MERGEABLE, no reviews yet).
+**Status:** ~~TEMPORARY cherry-pick — retire on the next rebase past upstream #631~~ — **DONE: retired on the 2026-08-10 rebase** (#631 merged as `57e91a9` 2026-08-03). See the retirement note at the top of this section.
 
 ---
 
-## 43. `fix(gpt-oss): plumb harmony tool calls through to response` — cherry-pick of upstream #562
+## 43. `fix(gpt-oss): plumb harmony tool calls through to response` — cherry-pick of upstream #562 — **RETIRED (in base as of `b998776`)**
+
+> **RETIRED on the 2026-08-10 rebase.** Upstream `b998776` (#562) merged into the base. As with #42 it did **not** auto-drop — the merged version is a superset of the `98d4f83` head we took. Ours was dropped explicitly and `harmony_tool_parser.py` is now byte-identical to `upstream/main`. Net gain: `<|channel|>` added as a pattern terminator (arguments can no longer glue into a later channel), streaming dedup by (name, arguments) with a `reset()` override, and block completion on the final-channel transition rather than only `<|call|>`. **Two carry-forwards:** (1) the server.py hand-merge below still applies, except upstream now hands the parser `_strip_harmony_analysis_blocks(output_text)` instead of raw `output_text` — patch #27's fold block sits after it exactly as before; (2) the `api/utils.py` `clean_output_text` bypass is **not** in upstream's merged design and was **not** re-applied — verified unnecessary (our `api/utils.py` has no harmony divergence from upstream and upstream's new `test_api_utils.py` passes). Section kept for history.
 
 **Files:** `vllm_mlx/server.py`, `vllm_mlx/tool_parsers/harmony_tool_parser.py`, `vllm_mlx/api/utils.py`, `tests/test_harmony_parsers.py`, `tests/test_server.py`
 
@@ -912,7 +924,7 @@ Plus a defensive `clean_output_text` bypass for commentary tool blocks in `api/u
 
 **Conflict surface:** only that one server.py region; `harmony_tool_parser.py`/`api/utils.py` carried no fork patches.
 
-**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #562** (MERGEABLE; collaborator-approved, owner re-review pending; PR self-closed/reopened once for staleness, so upstream timing is uncertain).
+**Status:** ~~TEMPORARY cherry-pick — retire on the next rebase past upstream #562~~ — **DONE: retired on the 2026-08-10 rebase** (#562 merged as `b998776` 2026-08-04). See the retirement note at the top of this section.
 
 ---
 
@@ -954,7 +966,7 @@ Ports **only the `_is_empty_tool_wrapper` guard** from upstream open PR [#497](h
 
 **Deliberately NOT taken from #497:** the scheduler.py/server.py "post-tool cumulative-text" piece — it's under unaddressed owner CHANGES-REQUESTED upstream (O(n²) per-chunk `list()` copy, full `model_dump()` per stream), collides with our scheduler finalization block (#34-series) and patch #27's streaming loop, and its symptom is unconfirmed on our SimpleEngine routes. Re-evaluate when it merges upstream in a reworked form.
 
-**Status:** the guard is byte-compatible with #497's version — auto-collapses if #497 ever merges as-is; otherwise ours to keep.
+**Status:** **PERMANENT as of the 2026-08-10 rebase — upstream #497 is now CLOSED without merging**, so the "auto-collapses if #497 ever merges" path is dead and this guard is ours to carry indefinitely. (It remains byte-compatible with #497's version, which is now only of historical interest.)
 
 ---
 
@@ -1437,7 +1449,7 @@ Open upstream PRs/issues worth tracking — not yet applied here, with the reaso
 
 - **[PR #574](https://github.com/waybarrios/vllm-mlx/pull/574) — SimpleEngine prefix trie cache (2026-07-07 review).** Stalled (owner demanded a semantic rewire against the multi-slot LRU; author silent ~1 month). Redundant with our grow-on-HIT stack (#9/#13/#19) on system prefixes, double-memory, hybrid-trim risk; as shipped it's even nested under `has_system`, so it can't serve the one niche (no-system growing prefixes) that could complement us. **Policy when it merges: reject the `simple.py` hunk wholesale (the #541 precedent).** Worth stealing: its exact-fit guard idea → audit that our restore paths never hand `stream_generate` an empty prompt on a 100%-prefix hit; its `NoFetchTrie` layering-assertion test pattern.
 
-- **[PR #497](https://github.com/waybarrios/vllm-mlx/pull/497) — Qwen tool streaming recovery.** Empty-wrapper guard taken as patch #46; the scheduler/server "post-tool cumulative-text" piece is under unaddressed owner CHANGES-REQUESTED (O(n²) copy, full model_dump) and collides with our scheduler finalization + patch #27 — re-evaluate when it merges reworked.
+- **[PR #497](https://github.com/waybarrios/vllm-mlx/pull/497) — Qwen tool streaming recovery. CLOSED upstream without merging (confirmed 2026-08-10).** Empty-wrapper guard was taken as patch #46, which is therefore **permanent** rather than pending-retirement. The scheduler/server "post-tool cumulative-text" piece was under unaddressed owner CHANGES-REQUESTED (O(n²) copy, full model_dump) and collided with our scheduler finalization + patch #27 — moot now that the PR is closed. Nothing to track; entry kept so the closure isn't rediscovered.
 
 - **[PR #541](https://github.com/waybarrios/vllm-mlx/pull/541) — multi-slot LRU for system-KV. MERGED upstream (commit `1656c15`), now in our base as of the 2026-05-29 rebase.** Its `simple.py` changes are superseded by our patch #13 (rejected during the rebase — see the rebase note at the top of this file). #541's version starts from PR #523's single-slot cache with no grow-on-HIT, and re-introduces the allowlist probe that gates off hybrid ArraysCache models (which our patch #12 denylist fixes). Our #13 is a strict superset, so we keep ours. If upstream's structure later diverges in a way worth adopting, reconciliation would mean re-layering grow-on-HIT (#9) + denylist probe (#12) + longest-prefix-match (#9) on top of upstream's OrderedDict — non-trivial; defer until there's a concrete upstream improvement to fold in.
 
