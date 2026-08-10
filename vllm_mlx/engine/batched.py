@@ -957,6 +957,7 @@ class BatchedEngine(BaseEngine):
             text, stop_hit = truncate_at_stop(output.output_text, stop)
             return GenerationOutput(
                 text=clean_output_text(text),
+                raw_text=text,
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -1000,6 +1001,7 @@ class BatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=clean_output_text(text),
+            raw_text=text,
             tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
@@ -1069,6 +1071,7 @@ class BatchedEngine(BaseEngine):
                 new_text, stop_hit = scanner.scan(output.new_text)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
+                    raw_text=output.output_text,
                     new_text=new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -1120,6 +1123,7 @@ class BatchedEngine(BaseEngine):
 
             yield GenerationOutput(
                 text=text,
+                raw_text=output.output_text,
                 new_text=new_text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
