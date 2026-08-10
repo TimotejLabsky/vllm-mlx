@@ -23,6 +23,14 @@ class GenerationOutput:
     """
 
     text: str
+    # Generation text BEFORE ``clean_output_text`` stripped special tokens.
+    # ``_clean_gpt_oss_output`` deletes whole harmony blocks
+    # (``<|channel|>commentary to=functions.X<|constrain|>json<|message|>``,
+    # ``<|start|>assistant``), so a tool parser handed ``text`` can never match
+    # a harmony tool call. The server parses ``raw_text`` when present and
+    # still emits ``text`` as user-facing content. Empty means "no raw copy
+    # kept" — callers must fall back to ``text``.
+    raw_text: str = ""
     tokens: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0

@@ -3038,6 +3038,23 @@ def _explicit_reasoning_markers_present(text: str) -> bool:
     return bool((start and start in text) or (end and end in text))
 
 
+def _parse_source_text(output: object) -> str:
+    """Return the text the reasoning/tool parsers should see.
+
+    Engines run ``clean_output_text`` over their final text, and for harmony
+    models ``_clean_gpt_oss_output`` deletes whole structural blocks —
+    ``<|channel|>commentary to=functions.X<|constrain|>json<|message|>`` and
+    ``<|start|>assistant`` — leaving only the bare argument JSON. A parser
+    handed that text can never match a tool call, which is why non-streaming
+    gpt-oss tool calling silently returned prose instead of ``tool_calls``.
+
+    ``raw_text`` is the pre-clean copy. Content is re-cleaned downstream, so
+    parsing from raw changes what the parsers match on, not what clients see.
+    Falls back to ``text`` for engines/paths that don't populate it.
+    """
+    return getattr(output, "raw_text", "") or getattr(output, "text", "") or ""
+
+
 def _extract_reasoning_and_tool_calls(
     output_text: str,
     request: ChatCompletionRequest | None = None,
@@ -5443,7 +5460,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-            output.text,
+            _parse_source_text(output),
             request,
             allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
             engine=engine,
@@ -5873,7 +5890,7 @@ async def create_anthropic_message(
         )
 
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-            output.text,
+            _parse_source_text(output),
             openai_request,
             allow_reasoning=(
                 not _thinking_disabled(openai_request, prepared.chat_kwargs)

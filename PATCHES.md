@@ -1404,6 +1404,39 @@ Cherry-pick of upstream [`4a8d94b`](https://github.com/waybarrios/vllm-mlx/commi
 
 ---
 
+## 72. `fix(gpt-oss): parse tool calls from pre-clean text` — non-streaming harmony tool calling
+
+**Files:** `vllm_mlx/engine/base.py`, `vllm_mlx/engine/simple.py`, `vllm_mlx/engine/batched.py`, `vllm_mlx/server.py`, `tests/test_harmony_raw_text_parsing.py`
+
+Non-streaming `gpt-oss-20b` tool calling returned reasoning prose as `content` with `tool_calls` absent, on **every** request. Reported as "harmony structural tokens are swallowed during detokenization"; that diagnosis was wrong at two layers and is recorded here so it is not re-investigated.
+
+**Not the tokenizer.** Probed on the deployed stack (transformers 5.14.1): all seven harmony control tokens are in vocab with `special=True`, decode to themselves, survive a full encode/decode round-trip, and survive `NaiveStreamingDetokenizer` — the exact path `scheduler.py` uses. Only `skip_special_tokens=True` strips them, and nothing in the fork passes it. The 2026-08-03 `transformers` bump is **exonerated**.
+
+**Not the parser, and not the prompt.** `HarmonyToolParser.extract_tool_calls()` extracts the call correctly from raw model output. `render_messages()` produces canonical harmony, and raw `mlx_lm` fed the byte-identical 138-token server prompt emits a textbook `<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{...}` block.
+
+**The actual cause:** both engines run `clean_output_text()` over their final text *before* returning `GenerationOutput`, and the server then parsed `output.text`. For harmony output `_clean_gpt_oss_output()` deletes whole structural blocks — the entire `<|channel|>commentary …<|message|>` header and `<|start|>assistant` — leaving only the bare argument JSON plus a stray `<|end|>` (that orphaned `<|end|>` is the live fingerprint). The parser was handed text from which every anchor it matches on had already been removed, so it could never fire. Engine-agnostic, which is why it reproduced identically on SimpleEngine and BatchedEngine.
+
+**Fix:** carry the pre-clean text on `GenerationOutput.raw_text` and parse from it via `_parse_source_text()`, falling back to `text` when absent. `clean_output_text` is upstream's no-reasoning-parser fallback and is **deliberately untouched** — an earlier attempt to fix this by editing `api/utils.py` fought that design and broke two upstream tests. Content is re-cleaned downstream, so this changes what the parsers match on, not what clients receive.
+
+**Verified live on the Studio** (spare ports, patched package shadowed via `PYTHONPATH`, production site-packages untouched). Neutral prompt, 4 runs each:
+
+| Config | structured `tool_calls` |
+|---|---|
+| prod `:8080`, unpatched, BatchedEngine | **0/4** |
+| patched, SimpleEngine | 3/4 (1 loss to the ramble below) |
+| patched, BatchedEngine + prod flags/env | **4/4** |
+
+Payload is correct OpenAI shape: `finish_reason="tool_calls"`, `content: null`, `reasoning_content` populated, `arguments={"location": "Tokyo"}`. Suite 2586 passed / 29 skipped / 26 deselected — unchanged from baseline.
+
+**Two adjacent findings, deliberately NOT fixed here:**
+
+- **`BatchedEngine` never uses harmony rendering.** `_apply_chat_template()` has no harmony branch, so `engine.use_harmony_rendering` (set by `_detect_harmony_rendering()`) is a **no-op on every batched route** — #581's renderer only ever reached `SimpleEngine.stream_chat()`. Latent since the 2026-07-09 fleet flip. Low severity today: the Jinja render differs from the harmony render only by a `Current date:` line (138 vs 127 tokens) and both generate correctly. It matters for multi-turn tool conversations, where #568's whole point was reconstructing prior `tool_calls` into the commentary channel rather than `[Calling tool: …]` bracket text. Worth a follow-up patch.
+- **gpt-oss rambles on some prompts** until it exhausts `max_tokens` without reaching the commentary channel. This is **model behaviour, not a fork defect** — raw `mlx_lm` rambles on the same prompt. Compounding it: batched sampling is reproducible (identical requests at `temperature=1.0` return byte-identical output; `temperature=0.0` differs, so temperature *is* honored), meaning a degenerate generation repeats exactly on retry rather than resampling out of it. That is why the route looked deterministically broken.
+
+**Upstreaming:** candidate. The bug exists upstream — `clean_output_text` runs in the engines there too — but the fix touches `GenerationOutput`, so it needs a small RFC rather than a drive-by PR.
+
+---
+
 ## Future work / prospects
 
 Fork-side follow-ups:
