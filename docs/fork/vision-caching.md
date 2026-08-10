@@ -1,6 +1,8 @@
 # Vision-route caching semantics (BatchedEngine MLLM branch)
 
-*Status: 2026-07-30, fork `9cf1e90`. Both VLM routes (GLM-4.6V-Flash-4bit,
+*Status: 2026-08-10 (arch coverage re-swept after the 08-03 dependency bump;
+cache semantics unchanged since 2026-07-30, fork `9cf1e90`). Both VLM routes
+(GLM-4.6V-Flash-4bit,
 Qwen3-VL-30B-A3B-8bit) run BatchedEngine in production; `vlm-server.py` is
 retired. This doc answers one question: **which caches apply to a vision
 route, which are deliberately off, and why.** Patch-level detail lives in
@@ -68,6 +70,61 @@ on BatchedEngine (spare-port runs on the Studio):
 Two conversions have **stripped vision towers** and can never serve vision
 regardless of engine: `Qwen3.6-35B-A3B-4bit-DWQ`, `Mistral-Small-3.2-24B`
 (0 vision weight keys in the safetensors index).
+
+## Re-sweep after the 2026-08-03 dependency bump (2026-08-10)
+
+The 08-03 rebase dragged `mlx-vlm` 0.6.3 → 0.6.8 with `mlx` 0.32 and
+`transformers` 5.5.4 → 5.14.1 fleet-wide, and the arch sweep was never re-run —
+it stood as the open residual. Re-run 2026-08-10 against the **deployed**
+site-packages (fork `c7da98d`), spare port 8096, one model at a time on
+BatchedEngine:
+
+| Arch | Tested with | Verdict |
+|---|---|---|
+| qwen3_5 | Qwen3.5-4B-4bit | **10/10** |
+| glm4v | GLM-4.6V-Flash-4bit | **10/10** (production route) |
+| mistral3 | Devstral-Small-2-24B-2512-4bit | **10/10** (#68/#69 still hold) |
+| gemma4 | gemma-4-26B-A4B-it-qat-4bit | **10/10** |
+| qwen3_vl_moe | Qwen3-VL-30B-A3B-Instruct-8bit | **10/10** (production route) |
+| qwen3_5_moe | — | **not re-tested** — see below |
+
+**No regression from the dependency bump on any testable family**, both
+production vision routes included. The residual is closed except for one family.
+
+**`qwen3_5_moe` cannot be tested on this box.** The 07-30 sweep used
+Ornith-1.0-35B, which is no longer in the HF cache, and the only cached
+`qwen3_5_moe` checkpoint (`Qwen3.6-35B-A3B-4bit-DWQ`) is one of the
+stripped-tower conversions above — `vision_config` absent. Re-testing this
+family requires re-downloading a vision-capable `qwen3_5_moe` checkpoint. No
+route serves vision on this arch today, so this is a coverage gap, not a live
+risk.
+
+**About the checks.** The original 14-check `fleetsmoke` script is gone from the
+Studio (only a stale `.pyc` under `~/Library/Caches` remains), so this is a
+reconstructed 10-check e2e over HTTP, weighted toward the vectors this fork
+actually cares about rather than breadth:
+
+1. `server_up` · 2. `single_image_red` · 3. `second_image_blue_not_aliased`
+· 4. `resend_red_after_blue` · 5. `divergent_size_green` · 6. `multi_image`
+· 7. `concurrent_cobatch` · 8. `text_only_on_vision_route`
+· 9. `streaming_vision` · 10. `status_vision_gauges`
+
+Checks 2–5 identify solid-colour images by name, which only passes if the vision
+tower genuinely sees pixels. The red → blue → red ordering (3, 4) is the direct
+probe for **cross-image cache aliasing** — the known open gap from the batched
+vision gap analysis; a second, different image answered from the first's cached
+embedding fails check 3. Check 5 uses a differently-*shaped* image (64×160 vs
+96×96) so its MRoPE delta differs, and check 7 co-batches two divergent-size
+images concurrently — the #57 vectors.
+
+**Harness note worth keeping:** the first run scored 5/10 on *every* model
+because `max_tokens=24` plus default thinking meant the budget was spent
+entirely inside `<think>` and the answer never arrived — the same artifact the
+07-30 sweep logged against gemma4. These are reasoning models; a vision smoke
+must send `chat_template_kwargs={"enable_thinking": false}` **and** leave real
+token headroom, and must match on `content` with reasoning stripped so a colour
+mentioned mid-thought isn't scored as the answer. Scoring reasoning text as the
+answer is how a vision smoke lies to you in both directions.
 
 Mixed `--text-only` routes are *not* flipped: serving vision there today would
 trade away the text stack (system-KV etc.). That's phase 2 `--vision-split`
