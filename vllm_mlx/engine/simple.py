@@ -757,6 +757,7 @@ class SimpleEngine(BaseEngine):
         text = clean_output_text(last_output.text)
         return GenerationOutput(
             text=text,
+            raw_text=last_output.text,
             tokens=list(last_output.tokens),
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
@@ -1074,6 +1075,7 @@ class SimpleEngine(BaseEngine):
             text = clean_output_text(final_output.text)
             return GenerationOutput(
                 text=text,
+                raw_text=getattr(final_output, "raw_text", "") or final_output.text,
                 tokens=list(final_output.tokens),
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
@@ -1122,6 +1124,7 @@ class SimpleEngine(BaseEngine):
             text = clean_output_text(output.text)
             return GenerationOutput(
                 text=text,
+                raw_text=output.text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -1153,6 +1156,7 @@ class SimpleEngine(BaseEngine):
             prompt_token_count = len(prompt_ids)
             return GenerationOutput(
                 text=text,
+                raw_text=output.text,
                 tokens=output.tokens,
                 prompt_tokens=prompt_token_count,
                 completion_tokens=len(output.tokens),
