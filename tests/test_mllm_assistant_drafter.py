@@ -274,15 +274,23 @@ async def test_simple_engine_forwards_mllm_draft_opt_in_to_mllm_path():
     engine._text_model = object()
     engine._model = FakeMLLM()
 
-    outputs = [
-        output
-        async for output in engine.stream_chat(
-            [{"role": "user", "content": "hello"}],
-            max_tokens=8,
-            temperature=0.0,
-            mllm_draft=True,
-        )
-    ]
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hello"}],
+                max_tokens=8,
+                temperature=0.0,
+                mllm_draft=True,
+            )
+        ]
+    finally:
+        # The real engine bound the mlx_lm generation-stream global to its
+        # worker thread; without stop()'s restore, the next test to build a
+        # real BatchGenerator on the main thread dies with "There is no
+        # Stream(gpu, N) in current thread" (bit upstream's #702 parity
+        # tests after the 2026-08-17 rebase).
+        await engine.stop()
 
     assert captured["kwargs"]["mllm_draft"] is True
     assert outputs[-1].mtp_drafts == 2

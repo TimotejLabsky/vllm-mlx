@@ -9,6 +9,14 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
+pytest.skip(
+    "upstream engine-internals test: exercises the #574 prefix trie / #679 "
+    "thread-pinning machinery of upstream engine/simple.py, which the fork "
+    "rejects wholesale (system-KV cache + serialized-worker stack supersede "
+    "it; see PATCHES.md rebase note 2026-08-17)",
+    allow_module_level=True,
+)
+
 from vllm_mlx.engine.simple import SimpleEngine
 
 pytestmark = pytest.mark.anyio
