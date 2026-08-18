@@ -64,16 +64,29 @@ def test_gemma4_unified_text_config_actually_constructs():
     assert getattr(args, "num_hidden_layers", None) == 2
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_6_text", "", "unknown"])
-def test_unmatched_types_keep_the_generic_fallback(model_type):
-    """Unknown families must not start raising — that would be a regression.
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_6_text", ""])
+def test_qwen_family_types_resolve_to_qwen3_5(model_type):
+    """The Qwen3.5/3.6 family resolves to qwen3_5's TextModel classes.
 
-    qwen3_5.TextModel handles dense and MoE natively, so it stays the default.
+    qwen3_5.TextModel handles dense and MoE natively.
     """
     Model, ModelArgs = _import_text_model_classes(model_type)
     assert Model.__module__ == "mlx_lm.models.qwen3_5"
     assert Model.__qualname__ == "TextModel"
     assert ModelArgs.__qualname__ == "TextModelArgs"
+
+
+def test_unknown_types_raise_instead_of_guessing():
+    """Fork semantics: an unknown family fails at the dispatch, loudly.
+
+    Upstream falls back to qwen3_5 here; the fork raises instead — a wrong
+    guess dies deep inside the chosen constructor with an error naming
+    neither the model nor the class, and the route quietly loses its
+    backend (build_text_model turns the ImportError into a logged warning
+    and returns None).
+    """
+    with pytest.raises(ImportError, match="unknown"):
+        _import_text_model_classes("unknown")
 
 
 def test_failure_names_the_model_type_and_the_chosen_class(tmp_path, caplog):
