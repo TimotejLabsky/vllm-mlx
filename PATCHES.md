@@ -1569,3 +1569,23 @@ git rebase pr-NNN                 # apply our patches on top of the PR's branch
 ```
 
 If the PR breaks our patches (touches the same code), the rebase will surface the conflicts. Useful for catching upstream regressions early or vetting third-party contributions before they land.
+
+---
+
+## 73. `patch: fail-closed structured output via llguidance` — adaptation of upstream #636
+
+**Files:** `vllm_mlx/constrained/llguidance_schema_processor.py` (new), `vllm_mlx/constrained/json_schema_processor.py`, `vllm_mlx/constrained/__init__.py`, `vllm_mlx/api/tool_calling.py`, `vllm_mlx/server.py`, `pyproject.toml`, `tests/test_constrained_decoding.py`, `tests/test_structured_output.py`, `tests/test_server.py`
+
+Adapts upstream open PR [#636](https://github.com/waybarrios/vllm-mlx/pull/636) (fail-open structured-output fix). Before this patch the fork's `response_format` enforcement was **lm-format-enforcer and failed open**: a streaming `json_object` request could return an array root with `finish_reason=stop`, numeric `minimum`/`maximum` were violated during decode, and an empty allowed-token set surfaced as HTTP 500 mid-stream. The 2026-08-17 ecosystem research (docs/fork/improvement-roadmap-2026-08.md) independently ranked "structured output via llguidance" the fork's #1 missing capability — LMFE is in maintenance mode and the slowest of the field; llguidance is ~50µs/token CPU-side (noise against 10–80ms/token MLX decode) and is the engine vLLM/SGLang/llama.cpp/mistral.rs standardized on.
+
+**What the patch does** (PR #636's design, unchanged): strict `json_schema` routes through a **request-local llguidance matcher** (`LLGuidanceJSONSchemaLogitsProcessor`) with MLX token masking via `llguidance.mlx` bitmasks, padded-vocab handling, schema-aware EOS (EOS before schema completion = `ConstrainedDecodingError`), and a bounded non-progress whitespace guard. `json_object` keeps the LMFE path but now requires an **object root**. Constrained-decoder setup/execution failures **fail closed** (HTTP error) instead of degrading to unconstrained generation. Streaming structured-output requests are **collected server-side before the 200 goes out** (`_build_chat_streaming_response`), so schema violations become HTTP errors, not mid-SSE breaks; buffered final validation stays the HTTP success boundary.
+
+**Fork-merge deltas vs the PR** (2 conflicts, both in `server.py`): the fork's `_probe_engine_busy` pre-admission probe is kept ahead of the new streaming builder, and the fork's `_streaming_json_fence_stripper` helper replaces the PR's inlined fence-stripper block (the PR's `response_format_content` accumulator added beside it). Everything else applied clean — `constrained/` carried no fork patches.
+
+**Dependency:** `llguidance>=1.7.6` (abi3 macOS-arm64 wheel; was already present in the Studio venv).
+
+**Verification:** full suite 2786 passed / 36 skipped / 30 deselected (includes the PR's 222-test structured/server suite: object-root rejection, numeric-range masking, fail-closed setup errors, EOS-before-complete, whitespace-runaway guard). Live verification on the Studio owed at next deploy: repeat the PR's Jobs-shaped strict-schema request against a production route.
+
+**Follow-up recorded, not built:** strict tool-argument schemas (constrain tool-call args JSON to the declared tool schema during decode — mistral.rs precedent, XGrammar-2 TagDispatch pattern); the roadmap doc carries it as the natural extension.
+
+**Upstreaming:** none needed — this *is* upstream's PR; if #636 merges, retire this patch on the next rebase (expect near-clean drop).
