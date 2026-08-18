@@ -1589,3 +1589,31 @@ Adapts upstream open PR [#636](https://github.com/waybarrios/vllm-mlx/pull/636) 
 **Follow-up recorded, not built:** strict tool-argument schemas (constrain tool-call args JSON to the declared tool schema during decode — mistral.rs precedent, XGrammar-2 TagDispatch pattern); the roadmap doc carries it as the natural extension.
 
 **Upstreaming:** none needed — this *is* upstream's PR; if #636 merges, retire this patch on the next rebase (expect near-clean drop).
+
+---
+
+## 74. `patch: observability — eviction-timing histograms, counter mirrors, /health/ready`
+
+**Files:** `vllm_mlx/system_kv.py`, `vllm_mlx/batched_system_kv.py`, `vllm_mlx/metrics.py`, `vllm_mlx/server.py`, `tests/test_observability_metrics.py` (new)
+
+Executes Tier-1 item 2 of docs/fork/improvement-roadmap-2026-08.md — and with it the **instrument-first mandate** of the prefix-cache landscape verdict (docs/fork/prefix-caching-landscape-2026-08.md): the one real gap identified there was recency-only eviction, and the verdict was to measure whether LRU is ever wrong on this box before building anything smarter. This patch is that measurement.
+
+**1. Entry-lifecycle timing** (`CacheTimingRecorder` in `system_kv.py`, wired into both caches): four histograms —
+- `vllm_mlx_cache_entry_lifetime_seconds` (store → evict),
+- `vllm_mlx_cache_entry_idle_before_evict_seconds` (last use → evict),
+- `vllm_mlx_cache_entry_reuse_gap_seconds` (consecutive-use gap),
+- `vllm_mlx_cache_evict_to_reuse_gap_seconds` — the verdict metric: a bounded **tombstone map keyed by content identity** (token-chain hash, not insertion seq — a re-store of an evicted chain must match) records the gap between evicting an entry and having to re-prefill the same chain. **Traffic here = the eviction policy discarded something still needed.** If it stays empty while `idle_before_evict` sits far above every `reuse_gap`, LRU is never wrong here and no Marconi-style scoring is warranted.
+
+Wiring: `SystemKVManager` (store_snapshot/store_extended, record_hit/record_partial_hit, both evict loops) and `BatchedSystemKV` (insert, LRU-touch hit, budget + pressure evictions; **absorbed/subsumed entries call `forget()`** — the chain lives on merged into a longer entry, neither hit nor loss). Recorders self-register in a module WeakSet; the exporter drains them at scrape with zero engine plumbing. All containers bounded (1024 obs / 1024 tombstones / 4096 live).
+
+**2. Counter mirrors** — the cumulative cache stats were exported as **gauges**, which PromQL cannot window (`rate()` needs Counter reset semantics; a precomputed `hit_rate` gauge can't be time-aligned at all — the vLLM v1 metrics design calls this out as the anti-pattern). New: `vllm_mlx_cache_events_total{event=hit|miss|eviction|partial_hit|pressure_eviction|ssd_promote}` and `vllm_mlx_cache_saved_tokens_total{kind=full|partial}`, fed by a scrape-time **delta bridge** (cumulative snapshot → `inc(delta)`; a value going backwards = in-process reset, counted from zero). All existing gauges kept — dashboards unbroken. Also new: `vllm_mlx_finish_reasons_total{endpoint,finish_reason}` (stop/length/tool_calls visibility — would have shown the #72 gpt-oss breakage as a vanished `tool_calls` rate) via an optional `finish_reason` on `InferenceTracker.finish`, and `vllm_mlx_metal_resource_limit` + `vllm_mlx_metal_recommended_working_set_bytes`.
+
+**Known limitation, recorded honestly:** MLX exposes only the resource-limit **ceiling** (~499k), not the live Metal buffer count — the `[metal::malloc] Resource limit exceeded` crash class (mlx-lm #1332, a buffer-COUNT limit that byte-denominated relief #48 cannot see) still has no live gauge. Mitigations remain code-side (no per-step concat without eval); revisit when mlx main's residency-set restructure (#4211) lands.
+
+**3. `/health/ready`** — `/health` is liveness and answers 200 while the engine is wedged (the 2026-07-14 llama-swap incident: process alive, every request starved). The new endpoint follows the vLLM readiness convention: a real **1-token forward pass** (`engine.generate(prompt="ok", max_tokens=1)`, timeout `VLLM_MLX_READY_TIMEOUT_S`=20s) — but **only when the engine is idle**: a busy engine (num_running/num_waiting > 0, or `EngineBusy` raced) is ready by definition and the probe must never queue behind real traffic. 503 with a reason on timeout/failure/empty output.
+
+**Verification:** suite green (2804 passed / 36 skipped / 30 deselected); 18 new tests pin the recorder semantics (tombstone round-trip, forget-is-silent, bounds), the delta bridge (monotonic across in-process resets), histogram drain, finish-reason labels, and all five /health/ready behaviors.
+
+**Deployment note:** llama-swap health checks can move to `/health/ready` per-route once deployed; the Grafana eviction panel wants `histogram_quantile` over `idle_before_evict` vs `reuse_gap` plus a singlestat on `rate(vllm_mlx_cache_evict_to_reuse_gap_seconds_count[1d])` — that last number staying at zero closes the eviction question.
+
+**Upstreaming:** the recorder + counter mirrors are upstream-general; candidate for a branch after Studio soak.
