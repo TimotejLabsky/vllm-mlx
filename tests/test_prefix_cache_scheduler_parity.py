@@ -18,6 +18,25 @@ from vllm_mlx.request import Request, SamplingParams  # noqa: E402
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _main_thread_generation_streams():
+    """Give these real-scheduler tests a live main-thread generation stream.
+
+    Fork hygiene: several fork tests drive the serialized SimpleEngine worker,
+    which rebinds mlx_lm/mlx_vlm's module-global ``generation_stream`` to a
+    worker-thread stream. Engines that are stop()ped restore the globals, but
+    tests that never call stop() leave the global naming a dead thread's
+    stream, and the real BatchGenerator these parity tests build then dies in
+    close() with "There is no Stream(gpu, N) in current thread". Rebinding on
+    the main thread here makes the tests order-independent.
+    """
+    from vllm_mlx.mlx_streams import bind_generation_streams
+
+    bind_generation_streams()
+    yield
+
+
+
 class _Tokenizer:
     eos_token_id = 99
     clean_up_tokenization_spaces = False
