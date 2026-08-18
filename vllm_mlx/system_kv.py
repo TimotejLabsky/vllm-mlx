@@ -24,9 +24,122 @@ and downstream code keep working unchanged.
 """
 
 import logging
-from collections import OrderedDict
+import threading
+import time
+import weakref
+from collections import OrderedDict, deque
 
 logger = logging.getLogger(__name__)
+
+# Every live CacheTimingRecorder registers here so the Prometheus exporter
+# (metrics.py) can drain observations without any engine plumbing. WeakSet:
+# a cache that dies takes its recorder with it.
+_TIMING_RECORDERS: "weakref.WeakSet[CacheTimingRecorder]" = weakref.WeakSet()
+
+
+class CacheTimingRecorder:
+    """Timing observations for cache-entry lifecycle (fork observability).
+
+    This is the instrumentation the prefix-cache landscape verdict called
+    for before touching eviction policy: histograms of entry lifetime
+    (store→evict), idle-before-evict (last use→evict), reuse gap (time
+    between consecutive uses), and — via a bounded tombstone map keyed by
+    content identity — the **evict-to-re-store gap**: an entry that had to
+    be re-prefilled after eviction is direct evidence the eviction was
+    wrong. If the idle_before_evict distribution sits far above every
+    observed reuse_gap and evict_to_reuse_gap stays empty, recency (LRU)
+    eviction is never wrong on this box and no smarter policy is needed.
+
+    Thread-safe; all containers are bounded. Observations accumulate in
+    deques until the exporter drains them at scrape time.
+    """
+
+    MAX_OBS = 1024
+    MAX_TOMBSTONES = 1024
+    MAX_LIVE = 4096
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key -> (stored_at, last_used)
+        self._live: "OrderedDict[object, tuple[float, float]]" = OrderedDict()
+        # key -> evicted_at (content-keyed so a re-store matches)
+        self._tombstones: "OrderedDict[object, float]" = OrderedDict()
+        self._obs: dict[str, deque] = {
+            "lifetime": deque(maxlen=self.MAX_OBS),
+            "idle_before_evict": deque(maxlen=self.MAX_OBS),
+            "reuse_gap": deque(maxlen=self.MAX_OBS),
+            "evict_to_reuse_gap": deque(maxlen=self.MAX_OBS),
+        }
+        _TIMING_RECORDERS.add(self)
+
+    def note_store(self, key) -> None:
+        now = time.time()
+        with self._lock:
+            evicted_at = self._tombstones.pop(key, None)
+            if evicted_at is not None:
+                self._obs["evict_to_reuse_gap"].append(now - evicted_at)
+            self._live[key] = (now, now)
+            self._live.move_to_end(key)
+            while len(self._live) > self.MAX_LIVE:
+                self._live.popitem(last=False)
+
+    def note_hit(self, key) -> None:
+        now = time.time()
+        with self._lock:
+            entry = self._live.get(key)
+            if entry is None:
+                # Hit on an entry stored before this recorder existed (or
+                # promoted from SSD without a note_store) — start tracking.
+                self._live[key] = (now, now)
+                return
+            stored_at, last_used = entry
+            self._obs["reuse_gap"].append(now - last_used)
+            self._live[key] = (stored_at, now)
+
+    def note_evict(self, key) -> None:
+        now = time.time()
+        with self._lock:
+            entry = self._live.pop(key, None)
+            if entry is not None:
+                stored_at, last_used = entry
+                self._obs["lifetime"].append(now - stored_at)
+                self._obs["idle_before_evict"].append(now - last_used)
+            self._tombstones[key] = now
+            while len(self._tombstones) > self.MAX_TOMBSTONES:
+                self._tombstones.popitem(last=False)
+
+    def forget(self, key) -> None:
+        """Drop tracking without observing — for entries absorbed/subsumed
+        into a longer chain (the entry lives on; neither a hit nor a loss)."""
+        with self._lock:
+            self._live.pop(key, None)
+
+    def drain(self) -> dict[str, list[float]]:
+        with self._lock:
+            out = {name: list(q) for name, q in self._obs.items()}
+            for q in self._obs.values():
+                q.clear()
+        return out
+
+
+def timing_key(tokens) -> int:
+    """Content identity for token-chain-keyed caches (stable across
+    re-stores, unlike insertion sequence numbers)."""
+    return hash(tuple(tokens))
+
+
+def drain_all_timing_observations() -> dict[str, list[float]]:
+    """Merge-drain every live recorder (called by metrics.py at scrape)."""
+    merged: dict[str, list[float]] = {
+        "lifetime": [],
+        "idle_before_evict": [],
+        "reuse_gap": [],
+        "evict_to_reuse_gap": [],
+    }
+    for recorder in list(_TIMING_RECORDERS):
+        for name, values in recorder.drain().items():
+            merged.setdefault(name, []).extend(values)
+    return merged
 
 
 # Template-family turn markers for the extended-prefix cache. The cache
@@ -324,6 +437,8 @@ class SystemKVManager:
         # from before this patch.
         self.snapshot = None  # List of (keys, values) per backbone layer
         self.system_hash = None  # Hash of system prefix text
+        # Entry-lifecycle timing (fork observability; keyed by system_hash).
+        self.timing = CacheTimingRecorder()
         self.token_count = 0
         self.token_ids = None  # EXTENDED_PREFIX_MARKER: cached prefix tokens
         # Per-layer meta_state + kind for the active snapshot (meta-state
@@ -654,6 +769,7 @@ class SystemKVManager:
         max_bag = max(0, self.capacity - 1)
         while len(self.lru) > max_bag:
             ev_hash, _ = self.lru.popitem(last=False)
+            self.timing.note_evict(ev_hash)
             self.evictions += 1
             evicted += 1
             logger.info(
@@ -714,6 +830,7 @@ class SystemKVManager:
                 if entry is None or bool(entry.get("spilled")) != spilled_first:
                     continue
                 self.lru.pop(ev_hash, None)
+                self.timing.note_evict(ev_hash)
                 self.evictions += 1
                 evicted += 1
                 logger.info(
@@ -788,6 +905,7 @@ class SystemKVManager:
 
     def record_hit(self, tokens_saved):
         """Bump the HIT counters (Prometheus gauges read these)."""
+        self.timing.note_hit(self.system_hash)
         self.hits += 1
         self.tokens_saved += tokens_saved
 
@@ -797,6 +915,7 @@ class SystemKVManager:
         the prefill did not recompute), while ``partial_*`` keep the
         partial path separately observable.
         """
+        self.timing.note_hit(self.system_hash)
         self.partial_hits += 1
         self.partial_tokens_saved += tokens_restored
         self.tokens_saved += tokens_restored
@@ -867,6 +986,7 @@ class SystemKVManager:
         """
         if self.system_hash and self.system_hash != system_hash:
             self.lru_demote_active_to_bag()
+        self.timing.note_store(system_hash)
         self.snapshot = snapshot
         self.system_hash = system_hash
         self.token_count = token_count
@@ -897,6 +1017,7 @@ class SystemKVManager:
             # overwrite active. Evicts oldest bag entry if needed.
             if self.system_hash and self.system_hash != system_hash:
                 self.lru_demote_active_to_bag()
+            self.timing.note_store(system_hash)
             self.snapshot = snapshot
             self.system_hash = system_hash
             self.token_count = len(extended_token_ids)
