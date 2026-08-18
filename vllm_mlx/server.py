@@ -6689,6 +6689,8 @@ async def stream_chat_completion(
     # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
     # their structured output in markdown (e.g. Gemma 4).
     fence_stripper = _streaming_json_fence_stripper(request)
+    # Buffered copy of emitted content for the #636 fail-closed final
+    # validation of structured-output streams.
     response_format_content: list[str] = []
 
     # Tool call streaming state
