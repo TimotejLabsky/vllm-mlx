@@ -1617,3 +1617,19 @@ Wiring: `SystemKVManager` (store_snapshot/store_extended, record_hit/record_part
 **Deployment note:** llama-swap health checks can move to `/health/ready` per-route once deployed; the Grafana eviction panel wants `histogram_quantile` over `idle_before_evict` vs `reuse_gap` plus a singlestat on `rate(vllm_mlx_cache_evict_to_reuse_gap_seconds_count[1d])` — that last number staying at zero closes the eviction question.
 
 **Upstreaming:** the recorder + counter mirrors are upstream-general; candidate for a branch after Studio soak.
+
+---
+
+## 75. `patch: batched-harmony-rendering` — BatchedEngine honors `use_harmony_rendering`
+
+**Files:** `vllm_mlx/engine/batched.py`, `tests/test_batched_harmony_rendering.py` (new)
+
+Closes known-open item (1) from the #72 record: the server sets `engine.use_harmony_rendering` on every engine, but `BatchedEngine._apply_chat_template()` had no harmony branch — #581's renderer only ever reached SimpleEngine, so the flag was **a no-op on every batched route** since the 2026-07-09 fleet flip. Benign for single-turn (the Jinja render differs only by a `Current date:` line), but multi-turn tool conversations — what #568's renderer exists for — rendered structural `tool_calls` history lossily on the deployed gpt-oss route.
+
+**Fix:** mirror SimpleEngine's branch at the top of `_apply_chat_template()` — after tool-call-argument normalization (which wraps the same `normalize_messages_for_chat_template` SimpleEngine feeds the renderer), if the flag is set and the request carries no media, render via `harmony_render.render_messages(messages, tools=..., reasoning_effort=chat_template_kwargs.get("reasoning_effort"))`. Media-bearing requests fall through to the template path (harmony models are text-only; MLLM semantics untouched). The batched call site passes original messages (media is extracted separately), so `tool_calls` history arrives intact.
+
+**Cache note:** no batched-cache gate needed, unlike SimpleEngine's `cache_blocking_controls` entry — the batched system-KV keys on raw token chains (LCP + checkpoints), not template-family prefix markers, so a harmony-rendered prompt caches like any other. gpt-oss has run batched+cache since 2026-07-02 (Jinja render); this changes the prompt text, not cache semantics.
+
+**Verification:** 4 new tests (harmony render replaces Jinja + preserves `to=functions.X` commentary structure; `reasoning_effort`/`tools` forwarding; media fall-through; flag-off unchanged); full suite green. Live gpt-oss multi-turn tool call through llama-swap owed at next deploy.
+
+**Upstreaming:** candidate — upstream's BatchedEngine has the same gap.
