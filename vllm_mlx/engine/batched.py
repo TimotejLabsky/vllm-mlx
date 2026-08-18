@@ -705,6 +705,30 @@ class BatchedEngine(BaseEngine):
         """
         messages = _normalize_tool_call_arguments_for_template(messages)
 
+        if getattr(self, "use_harmony_rendering", False) and not (
+            num_images or num_audios or num_videos
+        ):
+            # GPT-OSS / harmony-format models: render via openai-harmony
+            # instead of the Jinja chat_template — parity with SimpleEngine
+            # (#581/#568). The Jinja path degrades multi-turn tool
+            # conversations (structural ``tool_calls`` history renders
+            # lossily), which is exactly the case #568's renderer exists
+            # for. Media-bearing requests fall through to the template path
+            # (harmony models are text-only; the guard keeps MLLM semantics
+            # untouched).
+            from ..utils.harmony_render import (
+                render_messages as _harmony_render_messages,
+            )
+
+            _reasoning_effort = None
+            if chat_template_kwargs:
+                _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+            return _harmony_render_messages(
+                messages,
+                tools=tools,
+                reasoning_effort=_reasoning_effort,
+            )
+
         # Choose the best template applicator.
         # For MLLM models, the processor handles special vision tokens.
         # For text-only models, the tokenizer is sufficient.
