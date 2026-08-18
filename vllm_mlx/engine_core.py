@@ -193,7 +193,11 @@ class EngineCore:
                             executor=worker,
                         )
                 finally:
-                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
+                    # getattr: fork tests (and any duck-typed scheduler) supply
+                    # schedulers without the SSD tier.
+                    close_ssd = getattr(self.scheduler, "close_ssd_tier", None)
+                    if close_ssd is not None:
+                        await asyncio.to_thread(close_ssd)
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -418,7 +422,11 @@ class EngineCore:
                 # Close the SSD writer before joining the worker so any
                 # queued spills flush while the engine is still alive.
                 try:
-                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
+                    # getattr: upstream tests (and any duck-typed scheduler)
+                    # supply schedulers without the fork's SSD tier.
+                    close_ssd = getattr(self.scheduler, "close_ssd_tier", None)
+                    if close_ssd is not None:
+                        await asyncio.to_thread(close_ssd)
                 finally:
                     # Only tear down a worker this loop created. A caller-supplied
                     # one owns the loaded model and outlives the engine loop.
