@@ -180,8 +180,10 @@ class EngineCore:
         self.scheduler._close_batch_generator()
         # Safety net: close_ssd_tier() is idempotent (no-ops once _ssd_tier
         # is None), so this is safe even if _engine_loop's finally already
-        # closed it.
-        self.scheduler.close_ssd_tier()
+        # closed it. getattr: duck-typed schedulers may lack the fork's tier.
+        close_ssd = getattr(self.scheduler, "close_ssd_tier", None)
+        if close_ssd is not None:
+            close_ssd()
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -392,7 +394,11 @@ class EngineCore:
             finally:
                 # Close the SSD writer before joining the worker so any
                 # queued spills flush while the engine is still alive.
-                self.scheduler.close_ssd_tier()
+                # getattr: upstream tests (and any duck-typed scheduler)
+                # supply schedulers without the fork's SSD tier.
+                close_ssd = getattr(self.scheduler, "close_ssd_tier", None)
+                if close_ssd is not None:
+                    close_ssd()
                 # Only tear down a worker this loop created. A caller-supplied
                 # one owns the loaded model and outlives the engine loop.
                 if owns_worker:

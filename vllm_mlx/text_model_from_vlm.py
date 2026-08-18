@@ -22,6 +22,57 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
+def _import_text_model_classes(model_type: str):
+    """Return ``(Model, ModelArgs)`` classes for a text config ``model_type``.
+
+    Resolution order: the Qwen3.5/3.6 family short-circuits (their
+    ``text_config`` reports ``qwen3_5_text``/``qwen3_5_moe_text`` and the
+    classes live in ``qwen3_5``); otherwise explicit module candidates —
+    exact name, ``_text`` suffix stripped, then family-prefix fallbacks
+    (``gemma4*`` → ``gemma4_text``, ``qwen3*`` → ``qwen3_5``, upstream #686's
+    insight: a family must cover its variants, ``gemma4_unified_text``
+    included). Unknown families raise ImportError instead of guessing a
+    default — a wrong guess dies deep inside the chosen constructor with an
+    error naming neither the model nor the class (fork semantics; upstream
+    guesses qwen3_5).
+    """
+    import importlib
+
+    if model_type.startswith("qwen3_5") or model_type == "":
+        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+        return TextModel, TextModelArgs
+
+    if model_type.startswith("gemma4"):
+        # Family rule, not a fallback: every gemma4 variant
+        # ("gemma4_text", "gemma4_unified_text", bare "gemma4") must reach
+        # gemma4_text — the exact-module candidate below would resolve bare
+        # "gemma4" to mlx_lm.models.gemma4, the wrong class for a text tower.
+        from mlx_lm.models.gemma4_text import Model, ModelArgs
+
+        return Model, ModelArgs
+
+    candidates = [model_type]
+    if model_type.endswith("_text"):
+        candidates.append(model_type[: -len("_text")])
+    if model_type.startswith("qwen3"):
+        # qwen3_6_* checkpoints have no module of their own; the qwen3_5
+        # classes handle the family (dense and MoE) natively.
+        candidates.append("qwen3_5")
+    for cand in candidates:
+        try:
+            mod = importlib.import_module(f"mlx_lm.models.{cand}")
+        except ImportError:
+            continue
+        model_cls = getattr(mod, "TextModel", None) or mod.Model
+        args_cls = getattr(mod, "TextModelArgs", None) or mod.ModelArgs
+        return model_cls, args_cls
+    raise ImportError(
+        f"No mlx_lm model class for text model_type {model_type!r} "
+        f"(tried {candidates})"
+    )
+
+
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
@@ -60,56 +111,27 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         model_type = str(
             text_config.get("model_type") or config.get("model_type") or ""
         )
-        if model_type.startswith("qwen3_5") or model_type == "":
-            # Qwen3.5/3.6 family — text_config carries model_type
-            # "qwen3_5_text" / "qwen3_5_moe_text" (the top-level config says
-            # "qwen3_5"/"qwen3_5_moe"), so match by PREFIX: an exact-set
-            # check here once silently broke text routing (and with it the
-            # whole system-KV cache) for every Qwen MLLM in the lineup.
-            # Import from qwen3_5 — TextModel and TextModelArgs handle both
-            # dense and MoE natively (MTPDecoderLayer auto-selects
-            # SparseMoeBlock when args.num_experts > 0). qwen3_5_moe.py does
-            # NOT export these.
-            from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
-
-            # Build args with proper __post_init__ (handles
-            # partial_rotary_factor, rope_scaling, head_dim derivation)
-            args = TextModelArgs.from_dict(text_config)
-            text_model = TextModel(args)
-        else:
-            # Generic path: build the text model from the mlx_lm class for
-            # this model_type (e.g. gemma4_text -> mlx_lm.models.gemma4_text).
-            # Previously this function fed every config into the qwen3_5
-            # TextModelArgs, which crashed on gemma-4 ("float division by
-            # zero") — and the caller's None fallback silently routed text
-            # requests through the cacheless mlx_vlm path (no system-KV).
-            # Fallback chain: exact module; then the name with a trailing
-            # "_text" stripped (text-config model_types often add the suffix
-            # while the mlx_lm module is named after the family).
-            import importlib
-
-            mod = None
-            candidates = [model_type]
-            if model_type.endswith("_text"):
-                candidates.append(model_type[: -len("_text")])
-            for cand in candidates:
-                try:
-                    mod = importlib.import_module(f"mlx_lm.models.{cand}")
-                    break
-                except ImportError:
-                    continue
-            if mod is None:
-                logger.warning(
-                    "No mlx_lm model class for text model_type %r "
-                    "(tried %s); MLLM text routing unavailable",
-                    model_type,
-                    candidates,
-                )
-                return None
-            model_cls = getattr(mod, "TextModel", None) or mod.Model
-            args_cls = getattr(mod, "TextModelArgs", None) or mod.ModelArgs
-            args = args_cls.from_dict(text_config)
-            text_model = model_cls(args)
+        # Class selection lives in _import_text_model_classes: Qwen3.5/3.6
+        # short-circuit plus explicit module candidates with family-prefix
+        # fallbacks; raises on unknown families. Previously this function fed
+        # every config into qwen3_5.TextModelArgs, which crashed on gemma-4
+        # ("float division by zero") — and the caller's None fallback silently
+        # routed text requests through the cacheless mlx_vlm path (no
+        # system-KV).
+        try:
+            model_cls, args_cls = _import_text_model_classes(model_type)
+        except ImportError:
+            logger.warning(
+                "No mlx_lm model class for text model_type %r; "
+                "MLLM text routing unavailable",
+                model_type,
+            )
+            return None
+        text_model_cls = f"{model_cls.__module__}.{model_cls.__qualname__}"
+        # Build args with proper __post_init__ (handles partial_rotary_factor,
+        # rope_scaling, head_dim derivation).
+        args = args_cls.from_dict(text_config)
+        text_model = model_cls(args)
 
         # Collect all weights first: backbone from vlm + MTP from safetensors
         vlm_lm = vlm_model.language_model
