@@ -15,6 +15,12 @@
 > (e.g. why we run SimpleEngine + system-KV instead of continuous batching).
 > See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
 >
+> **2026-08-18 — fail-closed structured output** (PATCHES.md #73, upstream
+> PR #636 adapted): strict `json_schema` now decodes under a request-local
+> llguidance token mask (schema-aware EOS, fail-closed on setup errors),
+> `json_object` requires an object root, and streaming structured requests
+> validate server-side before HTTP 200.
+>
 > **2026-07-28 — hardened batched vision serving** (PATCHES.md #54–#67):
 > the continuous-batching MLLM stack now carries the fork's full rail set —
 > image-safe prefix caching, per-row MRoPE correctness for glm4v/qwen3_vl
