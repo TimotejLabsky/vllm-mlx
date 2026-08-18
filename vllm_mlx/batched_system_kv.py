@@ -42,6 +42,7 @@ from typing import Any, Optional
 from .memory_pressure import PressureManager
 
 from .system_kv import (
+    CacheTimingRecorder,
     append_checkpoint,
     apply_snapshot_states,
     capture_checkpoint_states,
@@ -50,6 +51,7 @@ from .system_kv import (
     classify_layers,
     common_prefix_len,
     select_restore_pos,
+    timing_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -185,6 +187,10 @@ class BatchedSystemKV:
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, dict] = OrderedDict()
         self._entry_seq = 0
+        # Entry-lifecycle timing (fork observability). Keyed by content
+        # (timing_key of the token chain), NOT _entry_seq — a re-store of
+        # an evicted chain must match its tombstone.
+        self._timing = CacheTimingRecorder()
         # request_id -> in-flight checkpoint ladder (list of {pos, states, metas})
         self._pending: dict[str, list] = {}
         # request_id -> absolute position already covered by a restored cache
@@ -423,7 +429,10 @@ class BatchedSystemKV:
         if absorbed:
             merged = {}
             for k in absorbed:
-                for cp in self._entries.pop(k)["checkpoints"]:
+                popped = self._entries.pop(k)
+                # Subsumed, not lost — the chain lives on in the new entry.
+                self._timing.forget(timing_key(popped["tokens"]))
+                for cp in popped["checkpoints"]:
                     merged[cp["pos"]] = cp
             for cp in checkpoints:
                 merged[cp["pos"]] = cp
@@ -454,6 +463,7 @@ class BatchedSystemKV:
             self._bpt_hint = entry["bytes"] / len(tokens_list)
         self._entry_seq += 1
         self._entries[self._entry_seq] = entry
+        self._timing.note_store(timing_key(tokens_list))
         self._enforce_budgets_locked()
         return entry
 
@@ -639,7 +649,8 @@ class BatchedSystemKV:
     def _enforce_budgets_locked(self) -> None:
         evicted = False
         while len(self._entries) > self.slots:
-            self._entries.popitem(last=False)
+            _, ev = self._entries.popitem(last=False)
+            self._timing.note_evict(timing_key(ev["tokens"]))
             self.evictions += 1
             evicted = True
         if self.ram_mb > 0:
@@ -648,7 +659,8 @@ class BatchedSystemKV:
                 len(self._entries) > 1
                 and sum(e["bytes"] for e in self._entries.values()) > budget
             ):
-                self._entries.popitem(last=False)
+                _, ev = self._entries.popitem(last=False)
+                self._timing.note_evict(timing_key(ev["tokens"]))
                 self.evictions += 1
                 evicted = True
         if evicted:
@@ -729,6 +741,7 @@ class BatchedSystemKV:
 
             # LRU touch
             self._entries.move_to_end(best_key)
+            self._timing.note_hit(timing_key(entry["tokens"]))
             self.hits += 1
             self.tokens_saved += pos
             divergent = best_lcp < min(len(tokens), len(entry["tokens"]))
@@ -850,7 +863,8 @@ class BatchedSystemKV:
         with self._lock:
             if not self._entries:
                 return False
-            self._entries.popitem(last=False)
+            _, ev = self._entries.popitem(last=False)
+            self._timing.note_evict(timing_key(ev["tokens"]))
             self.evictions += 1
             self.pressure_evictions += 1
         return True

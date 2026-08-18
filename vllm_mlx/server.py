@@ -3882,6 +3882,77 @@ async def metrics():
     return Response(content=payload, headers={"Content-Type": content_type})
 
 
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness: a real 1-token forward pass through the loaded engine.
+
+    /health is a liveness check — it answers 200 while the engine can be
+    wedged (the llama-swap 2026-07-14 incident: process alive, every request
+    starved). Readiness follows the vLLM convention instead: prove the model
+    can produce a token. A BUSY engine is ready by definition (it is
+    producing tokens for someone right now), so the probe only runs when the
+    engine is idle — it must never queue behind real traffic.
+
+    Returns 200 {"status": "ready"} or 503 with a reason. Probe timeout via
+    VLLM_MLX_READY_TIMEOUT_S (default 20).
+    """
+    if _engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "reason": "no engine loaded"},
+        )
+
+    stats = {}
+    try:
+        stats = _engine.get_stats() or {}
+    except Exception:
+        pass
+    if (stats.get("num_running") or 0) > 0 or (stats.get("num_waiting") or 0) > 0:
+        return {
+            "status": "ready",
+            "probe": "skipped",
+            "reason": "engine busy serving traffic",
+        }
+
+    timeout_s = float(os.environ.get("VLLM_MLX_READY_TIMEOUT_S", "20"))
+    started = time.perf_counter()
+    try:
+        output = await asyncio.wait_for(
+            _engine.generate(prompt="ok", max_tokens=1, temperature=0.0),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": f"forward-pass probe timed out after {timeout_s:.0f}s",
+            },
+        )
+    except EngineBusy:
+        # Raced a real request into the serialized route — busy means alive.
+        return {
+            "status": "ready",
+            "probe": "skipped",
+            "reason": "engine busy serving traffic",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "reason": f"probe failed: {exc}"},
+        )
+    if not output.tokens and not output.text:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "reason": "probe produced no output"},
+        )
+    return {
+        "status": "ready",
+        "probe": "forward_pass",
+        "probe_latency_s": round(time.perf_counter() - started, 3),
+    }
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -5697,6 +5768,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             result="success",
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
+            finish_reason=finish_reason,
         )
         return ChatCompletionResponse(
             model=_response_model_name(request.model),
@@ -6189,6 +6261,7 @@ async def create_anthropic_message(
             result="success",
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
+            finish_reason=finish_reason,
         )
         return Response(
             content=anthropic_response.model_dump_json(exclude_none=True),
