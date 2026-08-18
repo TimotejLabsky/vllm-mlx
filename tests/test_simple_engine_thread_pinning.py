@@ -19,6 +19,14 @@ from typing import Any
 
 import pytest
 
+pytest.skip(
+    "upstream engine-internals test: exercises the #574 prefix trie / #679 "
+    "thread-pinning machinery of upstream engine/simple.py, which the fork "
+    "rejects wholesale (system-KV cache + serialized-worker stack supersede "
+    "it; see PATCHES.md rebase note 2026-08-17)",
+    allow_module_level=True,
+)
+
 
 def _install_mlx_stubs() -> None:
     """Stub mlx.core only when the real one is missing.
