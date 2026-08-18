@@ -41,16 +41,40 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
-from ..mlx_streams import bind_generation_streams
+from ..mlx_streams import (
+    bind_generation_streams,
+    restore_generation_streams,
+    snapshot_generation_streams,
+)
 from .. import system_kv as system_kv_mod
 from ..system_kv import SystemKVManager
 
 logger = logging.getLogger(__name__)
 
 
+# The pre-bind (import-time, main-thread) generation-stream globals.
+# Captured once before the first worker rebind so stop() can put them back:
+# a retired worker otherwise leaves mlx_lm/mlx_vlm's module-level
+# ``generation_stream`` naming a stream no live thread can enter, and the
+# next main-thread BatchGenerator dies with "There is no Stream(gpu, N) in
+# current thread" (bit upstream's #702 scheduler-parity tests).
+_ORIGINAL_GENERATION_STREAMS: dict[str, object] | None = None
+
+
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
+    global _ORIGINAL_GENERATION_STREAMS
+    if _ORIGINAL_GENERATION_STREAMS is None:
+        _ORIGINAL_GENERATION_STREAMS = snapshot_generation_streams()
     bind_generation_streams()
+
+
+def _restore_original_generation_streams() -> None:
+    """Restore the pre-bind stream globals when the worker retires."""
+    global _ORIGINAL_GENERATION_STREAMS
+    if _ORIGINAL_GENERATION_STREAMS is not None:
+        restore_generation_streams(_ORIGINAL_GENERATION_STREAMS)
+        _ORIGINAL_GENERATION_STREAMS = None
 
 
 def _seed_logits_processors(
@@ -149,6 +173,9 @@ class SimpleEngine(BaseEngine):
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        prefix_trie_cache: bool = False,
+        prefix_trie_cache_size: int = 32,
+        prefix_trie_cache_memory_mb: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -201,6 +228,20 @@ class SimpleEngine(BaseEngine):
         # Live per-request state, mirroring BatchedEngine's "requests" list
         # in /v1/status (request_id, phase, ttft_s, tokens_per_second, ...).
         self._active_requests: dict[str, dict[str, Any]] = {}
+
+        # Upstream #574 added an LRUPromptCache prefix trie for pure-LLM
+        # SimpleEngine chat. The fork's system-KV cache (system_kv.py) already
+        # owns that niche — snapshot store with SSD tier, hybrid-safe — so the
+        # trie itself is not ported. The flags are accepted so upstream's
+        # cli/registry/server plumbing keeps working, but enabling them is an
+        # error rather than a silent no-op.
+        if prefix_trie_cache:
+            raise ValueError(
+                "--prefix-trie-cache is superseded by the fork's system-KV "
+                "cache and is not supported; remove the flag (system-KV is "
+                "on by default for SimpleEngine text routes)"
+            )
+        del prefix_trie_cache_size, prefix_trie_cache_memory_mb
 
         # SpecPrefill config
         self._specprefill_enabled = specprefill_enabled
@@ -582,6 +623,9 @@ class SimpleEngine(BaseEngine):
         # Release the system-KV snapshot stack (active slot + LRU bag +
         # counters + SSD store) — see SystemKVManager.reset().
         self._system_kv.reset()
+        # Put back the generation-stream globals the worker rebound; the
+        # worker thread retires with the engine.
+        _restore_original_generation_streams()
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -996,7 +1040,14 @@ class SimpleEngine(BaseEngine):
                 )
                 finish_reason = None
                 if finished:
-                    finish_reason = getattr(chunk, "finish_reason", "stop")
+                    # Upstream #681: a chunk that carries finish_reason=None at
+                    # the cutoff must still report WHY the stream ended —
+                    # "length" when the engine's own token budget tripped.
+                    finish_reason = getattr(chunk, "finish_reason", None)
+                    if finish_reason is None:
+                        finish_reason = (
+                            "length" if completion_tokens >= max_tokens else "stop"
+                        )
 
                 yield GenerationOutput(
                     text=accumulated_text,
