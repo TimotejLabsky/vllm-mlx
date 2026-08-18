@@ -36,6 +36,11 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return default
 
 
+# Cache-entry timing spans seconds (thrash) to a working day (healthy
+# long-lived entries); log-spaced buckets cover both regimes.
+_TIMING_BUCKETS = (1, 5, 15, 60, 300, 900, 1800, 3600, 7200, 14400, 43200)
+
+
 @dataclass
 class InferenceTracker:
     """Request-scoped inference timing and token accounting."""
@@ -63,6 +68,7 @@ class InferenceTracker:
         result: str,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
+        finish_reason: str | None = None,
     ) -> None:
         if self.collector is None or self._finished:
             return
@@ -73,6 +79,7 @@ class InferenceTracker:
             duration=time.perf_counter() - self.start_time,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            finish_reason=finish_reason,
         )
         self._finished = True
 
@@ -97,6 +104,9 @@ class MetricsCollector:
             self._init_prometheus()
 
     def _init_prometheus(self) -> None:
+        # Scrape-time delta bridge state for the cache counter mirrors:
+        # metric name -> last cumulative value seen in the stats snapshot.
+        self._cache_counter_seen: dict[str, float] = {}
         from prometheus_client import (
             CONTENT_TYPE_LATEST,
             CollectorRegistry,
@@ -307,6 +317,74 @@ class MetricsCollector:
                 "(#53 — fires even when the cache had nothing to evict).",
                 registry=registry,
             ),
+            # ---- counter mirrors of the cumulative cache stats (vLLM v1
+            # metric shapes): the gauges above snapshot cumulative values,
+            # which PromQL cannot window or reset-align; these are true
+            # monotonic Counters fed by a scrape-time delta bridge.
+            "cache_events_total": Counter(
+                "vllm_mlx_cache_events",
+                "Cache lifecycle events (monotonic counter mirrors of the "
+                "cumulative stats gauges, fed by a scrape-time delta bridge; "
+                "the gauges cannot be windowed or reset-aligned in PromQL).",
+                ["event"],
+                registry=registry,
+            ),
+            "cache_saved_tokens_total": Counter(
+                "vllm_mlx_cache_saved_tokens",
+                "Prompt tokens not recomputed thanks to the cache "
+                "(monotonic; kind=partial counts the partial-restore subset).",
+                ["kind"],
+                registry=registry,
+            ),
+            # ---- entry-lifecycle timing (the instrumentation the
+            # prefix-cache landscape verdict asked for before touching
+            # eviction policy; observations drained from
+            # system_kv.CacheTimingRecorder at scrape time).
+            "cache_entry_lifetime_seconds": Histogram(
+                "vllm_mlx_cache_entry_lifetime_seconds",
+                "Cache entry lifetime: store to eviction.",
+                registry=registry,
+                buckets=_TIMING_BUCKETS,
+            ),
+            "cache_entry_idle_before_evict_seconds": Histogram(
+                "vllm_mlx_cache_entry_idle_before_evict_seconds",
+                "Idle time between an entry's last use and its eviction.",
+                registry=registry,
+                buckets=_TIMING_BUCKETS,
+            ),
+            "cache_entry_reuse_gap_seconds": Histogram(
+                "vllm_mlx_cache_entry_reuse_gap_seconds",
+                "Gap between consecutive uses of a live cache entry.",
+                registry=registry,
+                buckets=_TIMING_BUCKETS,
+            ),
+            "cache_evict_to_reuse_gap_seconds": Histogram(
+                "vllm_mlx_cache_evict_to_reuse_gap_seconds",
+                "Gap between evicting an entry and having to re-store the "
+                "same token chain — nonzero traffic here means the eviction "
+                "policy discarded something that was still needed.",
+                registry=registry,
+                buckets=_TIMING_BUCKETS,
+            ),
+            "finish_reasons_total": Counter(
+                "vllm_mlx_finish_reasons_total",
+                "Chat/completion requests by terminal finish_reason.",
+                ["endpoint", "finish_reason"],
+                registry=registry,
+            ),
+            "metal_resource_limit": Gauge(
+                "vllm_mlx_metal_resource_limit",
+                "Metal resource limit: max live GPU buffer COUNT (not bytes) "
+                "before '[metal::malloc] Resource limit exceeded' — a crash "
+                "class byte-denominated relief cannot see. MLX exposes only "
+                "the ceiling, not the live count.",
+                registry=registry,
+            ),
+            "metal_recommended_working_set_bytes": Gauge(
+                "vllm_mlx_metal_recommended_working_set_bytes",
+                "Metal max recommended working set size in bytes.",
+                registry=registry,
+            ),
             "model_registry_entries": Gauge(
                 "vllm_mlx_model_registry_entries",
                 "Tracked model ownership entries.",
@@ -374,10 +452,16 @@ class MetricsCollector:
         duration: float,
         prompt_tokens: int,
         completion_tokens: int,
+        finish_reason: str | None = None,
     ) -> None:
         if not self._enabled or self._prom is None:
             return
         stream_label = _bool_str(stream)
+        if finish_reason:
+            self._prom["finish_reasons_total"].labels(
+                endpoint=endpoint,
+                finish_reason=str(finish_reason),
+            ).inc()
         self._prom["inference_requests_total"].labels(
             endpoint=endpoint,
             stream=stream_label,
@@ -573,6 +657,66 @@ class MetricsCollector:
             self._prom["cache_partial_tokens_saved"].set(0)
             self._prom["cache_memory_bytes"].set(0)
             self._prom["cache_memory_limit_bytes"].set(0)
+
+        # Counter mirrors: bridge the cumulative snapshot values into true
+        # monotonic Counters. delta < 0 means the engine (and its stats)
+        # was reset in-process — count the new cumulative from zero.
+        counter_sources = {
+            ("cache_events_total", "hit"): ("hits", "cache_hits"),
+            ("cache_events_total", "miss"): ("misses", "cache_misses"),
+            ("cache_events_total", "eviction"): ("evictions",),
+            ("cache_events_total", "partial_hit"): ("partial_hits",),
+            ("cache_events_total", "pressure_eviction"): ("pressure_evictions",),
+            ("cache_events_total", "ssd_promote"): ("ssd_promotes",),
+            ("cache_saved_tokens_total", "full"): ("tokens_saved",),
+            ("cache_saved_tokens_total", "partial"): ("partial_tokens_saved",),
+        }
+        if isinstance(cache_stats, dict):
+            for (metric_name, label), keys in counter_sources.items():
+                value = 0.0
+                for key in keys:
+                    if key in cache_stats:
+                        value = _coerce_float(cache_stats.get(key))
+                        break
+                seen_key = f"{metric_name}:{label}"
+                seen = self._cache_counter_seen.get(seen_key)
+                delta = value if seen is None or value < seen else value - seen
+                self._cache_counter_seen[seen_key] = value
+                if delta > 0:
+                    if metric_name == "cache_events_total":
+                        self._prom[metric_name].labels(event=label).inc(delta)
+                    else:
+                        self._prom[metric_name].labels(kind=label).inc(delta)
+
+        # Entry-lifecycle timing: drain every live CacheTimingRecorder.
+        try:
+            from .system_kv import drain_all_timing_observations
+
+            observations = drain_all_timing_observations()
+        except Exception:
+            observations = {}
+        for obs_key, metric_name in (
+            ("lifetime", "cache_entry_lifetime_seconds"),
+            ("idle_before_evict", "cache_entry_idle_before_evict_seconds"),
+            ("reuse_gap", "cache_entry_reuse_gap_seconds"),
+            ("evict_to_reuse_gap", "cache_evict_to_reuse_gap_seconds"),
+        ):
+            for value in observations.get(obs_key, ()):
+                self._prom[metric_name].observe(value)
+
+        # Metal ceilings (MLX exposes limits, not live buffer counts).
+        try:
+            import mlx.core as mx
+
+            device_info = mx.device_info()
+            self._prom["metal_resource_limit"].set(
+                _coerce_float(device_info.get("resource_limit"))
+            )
+            self._prom["metal_recommended_working_set_bytes"].set(
+                _coerce_float(device_info.get("max_recommended_working_set_size"))
+            )
+        except Exception:
+            pass
 
         try:
             from .model_registry import get_registry
