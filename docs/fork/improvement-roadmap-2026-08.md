@@ -6,6 +6,26 @@ measured verdicts (PATCHES.md, docs/fork/, memory). This file records what
 survived; the refuted/rejected list at the bottom is as load-bearing as the
 roadmap.
 
+**Status 2026-08-18** — executed so far (all pushed on fork `8d2bbf8`, **not
+yet deployed** to the Studio):
+
+- Tier 1 item 1 → **DONE**, patch #73 (llguidance fail-closed structured
+  output, upstream PR #636 adapted). Open follow-up: strict tool-argument
+  schemas.
+- Tier 1 item 2 → **DONE**, patch #74 (eviction-timing histograms + tombstone
+  gap, counter mirrors, finish-reason counter, `/health/ready`). The verdict
+  now waits on a post-deploy soak:
+  `rate(vllm_mlx_cache_evict_to_reuse_gap_seconds_count[1d])` staying at zero
+  closes the eviction question. The live Metal buffer-count gauge turned out
+  impossible (MLX exposes only the ~499k ceiling) — recorded as a limitation
+  in PATCHES.md #74.
+- Tier 1 item 3 (requant split) → discussed, **awaiting go**; agreed canary =
+  one 27B-8bit route to 6-bit RTN with KLD + needle-at-cap validation.
+- Also done en route (2026-08-17): rebase onto upstream `5021350` (v0.4.1) —
+  which consumed several watch items: upstream's #683 non-trimmable scheduler
+  cache and #648 chunked prefill are now in the base (batched-side; our
+  system-KV remains the active cache), and PR #636 became patch #73.
+
 ## Standing validations
 
 - **Hybrid-safe caching: third independent validation.** SGLang shipped a
@@ -32,7 +52,7 @@ roadmap.
 
 ## Tier 1
 
-1. **Structured output via llguidance** — the one big-backend capability the
+1. ✅ **DONE 2026-08-18, patch #73.** **Structured output via llguidance** — the one big-backend capability the
    fork lacks entirely; three of four surveys converged on it. Current
    `constrained/json_schema_processor.py` is lm-format-enforcer: maintenance
    mode, slowest of the field (llguidance ~50µs/token CPU; xgrammar <40µs),
@@ -43,7 +63,7 @@ roadmap.
    tool-argument schemas (mistral.rs precedent) — constrain tool-call args
    JSON during decode; malformed tool calls currently waste whole generations.
    → **fork patch #73.**
-2. **Instrumentation package** (fulfils the instrument-first verdict of
+2. ✅ **DONE 2026-08-18, patch #74** (verdict pends post-deploy soak). **Instrumentation package** (fulfils the instrument-first verdict of
    `prefix-caching-landscape-2026-08.md`): convert cache gauges to monotonic
    counters (vLLM v1 metric shapes), add `idle_before_evict` and `reuse_gap`
    histograms — the two distributions that decide empirically whether
@@ -55,7 +75,7 @@ roadmap.
    #1332](https://github.com/ml-explore/mlx-lm/issues/1332)) and a
    `/health/ready` probe that runs a real 1-token forward pass (vLLM
    convention; would catch the llama-swap-wedge failure class).
-3. **Requant split** (refines the 2026-07 "27B at 5–6bpw DWQ" lever — DWQ's
+3. ⏳ **AWAITING GO** (canary agreed: one 27B-8bit route → 6-bit RTN). **Requant split** (refines the 2026-07 "27B at 5–6bpw DWQ" lever — DWQ's
    own docs say distillation isn't worth it above 4-bit):
    - 27B-8bit routes → **6-bit RTN or ~5.5bpw `mlx_lm.dynamic_quant`**:
      measured KLD 0.029 vs bf16 on a 27B dense ("imperceptible"; 8-bit is
@@ -106,7 +126,10 @@ roadmap.
   seats/ceilings by virtual allocation instead of hand-measured ladders.
 - **Tool-call-pending eviction bit** (Continuum, arXiv 2511.02230):
   `finish_reason=tool_calls` → short-TTL protection so relief prefers other
-  victims. Do together with the Tier-1 instrumentation.
+  victims. The #74 instrumentation now measures the need: check whether
+  evict-to-reuse events cluster behind finish_reason=tool_calls bursts
+  before building.
+- ~~Upstream PR #636~~ — consumed: adapted as patch #73.
 - **Next mlx / mlx-lm releases** (we are at the released tips today): take mlx
   promptly (fp32-dequant + quantized-matmul numerics fixes) but re-run the
   patch-#48 staged 94K crash recipe first — the residency-set restructure
