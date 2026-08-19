@@ -839,6 +839,28 @@ def _prepare_chat_completion_invocation(
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )
+
+    # Forward OpenAI reasoning_effort into the chat template (patch #76).
+    # Precedence: the request's own chat_template_kwargs > this parameter >
+    # the server default (--default-chat-template-kwargs). A server default is
+    # a fallback, so a per-request effort has to be able to beat it — that is
+    # the whole point of the parameter (opencode / Claude Code send it per
+    # request). An explicit per-request chat_template_kwargs still wins.
+    # "none" is excluded: it keeps its established meaning below
+    # (enable_thinking=False), and no template family accepts it as a level.
+    # The value is NOT validated here — engines normalize it against the
+    # model's own template vocabulary right before rendering, because only
+    # they can see the template. See utils/reasoning_effort.py.
+    requested_effort = getattr(request, "reasoning_effort", None)
+    if (
+        isinstance(requested_effort, str)
+        and requested_effort.strip().lower() not in ("", "none")
+        and "reasoning_effort" not in (request.chat_template_kwargs or {})
+    ):
+        resolved_chat_template_kwargs["reasoning_effort"] = (
+            requested_effort.strip().lower()
+        )
+
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
 
@@ -2324,7 +2346,14 @@ def _responses_request_to_chat_request(
             status_code=400,
             detail="Responses text.format.type='json_object' is not supported on this backend",
         )
-    if request.reasoning is not None:
+    # Responses `reasoning.effort` shares the chat-completions vocabulary, so
+    # it rides the same path (patch #76): forwarded as `reasoning_effort` and
+    # normalized per-template in the engine. Everything else in the reasoning
+    # config (summaries, encrypted content) is still unsupported here.
+    responses_effort = (
+        request.reasoning.effort if request.reasoning is not None else None
+    )
+    if request.reasoning is not None and responses_effort is None:
         logger.debug("Ignoring reasoning configuration (not supported on this backend)")
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
@@ -2365,6 +2394,7 @@ def _responses_request_to_chat_request(
         tools=tools,
         tool_choice=request.tool_choice,
         chat_template_kwargs=request.chat_template_kwargs,
+        reasoning_effort=responses_effort,
     )
 
 

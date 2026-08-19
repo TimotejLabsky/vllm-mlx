@@ -32,6 +32,12 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
+from ..utils.reasoning_effort import (
+    HARMONY_EFFORT_LEVELS,
+    normalize_effort_in_template_kwargs,
+    normalize_reasoning_effort,
+    render_with_effort_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -750,7 +756,13 @@ class BatchedEngine(BaseEngine):
 
             _reasoning_effort = None
             if chat_template_kwargs:
-                _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                # harmony's vocabulary is low|medium|high; xhigh (Qwen3.8's top
+                # level) folds onto high rather than being ignored by
+                # render_messages' getattr guard.
+                _reasoning_effort = normalize_reasoning_effort(
+                    chat_template_kwargs.get("reasoning_effort"),
+                    HARMONY_EFFORT_LEVELS,
+                )
             return _harmony_render_messages(
                 messages,
                 tools=tools,
@@ -796,33 +808,44 @@ class BatchedEngine(BaseEngine):
             ):
                 tokenizer_applicator = tokenizer
 
-            try:
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
-            except ValueError as e:
-                # Some HF processors define apply_chat_template but do not carry
-                # a template (e.g. Gemma-3 processor). Retry on tokenizer.
-                if (
-                    tokenizer_applicator is not None
-                    and "does not have a chat template" in str(e)
-                ):
-                    return tokenizer_applicator.apply_chat_template(
-                        messages, **template_kwargs
+            # Normalize reasoning_effort against this template's own vocabulary
+            # before it can reach a raise_exception (#76). Processors don't
+            # always carry the template, so fall back to the tokenizer's.
+            normalize_effort_in_template_kwargs(
+                template_kwargs,
+                getattr(template_applicator, "chat_template", None)
+                or getattr(self.tokenizer, "chat_template", None),
+            )
+
+            def _render(**tk: Any) -> str:
+                try:
+                    return template_applicator.apply_chat_template(messages, **tk)
+                except ValueError as e:
+                    # Some HF processors define apply_chat_template but do not
+                    # carry a template (e.g. Gemma-3 processor). Retry on tokenizer.
+                    if (
+                        tokenizer_applicator is not None
+                        and "does not have a chat template" in str(e)
+                    ):
+                        return tokenizer_applicator.apply_chat_template(messages, **tk)
+                    raise
+                except TypeError as e:
+                    # Some templates don't accept extra kwargs; retry without them.
+                    logger.debug(
+                        f"Chat template TypeError, retrying without extras: {e}"
                     )
-                raise
-            except TypeError as e:
-                # Some templates don't accept extra kwargs; retry without them.
-                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in [
-                    "tools",
-                    "enable_thinking",
-                    *(chat_template_kwargs or {}).keys(),
-                ]:
-                    template_kwargs.pop(key, None)
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *(chat_template_kwargs or {}).keys(),
+                    ]:
+                        template_kwargs.pop(key, None)
+                        tk.pop(key, None)
+                    return template_applicator.apply_chat_template(messages, **tk)
+
+            return render_with_effort_fallback(
+                _render, template_kwargs, model_name=self._model_name
+            )
         else:
             # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
