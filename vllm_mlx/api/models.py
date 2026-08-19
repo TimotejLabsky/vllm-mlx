@@ -225,7 +225,13 @@ class ChatCompletionRequest(BaseModel):
     # Text-only requests also use this flag to leave the default TextModel route
     # and run through the MLLM path where the drafter can participate.
     mllm_draft: bool | None = None
-    reasoning_effort: str | None = None  # OpenAI-compatible: low/medium/high/none
+    # OpenAI-compatible: none/minimal/low/medium/high/xhigh (xhigh arrived with
+    # gpt-5.1-codex-max). Deliberately an unconstrained str, not a Literal:
+    # "none" is handled server-side (enable_thinking=False) and every other
+    # value is normalized against the target model's own chat-template
+    # vocabulary before rendering, so an unknown level degrades to the template
+    # default instead of a 422. See utils/reasoning_effort.py (patch #76).
+    reasoning_effort: str | None = None
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
