@@ -15,6 +15,14 @@
 > (e.g. why we run SimpleEngine + system-KV instead of continuous batching).
 > See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
 >
+> **2026-08-19 — per-request reasoning effort** (PATCHES.md #76): the OpenAI
+> `reasoning_effort` parameter (and Responses `reasoning.effort`) now reaches
+> the chat template instead of being dropped for every value except `none`.
+> Values are normalized against each model's own template vocabulary — `high`
+> becomes `xhigh` on Qwen3.8, `xhigh` becomes `high` on gpt-oss/harmony — and
+> anything still unsupported is dropped rather than allowed to hit the
+> template's `raise_exception` as an HTTP 500.
+>
 > **2026-08-18 — fail-closed structured output** (PATCHES.md #73, upstream
 > PR #636 adapted): strict `json_schema` now decodes under a request-local
 > llguidance token mask (schema-aware EOS, fail-closed on setup errors),
