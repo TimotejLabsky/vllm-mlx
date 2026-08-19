@@ -41,6 +41,12 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
+from ..utils.reasoning_effort import (
+    HARMONY_EFFORT_LEVELS,
+    normalize_effort_in_template_kwargs,
+    normalize_reasoning_effort,
+    render_with_effort_fallback,
+)
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -1442,29 +1448,46 @@ class SimpleEngine(BaseEngine):
 
                 _reasoning_effort = None
                 if chat_template_kwargs:
-                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                    # harmony's vocabulary is low|medium|high; xhigh (Qwen3.8's
+                    # top level) folds onto high rather than being ignored by
+                    # render_messages' getattr guard.
+                    _reasoning_effort = normalize_reasoning_effort(
+                        chat_template_kwargs.get("reasoning_effort"),
+                        HARMONY_EFFORT_LEVELS,
+                    )
                 prompt = _harmony_render_messages(
                     safe_messages,
                     tools=template_tools,
                     reasoning_effort=_reasoning_effort,
                 )
             else:
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-                except TypeError:
-                    # Some templates don't support all kwargs
-                    for key in [
-                        "tools",
-                        "enable_thinking",
-                        *chat_template_kwargs.keys(),
-                    ]:
-                        if key in template_kwargs:
-                            del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
+                # Normalize reasoning_effort against this template's own
+                # vocabulary before it can reach a raise_exception (#76).
+                normalize_effort_in_template_kwargs(
+                    template_kwargs, getattr(tokenizer, "chat_template", None)
+                )
+
+                def _render_prompt(**tk: Any) -> Any:
+                    try:
+                        return tokenizer.apply_chat_template(safe_messages, **tk)
+                    except TypeError:
+                        # Some templates don't support all kwargs. Mutate the
+                        # shared dict: the system-prefix probe below re-renders
+                        # with it and must match what we rendered here.
+                        for key in [
+                            "tools",
+                            "enable_thinking",
+                            *chat_template_kwargs.keys(),
+                        ]:
+                            template_kwargs.pop(key, None)
+                            tk.pop(key, None)
+                        return tokenizer.apply_chat_template(safe_messages, **tk)
+
+                prompt = render_with_effort_fallback(
+                    _render_prompt,
+                    template_kwargs,
+                    model_name=self._model_name,
+                )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -2281,20 +2304,28 @@ class SimpleEngine(BaseEngine):
             template_kwargs["tools"] = tools
         safe_messages = normalize_messages_for_chat_template(messages)
 
-        try:
-            # patch #4: use the route-resolved tokenizer (local text_tokenizer),
-            # not self._text_tokenizer — the latter is None in pure-LLM mode.
-            # Keep upstream's safe_messages normalization (#494 dangling-think fix).
-            full_prompt = text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
-        except TypeError:
-            # Template doesn't accept tools= or enable_thinking=
-            template_kwargs.pop("tools", None)
-            template_kwargs.pop("enable_thinking", None)
-            full_prompt = text_tokenizer.apply_chat_template(
-                safe_messages, **template_kwargs
-            )
+        # Normalize reasoning_effort against this template's own vocabulary
+        # before it can reach a raise_exception (#76).
+        normalize_effort_in_template_kwargs(
+            template_kwargs, getattr(text_tokenizer, "chat_template", None)
+        )
+
+        def _render_full_prompt(**tk: Any) -> Any:
+            try:
+                # patch #4: use the route-resolved tokenizer (local text_tokenizer),
+                # not self._text_tokenizer — the latter is None in pure-LLM mode.
+                # Keep upstream's safe_messages normalization (#494 dangling-think fix).
+                return text_tokenizer.apply_chat_template(safe_messages, **tk)
+            except TypeError:
+                # Template doesn't accept tools= or enable_thinking=
+                for key in ("tools", "enable_thinking"):
+                    template_kwargs.pop(key, None)
+                    tk.pop(key, None)
+                return text_tokenizer.apply_chat_template(safe_messages, **tk)
+
+        full_prompt = render_with_effort_fallback(
+            _render_full_prompt, template_kwargs, model_name=self._model_name
+        )
 
         sampler = make_sampler(
             temp=temperature,
