@@ -1633,3 +1633,53 @@ Closes known-open item (1) from the #72 record: the server sets `engine.use_harm
 **Verification:** 4 new tests (harmony render replaces Jinja + preserves `to=functions.X` commentary structure; `reasoning_effort`/`tools` forwarding; media fall-through; flag-off unchanged); full suite green. Live gpt-oss multi-turn tool call through llama-swap owed at next deploy.
 
 **Upstreaming:** candidate — upstream's BatchedEngine has the same gap.
+
+---
+
+## 76. `patch: reasoning-effort-forwarding` — the OpenAI parameter reaches the chat template
+
+**Files:** `vllm_mlx/utils/reasoning_effort.py` (new), `vllm_mlx/server.py`, `vllm_mlx/engine/simple.py`, `vllm_mlx/engine/batched.py`, `tests/test_reasoning_effort_forwarding.py` (new), `README.md`
+
+`server.py` translated `reasoning_effort` for exactly one value — `"none"` → `chat_template_kwargs.enable_thinking=False`. Every other value (`low`/`medium`/`high`/`xhigh`) was accepted by the API model (`api/models.py:228`) and then **silently dropped**. Two production consequences:
+
+1. opencode sends `reasoningEffort: "high"` per model. It reached the server and went nowhere, so Qwen3.8-27B ran at its chat template's `xhigh` **default** on every request — that model's dominant documented failure mode (runaway thinking, ~22K reasoning tokens for 3K of output; reported loops in this family occur inside the `<think>` block). The workaround was hardcoding `chat_template_kwargs: {reasoning_effort: "medium"}` in the LiteLLM route, which makes per-request switching impossible.
+2. Claude Code 2.1.235 sends `reasoning_effort: "high"` by default. Qwen3.8's template accepts **only** `xhigh|medium|low` and calls `raise_exception()` otherwise ([Qwen3.8-27B discussion #147](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/147)), so a naive forward turns every Claude Code request into an HTTP 500.
+
+**What the patch does.** `server.py` forwards the parameter into `chat_template_kwargs["reasoning_effort"]`, and both engines normalize it against the model's own template vocabulary immediately before rendering.
+
+**Precedence** — request `chat_template_kwargs` > request `reasoning_effort` > server default (`--default-chat-template-kwargs`) > empty. An explicit per-request `chat_template_kwargs` still wins, preserving `_resolve_chat_template_kwargs`'s contract. The OpenAI parameter is deliberately slotted **above** the server default: a CLI default is a fallback, and if it outranked the per-request parameter then per-request switching — the entire point — would still be impossible. Note for the infra repo: a `--default-chat-template-kwargs '{"reasoning_effort": ...}'` rail is now overridable per request.
+
+`"none"` keeps its established meaning exactly (`enable_thinking=False`, Home Assistant's conversation route depends on it) and is never forwarded as a level — no template family accepts it as one.
+
+**Fail-safe design — (a) introspect, with (b) as backstop.** The brief offered two designs; this takes (a) as primary and keeps (b) underneath, because they answer different questions:
+
+- **(a) Introspection** is the only one that can *fix* a value rather than discard it. `template_effort_vocabulary()` extracts the accepted tuple from the Jinja source (cached per template, `lru_cache`), which is what makes `high → xhigh` possible. Catch-and-retry can only ever drop, so on Qwen3.8 + Claude Code it would silently pin every request to the `xhigh` default — the exact runaway-thinking bug this patch exists to fix. It also costs nothing per request and needs no wasted render.
+- **(b) Catch-and-retry** covers templates whose vocabulary the probe can't parse. `render_with_effort_fallback()` renders, and on failure retries once without the kwarg, warning **once per model**. If the retry also fails the *original* exception is re-raised, so unrelated template breakage is never masked.
+
+Both directions of a probe error are safe: too narrow a vocabulary drops the kwarg (template default applies), too wide a one forwards a bad value into the backstop. Neither produces a 500.
+
+**Presence test is vLLM's, value normalization is ours.** The field survey behind this patch:
+
+| engine | behaviour |
+| --- | --- |
+| llama.cpp | `none` disables thinking; otherwise "the value is made available to the jinja template" — verbatim, unvalidated. This is precisely the configuration that 500s on Qwen3.8. |
+| vLLM | maps `reasoning_effort` onto an `enable_thinking` **bool** (low/medium/high → true, none → false), explicit `chat_template_kwargs` winning, then filters every kwarg through `resolve_chat_template_kwargs` = `jinja2.meta.find_undeclared_variables(template)` ∩ the `apply_chat_template` signature. **Variable**-level filtering. |
+| SGLang | server-wide `--chat-template-kwargs` plus per-request `chat_template_kwargs`; no value validation. |
+
+So the "does this template read `reasoning_effort`" test here is vLLM's mechanism (`jinja2.meta`, not a substring match — it correctly ignores `{% set resolved_reasoning_effort = ... %}` and mentions inside string literals), guarded against vLLM's own [#36907](https://github.com/vllm-project/vllm/issues/36907): a bare template *name* is valid trivial Jinja whose empty variable set would otherwise read as "declares nothing" and drop every kwarg. An inconclusive parse returns *unknown* (forward + backstop), never *absent*.
+
+The **value**-vocabulary layer on top is fork-specific — no upstream engine does it, because none of them has a fleet whose default model raises on the OpenAI default value. Mapping table: `high↔xhigh` and `low↔minimal` fold onto each other (same end of the scale); `medium` has no unambiguous neighbour, so a template without it gets the kwarg dropped rather than a coin flip between low and high. Non-string values (an explicit `{"reasoning_effort": null}`) are dropped too — `default()` only fires on *undefined*, so a literal `None` would otherwise reach `None not in ('xhigh', …)` and raise.
+
+**Measured against real templates** (not just fixtures): Qwen3.8-27B → `{low, medium, xhigh}`, `high→xhigh`; gpt-oss-120b → unknown (interpolated with a default, never validated — nothing can raise, so pass through); Qwen3.6-27B / Qwen3.5-0.8B / GLM-4.6V-Flash → no `reasoning_effort` variable, kwarg dropped, template default applies.
+
+**Harmony path.** Both engines' harmony branches (#75/#581) normalize against `HARMONY_EFFORT_LEVELS` (`low|medium|high`), so `xhigh` folds onto `high` instead of being swallowed by `render_messages`' `getattr` guard.
+
+**Cache note.** On a backstop drop the kwarg is removed from the *caller's* `template_kwargs` too, not just the retry copy: SimpleEngine re-renders that same dict for the system-prefix divergence probe (`simple.py`, cf. `prompt_warmup._build_strict_prefix_string`), and a probe rendered with kwargs the real prompt didn't use derives a prefix that never matches — a silent system-KV miss on every request.
+
+**Responses API — wired, not scoped out.** `ResponseReasoningConfig.effort` (`api/responses_models.py:34`) shares the chat-completions vocabulary, so `_responses_request_to_chat_request` now forwards it as `reasoning_effort` and it rides the identical normalization path. The "ignoring reasoning configuration" debug log still fires for the rest of the config (summaries, encrypted content), which remains unsupported.
+
+**Deliberate divergence from vLLM:** we do *not* also inject `enable_thinking=True` for non-`none` efforts. vLLM does; on this fleet it would flip thinking on for templates that default it off, which is a behaviour change nobody asked for.
+
+**Verification:** 35 new tests — vocabulary extraction (incl. the assignment-vs-read distinction and the #36907 guard), `high→xhigh`, drop-vs-passthrough-vs-unknown, non-string values, backstop retry / original-exception preservation / warn-once, four `BatchedEngine._apply_chat_template` integration tests rendering a real raising Qwen3.8-shaped template through the actual engine path, server precedence (incl. explicit-kwargs-wins, explicit-null-wins, `"none"` unchanged, server-default interaction), and Responses forwarding. Full suite green: **2855 passed, 24 skipped, 30 deselected**. Live per-request effort switch through llama-swap owed at next deploy; the LiteLLM `reasoning_effort` hardcode can come out then.
+
+**Upstreaming:** candidate — upstream has the same one-value translation, and the vocabulary normalizer is model-agnostic. Would need the fork's `_resolve_chat_template_kwargs` precedence to land alongside it.
