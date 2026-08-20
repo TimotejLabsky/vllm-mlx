@@ -12,14 +12,22 @@ The OpenAI ``reasoning_effort`` request parameter has no single vocabulary:
 
 This module resolves both problems with one rule: **never let an unsupported
 value reach the template.** The accepted-value tuple is introspected out of the
-Jinja source once per template (cached), the request value is mapped onto the
-nearest supported neighbour (``high -> xhigh``), and anything still unsupported
-is dropped so the template's own default applies. Dropping is always preferable
-to a 500.
+Jinja source once per template (cached), and the request value is resolved
+against it in this order — see :func:`normalize_reasoning_effort`:
+
+    exact match -> the route's configured floor -> nearest neighbour -> drop
+
+The floor rung is the important one and is vLLM-aligned: no engine invents a
+level for a request it can't honour, so the operator's
+``--default-chat-template-kwargs`` decides. Without it an unsupported value
+would land on the *template's* default, which on Qwen3.8 is ``xhigh`` — meaning
+a garbage effort would buy MORE thinking than sending nothing at all, and
+Claude Code's ``high`` would resolve to exactly the runaway-thinking mode this
+patch exists to prevent.
 
 :func:`render_with_effort_fallback` is the backstop for templates whose
-vocabulary we could not parse: render, and if that raises, retry once without
-``reasoning_effort`` and warn once per model.
+vocabulary we could not parse: render, and if that raises, retry down the same
+ladder (floor, then no effort at all) and warn once per model.
 
 How the field does it
 ---------------------
@@ -88,6 +96,21 @@ _WINDOW_AFTER = 300
 #: broken vocabulary logs once rather than once per request.
 _warned_models: set[str] = set()
 
+#: Reserved ``chat_template_kwargs`` key carrying the route's
+#: ``--default-chat-template-kwargs`` effort so the engine can fall back to it
+#: (see the resolution order in :func:`normalize_reasoning_effort`). The server
+#: sets it; :func:`normalize_effort_in_template_kwargs` pops it. It must never
+#: reach the Jinja context, hence the reserved-looking name.
+EFFORT_FALLBACK_KEY = "__vllm_mlx_effort_fallback"
+
+
+def _clean_level(value: Any) -> str | None:
+    """Lowercase/strip a level, or ``None`` if it isn't a usable string."""
+    if not isinstance(value, str):
+        return None
+    level = value.strip().lower()
+    return level or None
+
 
 def _declares_reasoning_effort(template_source: str) -> bool | None:
     """Does the template read a ``reasoning_effort`` variable?
@@ -153,30 +176,60 @@ def template_effort_vocabulary(template_source: str) -> frozenset[str] | None:
     return frozenset(found)
 
 
+def strip_effort_fallback(template_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy ``template_kwargs`` without the fork-internal fallback key.
+
+    For paths that hand ``chat_template_kwargs`` straight to a third-party
+    renderer (mlx-vlm's MLLM ``chat``) instead of through
+    :func:`normalize_effort_in_template_kwargs`, which is what normally pops it.
+    """
+    return {
+        k: v for k, v in (template_kwargs or {}).items() if k != EFFORT_FALLBACK_KEY
+    }
+
+
 def normalize_reasoning_effort(
     value: Any,
     vocabulary: Iterable[str] | None,
+    fallback: Any = None,
 ) -> str | None:
     """Map ``value`` onto ``vocabulary``, or return ``None`` to drop the kwarg.
+
+    Resolution order — **exact match, then the operator's floor, then the
+    nearest neighbour, then drop**:
+
+    1. ``value`` is in the vocabulary -> use it verbatim.
+    2. otherwise ``fallback`` (the route's ``--default-chat-template-kwargs``
+       level) if the template accepts it. This is the vLLM-aligned rule: no
+       engine invents a level for an unsupported request, and the operator's
+       configured default is the authority. It is what stops Claude Code's
+       ``high`` from resolving to Qwen3.8's ``xhigh`` — which is that
+       template's own default, i.e. the runaway-thinking mode this whole
+       patch exists to avoid.
+    3. otherwise the nearest unambiguous neighbour, which still serves routes
+       with no configured floor (``xhigh`` -> ``high`` on gpt-oss).
+    4. otherwise drop, and the template's default applies.
 
     Args:
         value: the requested effort level (case/whitespace insensitive).
         vocabulary: accepted levels, or ``None`` when they could not be
             determined -- in which case ``value`` passes through unchanged.
+        fallback: the route's configured default level, if any.
     """
-    if not isinstance(value, str):
-        return None
-    level = value.strip().lower()
-    if not level:
-        return None
+    level = _clean_level(value)
     if vocabulary is None:
         return level
 
     accepted = frozenset(vocabulary)
-    if not accepted:
+    if not accepted or level is None:
         return None
     if level in accepted:
         return level
+
+    floor = _clean_level(fallback)
+    if floor is not None and floor in accepted:
+        return floor
+
     for neighbour in _EFFORT_NEIGHBOURS.get(level, ()):
         if neighbour in accepted:
             return neighbour
@@ -189,8 +242,13 @@ def normalize_effort_in_template_kwargs(
 ) -> dict[str, Any]:
     """Normalize (or drop) ``template_kwargs["reasoning_effort"]`` in place.
 
+    Also pops :data:`EFFORT_FALLBACK_KEY` — always, even when there is no
+    ``reasoning_effort`` to normalize, because that key is fork-internal
+    plumbing and must never be handed to the Jinja context.
+
     Returns the same dict for call-site convenience.
     """
+    fallback = template_kwargs.pop(EFFORT_FALLBACK_KEY, None)
     if "reasoning_effort" not in template_kwargs:
         return template_kwargs
 
@@ -200,7 +258,7 @@ def normalize_effort_in_template_kwargs(
         if isinstance(template_source, str)
         else None
     )
-    resolved = normalize_reasoning_effort(raw, vocabulary)
+    resolved = normalize_reasoning_effort(raw, vocabulary, fallback=fallback)
     if resolved is None:
         template_kwargs.pop("reasoning_effort", None)
         logger.debug(
@@ -220,6 +278,7 @@ def render_with_effort_fallback(
     template_kwargs: dict[str, Any],
     *,
     model_name: str = "",
+    fallback: Any = None,
 ) -> Any:
     """Call ``render(**template_kwargs)``; on failure retry once without effort.
 
@@ -227,7 +286,11 @@ def render_with_effort_fallback(
     could not parse. If the retry also fails the *original* exception is
     re-raised, so unrelated template breakage is never masked.
 
-    On a successful retry ``reasoning_effort`` is **also removed from the
+    ``fallback`` (the route's configured floor) is tried before dropping
+    outright, so an unparseable template resolves the same way an introspected
+    one does — see :func:`normalize_reasoning_effort`'s resolution order.
+
+    On a successful retry ``reasoning_effort`` is **also updated in the
     caller's dict**: SimpleEngine reuses the same ``template_kwargs`` for the
     system-prefix divergence probe, and a probe rendered with kwargs the real
     prompt didn't use would derive a prefix that never matches (silent KV
@@ -238,21 +301,38 @@ def render_with_effort_fallback(
     except Exception as exc:
         if "reasoning_effort" not in template_kwargs:
             raise
-        retry_kwargs = dict(template_kwargs)
-        dropped = retry_kwargs.pop("reasoning_effort")
-        try:
-            result = render(**retry_kwargs)
-        except Exception:
-            raise exc from None
-        template_kwargs.pop("reasoning_effort", None)
-        if model_name not in _warned_models:
-            _warned_models.add(model_name)
-            logger.warning(
-                "Chat template for %s rejected reasoning_effort=%r (%s); "
-                "dropping it for this and subsequent renders. Add the level "
-                "to the template vocabulary probe if this is unexpected.",
-                model_name or "<unknown model>",
-                dropped,
-                exc,
-            )
-        return result
+        dropped = template_kwargs["reasoning_effort"]
+
+        # Floor first, then no effort at all.
+        attempts: list[tuple[str, dict[str, Any]]] = []
+        floor = _clean_level(fallback)
+        if floor is not None and floor != _clean_level(dropped):
+            attempts.append((floor, {**template_kwargs, "reasoning_effort": floor}))
+        without = dict(template_kwargs)
+        without.pop("reasoning_effort", None)
+        attempts.append(("<dropped>", without))
+
+        for label, retry_kwargs in attempts:
+            try:
+                result = render(**retry_kwargs)
+            except Exception:  # noqa: BLE001 - try the next rung down
+                continue
+            # Keep the caller's dict in step with what actually rendered.
+            if "reasoning_effort" in retry_kwargs:
+                template_kwargs["reasoning_effort"] = retry_kwargs["reasoning_effort"]
+            else:
+                template_kwargs.pop("reasoning_effort", None)
+            if model_name not in _warned_models:
+                _warned_models.add(model_name)
+                logger.warning(
+                    "Chat template for %s rejected reasoning_effort=%r (%s); "
+                    "rendering with %s for this and subsequent requests. Add "
+                    "the level to the template vocabulary probe if this is "
+                    "unexpected.",
+                    model_name or "<unknown model>",
+                    dropped,
+                    exc,
+                    label,
+                )
+            return result
+        raise exc from None
