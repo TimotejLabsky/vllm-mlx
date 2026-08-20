@@ -185,6 +185,7 @@ from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .utils.reasoning_effort import EFFORT_FALLBACK_KEY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -860,6 +861,20 @@ def _prepare_chat_completion_invocation(
         resolved_chat_template_kwargs["reasoning_effort"] = (
             requested_effort.strip().lower()
         )
+
+    # Hand the engine the route's configured default so it can fall back to it
+    # when the requested level isn't in the model's template vocabulary
+    # (vLLM-aligned: the operator's config decides, no engine invents a level).
+    # Without this the engine's drop lands on the *template* default, which on
+    # Qwen3.8 is xhigh — a garbage value would buy MORE thinking than sending
+    # nothing, defeating the floor entirely.
+    server_default_effort = (_default_chat_template_kwargs or {}).get(
+        "reasoning_effort"
+    )
+    if isinstance(server_default_effort, str) and (
+        "reasoning_effort" in resolved_chat_template_kwargs
+    ):
+        resolved_chat_template_kwargs[EFFORT_FALLBACK_KEY] = server_default_effort
 
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
