@@ -18,10 +18,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vllm_mlx.utils.reasoning_effort import (
+    EFFORT_FALLBACK_KEY,
     HARMONY_EFFORT_LEVELS,
     normalize_effort_in_template_kwargs,
     normalize_reasoning_effort,
     render_with_effort_fallback,
+    strip_effort_fallback,
     template_effort_vocabulary,
 )
 
@@ -36,6 +38,8 @@ QWEN38_TEMPLATE = """\
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh.' %}
+    {%- elif resolved_reasoning_effort == 'low' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low.' %}
     {%- endif %}
 {%- endif %}
 {{- reasoning_instructions }}
@@ -132,6 +136,64 @@ class TestNormalization:
         kwargs = {"tokenize": False, "reasoning_effort": "high"}
         normalize_effort_in_template_kwargs(kwargs, PLAIN_TEMPLATE)
         assert kwargs == {"tokenize": False}
+
+
+class TestFloorBeatsNeighbour:
+    """Resolution order: exact -> operator floor -> neighbour -> drop.
+
+    vLLM-aligned: no engine invents a level for an unsupported request, the
+    operator's --default-chat-template-kwargs decides. Without the floor rung,
+    an unsupported value lands on the TEMPLATE default, which on Qwen3.8 is
+    xhigh -- so garbage would buy more thinking than sending nothing, and
+    Claude Code's `high` would resolve to the runaway-thinking mode itself.
+    """
+
+    def setup_method(self):
+        self.vocab = template_effort_vocabulary(QWEN38_TEMPLATE)
+
+    def test_unsupported_value_takes_the_floor_not_the_neighbour(self):
+        # Without a floor this is "xhigh" (the neighbour). With one, medium.
+        assert normalize_reasoning_effort("high", self.vocab) == "xhigh"
+        assert normalize_reasoning_effort("high", self.vocab, "medium") == "medium"
+
+    def test_garbage_takes_the_floor_instead_of_the_template_default(self):
+        assert normalize_reasoning_effort("banana", self.vocab) is None
+        assert normalize_reasoning_effort("banana", self.vocab, "medium") == "medium"
+
+    def test_supported_value_still_beats_the_floor(self):
+        assert normalize_reasoning_effort("low", self.vocab, "medium") == "low"
+        assert normalize_reasoning_effort("xhigh", self.vocab, "medium") == "xhigh"
+
+    def test_floor_the_template_rejects_falls_through_to_neighbour(self):
+        # gpt-oss vocabulary; a "xhigh" floor is not renderable there.
+        assert (
+            normalize_reasoning_effort("xhigh", HARMONY_EFFORT_LEVELS, "xhigh")
+            == "high"
+        )
+
+    def test_floor_is_case_normalized(self):
+        assert normalize_reasoning_effort("high", self.vocab, " MEDIUM ") == "medium"
+
+    def test_kwargs_helper_consumes_the_reserved_key(self):
+        kwargs = {
+            "tokenize": False,
+            "reasoning_effort": "high",
+            EFFORT_FALLBACK_KEY: "medium",
+        }
+        normalize_effort_in_template_kwargs(kwargs, QWEN38_TEMPLATE)
+        assert kwargs == {"tokenize": False, "reasoning_effort": "medium"}
+
+    def test_reserved_key_never_survives_even_with_no_effort(self):
+        # It is fork-internal plumbing; it must not reach the Jinja context.
+        kwargs = {"tokenize": False, EFFORT_FALLBACK_KEY: "medium"}
+        normalize_effort_in_template_kwargs(kwargs, QWEN38_TEMPLATE)
+        assert kwargs == {"tokenize": False}
+
+    def test_strip_helper_leaves_the_original_untouched(self):
+        original = {"reasoning_effort": "low", EFFORT_FALLBACK_KEY: "medium"}
+        stripped = strip_effort_fallback(original)
+        assert stripped == {"reasoning_effort": "low"}
+        assert EFFORT_FALLBACK_KEY in original
 
 
 class TestRenderFallback:
@@ -265,6 +327,66 @@ class TestBatchedEngineIntegration:
         )
         assert "Reasoning effort is set to xhigh." not in prompt
 
+    def test_floor_wins_over_neighbour_end_to_end(self):
+        """Claude Code's `high` must not resolve to Qwen3.8's xhigh default."""
+        engine = self._engine(_qwen38_tokenizer())
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={
+                "reasoning_effort": "high",
+                EFFORT_FALLBACK_KEY: "medium",
+            },
+        )
+        # medium emits no instruction at all; xhigh would have emitted one.
+        assert "Reasoning effort is set to" not in prompt
+
+    def test_garbage_falls_to_the_floor_end_to_end(self):
+        engine = self._engine(_qwen38_tokenizer())
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={
+                "reasoning_effort": "banana",
+                EFFORT_FALLBACK_KEY: "low",
+            },
+        )
+        assert "Reasoning effort is set to low." in prompt
+
+    def test_reserved_key_never_reaches_the_template(self):
+        """A leaked fork-internal kwarg would land in the Jinja context."""
+        seen = {}
+        tokenizer = _qwen38_tokenizer()
+        real = tokenizer.apply_chat_template
+
+        def spy(messages, **kwargs):
+            seen.update(kwargs)
+            return real(messages, **kwargs)
+
+        tokenizer.apply_chat_template = spy
+        engine = self._engine(tokenizer)
+        engine._apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={
+                "reasoning_effort": "low",
+                EFFORT_FALLBACK_KEY: "medium",
+            },
+        )
+        assert EFFORT_FALLBACK_KEY not in seen
+
+    def test_backstop_ladder_lands_on_the_floor(self):
+        """Unparseable template: retry the floor before dropping outright."""
+        tokenizer = _qwen38_tokenizer()
+        tokenizer.chat_template = None  # defeat introspection
+        engine = self._engine(tokenizer)
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={
+                "reasoning_effort": "high",
+                EFFORT_FALLBACK_KEY: "low",
+            },
+        )
+        # Floor rendered, rather than dropping to the xhigh template default.
+        assert "Reasoning effort is set to low." in prompt
+
     def test_harmony_branch_folds_xhigh_onto_high(self):
         engine = self._engine(MagicMock())
         engine.use_harmony_rendering = True
@@ -372,6 +494,34 @@ class TestServerForwarding:
             srv, "_default_chat_template_kwargs", {"reasoning_effort": "medium"}
         )
         assert self._prepare(monkeypatch)["reasoning_effort"] == "medium"
+
+    def test_route_floor_is_handed_to_the_engine(self, monkeypatch):
+        """The engine can't see --default-chat-template-kwargs; ship it along."""
+        import vllm_mlx.server as srv
+
+        monkeypatch.setattr(
+            srv, "_default_chat_template_kwargs", {"reasoning_effort": "medium"}
+        )
+        ctk = self._prepare(monkeypatch, reasoning_effort="high")
+        assert ctk["reasoning_effort"] == "high"
+        assert ctk[EFFORT_FALLBACK_KEY] == "medium"
+
+    def test_no_floor_configured_ships_no_reserved_key(self, monkeypatch):
+        import vllm_mlx.server as srv
+
+        monkeypatch.setattr(srv, "_default_chat_template_kwargs", None)
+        ctk = self._prepare(monkeypatch, reasoning_effort="high")
+        assert EFFORT_FALLBACK_KEY not in ctk
+
+    def test_none_does_not_ship_a_floor(self, monkeypatch):
+        # "none" means enable_thinking=False, not "pick a level".
+        import vllm_mlx.server as srv
+
+        monkeypatch.setattr(
+            srv, "_default_chat_template_kwargs", {"reasoning_effort": "medium"}
+        )
+        ctk = self._prepare(monkeypatch, reasoning_effort="none")
+        assert ctk["enable_thinking"] is False
 
 
 class TestResponsesApiForwarding:
