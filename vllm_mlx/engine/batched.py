@@ -31,6 +31,7 @@ from .base import (
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..utils.reasoning_effort import (
+    EFFORT_FALLBACK_KEY,
     HARMONY_EFFORT_LEVELS,
     normalize_effort_in_template_kwargs,
     normalize_reasoning_effort,
@@ -734,6 +735,7 @@ class BatchedEngine(BaseEngine):
                 _reasoning_effort = normalize_reasoning_effort(
                     chat_template_kwargs.get("reasoning_effort"),
                     HARMONY_EFFORT_LEVELS,
+                    fallback=chat_template_kwargs.get(EFFORT_FALLBACK_KEY),
                 )
             return _harmony_render_messages(
                 messages,
@@ -783,6 +785,8 @@ class BatchedEngine(BaseEngine):
             # Normalize reasoning_effort against this template's own vocabulary
             # before it can reach a raise_exception (#76). Processors don't
             # always carry the template, so fall back to the tokenizer's.
+            # Read the route's floor before normalizing — the helper pops it.
+            _effort_floor = template_kwargs.get(EFFORT_FALLBACK_KEY)
             normalize_effort_in_template_kwargs(
                 template_kwargs,
                 getattr(template_applicator, "chat_template", None)
@@ -816,7 +820,10 @@ class BatchedEngine(BaseEngine):
                     return template_applicator.apply_chat_template(messages, **tk)
 
             return render_with_effort_fallback(
-                _render, template_kwargs, model_name=self._model_name
+                _render,
+                template_kwargs,
+                model_name=self._model_name,
+                fallback=_effort_floor,
             )
         else:
             # Fallback for models without apply_chat_template

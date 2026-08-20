@@ -41,10 +41,12 @@ from .base import (
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..utils.reasoning_effort import (
+    EFFORT_FALLBACK_KEY,
     HARMONY_EFFORT_LEVELS,
     normalize_effort_in_template_kwargs,
     normalize_reasoning_effort,
     render_with_effort_fallback,
+    strip_effort_fallback,
 )
 from ..mlx_streams import (
     bind_generation_streams,
@@ -1158,7 +1160,7 @@ class SimpleEngine(BaseEngine):
 
         if self._is_mllm:
             if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
+                kwargs["chat_template_kwargs"] = strip_effort_fallback(chat_template_kwargs)
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,
@@ -1299,7 +1301,7 @@ class SimpleEngine(BaseEngine):
             )
             logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
+                kwargs["chat_template_kwargs"] = strip_effort_fallback(chat_template_kwargs)
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
@@ -1314,7 +1316,7 @@ class SimpleEngine(BaseEngine):
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
             if chat_template_kwargs:
-                local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs["chat_template_kwargs"] = strip_effort_fallback(chat_template_kwargs)
             if mllm_draft_requested:
                 local_kwargs["mllm_draft"] = True
             return local_kwargs
@@ -1440,6 +1442,7 @@ class SimpleEngine(BaseEngine):
                     _reasoning_effort = normalize_reasoning_effort(
                         chat_template_kwargs.get("reasoning_effort"),
                         HARMONY_EFFORT_LEVELS,
+                        fallback=chat_template_kwargs.get(EFFORT_FALLBACK_KEY),
                     )
                 prompt = _harmony_render_messages(
                     safe_messages,
@@ -1449,6 +1452,8 @@ class SimpleEngine(BaseEngine):
             else:
                 # Normalize reasoning_effort against this template's own
                 # vocabulary before it can reach a raise_exception (#76).
+                # Read the route's floor first — the helper pops it.
+                _effort_floor = template_kwargs.get(EFFORT_FALLBACK_KEY)
                 normalize_effort_in_template_kwargs(
                     template_kwargs, getattr(tokenizer, "chat_template", None)
                 )
@@ -1473,6 +1478,7 @@ class SimpleEngine(BaseEngine):
                     _render_prompt,
                     template_kwargs,
                     model_name=self._model_name,
+                    fallback=_effort_floor,
                 )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -2287,7 +2293,9 @@ class SimpleEngine(BaseEngine):
         safe_messages = normalize_messages_for_chat_template(messages)
 
         # Normalize reasoning_effort against this template's own vocabulary
-        # before it can reach a raise_exception (#76).
+        # before it can reach a raise_exception (#76). Read the route's floor
+        # first — the helper pops it.
+        _effort_floor = template_kwargs.get(EFFORT_FALLBACK_KEY)
         normalize_effort_in_template_kwargs(
             template_kwargs, getattr(text_tokenizer, "chat_template", None)
         )
@@ -2306,7 +2314,10 @@ class SimpleEngine(BaseEngine):
                 return text_tokenizer.apply_chat_template(safe_messages, **tk)
 
         full_prompt = render_with_effort_fallback(
-            _render_full_prompt, template_kwargs, model_name=self._model_name
+            _render_full_prompt,
+            template_kwargs,
+            model_name=self._model_name,
+            fallback=_effort_floor,
         )
 
         sampler = make_sampler(
