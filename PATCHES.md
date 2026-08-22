@@ -1710,3 +1710,129 @@ Qwen3.8-27B degenerates in agentic sessions into exact repeating token cycles ("
 **Config** (env, mirroring the DRY rails — gateway `extra_body` is proven not to reach the engine): `VLLM_MLX_REPDETECT=1` to enable (default off), `VLLM_MLX_REPDETECT_{WINDOW,MIN_PERIOD,MAX_PERIOD,MIN_REPEATS,MIN_SPAN,INTERVAL,MIN_TOKENS}` to tune. Scope: BatchedEngine `_generation_step` only — the MTP decode path (`_mtp_next`, off on all production routes) does not run the detector.
 
 **Verification:** `tests/test_repetition_stop.py` (24 tests: detection shapes incl. rotation and multi-line cycles, near-variant limitation documented, span/interval/min-tokens gating, per-uid isolation, env parsing + sanitization, disabled no-op, perf smoke, wiring smoke). Full batched regression: `test_batched_engine`, `test_batched_dry`, `test_batched_per_request_sampling`, `test_batched_stop_strings`, `test_batched_flip_enablement`, `test_batched_engine_mllm_config`, `test_metrics` — all green.
+
+## 78. `patch: mlx-lm-0.32-pin` — production pin, and its CEILING
+
+**DEPLOYED to the Mac Studio 2026-08-22** (this entry documents production
+reality; the fork code change is only the `classify_layers` guard below). The
+Studio runs mlx-lm **`0.32.0@9acef5f`** + mlx/mlx-metal **0.32.1** installed
+over the fork. Rollback: `mlx==0.32.0`, `mlx-metal==0.32.0`, `mlx-lm==0.31.3`,
+`mlx-vlm==0.6.14`, fork `2ef2e06`. Suite on the box: 3018 passed / 29 skipped
+(the 5 `test_mcp_security` failures there are just missing Node — `npx` is not
+in PATH on the Studio, unrelated to the pin).
+
+**Why pin a git commit at all:** there has been no mlx-lm release since April,
+and the 0.31.3 → `9acef5f` window carries fixes we want — `3412b2d`
+(qwen3_coder drops tool calls with float-formatted integer args) and `9acef5f`
+(qwen3_coder fallback for invalid JSON values), both on the tool parser our
+production routes use, plus `43032ff` (strip trailing newline from GLM
+tool-call name) and `d06c537` (MLX 0.32.1).
+
+**IMPORTANT — the original rationale was WRONG and is withdrawn.** This pin was
+taken believing `4eeaf20` (mlx-lm#1623) fixed a double `gamma + 1` RMSNorm shift
+that was corrupting Qwen3.8 at load. It does not, for the checkpoints this fleet
+serves: `mlx-community/Qwen3.8-27B-{4bit,8bit}` contain **zero `mtp` keys** and
+their conv1d is already MLX-layout `[10240, 4, 1]`, so both the pre- and
+post-fix predicates evaluate to False. Verified at tensor level — calling the
+real `TextModel.sanitize` from `4eeaf20^` and `9acef5f` against 40 real tensors
+per checkpoint gives **bit-identical output**, and the norm means (~0.91–0.94)
+sit correctly near 1.0 where a double shift would read ~1.9. Every cached
+qwen3_5-family model reports `has_mtp_weights=False`, so `4eeaf20` is inert
+fleet-wide. The pin is retained on the tool-parser fixes above, not as a
+looping fix.
+
+**CEILING — do not bump past `9acef5f`.** Two commits later, `11a6ce7`
+(mlx-lm#1632) changes `ArraysCache.state` from a bare list to
+`(cache, left_padding, lengths)`. The system-KV stack identifies recurrent
+layers by state *shape* (`isinstance(st, list)`) across `system_kv.py`,
+`batched_system_kv.py`, `system_kv_ssd.py` and `ssd_cache.py`'s serializer
+dispatch; a 3-tuple matches neither `ckpt` (list) nor `trim` (2-tuple) and
+classifies as **`opaque`**, which refuses partial restore — 29 suite failures,
+and since Qwen3.8 is hybrid it would silently destroy the prefix cache on the
+fleet's busiest route. A version bound cannot express this (both `9acef5f` and
+tip report `0.32.0`), and `pyproject.toml`'s floor **stays at `>=0.31.3`**: it was
+briefly raised to `>=0.32.0`, but mlx-lm has not released since April so that
+bound is unsatisfiable from PyPI and made the package uninstallable (CI caught
+it). The raise was also justified by the premise disproved above — 0.31.3 does
+not corrupt our checkpoints — so there is nothing to exclude. `classify_layers` therefore emits a
+one-shot `logger.error` when a recurrent layer stops presenting a list state, so
+crossing the ceiling is loud instead of a silent fleet-wide cache loss.
+
+**Operational note (cost an outage):** `anyio` is a **production** dependency
+(fastapi/starlette need it) even though the fork also lists it under dev extras.
+Removing it alongside pytest broke every route spawn with
+`ImportError: cannot import name 'ObjectReceiveStream' from 'anyio.abc'` — at
+import time, before any model code, so it presents as a model failure.
+Already-running routes survive (module in memory); only new spawns die. The
+Studio's validated pair is `anyio==4.13.0` with `fastapi==0.135.3`.
+
+---
+
+## 79. `patch: thinking-processor-skips-the-prompt` — the phase machine must not walk the prompt
+
+**Files:** `vllm_mlx/constrained/thinking_processor.py`,
+`tests/test_thinking_processor_prompt_skip.py` (new),
+`tests/test_thinking_processor.py` (convention made explicit)
+
+`ThinkingAwareLogitsProcessor` assumed the `tokens` argument contained only
+GENERATED tokens. On the batched path it does not: mlx-lm's
+`BatchGenerator.prompt()` folds prompt tokens into the sequence it hands
+processors ("*Add the tokens to the self.tokens so they represent the tokens
+contained in the KV Cache*"), so the phase machine walked the **prompt**.
+
+That is not a cosmetic miscount. Any prompt replaying an earlier
+`<think>…</think>` span — i.e. **every multi-turn agent conversation** — drove
+the machine to `CONTENT` before the first token was generated, and `CONTENT`
+masks `<think>`/`</think>` to `-inf`. The model was then *physically unable to
+close its own think block*.
+
+**Measured on Qwen3.8-27B-4bit** with the processor instrumented, a 448-token
+prompt from a tool-replay history:
+
+```
+[dbg-sync] FIRST sync: n_tokens=448  end_token_in_seq=[103, 181, 217]
+                                     start_token_in_seq=[95, 180, 216, 446]
+                                     phase_before=Phase.THINKING
+[dbg-sync] after sync: processed=448 phase=Phase.CONTENT thinking_tokens=103
+```
+
+Every downstream symptom follows from that one line, which is why this had
+resisted several wrong diagnoses:
+
+- `reasoning_content` empty, the whole answer in `content` — the reasoning
+  parser needs a closer in the OUTPUT to split, and the closer was masked.
+- The thinking budget looked "inert" — already in `CONTENT`, so it never
+  counted a generated token.
+- Runs to `max_tokens` — nothing bounds a think span that cannot end.
+- **Hallucinated scaffold** (`<next_thinking>` tags, stray `";}` fragments):
+  vocabulary that exists nowhere in the template, fork or mlx-lm. The model is
+  reaching for a closer it is forbidden to emit and improvises training-time
+  structure instead.
+- Single-turn prompts worked *by luck* — no prior `</think>` to trip on.
+
+**Fix.** The machine now walks generated tokens only. Two call conventions
+exist and both are handled from an observable signal:
+
+| path | first call | handling |
+|---|---|---|
+| batched / mlx-lm | full sequence (prompt already folded in) | first call IS the prompt; skip it |
+| MLLM scheduler | empty (`mllm_batch_generator` passes `output_tokens`) | empty call records `prompt_len = 0`; skip nothing |
+
+A freshly-built processor has by definition seen no generated tokens, so
+whatever arrives on the first sync is prompt — unless an empty call already
+declared the generated-only convention.
+
+**Verification.** Live on the Studio, case-B (tool-replay) shape, temp 0, route
+default budget, instrumented build on a spare port:
+
+| | before | after |
+|---|---|---|
+| alpha | reason=**0**, content=1666 | reason=**1666**, content=9859 |
+| bravo | reason=**0**, content=4108 | reason=**4108**, content=8128 |
+
+The exact byte counts that were being dumped into `content` move into
+`reasoning_content`, the phase machine stays `THINKING` counting from 1, and
+`has_close` goes 0 → 1 (the model can emit `</think>` again). Suite: **2903
+passed / 24 skipped / 30 deselected**, including 21 pre-existing
+`test_thinking_processor.py` tests which now declare the generated-only
+convention explicitly with a leading empty call.

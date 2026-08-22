@@ -87,6 +87,7 @@ class ThinkingAwareLogitsProcessor:
         "_snapshots",
         "watchdog_was_enforced",
         "_no_final_content_token_limit",
+        "_prompt_len",
     )
 
     def __init__(
@@ -124,6 +125,9 @@ class ThinkingAwareLogitsProcessor:
                 self._state = Phase.THINKING
         else:
             self._state = Phase.IDLE
+        # Set on the first sync: mlx-lm hands processors the FULL sequence,
+        # so we have to learn where the prompt ends. See _sync_to_tokens.
+        self._prompt_len: int | None = None
         self._processed_len = 0
         self._processed_token_ids: list[int] = []
         self._snapshots = [self._snapshot_state()]
@@ -149,6 +153,13 @@ class ThinkingAwareLogitsProcessor:
         # The MLLM scheduler applies processors before the first completion
         # token is emitted, so ``tokens`` can be empty on step 0.
         if tokens.size == 0:
+            # An empty first call marks the generated-only convention (the MLLM
+            # scheduler applies processors before the first completion token).
+            # Callers on that path never send the prompt, so there is nothing to
+            # skip; recording 0 stops _sync_to_tokens treating their first real
+            # batch of GENERATED tokens as prompt.
+            if self._prompt_len is None:
+                self._prompt_len = 0
             if self._state == Phase.TRANSITIONING:
                 return self._force_transition(logits)
             if self._state == Phase.CONTENT:
@@ -209,7 +220,12 @@ class ThinkingAwareLogitsProcessor:
         # If rollback targets a CONTENT position beyond the snapshot list,
         # use the last available snapshot -- the state is identical since
         # _advance_with_token is a no-op in CONTENT.
-        snap_idx = min(processed_len, len(self._snapshots) - 1)
+        # Snapshots are indexed by GENERATED position: snapshots[0] is the state
+        # at the prompt boundary, since the prompt is skipped wholesale in
+        # _sync_to_tokens. Subtract the prompt length before indexing, or a
+        # rollback restores a snapshot from the wrong point in the generation.
+        generated_len = max(processed_len - (self._prompt_len or 0), 0)
+        snap_idx = min(generated_len, len(self._snapshots) - 1)
         (
             self._state,
             self._thinking_tokens,
@@ -227,6 +243,29 @@ class ThinkingAwareLogitsProcessor:
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
         token_ids = tokens.tolist()
+
+        # mlx-lm passes the FULL sequence (prompt + generated) to a logits
+        # processor. The phase machine must only ever walk GENERATED tokens.
+        #
+        # Walking the prompt is not a cosmetic miscount: any prompt replaying an
+        # earlier ``<think>...</think>`` span -- i.e. every multi-turn agent
+        # conversation -- drove the machine to CONTENT before the first token
+        # was generated. CONTENT masks ``<think>``/``</think>`` to -inf, so the
+        # model was then physically unable to close its own think block: the
+        # reasoning parser found no closer, dumped the whole answer into
+        # ``content`` with ``reasoning_content`` empty, the budget never
+        # engaged (already CONTENT), and generation ran to ``max_tokens``.
+        # Measured on Qwen3.8-27B-4bit: a 448-token prompt carried </think> at
+        # index 103, so the machine reached CONTENT with thinking_tokens=103
+        # before generation began.
+        #
+        # A freshly-built processor has by definition seen no generated tokens,
+        # so whatever is present on the first sync is prompt.
+        if self._prompt_len is None:
+            self._prompt_len = target_len
+            self._processed_len = target_len
+            self._processed_token_ids = list(token_ids)
+            return
         common_len = 0
         max_common = min(target_len, self._processed_len)
         while (
@@ -235,7 +274,12 @@ class ThinkingAwareLogitsProcessor:
         ):
             common_len += 1
         if common_len < self._processed_len:
-            self._restore_snapshot(common_len)
+            # Never roll back INTO the prompt. Those tokens were deliberately
+            # skipped above and must never be walked by the phase machine; a
+            # rewind past the prompt boundary would re-run the exact bug this
+            # guard exists to prevent. Within one request the prompt is fixed,
+            # so this clamp is defensive rather than load-bearing.
+            self._restore_snapshot(max(common_len, self._prompt_len or 0))
         if target_len == self._processed_len:
             return
         for token_id in token_ids[self._processed_len :]:
