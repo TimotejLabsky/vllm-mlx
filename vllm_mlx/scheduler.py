@@ -283,12 +283,6 @@ def _install_chunked_prefill(
     # Partial prefill state (None when no prefill in progress)
     batch_gen._partial = None
 
-    # Repetition-detection stop (env-gated: VLLM_MLX_REPDETECT=1).
-    # Ends a request whose generated tail is an exact repeating token
-    # cycle instead of letting it burn to max_tokens. See
-    # repetition_stop.py for the mechanism and env knobs.
-    batch_gen._repstop = RepetitionStopTracker()
-
     # Monkey-patch _process_prompts to capture prompt-only cache state.
     # At the point where _process_prompts returns, the Batch cache contains
     # the exact prompt-only state: all prompt tokens have been processed
@@ -344,40 +338,16 @@ def _install_chunked_prefill(
             cache_out = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
-            rep_hit = (
-                self._repstop.observe(uid, t, num_tok)
-                if self._repstop.enabled
-                else None
-            )
             if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
                 finish_reason = "length"
                 end_idx.append(e)
-            elif rep_hit is not None:
-                # Generated tail is an exact repeating cycle — end the
-                # request now instead of burning to max_tokens. Reported
-                # as "stop" for OpenAI-client compatibility; the log line
-                # and vllm_mlx_repetition_stops_total carry the detail.
-                finish_reason = "stop"
-                end_idx.append(e)
-                logger.warning(
-                    f"[repetition-stop] uid={uid}: period={rep_hit[0]} "
-                    f"tokens x {rep_hit[1]} repeats at {num_tok} "
-                    f"generated tokens — forcing stop"
-                )
-                try:
-                    from .metrics import metrics as _rs_metrics
-
-                    _rs_metrics.observe_repetition_stop()
-                except Exception:
-                    pass
             else:
                 finish_reason = None
                 keep_idx.append(e)
             if finish_reason is not None:
-                self._repstop.discard(uid)
                 cache_out = batch.extract_cache(e)
             responses.append(
                 self.Response(uid, t, logprobs[e], finish_reason, cache_out)
@@ -388,7 +358,6 @@ def _install_chunked_prefill(
                 batch.filter(keep_idx)
             else:
                 self.active_batch = None
-                self._repstop.clear()
 
         self._stats.generation_tokens += len(responses)
         return responses
@@ -722,8 +691,6 @@ def _install_chunked_prefill(
                 )
                 _self._partial = None
                 mx.clear_cache()  # flush Metal encoders after dropping partial state
-        for _uid in uids_to_remove:
-            _self._repstop.discard(_uid)
         _orig_remove(uids_to_remove)
 
     batch_gen._next = _chunked_next
@@ -1452,6 +1419,12 @@ class Scheduler:
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
 
+        # Repetition-detection stop (env-gated: VLLM_MLX_REPDETECT=1).
+        # Lives on the scheduler, enforced in _process_batch_responses, so
+        # it covers both the legacy (fork-patched) and native mlx-lm
+        # BatchGenerator layouts. See repetition_stop.py for the knobs.
+        self._repstop = RepetitionStopTracker()
+
         # Statistics
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
@@ -2144,6 +2117,7 @@ class Scheduler:
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
                 removed_from_batch = True
+            self._repstop.discard(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
 
@@ -2757,15 +2731,58 @@ class Scheduler:
                 completion_tokens=request.num_output_tokens,
             )
 
+            # Repetition-detection stop (env-gated VLLM_MLX_REPDETECT=1):
+            # enforced here at the consumer so it works on both the legacy
+            # (fork-patched) and native mlx-lm BatchGenerator layouts — a
+            # _generation_step hook never runs on the native API.
+            finish_reason = response.finish_reason
+            if finish_reason is None and self._repstop.enabled:
+                rep_hit = self._repstop.observe(
+                    response.uid, response.token, request.num_output_tokens
+                )
+                if rep_hit is not None:
+                    # Generated tail is an exact repeating cycle — end the
+                    # request now instead of burning to max_tokens.
+                    # Reported as "stop" for OpenAI-client compatibility;
+                    # the log line and vllm_mlx_repetition_stops_total
+                    # carry the detail.
+                    finish_reason = "stop"
+                    logger.warning(
+                        f"[repetition-stop] request={request_id[:12]} "
+                        f"uid={response.uid}: period={rep_hit[0]} tokens "
+                        f"x {rep_hit[1]} repeats at "
+                        f"{request.num_output_tokens} generated tokens — "
+                        f"forcing stop"
+                    )
+                    try:
+                        from .metrics import metrics as _rs_metrics
+
+                        _rs_metrics.observe_repetition_stop()
+                    except Exception:
+                        pass
+                    # Pull the sequence out of the generator now — mirrors
+                    # _process_pending_aborts; the generator is between
+                    # steps while responses are consumed. uid/request-id
+                    # mapping cleanup follows the normal finished path.
+                    if self.batch_generator is not None:
+                        try:
+                            self.batch_generator.remove([response.uid])
+                        except Exception as e:
+                            logger.warning(
+                                f"[repetition-stop] generator remove "
+                                f"failed for uid={response.uid}: {e}"
+                            )
+
             # Check if finished
-            if response.finish_reason is not None:
-                if response.finish_reason == "stop":
+            if finish_reason is not None:
+                self._repstop.discard(response.uid)
+                if finish_reason == "stop":
                     request.set_finished(RequestStatus.FINISHED_STOPPED)
-                elif response.finish_reason == "length":
+                elif finish_reason == "length":
                     request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED)
 
                 output.finished = True
-                output.finish_reason = response.finish_reason
+                output.finish_reason = finish_reason
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
@@ -2810,7 +2827,7 @@ class Scheduler:
                 self.num_requests_processed += 1
 
                 logger.debug(
-                    f"Request {request_id} finished: {response.finish_reason}, "
+                    f"Request {request_id} finished: {finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
 
@@ -3003,6 +3020,7 @@ class Scheduler:
         # Clear UID mappings
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._repstop.clear()
 
         logger.info("Cache recovery completed")
 
@@ -3034,6 +3052,7 @@ class Scheduler:
         # Clear UID mappings (batch generator is gone)
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._repstop.clear()
 
         # Release Metal memory
         mx.clear_cache()
@@ -3375,6 +3394,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._repstop.clear()
         self._detokenizer_pool.clear()
         self._close_batch_generator()
         self._current_sampler_params = None
