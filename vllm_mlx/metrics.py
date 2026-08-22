@@ -178,6 +178,12 @@ class MetricsCollector:
                 ["model"],
                 registry=registry,
             ),
+            "repetition_stops_total": Counter(
+                "vllm_mlx_repetition_stops_total",
+                "Requests force-stopped by the repetition detector "
+                "(VLLM_MLX_REPDETECT, scheduler stop-check).",
+                registry=registry,
+            ),
             "model_loaded": Gauge(
                 "vllm_mlx_model_loaded",
                 "Whether a generation model is currently loaded.",
@@ -416,6 +422,11 @@ class MetricsCollector:
         if not self._enabled:
             return InferenceTracker(None, endpoint, stream)
         return InferenceTracker(self, endpoint, stream)
+
+    def observe_repetition_stop(self) -> None:
+        if not self._enabled or self._prom is None:
+            return
+        self._prom["repetition_stops_total"].inc()
 
     def observe_http_start(self, *, method: str, path: str) -> None:
         if not self._enabled or self._prom is None:
