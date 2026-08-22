@@ -40,7 +40,16 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.31.3",  # 0.31.3+ required by current mlx-vlm runtime support
+    # Floor stays 0.31.3 — the last PyPI RELEASE. mlx-lm has not released since
+    # April, so `>=0.32.0` is unsatisfiable from PyPI and makes this package
+    # uninstallable (CI caught exactly that). Raising it was also justified by a
+    # premise we later disproved: 0.31.3 does NOT corrupt our checkpoints (see
+    # PATCHES.md #78). Production separately pins a git commit, mlx-lm@9acef5f,
+    # and must NOT go past it — 11a6ce7 turns ArraysCache.state into a 3-tuple
+    # and silently disables partial restore on every hybrid model. That ceiling
+    # is unexpressible as a version bound (both report 0.32.0), which is what
+    # the one-shot classify_layers guard exists for.
+    "mlx-lm>=0.31.3",
     "mlx-vlm>=0.6.5",  # 0.6.5+ fixes the Qwen3.5 sanitize double-run that made 0.6.4 corrupt (upstream #674; our old pin was >=0.6.2,!=0.6.4 — superseded)
 
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)

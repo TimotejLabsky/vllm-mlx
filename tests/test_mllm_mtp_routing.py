@@ -231,6 +231,10 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
         def decode(self, tokens):
             return "".join(str(token) for token in tokens)
 
+        def encode(self, text, **_kwargs):
+            # NaiveStreamingDetokenizer probes with "a ,b" at construction.
+            return [0]
+
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduler.uid_to_request_id = {7: "req-7"}
     scheduler.running = {"req-7": MLLMRequest(request_id="req-7", prompt="prompt")}
