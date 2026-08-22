@@ -214,6 +214,109 @@ def test_scheduler_imports_tracker():
     assert hasattr(sched, "RepetitionStopTracker")
 
 
+def _bare_scheduler_with_request(cfg):
+    """A Scheduler skeleton (no model, no engine) with one running request,
+    enough for _process_batch_responses to run end to end. This exercises
+    the CONSUMER-level enforcement path — the only path that runs on the
+    native mlx-lm BatchGenerator layout (a _generation_step hook does not)."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_mlx.request import Request, SamplingParams
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = Scheduler.__new__(Scheduler)
+    request = Request(
+        request_id="req-loop-1",
+        prompt="x",
+        sampling_params=SamplingParams(max_tokens=4096),
+    )
+    request.prompt_token_ids = [1, 2, 3]
+    request.num_prompt_tokens = 3
+    request.first_token_time = 0.0
+
+    detok = SimpleNamespace(
+        add_token=lambda t: None,
+        last_segment="",
+        finalize=lambda: None,
+        text="",
+    )
+    sched.uid_to_request_id = {11: "req-loop-1"}
+    sched.running = {"req-loop-1": request}
+    sched._repstop = RepetitionStopTracker(cfg)
+    sched.batch_generator = Mock()
+    sched._store_prompt_only_cache = lambda *a, **k: None
+    sched._get_detokenizer = lambda rid: detok
+    sched._detokenizer_pool = {"req-loop-1": detok}
+    sched._cleanup_detokenizer = lambda rid: None
+    sched._decode_tokens = lambda ids: ""
+    sched.total_completion_tokens = 0
+    sched.num_requests_processed = 0
+    return sched, request
+
+
+def test_consumer_forces_stop_on_repeating_stream():
+    from types import SimpleNamespace
+
+    cfg = RepetitionStopConfig(
+        enabled=True, window=128, min_period=1, max_period=16,
+        min_repeats=3, min_span=16, interval=4, min_tokens=16,
+    ).sanitized()
+    sched, request = _bare_scheduler_with_request(cfg)
+
+    finished = None
+    for _ in range(200):
+        resp = SimpleNamespace(uid=11, token=7, finish_reason=None)
+        outputs, finished_ids = sched._process_batch_responses([resp])
+        if finished_ids:
+            finished = outputs[0]
+            break
+    assert finished is not None, "detector never fired on a pure token run"
+    assert finished.finish_reason == "stop"
+    # fired at the first on-interval check past min_tokens, far below max
+    assert request.num_output_tokens <= cfg.min_tokens + cfg.interval
+    sched.batch_generator.remove.assert_called_once_with([11])
+    assert sched._repstop._buffers == {}
+
+
+def test_consumer_leaves_varied_stream_alone():
+    from types import SimpleNamespace
+
+    cfg = RepetitionStopConfig(
+        enabled=True, window=128, min_period=1, max_period=16,
+        min_repeats=3, min_span=16, interval=4, min_tokens=16,
+    ).sanitized()
+    sched, request = _bare_scheduler_with_request(cfg)
+
+    for i in range(150):
+        resp = SimpleNamespace(uid=11, token=1000 + i, finish_reason=None)
+        outputs, finished_ids = sched._process_batch_responses([resp])
+        assert not finished_ids
+    sched.batch_generator.remove.assert_not_called()
+
+
+def test_consumer_natural_finish_discards_buffer():
+    from types import SimpleNamespace
+
+    cfg = RepetitionStopConfig(
+        enabled=True, window=128, min_period=1, max_period=16,
+        min_repeats=3, min_span=16, interval=4, min_tokens=16,
+    ).sanitized()
+    sched, request = _bare_scheduler_with_request(cfg)
+
+    for i in range(5):
+        sched._process_batch_responses(
+            [SimpleNamespace(uid=11, token=1000 + i, finish_reason=None)]
+        )
+    outputs, finished_ids = sched._process_batch_responses(
+        [SimpleNamespace(uid=11, token=99, finish_reason="stop")]
+    )
+    assert finished_ids == {"req-loop-1"}
+    assert outputs[0].finish_reason == "stop"
+    assert sched._repstop._buffers == {}
+    sched.batch_generator.remove.assert_not_called()  # natural stop: no force
+
+
 def test_metrics_observe_exists():
     from vllm_mlx.metrics import metrics
 
