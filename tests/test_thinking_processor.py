@@ -119,6 +119,7 @@ class TestThinkingProcessorLifecycle:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
         assert proc.state == Phase.IDLE
 
         # Feed start token
@@ -142,6 +143,7 @@ class TestThinkingProcessorLifecycle:
             thinking_token_budget=3,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Enter thinking
         proc(_tokens(*THINK_START), _make_logits())
@@ -169,6 +171,7 @@ class TestThinkingProcessorLifecycle:
             vocab_size=VOCAB_SIZE,
             prompt_has_think_tag=True,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
         assert proc.state == Phase.TRANSITIONING
 
         # Force transition on empty tokens
@@ -184,6 +187,7 @@ class TestThinkingProcessorLifecycle:
             vocab_size=VOCAB_SIZE,
             prompt_has_think_tag=True,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
         assert proc.state == Phase.THINKING
 
     def test_is_retired_no_inner(self):
@@ -194,6 +198,7 @@ class TestThinkingProcessorLifecycle:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
         assert not proc.is_retired
         # Drive to CONTENT
         proc(_tokens(*THINK_START, 5, *THINK_END), _make_logits())
@@ -215,6 +220,8 @@ class TestThinkingProcessorLifecycle:
             inner=fake_inner,
             vocab_size=VOCAB_SIZE,
         )
+
+        proc(_tokens(), _make_logits())  # generated-only convention
         proc(_tokens(*THINK_START, 5, *THINK_END), _make_logits())
         assert proc.state == Phase.CONTENT
         assert not proc.is_retired
@@ -234,6 +241,7 @@ class TestThinkingProcessorMultiTokenEnd:
             thinking_token_budget=2,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Enter thinking and exhaust budget
         proc(_tokens(*THINK_START, 1, 2), _make_logits())
@@ -278,6 +286,8 @@ class TestThinkingProcessorInnerDelegation:
             vocab_size=VOCAB_SIZE,
         )
 
+        proc(_tokens(), _make_logits())  # generated-only convention
+
         # Drive to CONTENT -- inner is called on this step too since the
         # processor reaches CONTENT and then __call__ delegates.
         proc(_tokens(*THINK_START, 5, *THINK_END), _make_logits())
@@ -304,6 +314,8 @@ class TestThinkingProcessorInnerDelegation:
             vocab_size=VOCAB_SIZE,
         )
 
+        proc(_tokens(), _make_logits())  # generated-only convention
+
         proc(_tokens(*THINK_START, 5, 6), _make_logits())
         assert proc.state == Phase.THINKING
         assert len(calls) == 0
@@ -323,6 +335,7 @@ class TestThinkingProcessorContentMasking:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Drive to CONTENT
         proc(_tokens(*THINK_START, 5, *THINK_END), _make_logits())
@@ -340,6 +353,7 @@ class TestThinkingProcessorContentMasking:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # In THINKING
         proc(_tokens(*THINK_START), _make_logits())
@@ -362,6 +376,7 @@ class TestThinkingProcessorRollback:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Feed: start + two thinking tokens
         proc(_tokens(*THINK_START, 5, 6), _make_logits())
@@ -381,6 +396,7 @@ class TestThinkingProcessorRollback:
             thinking_token_budget=100,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Drive to CONTENT
         proc(_tokens(*THINK_START, 5, *THINK_END), _make_logits())
@@ -406,6 +422,7 @@ class TestThinkingProcessor2DLogits:
             thinking_token_budget=1,
             vocab_size=VOCAB_SIZE,
         )
+        proc(_tokens(), _make_logits())  # generated-only convention
 
         # Enter thinking, exhaust budget
         proc(_tokens(*THINK_START, 1), _make_logits())

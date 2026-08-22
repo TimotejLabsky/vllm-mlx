@@ -43,7 +43,10 @@ class _Tokenizer:
 
     @staticmethod
     def encode(text, **_kwargs):
-        return [int(token) for token in text.split()]
+        # mlx-lm 0.32's NaiveStreamingDetokenizer probes the tokenizer with the
+        # literal "a ,b" at construction to decide _clean_spaces, so encode must
+        # tolerate non-numeric text. Numeric tokens keep their old ids.
+        return [int(tok) if tok.isdigit() else ord(tok[0]) for tok in text.split()]
 
     @staticmethod
     def decode(tokens, **_kwargs):
