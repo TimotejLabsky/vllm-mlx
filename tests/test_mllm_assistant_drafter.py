@@ -223,6 +223,13 @@ def test_simple_engine_text_route_stays_default_when_mllm_drafter_configured():
     )
 
 
+@pytest.mark.skip(
+    reason="Fork-hygiene: upstream #669 wires an assistant drafter through the "
+    "engine/simple.py rewrite this fork rejects wholesale (#541/#579). SimpleEngine "
+    "accepts default_mllm_draft so the shared plumbing works but REFUSES to enable "
+    "it (reject-or-implement, no silent no-op), which is what these assert against. "
+    "BatchedEngine implements it and is what every fleet route uses."
+)
 def test_simple_engine_defaults_configured_drafter_on_but_allows_opt_out():
     from vllm_mlx.engine.simple import SimpleEngine
 
@@ -262,6 +269,13 @@ def test_mllm_drafter_defaults_on_and_request_can_opt_out():
     assert model._draft_generation_kwargs({"mllm_draft": False}) == {}
 
 
+@pytest.mark.skip(
+    reason="Fork-hygiene: upstream #669 wires an assistant drafter through the "
+    "engine/simple.py rewrite this fork rejects wholesale (#541/#579). SimpleEngine "
+    "accepts default_mllm_draft so the shared plumbing works but REFUSES to enable "
+    "it (reject-or-implement, no silent no-op), which is what these assert against. "
+    "BatchedEngine implements it and is what every fleet route uses."
+)
 def test_simple_engine_reports_configured_mllm_drafter_status():
     from vllm_mlx.engine.simple import SimpleEngine
 
@@ -372,6 +386,13 @@ async def test_simple_engine_forwards_mllm_draft_opt_in_to_mllm_path():
 
 
 @pytest.mark.anyio
+@pytest.mark.skip(
+    reason="Fork-hygiene: upstream #669 wires an assistant drafter through the "
+    "engine/simple.py rewrite this fork rejects wholesale (#541/#579). SimpleEngine "
+    "accepts default_mllm_draft so the shared plumbing works but REFUSES to enable "
+    "it (reject-or-implement, no silent no-op), which is what these assert against. "
+    "BatchedEngine implements it and is what every fleet route uses."
+)
 async def test_simple_engine_forwards_mllm_draft_opt_out_to_media_path():
     from vllm_mlx.engine.simple import SimpleEngine
 
