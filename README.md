@@ -1,44 +1,123 @@
 # vllm-mlx (TimotejLabsky fork)
 
-> ⚠️ **This is a fork** of [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx),
-> maintained for the homelab at
-> [`TimotejLabsky/personal-infratructure`](https://github.com/TimotejLabsky/personal-infratructure).
+> ⚠️ **This is a personal fork** of [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx),
+> maintained for a single home-lab Mac Studio that serves a small model fleet
+> behind [llama-swap](https://github.com/mostlygeek/llama-swap).
 >
-> The `main` branch of this fork carries a series of local patches on
-> top of upstream `7e304840`. Each patch is a separate commit prefixed
-> `patch:`. The branch is periodically rebased on `waybarrios/main` to
-> pick up upstream changes.
+> For general use you almost certainly want
+> [upstream](https://github.com/waybarrios/vllm-mlx), not this fork.
+
+## What this fork is
+
+A **patch stack**, not a feature branch. `main` carries ~135 local patches on top
+of upstream [`4b654c0`](https://github.com/waybarrios/vllm-mlx/commit/4b654c0);
+each is a separate commit prefixed `patch:`, and the branch is periodically
+rebased onto `waybarrios/main` to pick up upstream changes. Fixes that are
+generally useful get cherry-picked from upstream PRs or prepared as upstreaming
+branches; several have since merged upstream and been retired from the stack.
+The rest are home-lab-specific and stay here.
+
+The deployment it is tuned for is one box, one GPU memory pool, many models
+swapped in and out on demand, and long multi-turn agent sessions (Claude Code,
+coding agents, chat bots) hitting the same prompt prefixes over and over. That
+shapes every patch: **cache the prefix aggressively, never OOM the GPU, fail
+loudly instead of hanging.**
+
+## What the patches actually add
+
+**Hybrid-safe prefix caching ("system-KV").** Upstream's prefix cache gets zero
+hits on hybrid attention+SSM models (Qwen3-Next, Qwen3.5/3.6/3.8 — most of the
+lineup here) because their `ArraysCache` state can't be hashed or sliced the way
+an attention KV cache can. The fork replaces it with a checkpoint/snapshot cache
+that works on both: multi-slot LRU across concurrent conversations, grow-on-HIT
+so a warm chain extends instead of re-prefilling, partial restore for divergent
+branches, a RAM budget on the resident slot set, and an SSD tier so caches
+survive restarts and model swaps. Lives in fork-owned modules —
+`vllm_mlx/system_kv.py`, `system_kv_ssd.py`, `batched_system_kv.py`.
+
+**BatchedEngine made usable for this fleet.** The batched (continuous-batching)
+path got the same hybrid-safe cache plus the pieces it was missing: `--text-only`
+support, stop-string enforcement, per-request sampling parameters, the DRY
+sampler, segmented snapshots (O(delta) stores instead of an O(context) copy per
+turn), an SSD cold tier, and dynamic concurrency where batch seats float on a
+measured KV-byte budget instead of a fixed count. **Since 2026-07-09 the entire
+text fleet runs BatchedEngine**; vision routes stay on the mlx-vlm path and
+embeddings on their own route.
+
+**Memory-pressure survival.** Deep-context prefill on a 27B model would ramp GPU
+memory into the hard ceiling and crash mid-request. The fork watches peak memory
+per step, sheds cache slots and clears the MLX buffer cache before the ceiling
+rather than after, and rejects prompts past a per-route measured token envelope
+with a non-retryable `400 prompt_too_long` instead of dying.
+
+**Correct reasoning and tool-call behaviour for agent clients.** Per-request
+`reasoning_effort` normalized against each model's own chat-template vocabulary;
+a thinking-token budget that actually binds; reasoning-parser correctness when
+thinking is disabled; a detector that ends degenerate repetition loops at the
+scheduler; and several tool-parser fixes. Agent replay shapes (an assistant turn
+carrying `tool_calls` but no reasoning) are a first-class test case here, because
+that is what broke in practice.
+
+**Reliability and operational fixes.** Admission control on the serialized route
+(503 rather than a silent lock wait), lazy MLX array realization on the load
+thread (the cross-thread stream crash that took out gpt-oss and Gemma text
+routes), a `GET /` route for llama-swap's preload probe, and extra `/v1/status`
++ Prometheus gauges for cache hit rate, memory pressure, eviction timing, and
+admission.
+
+## Recent changes
+
+> **2026-08-23 — the thinking phase machine no longer walks the prompt**
+> (PATCHES.md #79). `ThinkingAwareLogitsProcessor` assumed it only saw generated
+> tokens, but mlx-lm hands logits processors the full sequence. Any prompt
+> replaying an earlier `<think>…</think>` span — i.e. every multi-turn agent
+> conversation — drove it to CONTENT before the first generated token, where it
+> masks `</think>` to `-inf`, leaving the model unable to close its own think
+> block. Reasoning then landed in `content`, the budget never engaged, and turns
+> ran to `max_tokens`.
 >
-> See [`PATCHES.md`](PATCHES.md) for the full patch list with rationale,
-> measurements, and upstreaming candidates.
-> See [`docs/fork/`](docs/fork/) for fork design docs and investigations
-> (e.g. why we run SimpleEngine + system-KV instead of continuous batching).
-> See [`NOTICE`](NOTICE) for Apache License 2.0 attribution.
+> **2026-08-22 — mlx-lm pinned to a git commit** (PATCHES.md #78) for two
+> qwen3_coder tool-parser fixes and a GLM tool-name fix. The pin is also a
+> **ceiling**: a later mlx-lm commit changes `ArraysCache.state` to a 3-tuple,
+> which the system-KV stack would classify as opaque and silently stop caching
+> hybrid models. A one-shot `logger.error` makes crossing it loud.
+>
+> **2026-08-22 — repetition-detection stop** (PATCHES.md #77): degenerate exact
+> repetition cycles are ended at the scheduler's stop-check rather than burning
+> to `max_tokens`. Default-off, `VLLM_MLX_REPDETECT=1` to arm.
 >
 > **2026-08-19 — per-request reasoning effort** (PATCHES.md #76): the OpenAI
-> `reasoning_effort` parameter (and Responses `reasoning.effort`) now reaches
-> the chat template instead of being dropped for every value except `none`.
-> Values are normalized against each model's own template vocabulary — `high`
-> becomes `xhigh` on Qwen3.8, `xhigh` becomes `high` on gpt-oss/harmony — and
-> anything still unsupported is dropped rather than allowed to hit the
-> template's `raise_exception` as an HTTP 500.
+> `reasoning_effort` parameter (and Responses `reasoning.effort`) reaches the
+> chat template instead of being dropped for every value except `none`. Values
+> resolve **exact vocabulary match → route floor → nearest neighbour → drop**,
+> so an unsupported level degrades to the operator's configured floor rather
+> than to the template default — and never reaches `raise_exception` as a 500.
 >
 > **2026-08-18 — fail-closed structured output** (PATCHES.md #73, upstream
-> PR #636 adapted): strict `json_schema` now decodes under a request-local
+> PR #636 adapted): strict `json_schema` decodes under a request-local
 > llguidance token mask (schema-aware EOS, fail-closed on setup errors),
 > `json_object` requires an object root, and streaming structured requests
 > validate server-side before HTTP 200.
 >
 > **2026-07-28 — hardened batched vision serving** (PATCHES.md #54–#67):
-> the continuous-batching MLLM stack now carries the fork's full rail set —
 > image-safe prefix caching, per-row MRoPE correctness for glm4v/qwen3_vl
 > families (real-model byte-compare gates), memory-pressure relief with
 > vision-encode bracketing, queue cap / prompt ceiling / media limits with
-> honest 400s (text-only routes no longer silently drop images), and
-> stats/Prometheus parity.
->
-> Upstream is [`waybarrios/vllm-mlx`](https://github.com/waybarrios/vllm-mlx)
-> — for general use you almost certainly want that, not this fork.
+> honest 400s, and stats/Prometheus parity.
+
+## Fork documentation
+
+- [`PATCHES.md`](PATCHES.md) — **single source of truth**: every patch with
+  rationale, measurements, rebase history, and upstreaming status.
+- [`docs/fork/`](docs/fork/) — design docs and investigations, e.g.
+  [`continuous-batching-hybrid-caching.md`](docs/fork/continuous-batching-hybrid-caching.md)
+  (why the stock batched prefix cache gets zero hits on hybrid models, and how
+  the fork's own batched cache fixed it).
+- [`NOTICE`](NOTICE) — Apache License 2.0 attribution.
+
+Everything below this line is upstream's README.
+
+---
 
 **Continuous batching + OpenAI + Anthropic APIs in one server. Native Apple Silicon inference.**
 
