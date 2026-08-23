@@ -3715,8 +3715,11 @@ class Scheduler:
                 self._ssd_tier = None
             logger.info("SSD cache tier closed")
 
-        if self.hybrid_kv is not None:
-            self.hybrid_kv.close()
+        # getattr: upstream's lifecycle tests build partially-initialised
+        # Schedulers that never ran the hybrid_kv init.
+        hybrid = getattr(self, "hybrid_kv", None)
+        if hybrid is not None:
+            hybrid.close()
 
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
