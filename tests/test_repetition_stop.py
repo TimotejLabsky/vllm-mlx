@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 
 from vllm_mlx.repetition_stop import (
     RepetitionStopConfig,
