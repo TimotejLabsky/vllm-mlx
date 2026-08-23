@@ -421,7 +421,7 @@ class BatchedEngine(BaseEngine):
         if (
             self._scheduler_config
             and self._scheduler_config.enable_mtp
-            and self._mllm_draft_model is None
+            and getattr(self, "_mllm_draft_model", None) is None
         ):
             self._inject_mtp_mllm()
 
@@ -507,7 +507,7 @@ class BatchedEngine(BaseEngine):
 
         # Create and start MLLM scheduler
         scheduler_kwargs = {}
-        if self._mllm_draft_model is not None:
+        if getattr(self, "_mllm_draft_model", None) is not None:
             scheduler_kwargs = {
                 "draft_model": getattr(self._mllm_instance, "_draft_model", None),
                 "draft_kind": self._mllm_draft_kind,
@@ -1001,7 +1001,14 @@ class BatchedEngine(BaseEngine):
                 # _merge_dry_processor already popped logits_processors out of
                 # kwargs, so the fork's merged local wins over upstream's pop.
                 logits_processors=logits_processors,
-                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                mllm_draft=bool(
+                    kwargs.pop(
+                        "mllm_draft",
+                        # getattr: fork tests build engines via __new__ and set
+                        # only what they exercise.
+                        getattr(self, "_default_mllm_draft", False),
+                    )
+                ),
             )
 
             # Stop STRINGS are token-id-blind in the batched schedulers;
@@ -1115,7 +1122,14 @@ class BatchedEngine(BaseEngine):
                 # _merge_dry_processor already popped logits_processors out of
                 # kwargs, so the fork's merged local wins over upstream's pop.
                 logits_processors=logits_processors,
-                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                mllm_draft=bool(
+                    kwargs.pop(
+                        "mllm_draft",
+                        # getattr: fork tests build engines via __new__ and set
+                        # only what they exercise.
+                        getattr(self, "_default_mllm_draft", False),
+                    )
+                ),
             )
 
             # Stop STRINGS are token-id-blind in the batched schedulers;
@@ -1446,7 +1460,7 @@ class BatchedEngine(BaseEngine):
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
-            if self._mllm_draft_model is not None:
+            if getattr(self, "_mllm_draft_model", None) is not None:
                 mtp_stats = stats.setdefault("mtp", {})
                 mtp_stats.setdefault("enabled", True)
                 mtp_stats.setdefault("implementation", "external_assistant")

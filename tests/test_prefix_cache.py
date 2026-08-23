@@ -597,7 +597,9 @@ class TestMLLMCompletionCacheStore:
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
         request = SimpleNamespace(
-            request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
+            request_id="saturated",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            has_media=False,
         )
         batch = SimpleNamespace(
             requests=[request],
@@ -627,7 +629,9 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
-        request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
+        request = SimpleNamespace(
+            request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]), has_media=False
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[4],
@@ -654,7 +658,9 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
-        request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
+        request = SimpleNamespace(
+            request_id="plain", input_ids=mx.array([[1, 2, 3]]), has_media=False
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[1],

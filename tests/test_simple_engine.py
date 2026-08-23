@@ -1540,6 +1540,11 @@ class TestSimpleEngineConcurrency:
         assert outputs[-1].new_text == "ok"
         assert outputs[-1].finished is True
 
+    @pytest.mark.skip(
+        reason="Fork-hygiene: exercises upstream's _generation_worker / lazy "
+        "text-model hooks, which live in the engine/simple.py rewrite this fork "
+        "rejects wholesale (#541/#579 precedent)."
+    )
     @pytest.mark.anyio
     async def test_start_keeps_text_routing_for_mllm_without_mtp(self):
         """MLLM text-only routing must stay available when MTP is disabled."""
@@ -1908,6 +1913,11 @@ class TestSimpleEngineConcurrency:
         assert model.loaded is True
         assert engine._text_model is None
 
+    @pytest.mark.skip(
+        reason="Fork-hygiene: exercises upstream's _generation_worker / lazy "
+        "text-model hooks, which live in the engine/simple.py rewrite this fork "
+        "rejects wholesale (#541/#579 precedent)."
+    )
     @pytest.mark.anyio
     async def test_non_draft_request_lazily_initializes_mllm_text_model(self):
         """An explicit draft opt-out retains the existing text-only route."""
@@ -2577,6 +2587,11 @@ class TestSimpleEngineConcurrency:
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
         tokenizer.encode.assert_not_called()
 
+    @pytest.mark.skip(
+        reason="Fork-hygiene: exercises upstream's _generation_worker / lazy "
+        "text-model hooks, which live in the engine/simple.py rewrite this fork "
+        "rejects wholesale (#541/#579 precedent)."
+    )
     @pytest.mark.anyio
     async def test_stream_generate_text_normal_path_uses_generation_worker(self):
         """VLM-derived TextModel generation must run on the pinned worker."""

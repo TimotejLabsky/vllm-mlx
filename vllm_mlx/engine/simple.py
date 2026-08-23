@@ -14,7 +14,7 @@ import os
 import threading
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -183,6 +183,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache: bool = False,
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -249,6 +250,22 @@ class SimpleEngine(BaseEngine):
                 "on by default for SimpleEngine text routes)"
             )
         del prefix_trie_cache_size, prefix_trie_cache_memory_mb
+
+        # Upstream #669 (`4b654c0`) enables a configured MLLM assistant drafter
+        # by default and forwards the flag to BOTH engines from server.py. This
+        # fork rejects upstream's engine/simple.py wholesale (#541/#579
+        # precedent), so the drafter semantics are not implemented here. Accept
+        # the kwarg so the shared plumbing keeps working, but refuse to enable
+        # it rather than silently ignore it — same reject-or-implement rule as
+        # prefix_trie_cache above. MTP/drafters are off fleet-wide anyway
+        # (measured dead on M-series), so nothing serves this today.
+        if default_mllm_draft:
+            raise ValueError(
+                "--default-mllm-draft is not supported on SimpleEngine in this "
+                "fork: upstream's assistant-drafter path lives in the "
+                "engine/simple.py rewrite this fork rejects. Use BatchedEngine "
+                "(--continuous-batching), which implements it."
+            )
 
         # SpecPrefill config
         self._specprefill_enabled = specprefill_enabled
@@ -630,6 +647,12 @@ class SimpleEngine(BaseEngine):
         # Release the system-KV snapshot stack (active slot + LRU bag +
         # counters + SSD store) — see SystemKVManager.reset().
         self._system_kv.reset()
+        # Release MLX's Metal buffer cache. Dropping Python references frees
+        # objects but NOT the retained GPU buffers, so without this an
+        # idle-unload reclaims no device memory — load-bearing since upstream
+        # #638 (auto-unload-idle-seconds). Wanted upstream delta, restored
+        # after the wholesale simple.py reject.
+        mx.clear_cache()
         # Put back the generation-stream globals the worker rebound; the
         # worker thread retires with the engine.
         _restore_original_generation_streams()

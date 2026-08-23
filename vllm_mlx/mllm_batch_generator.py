@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .memory_pressure import PressureManager
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
@@ -1964,8 +1964,12 @@ class MLLMBatchGenerator:
         """
         if not candidates:
             return [], 0
-        hot = self._pressure.under_pressure()
-        media_budget = max(1, int(self.prefill_batch_size or 1))
+        # getattr: upstream's guard tests build generators via __new__ and
+        # set only the attributes they exercise, so the fork's
+        # pressure/budget state can legitimately be absent.
+        pressure = getattr(self, "_pressure", None)
+        hot = pressure.under_pressure() if pressure is not None else False
+        media_budget = max(1, int(getattr(self, "prefill_batch_size", 0) or 1))
         selected: List[MLLMBatchRequest] = []
         media_taken = 0
         deferred_hot = 0
