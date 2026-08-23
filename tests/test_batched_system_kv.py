@@ -9,7 +9,6 @@ scheduler hooks with mocks.
 from unittest.mock import MagicMock
 
 import mlx.core as mx
-import pytest
 from mlx_lm.models.cache import ArraysCache, KVCache
 
 from vllm_mlx.batched_system_kv import BatchedSystemKV, batched_system_kv_enabled
