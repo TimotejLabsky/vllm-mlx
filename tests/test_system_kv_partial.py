@@ -573,3 +573,95 @@ def test_stats_active_carries_enabled_flag():
     s = m.stats()
     assert s is not None and s["enabled"] is True
     assert s["entry_count"] == 1
+
+
+# ── mlx-lm CEILING tripwire (PATCHES.md #78) ──────────────────────────────
+# classify_layers identifies recurrent layers by state *shape*. If a future
+# mlx-lm changes ArraysCache.state to a 3-tuple (mlx-lm#1632 / 11a6ce7), those
+# layers classify as 'opaque' and partial restore is silently refused on every
+# hybrid model. These cover the guard that makes that loud.
+
+
+class _FakeArraysCache:
+    """Stands in for mlx-lm's ArraysCache with the CURRENT (list) state."""
+
+    def __init__(self, state):
+        self.state = state
+
+
+_FakeArraysCache.__name__ = "ArraysCache"
+
+
+class _FakeMambaCache(_FakeArraysCache):
+    """A subclass, as mlx-lm ships per-architecture. Name-only matching on the
+    exact class misses this — the guard walks the MRO for that reason."""
+
+
+_FakeMambaCache.__name__ = "MambaCache"
+
+
+def _reset_ceiling_latch():
+    import vllm_mlx.system_kv as skv
+
+    skv._recurrent_shape_warned = False
+
+
+def test_ceiling_guard_silent_on_current_list_state():
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    import vllm_mlx.system_kv as skv
+
+    assert classify_layers([_FakeArraysCache([mx.zeros((1, 2))])]) == ["ckpt"]
+    assert skv._recurrent_shape_warned is False
+
+
+def test_ceiling_guard_fires_on_tuple_state(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    future = _FakeArraysCache((mx.zeros((1, 2)), 0, 4))  # the 1632 shape
+    with caplog.at_level("ERROR"):
+        kinds = classify_layers([future])
+    # The classification really does degrade — that is what makes it dangerous.
+    assert kinds == ["opaque"]
+    assert "SYSTEM-KV CEILING CROSSED" in caplog.text
+
+
+def test_ceiling_guard_matches_subclasses_over_the_mro(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    future = _FakeMambaCache((mx.zeros((1, 2)), 0, 4))
+    with caplog.at_level("ERROR"):
+        classify_layers([future])
+    assert "SYSTEM-KV CEILING CROSSED" in caplog.text
+
+
+def test_ceiling_guard_is_one_shot(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    layers = [_FakeArraysCache((mx.zeros((1, 2)), 0, 4)) for _ in range(4)]
+    with caplog.at_level("ERROR"):
+        classify_layers(layers)
+        classify_layers(layers)
+    assert caplog.text.count("SYSTEM-KV CEILING CROSSED") == 1
+
+
+def test_ceiling_guard_ignores_plain_kv_and_rotating():
+    """A 2-tuple KVCache and a RotatingKVCache are normal, not the ceiling."""
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    import vllm_mlx.system_kv as skv
+
+    class _KV:
+        state = (mx.zeros((1, 2, 3, 4)), mx.zeros((1, 2, 3, 4)))
+
+    class _Rot:
+        state = (mx.zeros((1, 2, 3, 4)), mx.zeros((1, 2, 3, 4)))
+
+    _Rot.__name__ = "RotatingKVCache"
+    assert classify_layers([_KV(), _Rot()]) == ["trim", "ckpt"]
+    assert skv._recurrent_shape_warned is False
