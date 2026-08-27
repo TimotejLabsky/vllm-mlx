@@ -225,6 +225,49 @@ def ckpt_bytes(ckpts):
     return n
 
 
+# Recurrent cache classes whose ``.state`` this stack expects to be a bare
+# list. Matched over the whole MRO, not on the exact class name: mlx-lm
+# subclasses ``ArraysCache`` per architecture (``MambaCache`` and friends),
+# and a name-only check misses every subclass.
+_ARRAYS_CACHE_NAMES = ("ArraysCache", "MambaCache")
+
+# One-shot latch for the ceiling warning below. Module-level so a single
+# process warns once no matter how many layers or requests trip it; tests
+# reset it directly.
+_recurrent_shape_warned = False
+
+
+def _warn_if_recurrent_shape_changed(c, st) -> None:
+    """Emit one loud error if a recurrent cache stops presenting a list state.
+
+    This is the tripwire for the **mlx-lm CEILING** (PATCHES.md #78).
+    ``classify_layers`` identifies recurrent layers by state *shape*
+    (``isinstance(st, list)``). mlx-lm ``11a6ce7`` (mlx-lm#1632) changes
+    ``ArraysCache.state`` to ``(cache, left_padding, lengths)`` — a 3-tuple
+    that matches neither ``ckpt`` (list) nor ``trim`` (2-tuple), so the layer
+    classifies as ``opaque`` and partial restore is refused. On a hybrid model
+    that is the fleet's busiest route, and the failure is **silent**: the
+    prefix cache simply stops working. A version bound cannot catch it —
+    both ``9acef5f`` and tip report ``0.32.0`` — so the guard is a runtime
+    shape check instead.
+    """
+    global _recurrent_shape_warned
+    if _recurrent_shape_warned or isinstance(st, list):
+        return
+    if not any(k.__name__ in _ARRAYS_CACHE_NAMES for k in type(c).__mro__):
+        return
+    _recurrent_shape_warned = True
+    logger.error(
+        "SYSTEM-KV CEILING CROSSED: %s.state is %s, not a list. The mlx-lm "
+        "version in use has changed the recurrent cache state shape (see "
+        "PATCHES.md #78). Recurrent layers now classify as 'opaque', which "
+        "DISABLES partial prefix-cache restore on hybrid models. Pin mlx-lm "
+        "back to 0.32.0@9acef5f or update classify_layers for the new shape.",
+        type(c).__name__,
+        type(st).__name__,
+    )
+
+
 def classify_layers(prompt_cache):
     """Per-layer snapshot semantics, from the live cache CLASSES (state
     shape alone cannot distinguish a RotatingKVCache from a KVCache — both
@@ -244,6 +287,7 @@ def classify_layers(prompt_cache):
     kinds = []
     for c in prompt_cache:
         st = c.state
+        _warn_if_recurrent_shape_changed(c, st)
         if isinstance(st, list) or type(c).__name__ == "RotatingKVCache":
             kinds.append("ckpt")
         elif (
