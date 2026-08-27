@@ -9,8 +9,8 @@
 
 ## What this fork is
 
-A **patch stack**, not a feature branch. `main` carries ~135 local patches on top
-of upstream [`4b654c0`](https://github.com/waybarrios/vllm-mlx/commit/4b654c0);
+A **patch stack**, not a feature branch. `main` carries ~137 local patches on top
+of upstream [`22efb47`](https://github.com/waybarrios/vllm-mlx/commit/22efb47);
 each is a separate commit prefixed `patch:`, and the branch is periodically
 rebased onto `waybarrios/main` to pick up upstream changes. Fixes that are
 generally useful get cherry-picked from upstream PRs or prepared as upstreaming
@@ -67,6 +67,13 @@ admission.
 
 ## Recent changes
 
+> **2026-08-27 — the mlx-lm ceiling now has a real tripwire** (PATCHES.md #78
+> correction, #80). The prefix cache identifies recurrent layers by the *shape*
+> of their state; a later mlx-lm changes that shape, at which point every hybrid
+> model silently loses partial restore. The guard was documented but had never
+> been committed — it now exists, matches over the class MRO, and fires once
+> per process.
+>
 > **2026-08-23 — the thinking phase machine no longer walks the prompt**
 > (PATCHES.md #79). `ThinkingAwareLogitsProcessor` assumed it only saw generated
 > tokens, but mlx-lm hands logits processors the full sequence. Any prompt
