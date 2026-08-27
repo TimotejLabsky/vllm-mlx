@@ -3418,9 +3418,18 @@ class TestSimpleEngineStreamClose:
 
     @pytest.mark.anyio
     async def test_public_stream_chat_close_cleans_nested_generate(self):
+        # FORK: upstream stubs ``engine._model.stream_generate``, but the fork's
+        # text route calls ``mlx_lm.stream_generate`` directly so it can hand in
+        # a ``prompt_cache`` (system-KV, PATCHES.md #13/#18). Stubbing only the
+        # wrapper let the real mlx-lm entry point run, which died on a MagicMock
+        # prompt before reaching any assertion. Both are stubbed here so the
+        # test exercises what it is actually about — that closing the public
+        # generator unwinds the nested one and releases the engine's state.
+        import mlx_lm
+
         backend_closed = False
 
-        def generate(**kwargs):
+        def generate(*args, **kwargs):
             nonlocal backend_closed
             try:
                 yield SimpleNamespace(
@@ -3436,12 +3445,13 @@ class TestSimpleEngineStreamClose:
         previous_handler = loop.get_exception_handler()
         loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
         try:
-            stream = engine.stream_chat(
-                messages=[{"role": "user", "content": "hi"}], max_tokens=50
-            )
-            await self._close_and_assert_clean(
-                engine, stream, lambda: backend_closed, loop_errors
-            )
+            with patch.object(mlx_lm, "stream_generate", generate):
+                stream = engine.stream_chat(
+                    messages=[{"role": "user", "content": "hi"}], max_tokens=50
+                )
+                await self._close_and_assert_clean(
+                    engine, stream, lambda: backend_closed, loop_errors
+                )
         finally:
             loop.set_exception_handler(previous_handler)
 
