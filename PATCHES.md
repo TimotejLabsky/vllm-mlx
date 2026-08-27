@@ -1785,8 +1785,8 @@ landed.** The paragraph above described `classify_layers`' one-shot
 `logger.error` as if it existed; the tripwire was absent from the tree — and
 absent from the pre-rebase tree too, so it was not lost in a rebase, it was
 never committed. Caught by verifying the entry against the code during the
-`22efb47` rebase rather than trusting the entry. Now implemented for real in
-`system_kv.py`: `_warn_if_recurrent_shape_changed` is called per layer from
+`22efb47` rebase rather than trusting the entry. Now implemented for real as
+**patch #80** in `system_kv.py`: `_warn_if_recurrent_shape_changed` is called per layer from
 `classify_layers` and fires once per process. It matches over the **whole
 MRO** (`ArraysCache`, `MambaCache`) rather than the exact class name, because
 mlx-lm subclasses `ArraysCache` per architecture and a name-only check misses
@@ -1874,3 +1874,50 @@ The exact byte counts that were being dumped into `content` move into
 passed / 24 skipped / 30 deselected**, including 21 pre-existing
 `test_thinking_processor.py` tests which now declare the generated-only
 convention explicitly with a leading empty call.
+
+---
+
+## 80. `patch: system-kv-ceiling-tripwire` — make crossing the mlx-lm ceiling loud
+
+**Committed 2026-08-27, deployed with the `22efb47` rebase.** This is the code
+that #78's entry already claimed existed. It did not: the symbol was absent
+from the tree, and absent from the pre-rebase tree too, so it was never
+committed rather than lost in a rebase. Found by grepping for the symbol named
+in the entry instead of trusting the entry — worth repeating on every
+verification pass.
+
+**The hazard.** `classify_layers` (`system_kv.py`) decides each layer's
+snapshot semantics from the *shape* of `c.state`: a bare `list` means recurrent
+(`ckpt`), a 2-tuple of arrays means plain KV (`trim`), anything else is
+`opaque`. mlx-lm `11a6ce7` (mlx-lm#1632) changes `ArraysCache.state` to
+`(cache, left_padding, lengths)` — a 3-tuple. That is not a crash; it is a
+reclassification. Every recurrent layer becomes `opaque`, `opaque` refuses
+partial restore, and the prefix cache quietly stops working on every hybrid
+model, which on this fleet is the busiest route (Qwen3.8). A version bound
+cannot catch it either: both `9acef5f` and mlx-lm tip report `0.32.0`.
+
+**The guard.** `_warn_if_recurrent_shape_changed(c, st)` is called per layer
+from `classify_layers` and emits one `logger.error` per process naming the
+class, the observed state type, and the pin to roll back to.
+
+Two details that are load-bearing:
+
+- **MRO matching, not class name.** mlx-lm subclasses `ArraysCache` per
+  architecture (`MambaCache` and friends), so `type(c).__name__ in (...)`
+  misses every subclass — the common case. The check walks `type(c).__mro__`.
+  An earlier name-only draft failed its own subclass test, which is why the
+  test for it exists.
+- **One-shot, module-level.** A hybrid model has dozens of recurrent layers and
+  serves many requests; without the latch this is a per-layer-per-request log
+  flood, which is its own kind of silence.
+
+**Tests** (`test_system_kv_partial.py`, 5): silent on today's list state;
+fires on the 1632 3-tuple **and asserts the classification really degrades to
+`opaque`** (the silent failure is the whole point); matches a subclass through
+the MRO; fires exactly once across layers and calls; stays silent for plain
+`KVCache` (2-tuple) and `RotatingKVCache`, which are normal.
+
+**Not a behaviour change.** The guard only logs — it cannot alter
+classification. Crossing the ceiling is still a downgrade; it is now an
+announced one. See #78 for the pin itself and why its original rationale was
+withdrawn.
