@@ -14,9 +14,8 @@ import os
 import threading
 import time
 import uuid
-from collections import OrderedDict, deque
-from collections.abc import AsyncGenerator, AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager
 from typing import Any
 
