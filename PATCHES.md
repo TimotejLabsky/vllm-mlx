@@ -1,6 +1,17 @@
 # Local patches in this fork
 
-This fork carries its patches on top of [`waybarrios/vllm-mlx@4b654c0`](https://github.com/waybarrios/vllm-mlx/commit/4b654c0) (2026-08-23; previous pins: `5021350` (2026-08-15, one commit past `v0.4.1`), `b998776`, `d96458c`, `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries its patches on top of [`waybarrios/vllm-mlx@22efb47`](https://github.com/waybarrios/vllm-mlx/commit/22efb47) (2026-08-27; previous pins: `4b654c0` (2026-08-23), `5021350` (2026-08-15, one commit past `v0.4.1`), `b998776`, `d96458c`, `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+
+> **2026-08-27 rebase note — rebased onto upstream `22efb47` (5 commits past `4b654c0`); suite green at 3315 passed / 31 skipped / 30 deselected, ruff clean.** 137 fork commits replayed, 6 conflict stops, all in three files. Backup: `backup/pre-rebase-2026-08-27`.
+> - **Upstream #677 collides with patch #27 head-on — fork semantics kept.** `0d93f84` adds `not _thinking_disabled(request, kwargs)` to the chat-completions streaming gate, which is *precisely* the skip #27 exists to prevent: with thinking off, gemma-4 still emits `<|channel>thought` and the parser must run to strip it, or raw markers leak into `content` (the HA "model not returning a valid response" break). The clause is deliberately dropped in both places it appears. Upstream's `or output_finished` **is** kept — #677 withholds a trailing partial tag and flushes it from `finalize_stream()` on the final output, which carries no new text — as is its `_extract_streaming_reasoning_delta` helper.
+> - **The Responses-path latch had to be rewired, not just re-applied.** Upstream computes `use_reasoning = parser and not thinking_off` once per output and gates on it; the fork's marker latch can engage the parser *mid-stream*, so `use_reasoning` is now derived from the latch (`not thinking_off or disabled_reasoning_latched`) and re-armed when the latch trips. Deriving it upstream's way would have silently disabled the latch — a clean-looking merge that defeats the patch.
+> - **#677 is a real win independent of the collision:** the old streaming parser scanned the whole accumulated output per delta (quadratic; upstream measured 1023x cost at 50x tokens). Fork-owned `reasoning/` files were **unmodified**, so the rewrite landed free.
+> - **Upstream #687 (`aclosing` on delegated streams) KEPT, not rejected.** Unlike the #541/#579 pattern, this one is a wanted delta the fork's patches do not supersede: it closes the inner generator promptly when a client disconnects. Resolved by taking upstream's `text_stream = ...` / `async with aclosing(...)` shape and re-applying the fork's `strip_effort_fallback` (#76) inside it. `aclosing` appears 9x in the post-rebase `simple.py`.
+> - **One upstream test needed a fork-aware fixture, not a skip.** `test_public_stream_chat_close_cleans_nested_generate` stubs `engine._model.stream_generate`, but the fork's text route calls `mlx_lm.stream_generate` directly (to pass `prompt_cache`, #13/#18), so the real mlx-lm entry point ran and died on a MagicMock prompt before reaching any assertion. Stubbing both makes it pass — and it then **verifies fork behaviour**: closing the public generator releases `_active_requests`, `_num_running`, `_generation_lock` and `_in_tracker`. Preferred over a skip because abort cleanup is exactly the class of bug that wedges a route.
+> - **Three upstream imports removed as genuinely dead**, not merge debris: `OrderedDict` (upstream's own system-KV LRU — the fork delegates to `SystemKVManager`) and `ThreadPoolExecutor` (upstream's generation-executor machinery, which the fork does not carry). Confirmed by reading upstream's uses of each before deleting.
+> - **Upstream #688 (`--max-kv-size` actually bounds the cache) is inert here** — the flag is set on **0 of 21 llama-swap routes**, so the path stays unbounded exactly as before. It merged with no conflict despite +239 lines in `scheduler.py`; seams re-counted rather than trusted.
+> - **Silent merges verified, not trusted:** seam counts unchanged from the previously-verified rebase — `scheduler.py` 22 `hybrid_kv` / 23 `ssd_tier`, `batched.py` 4 `raw_text` / 4 `force_text_only`, `mllm_batch_generator.py` 19 `rope_delta` / 9 `has_media`, `EFFORT_FALLBACK_KEY` (#76) in all three of `server.py`/`simple.py`/`batched.py`, #77 repetition-stop present, **#79 prompt-skip present (8 refs)**, #49's `hybrid.close()` drain intact.
+> - **Net-new upstream gained:** `0d93f84` (#677) streaming reasoning correctness + linear cost, `e1f3edc` (#688) `--max-kv-size` enforcement, `22efb47` (#687) delegated-stream close, `0a6d749` (#676) DeepSeek-V4-Flash support (parsers, encoding, tool parser — additive, not on this fleet), `36deafe` restart-test robustness.
 
 > **2026-08-23 rebase note — rebased onto upstream `4b654c0` (18 commits past `5021350`); suite green at 3044 passed / 31 skipped / 30 deselected.** Redone from current `main` rather than continuing the earlier draft branch, so #78 and #79 come along and there is no duplicate pin-documentation. 134 fork commits replayed, 6 conflict stops. Backup: `backup/pre-rebase-2026-08-23`.
 > - **`engine/simple.py` wholesale reject again** (#541/#579 precedent) — post-rebase `simple.py` is byte-identical to pre-rebase `main` (verified, empty diff). `git rerere` carried most resolutions over from the 08-22 attempt.
@@ -1768,6 +1779,22 @@ it). The raise was also justified by the premise disproved above — 0.31.3 does
 not corrupt our checkpoints — so there is nothing to exclude. `classify_layers` therefore emits a
 one-shot `logger.error` when a recurrent layer stops presenting a list state, so
 crossing the ceiling is loud instead of a silent fleet-wide cache loss.
+
+**CORRECTION (2026-08-27): that guard was documented here but never actually
+landed.** The paragraph above described `classify_layers`' one-shot
+`logger.error` as if it existed; the tripwire was absent from the tree — and
+absent from the pre-rebase tree too, so it was not lost in a rebase, it was
+never committed. Caught by verifying the entry against the code during the
+`22efb47` rebase rather than trusting the entry. Now implemented for real in
+`system_kv.py`: `_warn_if_recurrent_shape_changed` is called per layer from
+`classify_layers` and fires once per process. It matches over the **whole
+MRO** (`ArraysCache`, `MambaCache`) rather than the exact class name, because
+mlx-lm subclasses `ArraysCache` per architecture and a name-only check misses
+every subclass. Five tests in `test_system_kv_partial.py` cover it, including
+one that asserts the degraded classification really is `opaque` — the silent
+failure is what makes the tripwire necessary — and one that pins the one-shot
+behaviour. **Lesson: a PATCHES.md entry is a claim about the code, not
+evidence of it. Grep for the symbol.**
 
 **Operational note (cost an outage):** `anyio` is a **production** dependency
 (fastapi/starlette need it) even though the fork also lists it under dev extras.
