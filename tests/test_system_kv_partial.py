@@ -166,9 +166,12 @@ def test_capture_recurrent_states_shallow_copy():
     captured, captured_metas = capture_checkpoint_states(cache)
     assert list(captured.keys()) == [1]
     assert captured_metas[1] is None
-    # rebinding the live cache must not disturb the captured copy
+    # rebinding the live cache must not disturb the captured copy.
+    # Dual-shape (#81): pre-1632 ArraysCache.state is the bare list; 1632+
+    # returns (cache, left_padding, lengths) — the inner list either way.
+    inner = captured[1][0] if isinstance(captured[1], tuple) else captured[1]
     rec[0] = mx.full((1, 4), 99.0)
-    assert float(captured[1][0][0, 0]) == 1.0
+    assert float(inner[0][0, 0]) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -575,11 +578,11 @@ def test_stats_active_carries_enabled_flag():
     assert s["entry_count"] == 1
 
 
-# ── mlx-lm CEILING tripwire (PATCHES.md #78) ──────────────────────────────
-# classify_layers identifies recurrent layers by state *shape*. If a future
-# mlx-lm changes ArraysCache.state to a 3-tuple (mlx-lm#1632 / 11a6ce7), those
-# layers classify as 'opaque' and partial restore is silently refused on every
-# hybrid model. These cover the guard that makes that loud.
+# ── mlx-lm CEILING tripwire (PATCHES.md #78, re-aimed by #81) ─────────────
+# classify_layers identifies recurrent layers by state *shape*. Since #81 the
+# 1632 3-tuple (cache, left_padding, lengths) is a SUPPORTED shape; the guard
+# now fires on whatever comes NEXT — any ArraysCache state that is neither the
+# bare list nor the 1632 tuple classifies 'opaque' and must announce itself.
 
 
 class _FakeArraysCache:
@@ -604,6 +607,7 @@ def _reset_ceiling_latch():
     import vllm_mlx.system_kv as skv
 
     skv._recurrent_shape_warned = False
+    skv._kv_shape_warned = False
 
 
 def test_ceiling_guard_silent_on_current_list_state():
@@ -620,7 +624,9 @@ def test_ceiling_guard_fires_on_tuple_state(caplog):
     from vllm_mlx.system_kv import classify_layers
 
     _reset_ceiling_latch()
-    future = _FakeArraysCache((mx.zeros((1, 2)), 0, 4))  # the 1632 shape
+    # NOT the 1632 shape: its metadata slots are ints, not arrays — the
+    # guard must treat this as an UNKNOWN (post-1632) shape and fire.
+    future = _FakeArraysCache((mx.zeros((1, 2)), 0, 4))
     with caplog.at_level("ERROR"):
         kinds = classify_layers([future])
     # The classification really does degrade — that is what makes it dangerous.
@@ -665,3 +671,218 @@ def test_ceiling_guard_ignores_plain_kv_and_rotating():
     _Rot.__name__ = "RotatingKVCache"
     assert classify_layers([_KV(), _Rot()]) == ["trim", "ckpt"]
     assert skv._recurrent_shape_warned is False
+
+
+# ── mlx-lm 1632 recurrent state shape (PATCHES.md #81) ────────────────────
+# Post-11a6ce7 ArraysCache.state is (cache_list, left_padding, lengths).
+# The fork accepts BOTH shapes so the pin can move without a flag day.
+
+
+def _rec_states_1632(tag: float, empty_meta: bool = False):
+    cache = _rec_states(tag)
+    if empty_meta:
+        lp = mx.array([], dtype=mx.float32)
+        ln = mx.array([], dtype=mx.float32)
+    else:
+        lp = mx.array([0], dtype=mx.int32)
+        ln = mx.array([int(tag) % 97 + 1], dtype=mx.int32)
+    mx.eval(lp, ln)
+    return (cache, lp, ln)
+
+
+def test_classify_1632_state_is_ckpt_and_silent(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    import vllm_mlx.system_kv as skv
+
+    with caplog.at_level("ERROR"):
+        kinds = classify_layers([_FakeArraysCache(_rec_states_1632(1.0))])
+    assert kinds == ["ckpt"]
+    assert skv._recurrent_shape_warned is False
+    assert "CEILING" not in caplog.text
+
+
+def test_classify_1632_empty_metadata_is_ckpt():
+    """Rows without padding metadata encode it as empty arrays (mlx-lm's
+    None-serialization convention) — still the supported shape."""
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+    kinds = classify_layers(
+        [_FakeArraysCache(_rec_states_1632(2.0, empty_meta=True))]
+    )
+    assert kinds == ["ckpt"]
+
+
+def test_pin_state_1632_does_not_alias_the_live_cache_list():
+    """pin_state copies the element-0 CONTAINER: a later in-place slot
+    rebind on the live cache (self.cache[i] = v) must not reach the pin."""
+    from vllm_mlx.system_kv import pin_state
+
+    live = _rec_states_1632(3.0)
+    pinned = pin_state(live)
+    original = live[0][0]
+    live[0][0] = mx.zeros_like(live[0][0])  # the live cache moves on
+    assert pinned[0][0] is original
+    assert pinned[1] is live[1] and pinned[2] is live[2]  # arrays shared
+
+
+def test_state_arrays_walks_every_shape():
+    from vllm_mlx.system_kv import state_arrays
+
+    st3 = _rec_states_1632(4.0)
+    arrs = state_arrays(st3)
+    assert len(arrs) == len(st3[0]) + 2  # cache items + lp + ln
+    kv = _kv_layer(8)
+    assert state_arrays(kv) == [kv[0], kv[1]]
+    assert len(state_arrays(_rec_states(1.0))) == 2
+
+
+def test_entry_and_ckpt_bytes_count_1632_metadata():
+    from vllm_mlx.system_kv import ckpt_bytes, entry_bytes
+
+    st3 = _rec_states_1632(5.0)
+    expected = sum(a.nbytes for a in st3[0]) + st3[1].nbytes + st3[2].nbytes
+    assert entry_bytes([st3]) == expected
+    cps = [{"pos": 8, "states": {1: st3}, "metas": {1: None}}]
+    assert ckpt_bytes(cps) == expected
+
+
+def test_partial_restore_fallback_treats_1632_as_ckpt():
+    """Legacy plans without kinds classify by shape — the 1632 tuple must
+    land on the ckpt branch, not be unpacked as (k, v)."""
+    snap = [_kv_layer(800), _rec_states_1632(6.0), _kv_layer(800)]
+    ck = {1: _rec_states_1632(512.0)}
+    states, metas = build_partial_restore_states(snap, ck, 512)
+    assert states is not None
+    assert states[1] is ck[1]
+    k512, _ = states[0]
+    assert k512.shape[2] == 512
+
+
+def test_select_restore_pos_full_donor_with_1632_snapshot():
+    from vllm_mlx.system_kv import select_restore_pos
+
+    snap = [_kv_layer(64), _rec_states_1632(7.0)]
+    plan = {"d": 64, "snapshot": snap, "checkpoints": [],
+            "kinds": None, "metas": None, "donor_len": 64}
+    pos, states, metas = select_restore_pos(plan, 10_000)
+    assert pos == 64
+    assert states == {1: snap[1]}
+
+
+def test_apply_snapshot_states_pins_1632_shape():
+    from vllm_mlx.system_kv import apply_snapshot_states
+
+    class _Settable:
+        state = None
+
+    target = [_Settable()]
+    st3 = _rec_states_1632(8.0)
+    apply_snapshot_states(target, [st3])
+    assert target[0].state[0] is not st3[0]  # container copied
+    assert target[0].state[0][0] is st3[0][0]  # arrays shared
+
+
+def test_flatten_unflatten_snapshot_roundtrips_1632(tmp_path):
+    """arrays3 layers survive flatten -> safetensors -> unflatten, empty
+    metadata arrays included (the mlx-lm None encoding)."""
+    from vllm_mlx.system_kv_ssd import unflatten_snapshot
+
+    snap = [
+        _kv_layer(16),
+        _rec_states_1632(9.0),
+        _rec_states_1632(10.0, empty_meta=True),
+    ]
+    tensors, layer_meta = flatten_snapshot(snap)
+    assert [lm["kind"] for lm in layer_meta] == ["kv", "arrays3", "arrays3"]
+    path = str(tmp_path / "snap.safetensors")
+    mx.save_safetensors(path, tensors)
+    loaded = mx.load(path)
+    rebuilt = unflatten_snapshot(loaded, layer_meta)
+    assert isinstance(rebuilt[1], tuple) and isinstance(rebuilt[1][0], list)
+    assert _arrays_equal(rebuilt[1][0][0], snap[1][0][0])
+    assert _arrays_equal(rebuilt[1][1], snap[1][1])
+    assert rebuilt[2][1].size == 0 and rebuilt[2][2].size == 0
+
+
+def test_flatten_unflatten_checkpoints_roundtrips_1632():
+    cps = [{
+        "pos": 256,
+        "states": {1: _rec_states_1632(11.0), 2: _rec_states(12.0)},
+        "metas": {1: None, 2: None},
+    }]
+    tensors, ckpt_meta = flatten_checkpoints(cps)
+    rebuilt = unflatten_checkpoints(tensors, ckpt_meta)
+    st = rebuilt[0]["states"][1]
+    assert isinstance(st, tuple) and isinstance(st[0], list)
+    assert _arrays_equal(st[0][1], cps[0]["states"][1][0][1])
+    assert _arrays_equal(st[1], cps[0]["states"][1][1])
+    assert isinstance(rebuilt[0]["states"][2], list)  # old shape untouched
+
+
+def test_batched_derive_kinds_and_nbytes_understand_1632():
+    from vllm_mlx.batched_system_kv import _derive_kinds, _entry_nbytes
+
+    st3 = _rec_states_1632(13.0)
+    assert _derive_kinds([_kv_layer(8), st3]) == ["trim", "ckpt"]
+    seg = [_kv_layer(8)]
+    expected = (
+        seg[0][0].nbytes + seg[0][1].nbytes
+        + sum(a.nbytes for a in st3[0]) + st3[1].nbytes + st3[2].nbytes
+    )
+    assert _entry_nbytes([seg, st3]) == expected
+
+
+# ── next-ceiling tripwire: base KVCache shape (mlx-lm PR #1778) ───────────
+
+
+def test_kv_guard_fires_on_1778_full_state(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+
+    class _KV:
+        state = (mx.zeros((1, 2, 4, 8)), mx.zeros((1, 2, 4, 8)),
+                 mx.array([4]))
+
+    _KV.__name__ = "KVCache"
+    with caplog.at_level("ERROR"):
+        kinds = classify_layers([_KV()])
+    assert kinds == ["opaque"]  # the degradation is the danger
+    assert "KVCache.state" in caplog.text and "CEILING" in caplog.text
+
+
+def test_kv_guard_silent_on_normal_2tuple_and_subclasses(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+
+    class _KV:
+        state = (mx.zeros((1, 2, 4, 8)), mx.zeros((1, 2, 4, 8)))
+
+    _KV.__name__ = "KVCache"
+
+    class _Quant:
+        state = (mx.zeros((1, 2)), mx.zeros((1, 2)), mx.zeros((1, 2)))
+
+    _Quant.__name__ = "QuantizedKVCache"
+    with caplog.at_level("ERROR"):
+        classify_layers([_KV(), _Quant()])
+    assert "CEILING" not in caplog.text
+
+
+def test_kv_guard_is_one_shot(caplog):
+    from vllm_mlx.system_kv import classify_layers
+
+    _reset_ceiling_latch()
+
+    class _KV:
+        state = (mx.zeros((1, 2)),)
+
+    _KV.__name__ = "KVCache"
+    with caplog.at_level("ERROR"):
+        classify_layers([_KV(), _KV()])
+        classify_layers([_KV()])
+    assert caplog.text.count("CEILING CROSSED") == 1

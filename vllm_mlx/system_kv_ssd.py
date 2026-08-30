@@ -116,14 +116,11 @@ class SystemKVSSDConfig:
 
 
 def _snapshot_nbytes(snapshot: list) -> int:
+    from .system_kv import state_arrays
+
     total = 0
     for st in snapshot:
-        if isinstance(st, tuple):
-            for a in st:
-                total += int(getattr(a, "nbytes", 0))
-        else:
-            for a in st:
-                total += int(getattr(a, "nbytes", 0))
+        total += sum(int(a.nbytes) for a in state_arrays(st))
     return total
 
 
@@ -132,11 +129,23 @@ def flatten_snapshot(snapshot: list) -> tuple[dict, list[dict]]:
 
     KVCache layers (tuple state) -> ``l{i}_k`` / ``l{i}_v``.
     ArraysCache layers (list state) -> ``l{i}_s{j}`` for j in range(n).
+    1632-shape recurrent layers (#81, ``(cache, left_padding, lengths)``)
+    -> ``l{i}_s{j}`` for the cache items plus ``l{i}_lp`` / ``l{i}_ln``,
+    kind ``arrays3``. A pre-#81 reader hitting ``arrays3`` raises and the
+    entry is quarantined — the documented rollback cost.
     """
+    from .system_kv import is_new_recurrent_state
+
     tensors: dict[str, Any] = {}
     layer_meta: list[dict] = []
     for i, st in enumerate(snapshot):
-        if isinstance(st, tuple):
+        if is_new_recurrent_state(st):
+            for j, a in enumerate(st[0]):
+                tensors[f"l{i}_s{j}"] = a
+            tensors[f"l{i}_lp"] = st[1]
+            tensors[f"l{i}_ln"] = st[2]
+            layer_meta.append({"i": i, "kind": "arrays3", "n": len(st[0])})
+        elif isinstance(st, tuple):
             if len(st) != 2:
                 raise ValueError(
                     f"unexpected KV state arity {len(st)} at layer {i}"
@@ -170,6 +179,12 @@ def unflatten_snapshot(tensors: dict, layer_meta: list[dict]) -> list:
             snapshot.append((tensors[f"l{i}_k"], tensors[f"l{i}_v"]))
         elif lm["kind"] == "arrays":
             snapshot.append([tensors[f"l{i}_s{j}"] for j in range(lm["n"])])
+        elif lm["kind"] == "arrays3":
+            snapshot.append((
+                [tensors[f"l{i}_s{j}"] for j in range(lm["n"])],
+                tensors[f"l{i}_lp"],
+                tensors[f"l{i}_ln"],
+            ))
         else:
             raise ValueError(f"unknown layer kind {lm['kind']!r} at layer {i}")
     return snapshot
@@ -185,16 +200,31 @@ def flatten_checkpoints(checkpoints: list | None) -> tuple[dict, list[dict]]:
     ``unflatten_checkpoints`` rebuilds the
     ``{"pos", "states": {i: state}, "metas": {i: meta|None}}`` shape exactly.
     """
+    from .system_kv import is_new_recurrent_state
+
     tensors: dict[str, Any] = {}
     ckpt_meta: list[dict] = []
     for n, cp in enumerate(checkpoints or []):
         layers = []
         cp_metas = cp.get("metas") or {}
         for i, st in sorted(cp["states"].items()):
+            m = cp_metas.get(i)
+            if is_new_recurrent_state(st):
+                # 1632 shape (#81): cache items + lp/ln metadata arrays.
+                for j, a in enumerate(st[0]):
+                    tensors[f"c{n}_l{i}_s{j}"] = a
+                tensors[f"c{n}_l{i}_lp"] = st[1]
+                tensors[f"c{n}_l{i}_ln"] = st[2]
+                layers.append({
+                    "i": i,
+                    "n": len(st[0]),
+                    "kind3": True,
+                    "meta": list(m) if m else None,
+                })
+                continue
             seq = st if isinstance(st, list) else list(st)
             for j, a in enumerate(seq):
                 tensors[f"c{n}_l{i}_s{j}"] = a
-            m = cp_metas.get(i)
             layers.append({
                 "i": i,
                 "n": len(seq),
@@ -217,7 +247,12 @@ def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
         for lm in cm["layers"]:
             i = lm["i"]
             seq = [tensors[f"c{n}_l{i}_s{j}"] for j in range(lm["n"])]
-            states[i] = tuple(seq) if lm.get("tuple") else seq
+            if lm.get("kind3"):
+                states[i] = (
+                    seq, tensors[f"c{n}_l{i}_lp"], tensors[f"c{n}_l{i}_ln"]
+                )
+            else:
+                states[i] = tuple(seq) if lm.get("tuple") else seq
             m = lm.get("meta")
             metas[i] = tuple(m) if m else None
         checkpoints.append({"pos": cm["pos"], "states": states, "metas": metas})
