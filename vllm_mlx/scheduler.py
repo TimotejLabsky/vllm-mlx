@@ -3927,8 +3927,28 @@ class Scheduler:
                             dt = _mx_dtype_from_name(dtype_name)
                             if dt is not None:
                                 state_arrays[i] = state_arrays[i].astype(dt)
-                    layer_obj = ArraysCache(len(state_arrays))
-                    layer_obj.state = state_arrays
+                    # #81: entries spilled on the 1632 state shape carry
+                    # ``arity3_n`` (split point: cache items | lp, ln).
+                    # Old-format entries read on a 1632 mlx-lm need the
+                    # tuple wrap (empty arrays = the None encoding).
+                    n3 = ld.get("arity3_n")
+                    if n3 is not None:
+                        layer_obj = ArraysCache(n3)
+                        layer_obj.state = (
+                            state_arrays[:n3],
+                            state_arrays[n3],
+                            state_arrays[n3 + 1],
+                        )
+                    else:
+                        layer_obj = ArraysCache(len(state_arrays))
+                        try:
+                            layer_obj.state = state_arrays
+                        except (TypeError, ValueError):
+                            layer_obj.state = (
+                                state_arrays,
+                                mx.array([]),
+                                mx.array([]),
+                            )
                     result.append(layer_obj)
                 else:
                     logger.warning(

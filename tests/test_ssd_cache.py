@@ -1178,7 +1178,11 @@ class TestIntegrationSpillAndFetch:
 
         assert reconstructed is not None
         assert isinstance(reconstructed[0], cache_mod.ArraysCache)
-        assert reconstructed[0].state[0].tolist() == mx.array([1, 2]).tolist()
+        # Dual-shape (#81): 1632+ state is (cache, lp, ln) — the array we
+        # stored is the first cache item either way.
+        st = reconstructed[0].state
+        inner = st[0] if isinstance(st, tuple) else st
+        assert inner[0].tolist() == mx.array([1, 2]).tolist()
 
     def test_capacity_eviction_end_to_end(self, tmp_path):
         """Entries beyond max_entries are evicted from SSD."""

@@ -183,10 +183,16 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 pass
             # Detachment also copies these metadata arrays on state-carrying
             # layers; price them so accounting equals snapshot residency.
-            for attr in ("left_padding", "lengths"):
-                extra = getattr(layer_cache, attr, None)
-                if extra is not None and hasattr(extra, "shape"):
-                    total_bytes += _array_memory(extra)
+            # On the 1632 state shape (#81) the metadata already rides
+            # INSIDE ``state`` and was priced by the walk above — pricing
+            # the attrs again double-counts.
+            from .system_kv import is_new_recurrent_state
+
+            if not is_new_recurrent_state(getattr(layer_cache, "state", None)):
+                for attr in ("left_padding", "lengths"):
+                    extra = getattr(layer_cache, attr, None)
+                    if extra is not None and hasattr(extra, "shape"):
+                        total_bytes += _array_memory(extra)
 
     return total_bytes
 
@@ -780,9 +786,15 @@ def _detach_cache_for_storage(
             # its arrays instead of aliasing it.
             snap = copy.copy(layer)
             snap.state = _detach_container(layer.state)
-            for attr in ("left_padding", "lengths"):
-                if getattr(snap, attr, None) is not None:
-                    setattr(snap, attr, _detach(getattr(snap, attr)))
+            # On the 1632 state shape (#81) the ``state`` setter above has
+            # already installed detached metadata; re-detaching the attrs
+            # would orphan those copies for nothing.
+            from .system_kv import is_new_recurrent_state
+
+            if not is_new_recurrent_state(getattr(layer, "state", None)):
+                for attr in ("left_padding", "lengths"):
+                    if getattr(snap, attr, None) is not None:
+                        setattr(snap, attr, _detach(getattr(snap, attr)))
             return snap
         if _bears_arrays(layer):
             raise UndetachableCacheError(

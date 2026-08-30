@@ -54,7 +54,7 @@ from ..mlx_streams import (
     snapshot_generation_streams,
 )
 from .. import system_kv as system_kv_mod
-from ..system_kv import SystemKVManager
+from ..system_kv import SystemKVManager, pin_state
 
 logger = logging.getLogger(__name__)
 
@@ -2601,7 +2601,7 @@ class SimpleEngine(BaseEngine):
                                         if a is not None
                                     ])
                                     _grow_snapshot = [
-                                        list(c.state) if isinstance(c.state, list) else c.state
+                                        pin_state(c.state)
                                         for c in backbone_cache
                                     ]
                                     mx.eval(

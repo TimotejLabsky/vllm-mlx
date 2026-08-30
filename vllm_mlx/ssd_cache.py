@@ -640,14 +640,28 @@ class ArraysCacheSerializer(LayerSerializer):
     """
 
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        from .system_kv import is_new_recurrent_state
+
+        st = layer.state
+        arity3_n: int | None = None
+        if is_new_recurrent_state(st):
+            # 1632 shape (#81): flatten to cache items + the two metadata
+            # arrays; ``arity3_n`` records the split point for rebuild.
+            arity3_n = len(st[0])
+            arrays = list(st[0]) + [st[1], st[2]]
+        else:
+            arrays = list(st)
+
         state_np: list[np.ndarray] = []
         original_dtypes: list[str | None] = []
-        for arr in layer.state:
+        for arr in arrays:
             np_arr, orig = _mx_to_numpy_safe(arr)
             state_np.append(np_arr)
             original_dtypes.append(orig)
 
         snapshot: dict[str, Any] = {"state_np": state_np}
+        if arity3_n is not None:
+            snapshot["arity3_n"] = arity3_n
         # Skip the dtype list in the common (fp16/fp32) case.
         if any(d is not None for d in original_dtypes):
             snapshot["state_original_dtypes"] = original_dtypes
@@ -672,6 +686,8 @@ class ArraysCacheSerializer(LayerSerializer):
         }
         if "state_original_dtypes" in snapshot:
             metadata["state_original_dtypes"] = snapshot["state_original_dtypes"]
+        if "arity3_n" in snapshot:
+            metadata["arity3_n"] = snapshot["arity3_n"]
         return metadata
 
     def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
@@ -687,6 +703,8 @@ class ArraysCacheSerializer(LayerSerializer):
         result = {"state": state}
         if "state_original_dtypes" in metadata:
             result["state_original_dtypes"] = metadata["state_original_dtypes"]
+        if "arity3_n" in metadata:
+            result["arity3_n"] = metadata["arity3_n"]
         return result
 
 
@@ -701,8 +719,13 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
     """
     if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
         return KVCacheSerializer()
-    if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
-        return ArraysCacheSerializer()
+    if hasattr(layer, "state"):
+        from .system_kv import is_recurrent_state
+
+        # Bare list (pre-1632) OR the (cache, left_padding, lengths)
+        # 3-tuple (mlx-lm 11a6ce7+, fork #81).
+        if is_recurrent_state(getattr(layer, "state", None)):
+            return ArraysCacheSerializer()
     raise ValueError(
         f"Unsupported cache layer type: {type(layer).__name__}. "
         f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
