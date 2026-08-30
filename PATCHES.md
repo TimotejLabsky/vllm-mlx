@@ -1921,3 +1921,108 @@ the MRO; fires exactly once across layers and calls; stays silent for plain
 classification. Crossing the ceiling is still a downgrade; it is now an
 announced one. See #78 for the pin itself and why its original rationale was
 withdrawn.
+
+> **Re-aimed by #81 (2026-08-30):** the 1632 3-tuple is now a SUPPORTED
+> shape (`classify_layers` reads it as `ckpt`), so this guard no longer
+> fires on it — it guards whatever comes next, and a second guard covers
+> the base-`KVCache` shape (mlx-lm PR #1778 lineage). See #81.
+
+## 81. `patch: system-kv-1632-state-shape` — accept the `(cache, left_padding, lengths)` recurrent state
+
+**Files:** `vllm_mlx/system_kv.py` (new shape helpers + re-aimed tripwires),
+`vllm_mlx/batched_system_kv.py`, `vllm_mlx/system_kv_ssd.py` (`arrays3` /
+`kind3` layer encoding), `vllm_mlx/engine/simple.py` (grow-path pin),
+`tests/test_system_kv_partial.py` (13 new tests, ceiling section re-aimed)
+
+**Why now — the #78 ceiling and a production crash are the same commit.**
+The 2026-08-30 research pass (docs/fork/improvement-research-2026-08-30.md)
+established that mlx-lm `11a6ce7` (mlx-lm#1632) — the exact commit #78 pinned
+BELOW because it changes `ArraysCache.state` to a 3-tuple — is the fix for
+`[metal::malloc] Resource limit (499000) exceeded`: unbounded lazy-graph
+growth on the `left_padding`/`lengths` metadata (1,280 edges per array per
+decode step), the crash the Qwen3.8 investigation hit at ~21K generation
+steps and that blocked the 6144-thinking-budget verification. Staying pinned
+kept a known long-decode crash to avoid a compat issue this patch removes.
+(oMLX independently shipped the same fix as #3227.)
+
+**What it does.** Three boundary helpers in `system_kv.py`, used everywhere a
+state's shape was previously assumed:
+
+- `is_new_recurrent_state(st)` — detects the post-1632 shape:
+  `(cache_list, left_padding, lengths)`, metadata as arrays (`mx.array([])`
+  encodes None — mlx-lm's own serialization convention).
+- `is_recurrent_state(st)` — bare list OR the 1632 tuple; replaces every
+  `isinstance(st, list)` classification (`classify_layers`,
+  `select_restore_pos` fallback, `build_partial_restore_states` fallback,
+  batched `_derive_kinds`).
+- `pin_state(st)` — container copy for snapshots. Load-bearing for the new
+  shape: its element-0 list IS the live `self.cache` object, so storing the
+  tuple verbatim would alias the live cache and every later in-place slot
+  write (`self.cache[i] = v`) would corrupt the snapshot. Replaces the
+  `list(st) if isinstance(st, list) else st` idiom in
+  `apply_snapshot_states`, `capture_checkpoint_states`, batched
+  `_build_snapshot`, and the SimpleEngine grow path.
+- `state_arrays(st)` — the one flattening walk for `mx.eval` and `nbytes`
+  accounting (`entry_bytes`, `ckpt_bytes`, batched `_entry_nbytes`,
+  `capture_segment`'s materialization, SSD `_snapshot_nbytes`). The metadata
+  arrays are counted and evaluated WITH the cache items — evaluating them on
+  capture is exactly what keeps 1632's graph bounded on our snapshots too.
+
+**Tripwires re-aimed, not removed** (#80's design carries forward):
+
+- `_warn_if_recurrent_shape_changed` now stays silent on both supported
+  shapes and fires on whatever mlx-lm ships NEXT (still MRO-matched,
+  still one-shot).
+- NEW `_warn_if_kv_shape_changed`: fires when the base `KVCache` stops
+  returning a `(keys, values)` 2-tuple — the shape of mlx-lm PR #1778
+  ("Make state of cache return full state", open at time of writing), which
+  would silently opaque every attention layer on EVERY model. Exact-name
+  check, deliberately not MRO: subclasses (Rotating, Quantized) legitimately
+  differ; the signal is the base class changing. Own one-shot latch.
+
+**SSD format.** `flatten_snapshot`/`unflatten_snapshot` gain layer kind
+`arrays3` (`l{i}_s{j}` + `l{i}_lp`/`l{i}_ln`); `flatten_checkpoints`/
+`unflatten_checkpoints` gain the `kind3` flag with the same key scheme.
+Old entries read unchanged. A pre-#81 build reading an `arrays3` entry
+raises and quarantines it (the existing corrupt-entry path) — the accepted
+rollback cost, same class as every prior format bump.
+
+**Completed on the Studio during the 2026-08-30 pin lift** (the on-box
+suite against mlx-lm@`77c33b1` caught what the old-pin laptop could not):
+the fork stack was clean, but the *stock* cache layers carried the same
+list-shape assumptions — `ssd_cache.get_serializer_for_layer` refused the
+3-tuple, `ArraysCacheSerializer` iterated the tuple as arrays, the
+scheduler's `_reconstruct_ssd_layers` flat-assigned into the 1632 setter
+(fail-closed None → cold prefill), `prefix_cache.reconstruct_cache` broke
+on cross-shape `from_state`, and `memory_cache` double-counted the
+metadata (priced inside `state` by the walk AND again from the attrs —
+its detach also orphaned a redundant metadata copy). All now dual-shape
+via the same helpers; SSD entries spilled on the new shape carry an
+`arity3_n` split marker, and old-format entries read on a 1632 mlx-lm
+get the empty-metadata tuple wrap. Two shape-assuming tests made
+dual-shape. Gate evidence: laptop suite green on the old pin, Studio
+suite green on the new pin — the pair is the dual-shape proof.
+
+**The pin is NOT moved by this patch.** This is forward-compatibility so the
+lift is a deploy decision, not a flag day. The lift itself (install
+mlx-lm@`11a6ce7`+ on the box) still owes its gates: suite ON THE STUDIO,
+T=0 byte-identical warm-vs-cold at ≥2K, and a long-decode probe past ~21K
+generated tokens on a hybrid route to confirm the 499000 crash is gone.
+Take `e2f2fb2` (#1772), `74e7cf9` (#1775), `94ecd0a` (#1600), `96830a6`
+(#1790) with it; do NOT take PR #1799 (gated-delta readout scale) blind —
+it patches `qwen3_5`'s forward pass on an unverified claim.
+
+**Adjacent, deliberately untouched:** `stream_chat`'s system-prefix snapshot
+(`engine/simple.py` `snapshot = [c.state for c in bc]`) stores recurrent list
+states by reference — pre-existing on both shapes, media-path only, and the
+denylist probe limits exposure; noted here so the next reader doesn't assume
+#81 covered it.
+
+**Verification:** `tests/test_system_kv_partial.py` 43/43 — new-shape
+classification (incl. empty-metadata rows), pin aliasing (live slot rebind
+does not reach the pinned copy), byte accounting counts metadata, restore
+fallbacks treat the tuple as ckpt, SSD safetensors round-trip incl. empty
+arrays, batched kinds/nbytes, and the #1778 KV guard (fires + degrades to
+`opaque`, silent on 2-tuple and on `QuantizedKVCache`, one-shot). Targeted
+system-kv/batched selection 216 passed; full suite run recorded in the
+commit.
