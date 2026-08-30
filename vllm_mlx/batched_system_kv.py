@@ -50,7 +50,10 @@ from .system_kv import (
     ckpt_bytes,
     classify_layers,
     common_prefix_len,
+    is_recurrent_state,
+    pin_state,
     select_restore_pos,
+    state_arrays,
     timing_key,
 )
 
@@ -74,7 +77,7 @@ def _derive_kinds(snapshot: list) -> list:
     """Shape-based kind fallback for legacy (pre-kinds) SSD entries: tuple =>
     trim, list => ckpt — correct for everything that could have produced
     such an entry (same reasoning as build_partial_restore_states)."""
-    return ["ckpt" if isinstance(st, list) else "trim" for st in snapshot]
+    return ["ckpt" if is_recurrent_state(st) else "trim" for st in snapshot]
 
 
 def _is_segments(layer: Any) -> bool:
@@ -91,10 +94,8 @@ def _entry_nbytes(snapshot: list) -> int:
         if _is_segments(layer):
             for k, v in layer:
                 n += k.nbytes + v.nbytes
-        elif isinstance(layer, tuple) and len(layer) == 2:
-            n += layer[0].nbytes + layer[1].nbytes
-        elif isinstance(layer, list):
-            n += sum(a.nbytes for a in layer if a is not None)
+        else:
+            n += sum(a.nbytes for a in state_arrays(layer))
     return n
 
 
@@ -327,14 +328,14 @@ class BatchedSystemKV:
 
         arrs = []
         for st in states.values():
-            # ckpt-class states are LISTS for recurrent ArraysCache but
-            # TUPLES for RotatingKVCache (sliding-window: gpt-oss, gemma
-            # text). Missing the tuple case left Rotating checkpoint states
-            # lazy on the executor stream — fetch's cross-thread eval then
-            # died with "no Stream(gpu, N)" (found live: gpt-oss batched
-            # smoke; the 27B was clean because deltanet states are lists).
-            items = st if isinstance(st, (list, tuple)) else [st]
-            arrs.extend(a for a in items if a is not None and hasattr(a, "ndim"))
+            # ckpt-class states are LISTS for recurrent ArraysCache (or the
+            # 1632 3-tuple, #81) but (k, v) TUPLES for RotatingKVCache
+            # (sliding-window: gpt-oss, gemma text). Missing the tuple case
+            # left Rotating checkpoint states lazy on the executor stream —
+            # fetch's cross-thread eval then died with "no Stream(gpu, N)"
+            # (found live: gpt-oss batched smoke; the 27B was clean because
+            # deltanet states are lists). state_arrays walks every shape.
+            arrs.extend(state_arrays(st))
         if arrs:
             mx.eval(arrs)
 
@@ -408,9 +409,8 @@ class BatchedSystemKV:
                     mx.eval([a for a in st if a is not None])
                     snapshot.append([tuple(st)])  # single segment
             else:
-                snapshot.append(list(st) if isinstance(st, list) else st)
-                items = st if isinstance(st, (list, tuple)) else [st]
-                mx.eval([a for a in items if a is not None and hasattr(a, "ndim")])
+                snapshot.append(pin_state(st))
+                mx.eval(state_arrays(st))
         return kinds, snapshot, capture_snapshot_meta(cache_list), grown
 
     def _insert_entry_locked(self, tokens_list, kinds, snapshot, metas, checkpoints):

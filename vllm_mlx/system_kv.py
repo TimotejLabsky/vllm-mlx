@@ -209,10 +209,7 @@ def entry_bytes(snap):
     if not snap:
         return 0
     for layer in snap:
-        if isinstance(layer, tuple) and len(layer) == 2:
-            n += layer[0].nbytes + layer[1].nbytes
-        elif isinstance(layer, list):
-            n += sum(a.nbytes for a in layer if a is not None)
+        n += sum(a.nbytes for a in state_arrays(layer))
     return n
 
 
@@ -221,7 +218,7 @@ def ckpt_bytes(ckpts):
     n = 0
     for cp in ckpts or []:
         for st in cp["states"].values():
-            n += sum(a.nbytes for a in st if a is not None)
+            n += sum(a.nbytes for a in state_arrays(st))
     return n
 
 
@@ -235,6 +232,57 @@ _ARRAYS_CACHE_NAMES = ("ArraysCache", "MambaCache")
 # process warns once no matter how many layers or requests trip it; tests
 # reset it directly.
 _recurrent_shape_warned = False
+
+# Second latch: the KVCache-shape tripwire (#81) — the guard for the NEXT
+# ceiling (mlx-lm PR #1778 moves the base KVCache to a full-state tuple).
+# Separate from the recurrent latch so each fires once.
+_kv_shape_warned = False
+
+
+def is_new_recurrent_state(st) -> bool:
+    """True for the post-``11a6ce7`` (mlx-lm#1632) ``ArraysCache.state``
+    shape: ``(cache_list, left_padding, lengths)`` — element 0 is the
+    recurrent array list, elements 1-2 are per-row metadata arrays
+    (``mx.array([])`` when the row carries none). See PATCHES.md #81.
+    """
+    return (
+        isinstance(st, tuple)
+        and len(st) == 3
+        and isinstance(st[0], list)
+        and all(hasattr(a, "ndim") for a in st[1:])
+    )
+
+
+def is_recurrent_state(st) -> bool:
+    """Recurrent (checkpoint-class) state in either supported shape:
+    the pre-1632 bare list, or the 1632 3-tuple."""
+    return isinstance(st, list) or is_new_recurrent_state(st)
+
+
+def pin_state(st):
+    """Copy state CONTAINERS so the live cache's slot rebinds
+    (``self.cache[i] = v``) cannot mutate a snapshot; arrays are shared by
+    reference (immutable). Patch-#6 aliasing discipline, extended to the
+    1632 shape — its element-0 list IS the live ``self.cache`` object, so
+    snapshotting the tuple verbatim would alias it."""
+    if isinstance(st, list):
+        return list(st)
+    if is_new_recurrent_state(st):
+        return (list(st[0]), st[1], st[2])
+    return st
+
+
+def state_arrays(st) -> list:
+    """Flat list of the mx arrays inside any supported state shape (list,
+    ``(k, v)`` tuple, 1632 3-tuple, or a bare array) — the one place that
+    knows how to walk them for ``mx.eval`` / ``nbytes`` accounting."""
+    if is_new_recurrent_state(st):
+        items = list(st[0]) + [st[1], st[2]]
+    elif isinstance(st, (list, tuple)):
+        items = list(st)
+    else:
+        items = [st]
+    return [a for a in items if a is not None and hasattr(a, "ndim")]
 
 
 def _warn_if_recurrent_shape_changed(c, st) -> None:
@@ -252,18 +300,47 @@ def _warn_if_recurrent_shape_changed(c, st) -> None:
     shape check instead.
     """
     global _recurrent_shape_warned
-    if _recurrent_shape_warned or isinstance(st, list):
+    if _recurrent_shape_warned or is_recurrent_state(st):
         return
     if not any(k.__name__ in _ARRAYS_CACHE_NAMES for k in type(c).__mro__):
         return
     _recurrent_shape_warned = True
     logger.error(
-        "SYSTEM-KV CEILING CROSSED: %s.state is %s, not a list. The mlx-lm "
-        "version in use has changed the recurrent cache state shape (see "
-        "PATCHES.md #78). Recurrent layers now classify as 'opaque', which "
-        "DISABLES partial prefix-cache restore on hybrid models. Pin mlx-lm "
-        "back to 0.32.0@9acef5f or update classify_layers for the new shape.",
+        "SYSTEM-KV CEILING CROSSED: %s.state is %s — neither the bare-list "
+        "shape nor the 1632 (cache, left_padding, lengths) tuple, both of "
+        "which are supported since PATCHES.md #81. The mlx-lm in use has "
+        "changed the recurrent cache state shape AGAIN. Recurrent layers "
+        "now classify as 'opaque', which DISABLES partial prefix-cache "
+        "restore on hybrid models. Pin mlx-lm back, or update "
+        "classify_layers for the new shape.",
         type(c).__name__,
+        type(st).__name__,
+    )
+
+
+def _warn_if_kv_shape_changed(c, st) -> None:
+    """Tripwire for the NEXT ceiling (mlx-lm PR #1778 lineage): the base
+    ``KVCache`` returning padded full state (keys, values, offset, ...)
+    instead of the ``(keys, values)`` 2-tuple. Exact-name check, not MRO:
+    subclasses (RotatingKVCache, QuantizedKVCache, ...) legitimately carry
+    different state shapes — the signal is the BASE class changing."""
+    global _kv_shape_warned
+    if _kv_shape_warned or type(c).__name__ != "KVCache":
+        return
+    if (
+        isinstance(st, tuple)
+        and len(st) == 2
+        and all(hasattr(a, "ndim") for a in st)
+    ):
+        return
+    _kv_shape_warned = True
+    logger.error(
+        "SYSTEM-KV CEILING CROSSED: KVCache.state is %s, not a "
+        "(keys, values) 2-tuple. The mlx-lm in use has changed the base KV "
+        "state shape (mlx-lm PR #1778 lineage — see PATCHES.md #81). "
+        "Attention layers now classify as 'opaque', which DISABLES the "
+        "prefix cache on EVERY model. Pin mlx-lm back, or update "
+        "classify_layers.",
         type(st).__name__,
     )
 
@@ -288,7 +365,8 @@ def classify_layers(prompt_cache):
     for c in prompt_cache:
         st = c.state
         _warn_if_recurrent_shape_changed(c, st)
-        if isinstance(st, list) or type(c).__name__ == "RotatingKVCache":
+        _warn_if_kv_shape_changed(c, st)
+        if is_recurrent_state(st) or type(c).__name__ == "RotatingKVCache":
             kinds.append("ckpt")
         elif (
             isinstance(st, tuple)
@@ -320,7 +398,7 @@ def apply_snapshot_states(prompt_cache, states, metas=None):
     meta is applied AFTER state, mirroring mlx-lm's ``from_state`` order.
     """
     for i, st in enumerate(states):
-        prompt_cache[i].state = list(st) if isinstance(st, list) else st
+        prompt_cache[i].state = pin_state(st)
         m = metas[i] if metas and i < len(metas) else None
         if m:
             prompt_cache[i].meta_state = m
@@ -344,7 +422,7 @@ def capture_checkpoint_states(prompt_cache, kinds=None):
         if kinds[i] != "ckpt":
             continue
         st = c.state
-        states[i] = list(st) if isinstance(st, list) else st
+        states[i] = pin_state(st)
         m = getattr(c, "meta_state", "")
         metas[i] = m if m else None
     return states, metas
@@ -387,7 +465,7 @@ def select_restore_pos(plan, cap):
     has_ckpt_layers = (
         any(k == "ckpt" for k in kinds)
         if kinds
-        else any(isinstance(st, list) for st in plan["snapshot"])
+        else any(is_recurrent_state(st) for st in plan["snapshot"])
     )
     if has_ckpt_layers:
         if d == plan["donor_len"]:
@@ -399,7 +477,7 @@ def select_restore_pos(plan, cap):
             snap_metas = plan.get("metas")
             for i, st in enumerate(plan["snapshot"]):
                 is_ckpt = (
-                    kinds[i] == "ckpt" if kinds else isinstance(st, list)
+                    kinds[i] == "ckpt" if kinds else is_recurrent_state(st)
                 )
                 if is_ckpt:
                     states[i] = st
@@ -447,7 +525,7 @@ def build_partial_restore_states(snapshot, ckpt_states, pos,
     metas = []
     for i, st in enumerate(snapshot):
         kind = kinds[i] if kinds else (
-            "ckpt" if isinstance(st, list) else "trim"
+            "ckpt" if is_recurrent_state(st) else "trim"
         )
         if kind == "trim":
             k, v = st
