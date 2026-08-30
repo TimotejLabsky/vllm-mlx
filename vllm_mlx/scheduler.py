@@ -3023,6 +3023,7 @@ class Scheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                cached_tokens=request.cached_tokens,
             )
 
             # Repetition-detection stop (env-gated VLLM_MLX_REPDETECT=1):
