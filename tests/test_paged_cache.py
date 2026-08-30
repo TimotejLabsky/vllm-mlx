@@ -592,6 +592,14 @@ class TestThreadSafety:
 # =============================================================================
 
 
+
+def _rec_state_inner(cache):
+    """Dual-shape (#81): 1632+ ArraysCache.state is (cache, lp, ln) — the
+    recurrent array list is element 0; pre-1632 it IS the state."""
+    st = cache.state
+    return st[0] if isinstance(st, tuple) and st and isinstance(st[0], list) else st
+
+
 class TestBlockAwarePrefixCache:
     """Test BlockAwarePrefixCache class."""
 
@@ -785,8 +793,9 @@ class TestBlockAwarePrefixCache:
         assert isinstance(reconstructed[1], ArraysCache)
         assert reconstructed[0].state[0].tolist() == kv_keys.tolist()
         assert reconstructed[0].state[1].tolist() == kv_values.tolist()
-        assert reconstructed[1].state[0].tolist() == linear_state[0].tolist()
-        assert reconstructed[1].state[1].tolist() == linear_state[1].tolist()
+        rec_inner = _rec_state_inner(reconstructed[1])
+        assert rec_inner[0].tolist() == linear_state[0].tolist()
+        assert rec_inner[1].tolist() == linear_state[1].tolist()
 
     def test_rejects_hybrid_prefix_without_boundary_snapshot(self):
         from mlx_lm.models.cache import ArraysCache, KVCache
@@ -916,9 +925,9 @@ class TestBlockAwarePrefixCache:
         # Reconstruct A: should use A's recurrent state (ones), not B's (twos)
         recon_a = cache.reconstruct_cache(bt_a)
         assert recon_a is not None
-        assert recon_a[1].state[0].tolist() == recurrent_a[0].tolist()
+        assert _rec_state_inner(recon_a[1])[0].tolist() == recurrent_a[0].tolist()
 
         # Reconstruct B: should use B's recurrent state (twos)
         recon_b = cache.reconstruct_cache(bt_b)
         assert recon_b is not None
-        assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
+        assert _rec_state_inner(recon_b[1])[0].tolist() == recurrent_b[0].tolist()

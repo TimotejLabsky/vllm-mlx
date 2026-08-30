@@ -934,7 +934,21 @@ class BlockAwarePrefixCache:
                         cache.values = values
                         cache.offset = keys.shape[self._cache_state_seq_axis(state)]
                     else:
-                        cache = cache_cls.from_state(state, meta_state)
+                        try:
+                            cache = cache_cls.from_state(state, meta_state)
+                        except (TypeError, ValueError):
+                            # #81: a pre-1632 flat-list recurrent state fed
+                            # to a 1632 mlx-lm class — wrap with the empty
+                            # metadata arrays (mlx-lm's None encoding).
+                            import mlx.core as mx
+
+                            if isinstance(state, list):
+                                cache = cache_cls.from_state(
+                                    (state, mx.array([]), mx.array([])),
+                                    meta_state,
+                                )
+                            else:
+                                raise
                 else:
                     from mlx_lm.models.cache import KVCache
 
