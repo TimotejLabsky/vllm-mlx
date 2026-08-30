@@ -108,6 +108,7 @@ from .api.models import (
     RerankUsage,
     ResponseFormat,
     ToolCall,
+    PromptTokensDetails,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
@@ -6495,6 +6496,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
+                prompt_tokens_details=(
+                    PromptTokensDetails(cached_tokens=output.cached_tokens)
+                    if getattr(output, "cached_tokens", 0)
+                    else None
+                ),
             ),
             generation_metadata=_generation_metadata(
                 prepared.thinking_processor, output
@@ -7636,6 +7642,7 @@ async def stream_chat_completion(
     # Track token counts for usage reporting
     prompt_tokens = 0
     completion_tokens = 0
+    cached_prompt_tokens = 0  # system-KV prefix-cache hits (#82)
     last_output = None
 
     # Response-format streaming filter — strip markdown code fences from
@@ -7675,6 +7682,8 @@ async def stream_chat_completion(
             # Track token counts from output (updated each chunk)
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
+            if getattr(output, "cached_tokens", 0):
+                cached_prompt_tokens = output.cached_tokens
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
@@ -8213,6 +8222,11 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=(
+                        PromptTokensDetails(cached_tokens=cached_prompt_tokens)
+                        if cached_prompt_tokens
+                        else None
+                    ),
                 ),
                 generation_metadata=terminal_metadata,
             )

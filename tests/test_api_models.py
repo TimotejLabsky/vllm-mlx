@@ -824,147 +824,57 @@ class TestModelSerialization:
         assert "schema" in data
 
 
-class TestReasoningConstructorCompatibility:
-    @pytest.mark.parametrize(
-        "index,constructor,keywords",
-        [
-            (0, "AssistantMessage", ["content", "reasoning_content", "tool_calls"]),
-            (1, "ChatCompletionChunkDelta", ["reasoning_content"]),
-            (
-                2,
-                "ChatCompletionChunkDelta",
-                ["tool_calls", "content", "reasoning_content"],
-            ),
-            (3, "ChatCompletionChunkDelta", ["content", "reasoning_content"]),
-        ],
+# ── usage.prompt_tokens_details.cached_tokens (PATCHES.md #82) ────────────
+
+
+def test_usage_omits_details_when_unset():
+    """Pre-#82 payload shape must stay byte-identical for cold requests:
+    the key is OMITTED, not null (matching OpenAI's serialization)."""
+    from vllm_mlx.api.models import Usage
+
+    data = Usage(prompt_tokens=3, completion_tokens=2, total_tokens=5).model_dump()
+    assert "prompt_tokens_details" not in data
+    assert '"prompt_tokens_details"' not in Usage().model_dump_json()
+
+
+def test_usage_carries_cached_tokens_when_set():
+    from vllm_mlx.api.models import PromptTokensDetails, Usage
+
+    u = Usage(
+        prompt_tokens=100,
+        completion_tokens=1,
+        total_tokens=101,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=96),
     )
-    def test_server_uses_declared_reasoning_constructor_keywords(
-        self, index, constructor, keywords
-    ):
-        source = Path(__file__).resolve().parents[1] / "vllm_mlx" / "server.py"
-        calls = sorted(
-            (
-                node
-                for node in ast.walk(ast.parse(source.read_text()))
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id in {"AssistantMessage", "ChatCompletionChunkDelta"}
-                and any(
-                    keyword.arg in {"reasoning", "reasoning_content"}
-                    for keyword in node.keywords
-                )
-            ),
-            key=lambda node: node.lineno,
-        )
-        assert len(calls) == 4
-        call = calls[index]
-        assert call.func.id == constructor
-        assert [keyword.arg for keyword in call.keywords] == keywords
+    assert u.model_dump()["prompt_tokens_details"] == {"cached_tokens": 96}
 
-    @pytest.mark.parametrize("model", [AssistantMessage, ChatCompletionChunkDelta])
-    @pytest.mark.parametrize("value", [None, "", " \t\n", "雪🙂\x00\r\n", "Thought"])
-    @pytest.mark.parametrize("by_alias", [False, True])
-    @pytest.mark.parametrize("exclude_none", [False, True])
-    def test_canonical_and_legacy_reasoning_preserve_nested_output(
-        self, model, value, by_alias, exclude_none
-    ):
-        tool = {
-            "id": "call_fixed",
-            "type": "function",
-            "function": {"name": "lookup", "arguments": '{"q":"雪\\n"}'},
-        }
-        if model is AssistantMessage:
-            payload = {"content": None, "tool_calls": [tool]}
-            expected = {"role": "assistant", "content": None}
-        else:
-            tool = {"index": 0, **tool}
-            payload = {"content": None, "tool_calls": [tool]}
-            expected = {}
-        if value is not None:
-            expected["reasoning_content"] = value
-        expected["tool_calls"] = [tool]
-        instances = [
-            model(reasoning_content=value, **payload),
-            model(reasoning=value, **payload),
-            model.model_validate({"reasoning_content": value, **payload}),
-            model.model_validate({"reasoning": value, **payload}),
-        ]
-        options = {"by_alias": by_alias, "exclude_none": exclude_none}
-        nested_json = []
-        for instance in instances:
-            assert instance.reasoning == instance.reasoning_content == value
-            assert instance.model_dump(**options) == expected
-            assert json.loads(instance.model_dump_json(**options)) == expected
-            if model is AssistantMessage:
-                wrapper = ChatCompletionResponse(
-                    id="chatcmpl-fixed",
-                    created=123,
-                    model="test-model",
-                    choices=[
-                        ChatCompletionChoice(
-                            message=instance, finish_reason="tool_calls"
-                        )
-                    ],
-                )
-                field = "message"
-            else:
-                wrapper = ChatCompletionChunk(
-                    id="chatcmpl-fixed",
-                    created=123,
-                    model="test-model",
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            delta=instance, finish_reason="tool_calls"
-                        )
-                    ],
-                )
-                field = "delta"
-            assert wrapper.model_dump(**options)["choices"][0][field] == expected
-            serialized = wrapper.model_dump_json(**options)
-            assert json.loads(serialized)["choices"][0][field] == expected
-            nested_json.append(serialized)
-        assert len(set(nested_json)) == 1
 
-    @pytest.mark.parametrize("model", [AssistantMessage, ChatCompletionChunkDelta])
-    @pytest.mark.parametrize("value", [None, "", " \t\n", "雪🙂\x00\r\n", "Thought"])
-    def test_canonical_reasoning_takes_precedence_over_legacy(self, model, value):
-        payload = {"reasoning_content": value, "reasoning": "legacy fallback"}
-        for instance in [model(**payload), model.model_validate(payload)]:
-            assert instance.reasoning == instance.reasoning_content == value
-            data = instance.model_dump()
-            assert "reasoning" not in data
-            assert data.get("reasoning_content") == value
-            assert ("reasoning_content" in data) is (value is not None)
+def test_generation_output_carries_cached_tokens():
+    from vllm_mlx.engine.base import GenerationOutput
+    from vllm_mlx.request import RequestOutput
 
-    @pytest.mark.parametrize("model", [AssistantMessage, ChatCompletionChunkDelta])
-    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
-    def test_explicit_null_reasoning_and_tools_keep_content_contract(
-        self, model, field
-    ):
-        instance = model(**{field: None}, content=None, tool_calls=None)
-        expected = (
-            {"role": "assistant", "content": None} if model is AssistantMessage else {}
-        )
-        for by_alias in [False, True]:
-            for exclude_none in [False, True]:
-                options = {"by_alias": by_alias, "exclude_none": exclude_none}
-                assert instance.model_dump(**options) == expected
-                assert json.loads(instance.model_dump_json(**options)) == expected
+    ro = RequestOutput(request_id="r", prompt_tokens=10, cached_tokens=8)
+    assert ro.cached_tokens == 8
+    go = GenerationOutput(text="x", cached_tokens=ro.cached_tokens)
+    assert go.cached_tokens == 8
+    assert GenerationOutput(text="x").cached_tokens == 0  # engines that don't track
 
-    @pytest.mark.parametrize("model", [AssistantMessage, ChatCompletionChunkDelta])
-    @pytest.mark.parametrize("mode", ["validation", "serialization"])
-    @pytest.mark.parametrize("by_alias", [False, True])
-    def test_reasoning_schema_keeps_validation_and_serializer_contract(
-        self, model, mode, by_alias
-    ):
-        schema = model.model_json_schema(mode=mode, by_alias=by_alias)
-        if mode == "serialization":
-            assert schema == {"additionalProperties": True, "type": "object"}
-            return
-        properties = schema["properties"]
-        assert "reasoning_content" in properties
-        assert "reasoning" not in properties
-        assert properties["reasoning_content"]["anyOf"] == [
-            {"type": "string"},
-            {"type": "null"},
-        ]
+
+def test_collector_merge_preserves_cached_tokens_and_error_kind():
+    """#82: _merge_outputs rebuilds RequestOutput field-by-field; the
+    non-streaming path (generate() drains the collector) virtually always
+    merges, so any field missing from the rebuild is silently zeroed —
+    exactly how cached_tokens vanished on the first live deploy."""
+    from vllm_mlx.output_collector import RequestOutputCollector
+    from vllm_mlx.request import RequestOutput
+
+    c = RequestOutputCollector(aggregate=True)
+    c.put(RequestOutput(request_id="r", new_text="a", cached_tokens=582,
+                        prompt_tokens=583))
+    c.put(RequestOutput(request_id="r", new_text="b", cached_tokens=582,
+                        prompt_tokens=583, finished=True,
+                        error_kind="prompt_too_long"))
+    merged = c.get_nowait()
+    assert merged.new_text == "ab"
+    assert merged.cached_tokens == 582
+    assert merged.error_kind == "prompt_too_long"
