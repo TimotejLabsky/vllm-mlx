@@ -2026,3 +2026,57 @@ arrays, batched kinds/nbytes, and the #1778 KV guard (fires + degrades to
 `opaque`, silent on 2-tuple and on `QuantizedKVCache`, one-shot). Targeted
 system-kv/batched selection 216 passed; full suite run recorded in the
 commit.
+
+## 82. `patch: usage-cached-tokens` — `usage.prompt_tokens_details.cached_tokens`
+
+**Files:** `vllm_mlx/api/models.py` (`PromptTokensDetails` + omit-when-unset
+serializer), `vllm_mlx/request.py` (`RequestOutput.cached_tokens`),
+`vllm_mlx/engine/base.py` (`GenerationOutput.cached_tokens`),
+`vllm_mlx/engine/batched.py` (4 pass-throughs), `vllm_mlx/scheduler.py`
+(one line: `cached_tokens=request.cached_tokens`), `vllm_mlx/server.py`
+(chat non-stream + chat SSE usage chunk), `tests/test_api_models.py`
+
+P1-c of docs/fork/improvement-research-2026-08-30.md. Upstream PR #732 adds
+the same OpenAI field by diffing all engines; per the 08-30 review verdict we
+take the **API shape** and source the number from our own cache instead —
+`Request.cached_tokens` has been populated by `batched_system_kv.fetch` since
+#34/#35 (the restore position), it just never left the process. Now:
+`Request.cached_tokens` → `RequestOutput` (scheduler consumer) →
+`GenerationOutput` (batched engine, `getattr` default 0) → `Usage`.
+
+**Two load-bearing details found the hard way.** (1)
+`RequestOutputCollector._merge_outputs` rebuilds `RequestOutput`
+field-by-field, and the non-streaming path (`engine_core.generate` drains
+the collector at the end) virtually always merges — so the field was
+silently zeroed in production while every direct-path test passed. Caught
+by the first live smoke test (cache stats said `hits: 1, tokens_saved:
+582`; usage said nothing). The merge now carries `cached_tokens` AND the
+previously-dropped `error_kind` (same rebuild-drop class, latent since
+#50-era typed errors). Lesson: a field added to a dataclass that any code
+RECONSTRUCTS is not added until every reconstruction site is audited.
+(2) **Serialization.** A nullable pydantic field
+serializes as `"prompt_tokens_details": null`, which changed every response
+payload and broke 4 exact-dict stream-usage assertions in `test_server.py`.
+Instead of editing upstream-adapted tests (rebase surface), `Usage` carries a
+wrap-mode `model_serializer` that OMITS the key when unset — cold requests
+and SimpleEngine responses stay byte-identical to pre-#82, and OpenAI itself
+omits rather than nulls. LiteLLM/opencode dashboards read the field natively;
+it also gives the P0.5-style instrumented session a per-request cache signal
+without grepping server logs.
+
+**Scope:** BatchedEngine chat (non-stream + streaming usage chunk) — the
+whole text fleet. Deliberately NOT wired: SimpleEngine (its system-KV restore
+path doesn't thread a per-request count today), the completions endpoint
+(aggregates multiple prompts), the Anthropic adapter and Responses API
+streams (their own usage shapes; wire on demand). All default to omitted.
+
+**Rebase note:** when upstream #732 lands, reject its `engine/`,
+`scheduler.py` and `server.py` hunks wholesale (ours are supersets sourcing
+from the fork cache) and keep whatever field name/shape their API model uses
+if it diverges — the wire format is the contract, not the plumbing.
+
+**Verification:** `test_api_models.py` — omit-when-unset (byte-identical
+pre-#82 shape), carries the count when set, dataclass plumbing incl. the
+engines-that-don't-track default. `test_server.py` 231 passed (the 4
+stream-usage exact-dict tests now prove the omit behavior). Full suite green
+recorded in the commit.
