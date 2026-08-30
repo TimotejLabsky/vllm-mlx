@@ -2080,3 +2080,62 @@ pre-#82 shape), carries the count when set, dataclass plumbing incl. the
 engines-that-don't-track default. `test_server.py` 231 passed (the 4
 stream-usage exact-dict tests now prove the omit behavior). Full suite green
 recorded in the commit.
+
+## 83. `patch: normalize-merge-keeps-tool-calls` — structural same-role merge
+
+**Files:** `vllm_mlx/server.py` (`_normalize_messages`),
+`tests/test_normalize_messages.py` (+6)
+
+Found by the 2026-08-30 grammar/thinking/stop ordering audit (P1-d of the
+research doc), reproduced live before fixing: `_normalize_messages` merges
+consecutive same-role string-content messages by concatenating `content` and
+**discarding the rest of the second dict** — deleting every key beyond
+role/content. The damaging case is an assistant text turn followed by an
+assistant tool-call turn (a standard agent-loop history shape):
+
+```
+[user, assistant("Let me check."), assistant("", tool_calls=[get_weather])]
+  -> 2 messages, tool_calls GONE
+```
+
+Every re-sent history of that shape lost the call — the model sees itself
+having announced a tool call and then never made it, which invites
+re-calling or hallucinating the result. Same corruption class as llama.cpp
+#27626, reached through the merge instead of prefill-continuation.
+
+**Fix.** The merge stays (chat templates require alternating roles — that is
+the function's purpose) but becomes structural: list-valued keys concatenate
+(`prev + msg`, so two tool-call turns keep every call in order, producing a
+new list — inputs not mutated), other extra keys land first-writer-wins
+(only when `prev`'s value is missing/empty), and an empty content side no
+longer injects a stray `\n\n` separator. The merged message is the standard
+OpenAI combined shape (content + tool_calls on one assistant message), which
+both the native-format renderer and the `[Calling tool: ...]` degradation in
+`api/utils.py` already handle.
+
+**Behaviour delta beyond the bug fix:** `assistant("text") + assistant("")`
+now merges to `"text"` (was `"text\n\n"`). Deliberate — the trailing
+separator was an artifact of the same blind concat.
+
+**Ordering caveat (documented, not solved):** when a text turn follows a
+tool-call turn, the merged shape renders content before the calls even
+though history had them in the other order. Strictly better than deleting
+the calls; a client that needs exact interleaving should send a tool result
+between them (which blocks the merge entirely, as different roles never
+merge).
+
+**Verification:** `test_normalize_messages.py` 18/18 (6 new: text+tool-call
+keeps calls, two call turns concatenate in order, calls survive a text
+follow-up, scalar keys first-writer-wins, plain merge unchanged, inputs not
+mutated). Full suite green recorded in the commit.
+
+**Remaining P1-d audit findings (recorded, not yet fixed):** (a) stop
+strings and repetition-stop can truncate mid-JSON with no grammar
+coordination — vLLM #49227's mask-the-stop rule is the model; (b)
+`ThinkingAwareLogitsProcessor` knows only `</think>` as a THINK exit, so an
+armed thinking budget can force `</think>` into the middle of a tool call
+(latent: budget unarmed by default); (c) `response_format` forces
+`enable_thinking=False`, which harmony rendering ignores — grammar can mask
+harmony control tokens on gpt-oss routes. Each needs its own patch + a
+live-route verification; see the audit record in the 08-30 research doc
+follow-ups.
