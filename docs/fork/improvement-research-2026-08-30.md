@@ -305,6 +305,41 @@ already in #76 (`server.py:882-885`) — no action.
 - **Long-context llama.cpp arm of survey item 1**: no new M1/M2 Ultra data at
   30–150K appeared; our July ladders remain the only numbers for that regime.
 
+## P1-d audit results (run 2026-08-30, same day)
+
+The ordering audit ran against the four field rules. Verdicts, with the
+runtime checks that remain:
+
+1. **Grammar vs thinking — BUG (conditional).**
+   `_attach_response_format_logits_processor` (`server.py:730-746`) forces
+   `enable_thinking=False` instead of gating the grammar behind `</think>`;
+   the `ThinkingAwareLogitsProcessor(inner=...)` composition that would gate
+   it is only ever built in tests. Coherent for Qwen-style templates that
+   honour the flag; broken for **harmony rendering**, which takes no
+   `enable_thinking` at all — on a gpt-oss route the grammar masks harmony
+   control tokens from token 0. The #79 prompt-token convention is SAFE on
+   both schema processors (they self-learn the boundary on first call).
+   *Runtime check:* JSON-schema request against the live gpt-oss route.
+2. **Stop strings / repetition-stop vs un-terminated grammar — BUG.**
+   `truncate_at_stop` / `StopStringScanner` and the #77 repetition-stop all
+   fire with zero grammar coordination: `stop=["\n\n"]` + pretty-printed
+   schema truncates mid-object; non-streaming is saved by the 422 re-parse,
+   streaming has already sent the broken JSON. Fix model = vLLM #49227:
+   mask the stop while the matcher is not accepting; repetition-stop inside
+   a grammar should finish as `length`, never `stop`.
+3. **Think-terminator set — BUG, latent.** `</think>` is the ONLY THINK
+   exit (`server.py:540-541`); a THINK → `<tool_call>` transition stays in
+   THINKING, and an armed thinking budget's `_force_transition` then masks
+   everything except `</think>` — **injecting `</think>` mid-tool-call**.
+   Unarmed by default; exposure = whether any route sets a thinking budget
+   in llama-swap (check `personal-infratructure`). Fix model = llama.cpp
+   #26252: register tool-start markers as THINK terminators and suppress
+   the forced transition while the tail matches a partial tool-start.
+4. **Trailing assistant turn — the llama.cpp #27626 mechanism is N/A**
+   (no prefill-continuation here), **but the same corruption existed via
+   `_normalize_messages`**: the same-role merge dropped `tool_calls`
+   entirely. Reproduced live, **fixed as patch #83** (structural merge).
+
 ## Recommended sequence
 
 1. **P0-b sanity check** (10 min): confirm T=1.0 sampling varies on the
