@@ -147,8 +147,16 @@ class RequestOutputCollector:
             output_text=new.output_text,  # Use latest cumulative
             finished=new.finished,
             finish_reason=new.finish_reason,
+            # Carry the typed error cause — dropping it here turned typed
+            # errors generic whenever the producer outpaced the consumer.
+            error_kind=new.error_kind or existing.error_kind,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            # #82: the merge rebuilds the dataclass, so every carried field
+            # must be listed — cached_tokens was silently zeroed on exactly
+            # the non-streaming path (generate() drains the collector last,
+            # which has merged by then).
+            cached_tokens=new.cached_tokens or existing.cached_tokens,
         )
 
     def clear(self) -> None:

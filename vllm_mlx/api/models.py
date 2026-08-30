@@ -275,12 +275,34 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str | None = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """OpenAI ``usage.prompt_tokens_details`` — the subset we can source.
+
+    ``cached_tokens`` = prompt tokens served from the system-KV prefix
+    cache (the restore position). Fork #82; API shape follows upstream
+    PR #732 / the OpenAI spec so LiteLLM-side dashboards read it natively.
+    """
+
+    cached_tokens: int = 0
+
+
 class Usage(BaseModel):
     """Token usage statistics."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Present only when the prefix cache served tokens (#82). Omitted (not
+    # null) when unset, so every pre-#82 payload shape is byte-identical —
+    # OpenAI likewise omits the object rather than sending null.
+    prompt_tokens_details: PromptTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_null_details(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("prompt_tokens_details") is None:
+            data.pop("prompt_tokens_details", None)
+        return data
 
 
 class GenerationMetadata(BaseModel):

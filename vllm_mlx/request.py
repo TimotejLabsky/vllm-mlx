@@ -215,6 +215,10 @@ class RequestOutput:
     # "prompt_too_long"), so engine callers can translate mid-generator
     # failures into typed API errors.
     error_kind: Optional[str] = None
+    # Prompt tokens served from the system-KV prefix cache (the restore
+    # position); 0 for a cold prefill. Surfaces as OpenAI
+    # ``usage.prompt_tokens_details.cached_tokens`` (#82).
+    cached_tokens: int = 0
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
