@@ -5883,8 +5883,28 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             and isinstance(prev.get("content"), str)
             and isinstance(msg.get("content"), str)
         ):
-            # Merge string content with double newline separator
-            prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            # Merge string content with double newline separator (an empty
+            # side merges without injecting a stray separator).
+            if prev["content"] and msg["content"]:
+                prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            else:
+                prev["content"] = prev["content"] or msg["content"]
+            # Structural merge (#83): the old dict-drop merge silently
+            # DELETED every key beyond role/content — most damagingly the
+            # tool_calls of an assistant text-turn + tool-call-turn pair,
+            # a standard agent-loop history shape (same corruption class
+            # as llama.cpp #27626). Carry list-valued keys by
+            # concatenation (two tool_calls turns keep every call, in
+            # order) and other extra keys first-writer-wins, so the merged
+            # message is the standard OpenAI combined shape
+            # (content + tool_calls on one assistant message).
+            for key, value in msg.items():
+                if key in ("role", "content"):
+                    continue
+                if isinstance(value, list) and isinstance(prev.get(key), list):
+                    prev[key] = prev[key] + value
+                elif prev.get(key) in (None, ""):
+                    prev[key] = value
             logger.debug(
                 f"Merged consecutive {role} messages "
                 f"({len(prev['content'])} chars total)"
