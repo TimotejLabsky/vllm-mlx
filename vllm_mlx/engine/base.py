@@ -35,6 +35,9 @@ class GenerationOutput:
     tokens: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Prompt tokens served from the system-KV prefix cache (#82); 0 when
+    # the prefill ran cold or the engine does not track it.
+    cached_tokens: int = 0
     finish_reason: str | None = "stop"
     mtp_drafts: int = 0
     mtp_accepted: int = 0

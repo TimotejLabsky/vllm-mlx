@@ -771,3 +771,59 @@ class TestModelSerialization:
         )
         data = schema.model_dump(by_alias=True)
         assert "schema" in data
+
+
+# ── usage.prompt_tokens_details.cached_tokens (PATCHES.md #82) ────────────
+
+
+def test_usage_omits_details_when_unset():
+    """Pre-#82 payload shape must stay byte-identical for cold requests:
+    the key is OMITTED, not null (matching OpenAI's serialization)."""
+    from vllm_mlx.api.models import Usage
+
+    data = Usage(prompt_tokens=3, completion_tokens=2, total_tokens=5).model_dump()
+    assert "prompt_tokens_details" not in data
+    assert '"prompt_tokens_details"' not in Usage().model_dump_json()
+
+
+def test_usage_carries_cached_tokens_when_set():
+    from vllm_mlx.api.models import PromptTokensDetails, Usage
+
+    u = Usage(
+        prompt_tokens=100,
+        completion_tokens=1,
+        total_tokens=101,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=96),
+    )
+    assert u.model_dump()["prompt_tokens_details"] == {"cached_tokens": 96}
+
+
+def test_generation_output_carries_cached_tokens():
+    from vllm_mlx.engine.base import GenerationOutput
+    from vllm_mlx.request import RequestOutput
+
+    ro = RequestOutput(request_id="r", prompt_tokens=10, cached_tokens=8)
+    assert ro.cached_tokens == 8
+    go = GenerationOutput(text="x", cached_tokens=ro.cached_tokens)
+    assert go.cached_tokens == 8
+    assert GenerationOutput(text="x").cached_tokens == 0  # engines that don't track
+
+
+def test_collector_merge_preserves_cached_tokens_and_error_kind():
+    """#82: _merge_outputs rebuilds RequestOutput field-by-field; the
+    non-streaming path (generate() drains the collector) virtually always
+    merges, so any field missing from the rebuild is silently zeroed —
+    exactly how cached_tokens vanished on the first live deploy."""
+    from vllm_mlx.output_collector import RequestOutputCollector
+    from vllm_mlx.request import RequestOutput
+
+    c = RequestOutputCollector(aggregate=True)
+    c.put(RequestOutput(request_id="r", new_text="a", cached_tokens=582,
+                        prompt_tokens=583))
+    c.put(RequestOutput(request_id="r", new_text="b", cached_tokens=582,
+                        prompt_tokens=583, finished=True,
+                        error_kind="prompt_too_long"))
+    merged = c.get_nowait()
+    assert merged.new_text == "ab"
+    assert merged.cached_tokens == 582
+    assert merged.error_kind == "prompt_too_long"
