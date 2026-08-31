@@ -2546,6 +2546,7 @@ class Scheduler:
                     return _batched_kv.insert_segmented(
                         self.hybrid_kv, self.batch_generator, request,
                         toks, insert_kwargs,
+                        tokenizer=self.tokenizer,  # #88 boundary detection
                     )
                 return self.batch_generator.insert([toks], **insert_kwargs)
 
