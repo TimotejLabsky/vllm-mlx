@@ -5322,3 +5322,84 @@ def pytest_addoption(parser):
         default="http://localhost:8000",
         help="URL of the vllm-mlx server for integration tests",
     )
+
+
+class TestCompletionDryForwarding:
+    """#86: CompletionRequest DECLARES dry_* fields; both completion
+    handlers must forward them (they returned 200 and dropped them, unlike
+    chat and the Anthropic adapter — a declared-but-ignored parameter)."""
+
+    @pytest.mark.anyio
+    async def test_nonstream_completion_forwards_dry(self, monkeypatch):
+        from vllm_mlx.server import CompletionRequest, create_completion
+        import vllm_mlx.server as server
+
+        captured = {}
+
+        class DummyEngine:
+            async def generate(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    text="ok",
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_residency_manager", None)
+        monkeypatch.setattr(server, "_default_model_key", None)
+        monkeypatch.setattr(server, "get_engine", lambda: DummyEngine())
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            dry_multiplier=0.8,
+            dry_base=1.75,
+            dry_allowed_length=4,
+            dry_range=1024,
+        )
+        await create_completion(request, raw_request=None)
+        assert captured["dry_multiplier"] == 0.8
+        assert captured["dry_base"] == 1.75
+        assert captured["dry_allowed_length"] == 4
+        assert captured["dry_range"] == 1024
+        # absent field defers to per-model env defaults as None
+        assert captured["dry_sequence_breakers"] is None
+
+    @pytest.mark.anyio
+    async def test_stream_completion_forwards_dry(self):
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        captured = {}
+
+        class DummyEngine:
+            async def stream_generate(self, **kwargs):
+                captured.update(kwargs)
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            dry_multiplier=0.5,
+        )
+        _ = [
+            chunk
+            async for chunk in stream_completion(
+                DummyEngine(),
+                "hello",
+                request,
+                max_tokens=8,
+            )
+        ]
+        assert captured["dry_multiplier"] == 0.5

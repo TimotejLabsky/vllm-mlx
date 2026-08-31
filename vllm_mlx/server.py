@@ -5491,6 +5491,17 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 "min_p": _resolve_min_p(request.min_p),
                 "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
                 "stop": request.stop,
+                # DRY (#86): CompletionRequest DECLARES these fields, so a
+                # 200 without forwarding them was a silent lie — chat and
+                # Anthropic forward them, completions dropped them. None
+                # defers to per-model VLLM_MLX_DRY_* env defaults.
+                "dry_multiplier": getattr(request, "dry_multiplier", None),
+                "dry_base": getattr(request, "dry_base", None),
+                "dry_allowed_length": getattr(request, "dry_allowed_length", None),
+                "dry_range": getattr(request, "dry_range", None),
+                "dry_sequence_breakers": getattr(
+                    request, "dry_sequence_breakers", None
+                ),
             }
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
@@ -6841,6 +6852,13 @@ async def stream_completion(
         "min_p": _resolve_min_p(request.min_p),
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "stop": request.stop,
+        # DRY (#86): same forwarding as the non-streaming handler — the
+        # declared fields must reach the engine on both paths.
+        "dry_multiplier": getattr(request, "dry_multiplier", None),
+        "dry_base": getattr(request, "dry_base", None),
+        "dry_allowed_length": getattr(request, "dry_allowed_length", None),
+        "dry_range": getattr(request, "dry_range", None),
+        "dry_sequence_breakers": getattr(request, "dry_sequence_breakers", None),
     }
     generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
         repetition_penalty
