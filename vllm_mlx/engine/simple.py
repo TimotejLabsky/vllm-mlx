@@ -32,6 +32,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
+from ..grammar_guard import grammar_unterminated
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -129,6 +130,16 @@ def _sample_with_processors(
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     tok = sampler(logprobs)
     return tok, logprobs
+
+
+def _count_grammar_stop_suppressed(source: str) -> None:
+    """Best-effort counter for a stop withheld inside a grammar (#89)."""
+    try:
+        from ..metrics import metrics as _gg_metrics
+
+        _gg_metrics.observe_grammar_stop_suppressed(source=source)
+    except Exception:
+        pass
 
 
 def _processors_can_retire(processors: list[Any] | None) -> bool:
@@ -3406,6 +3417,8 @@ class SimpleEngine(BaseEngine):
         # stays bounded instead of re-scanning the whole accumulated text every
         # token (which made stop-sequence matching O(n^2) over a generation).
         _max_stop_len = max((len(s) for s in stop), default=0) if stop else 0
+        # One suppression counted per request (PATCHES.md #89).
+        _grammar_stop_suppressed = False
         try:
             while True:
                 kind, payload = await response_queue.get()
@@ -3433,6 +3446,17 @@ class SimpleEngine(BaseEngine):
                         else accumulated_text[-window_len:]
                     )
                     stop_hit = any(stop_seq in window for stop_seq in stop)
+                    if stop_hit and grammar_unterminated(all_processors):
+                        # The match is inside a still-open structured-output
+                        # value; stopping here streams truncated JSON under
+                        # finish_reason="stop" (PATCHES.md #89).
+                        stop_hit = False
+                        # Latched: this window overlaps the previous one, so
+                        # the same match re-detects for the next few tokens
+                        # and would otherwise inflate the counter.
+                        if not _grammar_stop_suppressed:
+                            _grammar_stop_suppressed = True
+                            _count_grammar_stop_suppressed("stop_string")
                 finished = stop_hit or token_count >= max_tokens
                 finish_reason = getattr(resp, "finish_reason", None)
                 if stop_hit:
