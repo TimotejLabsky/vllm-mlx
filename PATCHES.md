@@ -2129,9 +2129,8 @@ keeps calls, two call turns concatenate in order, calls survive a text
 follow-up, scalar keys first-writer-wins, plain merge unchanged, inputs not
 mutated). Full suite green recorded in the commit.
 
-**Remaining P1-d audit findings (recorded, not yet fixed):** (a) stop
-strings and repetition-stop can truncate mid-JSON with no grammar
-coordination — vLLM #49227's mask-the-stop rule is the model; (b)
+**Remaining P1-d audit findings:** (a) stop strings and repetition-stop can
+truncate mid-JSON with no grammar coordination — **FIXED, patch #89**; (b)
 `ThinkingAwareLogitsProcessor` knows only `</think>` as a THINK exit, so an
 armed thinking budget can force `</think>` into the middle of a tool call
 (latent: budget unarmed by default); (c) `response_format` forces
@@ -2335,3 +2334,161 @@ cleanup, per-family marker caching, thinning policy (non-boundary victim,
 last-two protection, flag carriage). Existing capture/restore/thinning
 suites green unchanged. NOT yet deployed — next deploy owes the standing
 T=0 byte-identical warm-vs-cold gate on a live route.
+
+## 89. `patch: stop-vs-grammar-masking` — a stop terminator may not cut an open JSON value
+
+**Files:** `vllm_mlx/grammar_guard.py` (new, fork-owned),
+`vllm_mlx/constrained/llguidance_schema_processor.py` (+`is_accepting`),
+`vllm_mlx/constrained/json_schema_processor.py` (+`is_accepting`),
+`vllm_mlx/stop_strings.py` (+`deferred_scan`), `vllm_mlx/engine/batched.py`
+(`_GrammarStopGate` + the non-stream helper, four stop sites),
+`vllm_mlx/engine/simple.py` (one stop site), `vllm_mlx/request.py`
+(+`RequestOutput.grammar_unterminated`), `vllm_mlx/output_collector.py`
+(merge carries it), `vllm_mlx/scheduler.py` (stamp + rep-stop finish
+reason), `vllm_mlx/mllm_scheduler.py` (stamp), `vllm_mlx/metrics.py` (+1
+counter), `tests/test_grammar_stop_guard.py` (new, 35 tests)
+
+The last open finding of the 2026-08-30 ordering audit (P1-d-2, recorded in
+#83). A structured-output request carries two terminators that knew nothing
+about each other: the schema processor (#73 llguidance, or the
+lm-format-enforcer fallback) which masks logits so the output *must* be a
+legal JSON value, and the stop terminators — user/parser `stop` strings
+(#32) and the repetition detector (#77). A pretty-printed schema
+legitimately emits `"\n\n"` between members, and every OpenAI-shaped agent
+harness sends `stop=["\n\n"]`, so the request was cut mid-object and
+reported as `finish_reason="stop"` — a clean stop on truncated JSON, the
+worst of the two failure shapes. Non-streaming caught it after the fact
+(`_apply_response_format_or_raise` re-parses and 422s); streaming had
+already put the broken JSON on the wire, which is the case that matters.
+Fix model: vLLM #49227/#50595 — while a schema matcher is not accepting, the
+stop terminators must not fire.
+
+**The seam.** `grammar_guard.py` is pure duck typing (no imports from
+`constrained/`, no mlx), so any stop path can consult it. A processor
+participates by exposing a nullary `is_accepting() -> bool`; the module
+flattens both the flat per-request list and the scheduler's per-sequence
+nested lists, ignores non-participating processors (DRY, penalties,
+thinking), and returns `False` from `grammar_unterminated` whenever no
+schema processor is attached — every stop path stays byte-identical on
+unconstrained requests, which is the whole regression surface.
+
+**Wrappers.** A schema processor can be held as `_inner` by either thinking
+processor (`ThinkingAwareLogitsProcessor`, `server.py`'s
+`_ThinkingAwareLogitsProcessor`), which gate it behind `</think>`. Neither
+composition is built on a live route today — `enable_thinking` is forced
+`False` whenever a grammar exists, which is audit bug 1 — but the guard
+follows the `_inner` chain (depth-capped, cycle-safe) so it cannot go
+silently blind if bug 1 is fixed by actually using the wrapper. A wrapper
+that answers for itself wins; this mirrors the `schema` / `_disabled`
+forwarding those wrappers already do. Descending is conservative during a
+wrapper's pre-delegation phase — the inner processor has not been called, so
+stops stay suppressed through the thinking block, which is the right answer
+anyway: under `response_format` a stop firing before the value is complete
+yields no JSON at all.
+
+**Why the processors cache a bool.** `is_accepting()` returns the grammar
+state as of the last mask application rather than calling into the matcher
+on demand: the stop paths run on the consumer/asyncio thread while
+generation mutates the matcher on the model thread, and a bool read is
+atomic under the GIL where an FFI call into a `&mut self` Rust matcher is
+not. That makes the predicate one token stale by construction (the
+processor masks step N's logits before token N is sampled; the stop paths
+inspect text that already contains token N) — safe in the only direction
+that matters for the schemas these routes serve: under an object or array
+schema the matcher accepts only at the closing brace/bracket, so the token
+which *closes* the value flips accepting False → True and a guard consulted
+at that moment reports "un-terminated", suppressing a stop that had nothing
+left to cut. Never the reverse. That is a property of *container* schemas,
+not of JSON grammars generally — a top-level scalar schema
+(`{"type": "integer"}`) accepts after `1` while `12` is still reachable, so
+accepting can be true mid-value there and a stop could fire. Agent traffic
+sends object schemas; a scalar-root fix would be a "no token can extend the
+value" predicate, not a staleness fix.
+llguidance reports `_terminal or matcher.is_accepting()`; the
+lm-format-enforcer path publishes `_suffix_is_complete_json` — the *same*
+predicate that gates unmasking EOS, so the two terminators cannot disagree
+about when the value is finished. A predicate that raises counts as
+un-terminated (fail-closed, matching #73's house style).
+
+**The verdict is stamped by the producer, not read by the consumer.** The
+first cut of this patch had `_GrammarStopGate` read `is_accepting()` live
+when a chunk was dequeued; the code review caught that as the one High
+finding, and it was a real bug. Chunks are drained from
+`RequestOutputCollector`, a lag-tolerant buffer that also MERGES outputs
+when the producer outruns the consumer (backpressured client, co-batched
+requests), so the processor's live state at drain time can be many tokens
+*ahead* of the text in hand. Worst case is the ordinary end of a request:
+the last mask application flips accepting to true, the remaining buffered
+chunks drain, the guard now answers "finished" for every one of them, and
+the scanner cuts a mid-object chunk — exactly the failure this patch
+exists to prevent, reintroduced by the guard itself. So
+`RequestOutput.grammar_unterminated` is stamped where the chunk is produced
+(both schedulers), the collector's merge ORs it (a merged span is mid-value
+if *either* constituent was — and #82's lesson applies: the merge rebuilds
+the dataclass, so every carried field must be listed), and the gate reads
+the stamp. The live read survives only as a fallback for producers that do
+not stamp, which keeps unstamped paths on their pre-#89 behaviour.
+
+**Streaming vs non-streaming.** Streaming is position-accurate: while the
+grammar is mid-value the chunk passes through and the stop is withheld, via
+the new `StopStringScanner.deferred_scan` — which *does* advance the carried
+tail (so a later real scan still finds cross-chunk matches) and reports
+whether a match was ignored, so suppressions stay countable. The counter is
+latched once per stream: `deferred_scan` retains `max_len - 1` characters,
+so a stop string shorter than the longest one sits wholly inside the tail
+and re-matches for several chunks — and `get_parser_stop_tokens` merges the
+tool parser's own stop tokens into the user's list, making mixed lengths the
+normal shape rather than an edge case. Non-streaming has no
+per-position grammar state to consult and does not need one: with a schema
+attached the whole generated text IS the value — once the grammar accepts,
+only EOS is unmasked, so nothing can follow — hence every stop match lands
+inside it and truncation is suppressed wholesale. `server.py`'s re-parse
+still 422s genuinely broken JSON.
+
+**Repetition-stop reports `length`, not `stop`.** #77 deliberately reports
+`"stop"` for OpenAI-client compatibility; that choice is kept everywhere
+except inside an un-terminated grammar, where "stop" would tell the client
+a truncated object is complete. `"length"` is the honest reason — the
+request ended without reaching a legal end of value — and it is the same
+shape a `max_tokens` cut produces, which every OpenAI client already
+handles as retry-or-raise. `vllm_mlx_repetition_stops_total` still counts
+the event; the log line names the downgrade.
+
+**Observability.** `vllm_mlx_grammar_stop_suppressions_total{source}` —
+`stop_string` for an ignored match, `repetition` for a downgraded rep-stop.
+Per-process like every `vllm_mlx_*` metric (see #87's note). Both engines
+count through a best-effort helper that can never fail a generation.
+
+**SimpleEngine covered too.** One gated line at its streaming stop-check,
+with its own per-request latch (that check re-scans an overlapping window,
+so one match re-detects for the next few tokens). The fleet runs
+BatchedEngine on every text and vision route, so this is parity insurance
+rather than a live path, but the bug is identical there and the surface is
+a handful of lines.
+
+**Also fixed from the review:** the `_disabled` branch of the
+lm-format-enforcer processor now publishes `_accepting = True`. It is
+unreachable today (`_disabled` is only ever assigned `False`), but if armed
+it means *no grammar is being enforced*, and reporting mid-value there would
+suppress every stop terminator for the rest of the request while
+`_eos_logits_or_original` returns the original logits when there is no EOS
+to force — nothing would end it before `max_tokens`.
+
+**Verification:** 35 new tests — guard unit level (no processors, plain
+processors, nested per-sequence lists, bare processor, raising predicate,
+any-open-grammar-wins, `_inner` wrappers incl. a self-referential cycle),
+`deferred_scan` (reports once, cross-chunk, tail stays correct for a later
+real scan), batched streaming + non-streaming + MLLM streaming with a
+pretty-printed object whose separator IS the stop string (suppressed with a
+grammar; **unchanged without one**, and unchanged with a non-participating
+processor), the producer stamp beating a stale live read in **both**
+directions, the collector merge's OR semantics, the latched counter under a
+mixed-length stop list, rep-stop → `length` mid-grammar / `stop` when
+accepting / `stop` with no grammar, and the processor predicate wiring on
+both backends. Existing #32 (11) and #77 (24) suites green untouched. Full
+suite 3391 passed / 31 skipped.
+
+**NOT yet deployed.** Owes the live probe: a JSON-schema request with
+`stop=["\n\n"]` against a route with llguidance active, asserting complete
+JSON plus the right finish_reason — plus the standing T=0 gate the #88
+deploy already owes.
