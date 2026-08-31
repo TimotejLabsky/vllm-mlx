@@ -814,3 +814,84 @@ def test_get_stats_emits_system_kv_cache_block(monkeypatch):
     assert "system_kv_cache" in stats
     assert stats["system_kv_cache"]["enabled"] is True
     assert "memory_aware_cache" not in stats
+
+
+# ── message-boundary checkpoints (PATCHES.md #88) ─────────────────────────
+
+
+class _FakeTok:
+    """Marker strings encode to distinctive id runs (100+char ords)."""
+
+    bos_token_id = 1
+
+    def encode(self, text, add_special_tokens=True):
+        return [100 + (ord(c) % 50) for c in text[:4]]
+
+
+def _boundary_kv(monkeypatch, min_step=None):
+    if min_step is not None:
+        monkeypatch.setenv("VLLM_MLX_BATCHED_KV_BOUNDARY_MIN_STEP", str(min_step))
+    else:
+        monkeypatch.delenv("VLLM_MLX_BATCHED_KV_BOUNDARY_MIN_STEP", raising=False)
+    return BatchedSystemKV(_FakeModel())
+
+
+def test_find_message_boundaries_hits_and_min_step(monkeypatch):
+    from vllm_mlx.batched_system_kv import find_message_boundaries
+
+    marker = (7, 8, 9)
+    toks = [0] * 100 + [7, 8, 9] + [0] * 50 + [7, 8, 9] + [0] * 300 + [7, 8, 9] + [0] * 20
+    # hits at 100, 153, 456. min_step measures from the previous accepted
+    # cut INCLUDING position 0: with 120, 100 is too close to the start,
+    # 153 accepted, 456 accepted (303 past 153).
+    got = find_message_boundaries(toks, [marker], 120)
+    assert got == (153, 456)
+    # min_step 0 keeps all
+    assert find_message_boundaries(toks, [marker], 0) == (100, 153, 456)
+    # the LAST boundary bypasses min_step (llama.cpp #24176 rule)
+    got = find_message_boundaries(toks, [marker], 10_000)
+    assert got == (456,)
+    # no markers / no hits
+    assert find_message_boundaries(toks, [], 0) == ()
+    assert find_message_boundaries([0] * 50, [marker], 0) == ()
+
+
+def test_split_segments_boundary_cuts_with_interval_bound(monkeypatch):
+    kv = _boundary_kv(monkeypatch)
+    kv.ckpt_interval = 256
+    toks = list(range(1000))
+    segs = kv.split_segments(toks, boundaries=(300, 900))
+    # cuts at 300 and 900, interval subdivision between them
+    lens = [len(s) for s in segs]
+    assert sum(lens) == 1000
+    assert all(ln <= 256 for ln in lens)
+    # reassembles exactly
+    flat = [t for s in segs for t in s]
+    assert flat == toks
+    # boundary positions are segment starts
+    starts = [0]
+    for ln in lens[:-1]:
+        starts.append(starts[-1] + ln)
+    assert 300 in starts and 900 in starts
+    # no boundaries -> legacy uniform split
+    legacy = kv.split_segments(toks)
+    assert [len(s) for s in legacy] == [256, 256, 256, 232]
+
+
+def test_note_scheduled_stores_absolute_boundaries_and_capture_flags(monkeypatch):
+    kv = _boundary_kv(monkeypatch)
+    kv.note_scheduled("r1", 500, boundaries=(300,))
+    assert kv._boundary_pos["r1"] == frozenset({800})
+    kv.discard_pending("r1")
+    assert "r1" not in kv._boundary_pos
+
+
+def test_boundary_marker_ids_detects_family_and_caches(monkeypatch):
+    kv = _boundary_kv(monkeypatch)
+    prompt = "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nhi"
+    tok = _FakeTok()
+    seqs = kv.boundary_marker_ids(prompt, tok)
+    assert seqs and all(isinstance(s, tuple) and s for s in seqs)
+    assert kv.boundary_marker_ids(prompt, tok) is seqs  # cached per family
+    assert kv.boundary_marker_ids("no markers here", tok) == ()
+    assert kv.boundary_marker_ids(prompt, None) == ()
