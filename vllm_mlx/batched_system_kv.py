@@ -42,8 +42,11 @@ from typing import Any, Optional
 from .memory_pressure import PressureManager
 
 from .system_kv import (
+    TEMPLATE_MARKERS,
     CacheTimingRecorder,
     append_checkpoint,
+    detect_template_markers,
+    thin_checkpoints,
     apply_snapshot_states,
     capture_checkpoint_states,
     capture_snapshot_meta,
@@ -207,6 +210,22 @@ class BatchedSystemKV:
         self.ckpt_interval = max(
             256, _env_int("VLLM_MLX_BATCHED_KV_CKPT_INTERVAL", 2048)
         )
+        # Message-boundary checkpoints (#88): minimum token distance between
+        # accepted boundary splits, so a burst of short turns doesn't shred
+        # the ladder (llama.cpp #24176 raised theirs 256 -> 8192; start at
+        # the proven interval and tune from ladder data).
+        self.boundary_min_step = max(
+            0, _env_int("VLLM_MLX_BATCHED_KV_BOUNDARY_MIN_STEP", 2048)
+        )
+        # request_id -> frozenset of ABSOLUTE message-boundary positions,
+        # recorded at insert so capture_segment can flag boundary-aligned
+        # checkpoints for the thinning policy.
+        self._boundary_pos: dict[str, frozenset] = {}
+        # template family -> tuple of marker token-id sequences (encoded
+        # once per family per process; markers are special tokens with
+        # stable ids, so token-space scanning avoids the byte-offset
+        # translation llama.cpp #24176 dropped for the same reason).
+        self._marker_ids: dict[str, tuple] = {}
         # Admission-gate budgets (0 = disabled). See should_defer_cobatch.
         self.pad_waste_mb = _env_int("VLLM_MLX_BATCHED_PAD_WASTE_MB", 0)
         # Total padded-KV byte budget: effective concurrency floats on the
@@ -286,22 +305,74 @@ class BatchedSystemKV:
 
     # ------------------------------------------------------------- schedule
 
-    def split_segments(self, tokens: list) -> list:
+    def split_segments(self, tokens: list, boundaries=()) -> list:
         """Split inserted tokens at checkpoint boundaries for
         ``insert_segments`` — the generator stops at each boundary, which is
-        where ``capture_segment`` snapshots recurrent state."""
-        if len(tokens) <= self.ckpt_interval:
-            return [list(tokens)]
-        return [
-            list(tokens[i : i + self.ckpt_interval])
-            for i in range(0, len(tokens), self.ckpt_interval)
-        ]
+        where ``capture_segment`` snapshots recurrent state.
 
-    def note_scheduled(self, request_id: str, cached_tokens: int) -> None:
+        #88: ``boundaries`` (positions relative to ``tokens``) add message-
+        boundary cuts IN ADDITION to the uniform interval; the interval
+        stays a hard upper bound on segment length, so a 60K-token tool
+        result can never become one enormous prefill chunk (the #48/#53
+        memory rails are tuned against interval-sized transients)."""
+        n = len(tokens)
+        cuts = sorted({int(b) for b in boundaries if 0 < int(b) < n})
+        if not cuts and n <= self.ckpt_interval:
+            return [list(tokens)]
+        segments = []
+        start = 0
+        for cut in cuts + [n]:
+            while cut - start > self.ckpt_interval:
+                segments.append(list(tokens[start : start + self.ckpt_interval]))
+                start += self.ckpt_interval
+            if cut > start:
+                segments.append(list(tokens[start:cut]))
+                start = cut
+        return segments
+
+    def boundary_marker_ids(self, prompt_text, tokenizer) -> tuple:
+        """Token-id sequences of the prompt's template-family turn markers
+        (#88). Detected from the rendered prompt via patch #20's marker
+        table, encoded once per family per process."""
+        if not prompt_text or tokenizer is None:
+            return ()
+        family, _idx, _gen = detect_template_markers(prompt_text)
+        if family is None:
+            return ()
+        cached = self._marker_ids.get(family)
+        if cached is not None:
+            return cached
+        seqs = []
+        for fam, boundary_markers, _g in TEMPLATE_MARKERS:
+            if fam != family:
+                continue
+            for marker in boundary_markers:
+                try:
+                    ids = tokenizer.encode(marker, add_special_tokens=False)
+                except TypeError:
+                    ids = tokenizer.encode(marker)
+                    bos = getattr(tokenizer, "bos_token_id", None)
+                    if bos is not None and ids and ids[0] == bos:
+                        ids = ids[1:]
+                if ids:
+                    seqs.append(tuple(ids))
+            break
+        self._marker_ids[family] = tuple(seqs)
+        return self._marker_ids[family]
+
+    def note_scheduled(
+        self, request_id: str, cached_tokens: int, boundaries=()
+    ) -> None:
         """Record the restored-prefix offset so segment positions (relative
-        to the inserted tokens) map to absolute sequence positions."""
+        to the inserted tokens) map to absolute sequence positions — and
+        (#88) the absolute message-boundary set, so captures at those
+        positions get the preferred-survivor flag."""
         with self._lock:
             self._base_pos[request_id] = cached_tokens
+            if boundaries:
+                self._boundary_pos[request_id] = frozenset(
+                    cached_tokens + int(b) for b in boundaries
+                )
 
     # -------------------------------------------------------------- capture
 
@@ -348,12 +419,14 @@ class BatchedSystemKV:
                 states,
                 metas,
                 self.ckpt_capacity,
+                boundary=pos in self._boundary_pos.get(request_id, ()),
             )
 
     def discard_pending(self, request_id: str) -> None:
         with self._lock:
             self._pending.pop(request_id, None)
             self._base_pos.pop(request_id, None)
+            self._boundary_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
 
     # ---------------------------------------------------------------- store
@@ -437,9 +510,7 @@ class BatchedSystemKV:
             for cp in checkpoints:
                 merged[cp["pos"]] = cp
             checkpoints = [merged[p] for p in sorted(merged)]
-            while len(checkpoints) > max(1, self.ckpt_capacity):
-                tail = checkpoints[-1]
-                checkpoints = checkpoints[:-1][::2] + [tail]
+            checkpoints = thin_checkpoints(checkpoints, self.ckpt_capacity)
         if kinds is None:
             kinds = _derive_kinds(snapshot)
         # Normalize: trim layers always hold SEGMENT lists internally (a
@@ -1113,13 +1184,75 @@ def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> No
         hybrid_kv.discard_pending(request_id)
 
 
-def insert_segmented(hybrid_kv: "BatchedSystemKV", batch_generator, request, tokens, insert_kwargs):
+def find_message_boundaries(tokens, marker_seqs, min_step) -> tuple:
+    """Positions in ``tokens`` where a template turn marker STARTS (#88) —
+    checkpoint placement at message boundaries, on the token stream.
+
+    ``min_step`` thins boundaries closer than that to the previous accepted
+    cut (short-turn bursts must not shred the ladder); the LAST boundary is
+    always kept regardless (llama.cpp #24176's rule — the newest turn start
+    is the likeliest divergence point of the next request)."""
+    if not marker_seqs:
+        return ()
+    n = len(tokens)
+    hits = set()
+    for seq in marker_seqs:
+        m = len(seq)
+        if m == 0 or m > n:
+            continue
+        first = seq[0]
+        i = 0
+        while True:
+            try:
+                i = tokens.index(first, i)
+            except ValueError:
+                break
+            if tuple(tokens[i : i + m]) == seq:
+                hits.add(i)
+            i += 1
+    ordered = sorted(h for h in hits if 0 < h < n)
+    if not ordered:
+        return ()
+    accepted = []
+    last_cut = 0
+    for h in ordered:
+        if h - last_cut >= min_step:
+            accepted.append(h)
+            last_cut = h
+    if not accepted or accepted[-1] != ordered[-1]:
+        accepted.append(ordered[-1])  # newest boundary bypasses min_step
+    return tuple(accepted)
+
+
+def insert_segmented(
+    hybrid_kv: "BatchedSystemKV",
+    batch_generator,
+    request,
+    tokens,
+    insert_kwargs,
+    tokenizer=None,
+):
     """_schedule_waiting insert hook (#34): split the prompt at checkpoint
     boundaries so the generator stops there (insert_segments) and
-    capture_checkpoints can snapshot recurrent state."""
-    hybrid_kv.note_scheduled(request.request_id, request.cached_tokens)
+    capture_checkpoints can snapshot recurrent state. #88 adds message-
+    boundary cuts (detected on the token stream from the request's
+    template family) so checkpoints land where agent histories actually
+    diverge; failure to detect degrades to the uniform interval."""
+    boundaries = ()
+    try:
+        marker_seqs = hybrid_kv.boundary_marker_ids(
+            getattr(request, "prompt", None), tokenizer
+        )
+        boundaries = find_message_boundaries(
+            tokens, marker_seqs, hybrid_kv.boundary_min_step
+        )
+    except Exception:
+        logger.debug("[batched_system_kv] boundary detection failed", exc_info=True)
+    hybrid_kv.note_scheduled(
+        request.request_id, request.cached_tokens, boundaries=boundaries
+    )
     return batch_generator.insert_segments(
-        [hybrid_kv.split_segments(tokens)],
+        [hybrid_kv.split_segments(tokens, boundaries=boundaries)],
         **insert_kwargs,
     )
 
