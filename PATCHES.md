@@ -2261,3 +2261,27 @@ survey item doesn't resurface as-is.
 **Verification:** 2 forwarding tests (non-stream + stream, via the
 captured-kwargs DummyEngine harness the mllm_draft tests established).
 Full suite green in the commit.
+
+## 87. `patch: empty-completions-counter` — silent empty turns become countable
+
+**Files:** `vllm_mlx/metrics.py`, `tests/test_observability_metrics.py` (+1)
+
+Survey item 11 (fork half), executed 2026-08-31. Two gateway layers mask
+dead turns: llama-swap returns a dead upstream stream as HTTP 200 with an
+empty completion, and LiteLLM rewrites upstream `finish_reason:"error"` to
+`"stop"` with `content: None` — so the client sees a "successful" empty
+turn and nothing anywhere counts it. The fork is the only layer with
+ground truth. `vllm_mlx_empty_completions_total{endpoint}` increments in
+`observe_inference` when `result == "success" and completion_tokens == 0`;
+errors and cancellations are deliberately excluded (they have their own
+counters — this metric isolates the SILENT shape).
+
+**Still infra-side (Tim):** the LiteLLM `post_call` callback for the
+never-reached-the-fork case (the 2026-07-14 llama-swap wedge shape), and
+the alert `increase(vllm_mlx_empty_completions_total[15m]) > 0`. Note the
+counter is per-process like every `vllm_mlx_*` metric — for alerting it
+needs either the exporter mirror treatment or scraping acceptance of
+resets (rate() handles resets fine; absence between scrapes is the gap).
+
+**Verification:** counter fires on the silent shape only (success+zero),
+not on non-empty or error finishes. Full suite green in the commit.
