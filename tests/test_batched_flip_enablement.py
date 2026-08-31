@@ -548,3 +548,36 @@ def test_scheduler_step_relieves_pressure(monkeypatch):
     scheduler.hybrid_kv.has_ssd = False
     scheduler.step()
     scheduler.hybrid_kv.relieve_pressure.assert_called_once()
+
+
+# ------------------------------------------- completion ceiling (#84)
+
+
+def test_completion_ceiling_clamps_oversized_max_tokens(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_MAX_COMPLETION_TOKENS", "5")
+    scheduler = _capped_scheduler(monkeypatch, None)
+    req = _mk_request("clamped")  # SamplingParams(max_tokens=8) > 5
+    scheduler.add_request(req)
+    assert req.sampling_params.max_tokens == 5
+    assert scheduler.completion_clamps == 1
+    assert scheduler.get_stats()["completion_clamps"] == 1
+    assert scheduler.get_stats()["max_completion_tokens"] == 5
+    assert "clamped" in scheduler.requests  # admitted, not rejected
+
+
+def test_completion_ceiling_leaves_smaller_requests_alone(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_MAX_COMPLETION_TOKENS", "100")
+    scheduler = _capped_scheduler(monkeypatch, None)
+    req = _mk_request("fits")
+    scheduler.add_request(req)
+    assert req.sampling_params.max_tokens == 8  # untouched
+    assert scheduler.completion_clamps == 0
+
+
+def test_completion_ceiling_inert_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_MAX_COMPLETION_TOKENS", raising=False)
+    scheduler = _capped_scheduler(monkeypatch, None)
+    req = _mk_request("free")
+    scheduler.add_request(req)
+    assert req.sampling_params.max_tokens == 8
+    assert scheduler.get_stats()["max_completion_tokens"] == 0

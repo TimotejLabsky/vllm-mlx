@@ -4126,6 +4126,8 @@ async def status():
         "queue_rejections": stats.get("queue_rejections", 0),
         "max_prompt_tokens": stats.get("max_prompt_tokens", 0),
         "prompt_rejections": stats.get("prompt_rejections", 0),
+        "max_completion_tokens": stats.get("max_completion_tokens", 0),
+        "completion_clamps": stats.get("completion_clamps", 0),
         "vision_encodes_deferred": stats.get("vision_encodes_deferred", 0),
         "total_requests_processed": stats.get("num_requests_processed", 0),
         "total_prompt_tokens": stats.get("total_prompt_tokens", 0),

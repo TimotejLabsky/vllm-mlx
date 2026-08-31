@@ -1429,6 +1429,23 @@ class Scheduler:
             self.max_prompt_tokens = 0
         self.prompt_rejections = 0
 
+        # Completion-token ceiling (fork #84): CLAMP max_tokens so a single
+        # request can never decode into mlx's `[metal::malloc] Resource
+        # limit (499000) exceeded` wall (~10.5K decode steps on
+        # Qwen3.6-27B-4bit — an upstream bug reproduced with PURE mlx-lm,
+        # no vllm-mlx in the process; repro + probe matrix in
+        # docs/fork/mlxlm-issue-499000-draft.md). Unlike the prompt ceiling
+        # this is not a rejection: the request runs and finishes as
+        # `length` below the wall instead of erroring mid-flight.
+        # 0 (default) = off; arm per route where the wall is measured.
+        try:
+            self.max_completion_tokens = int(
+                os.environ.get("VLLM_MLX_MAX_COMPLETION_TOKENS", "0") or 0
+            )
+        except ValueError:
+            self.max_completion_tokens = 0
+        self.completion_clamps = 0
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -2115,6 +2132,19 @@ class Scheduler:
                 raise PromptTooLong(
                     f"prompt is {n} tokens; this route accepts at most "
                     f"{self.max_prompt_tokens} (VLLM_MLX_MAX_PROMPT_TOKENS)"
+                )
+
+        # Completion-token ceiling (fork #84) — clamp, don't reject.
+        if self.max_completion_tokens > 0 and request.sampling_params is not None:
+            mt = getattr(request.sampling_params, "max_tokens", None)
+            if mt is None or mt <= 0 or mt > self.max_completion_tokens:
+                request.sampling_params.max_tokens = self.max_completion_tokens
+                self.completion_clamps += 1
+                logger.info(
+                    f"[completion-ceiling] clamped request "
+                    f"{request.request_id[:12]} max_tokens "
+                    f"{mt} -> {self.max_completion_tokens} "
+                    "(VLLM_MLX_MAX_COMPLETION_TOKENS)"
                 )
 
         # Check prefix cache for cached KV state
@@ -3412,6 +3442,17 @@ class Scheduler:
                 tokens = self.batch_generator.active_batch.tokens
                 if tokens:
                     mx.eval(*tokens)
+            # NOTE (2026-08-30, the 499000 investigation): materializing
+            # MORE than tokens here does NOT help. A hook that additionally
+            # evaled every per-layer cache state and batch bookkeeping
+            # array was probed against the `[metal::malloc] Resource limit
+            # (499000) exceeded` crash and the crash step did not move; a
+            # gc census showed the Python-side mx-array count dead flat
+            # (2063) while Metal's resource count climbed ~48/decode-step;
+            # and the crash step (~10.5K, Qwen3.6-27B-4bit) is IDENTICAL
+            # across mlx-lm 9acef5f, 74e7cf9 and 77c33b1. The leak lives
+            # below mlx-lm — mlx core's Metal layer. See PATCHES.md #84
+            # for the resolution.
             mx.clear_cache()
 
         # Periodically log memory stats for monitoring
@@ -3531,6 +3572,8 @@ class Scheduler:
         stats["queue_rejections"] = self.queue_rejections
         stats["max_prompt_tokens"] = self.max_prompt_tokens
         stats["prompt_rejections"] = self.prompt_rejections
+        stats["max_completion_tokens"] = self.max_completion_tokens
+        stats["completion_clamps"] = self.completion_clamps
 
         # Include cache stats
         if self.hybrid_kv is not None:
