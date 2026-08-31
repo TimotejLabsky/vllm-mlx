@@ -927,6 +927,7 @@ class BatchedSystemKV:
                 "pressure_evictions": self.pressure_evictions,
                 "pressure_skipped_stores": self.pressure_skipped_stores,
                 "pressure_cache_clears": self.pressure_cache_clears,
+                "timing_verdict": self._timing.verdict_totals(),
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
                 "memory_mb": mem / (1024 * 1024),

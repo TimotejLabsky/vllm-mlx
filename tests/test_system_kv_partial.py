@@ -886,3 +886,71 @@ def test_kv_guard_is_one_shot(caplog):
         classify_layers([_KV(), _KV()])
         classify_layers([_KV()])
     assert caplog.text.count("CEILING CROSSED") == 1
+
+
+# ── durable eviction-verdict counters (PATCHES.md #85) ───────────────────
+
+
+def test_verdict_counters_persist_across_recorder_lifetimes(tmp_path, monkeypatch):
+    """The one number the landscape verdict waits on must survive a
+    process recycle: two recorder lifetimes accumulate into one file."""
+    from vllm_mlx.system_kv import CacheTimingRecorder
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+
+    r1 = CacheTimingRecorder()
+    r1.note_store("a")
+    r1.note_hit("a")
+    r1.note_evict("a")
+    r1.note_store("a")  # re-store after evict = THE verdict event
+    t1 = r1.verdict_totals()
+    assert t1["durable"] is True
+    assert t1["evictions"] == 1
+    assert t1["evict_to_reuse_events"] == 1
+
+    r2 = CacheTimingRecorder()  # "restarted process"
+    r2.note_store("b")
+    r2.note_evict("b")
+    t2 = r2.verdict_totals()
+    assert t2["evictions"] == 2  # accumulated across lifetimes
+    assert t2["evict_to_reuse_events"] == 1
+    assert t2["since"] is not None
+
+
+def test_verdict_counters_session_only_without_ssd_dir(monkeypatch):
+    from vllm_mlx.system_kv import CacheTimingRecorder
+
+    monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", raising=False)
+    r = CacheTimingRecorder()
+    r.note_store("x")
+    r.note_hit("x")
+    t = r.verdict_totals()
+    assert t["durable"] is False
+    assert t["reuses"] == 1
+
+
+def test_verdict_reuses_counted_and_manager_stats_carry_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    m = SystemKVManager()
+    m.store_extended("h", _hybrid_snapshot(32), list(range(16)), promoted=False)
+    s = m.stats()
+    assert "timing_verdict" in s
+    assert s["timing_verdict"]["durable"] is True
+
+
+def test_verdict_persistence_failure_never_breaks_recording(tmp_path, monkeypatch):
+    """A read-only dir must not raise out of note_evict."""
+    import os
+
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(ro, 0o500)
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(ro / "sub"))
+    from vllm_mlx.system_kv import CacheTimingRecorder
+
+    r = CacheTimingRecorder()
+    r.note_store("a")
+    r.note_evict("a")  # flush hits unwritable path — must swallow
+    t = r.verdict_totals()
+    assert t["evictions"] == 1 and t["durable"] is False
+    os.chmod(ro, 0o700)

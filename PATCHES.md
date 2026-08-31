@@ -2194,3 +2194,42 @@ untouched, inert by default); live spare-port check: clamp armed at 64 →
 24000-token request finishes `length` at 64. Full suite green in the
 commit. The 24K wall itself remains upstream's to fix — the issue draft is
 ready to file.
+
+## 85. `patch: durable-eviction-verdict` — the landscape verdict's number, recycle-proof
+
+**Files:** `vllm_mlx/system_kv.py` (`CacheTimingRecorder` persistence +
+manager stats), `vllm_mlx/batched_system_kv.py` (stats key),
+`tests/test_system_kv_partial.py` (+4)
+
+**The gap.** The prefix-cache landscape verdict (2026-08) said: instrument
+first — build a smarter eviction policy only if LRU is ever provably wrong,
+i.e. if an evicted entry ever has to be re-prefilled. Patch #74 built the
+instrument (eviction-timing histograms, tombstone-keyed
+`evict_to_reuse_gap`). The 2026-08-31 item-1 check found the instrument
+CANNOT accumulate: the histograms live in process memory and llama-swap
+recycles route processes on every swap/TTL; the Go exporter mirrors
+`/v1/status` gauges only (no `vllm_mlx_*` metric reaches Prometheus); and
+per-route `/metrics` endpoints are scraped by nothing. A week of soak
+produces a week of amnesia.
+
+**The fix.** `CacheTimingRecorder` now keeps three cumulative counters —
+`evictions`, `reuses`, `evict_to_reuse_events` — and merges them into
+`$VLLM_MLX_SSD_SYSTEM_KV_DIR/timing-verdict.json` via advisory-flock
+read-modify-write (multiple route processes write the same file; the LRU
+question is box-level, so the aggregate is the right granularity). Flush on
+every eviction and on every verdict event (rare); zero-delta passes still
+CREATE the file, because "a week of zero evictions" must read as durable
+evidence that collection was on, not as a missing instrument. Exposed as
+`timing_verdict` in both cache stats blocks → `/v1/status` on every route,
+with `durable: false` marking env-less (dev) sessions. Persistence is
+fail-soft everywhere — an unwritable dir can never break serving.
+
+**How the verdict gets read now:** at any point,
+`curl :PORT/v1/status | jq .cache.timing_verdict` —
+`evict_to_reuse_events == 0` with a healthy `evictions` count and an old
+`since` closes the P1-a session-eviction item for good;
+`evict_to_reuse_events > 0` funds it.
+
+**Verification:** 4 tests — accumulation across recorder lifetimes (the
+recycle), session-only fallback without the env, manager stats carry the
+block, unwritable-dir fail-soft. Full suite green in the commit.
