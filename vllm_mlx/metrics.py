@@ -378,6 +378,17 @@ class MetricsCollector:
                 ["endpoint", "finish_reason"],
                 registry=registry,
             ),
+            "empty_completions_total": Counter(
+                "vllm_mlx_empty_completions_total",
+                "Requests that finished successfully with ZERO completion "
+                "tokens — ground truth for silent empty turns (#87): "
+                "llama-swap returns a dead upstream as HTTP 200 with an "
+                "empty completion and LiteLLM rewrites upstream errors to "
+                "finish_reason=stop/content=None, so only this layer can "
+                "count them. Alert on any increase.",
+                ["endpoint"],
+                registry=registry,
+            ),
             "metal_resource_limit": Gauge(
                 "vllm_mlx_metal_resource_limit",
                 "Metal resource limit: max live GPU buffer COUNT (not bytes) "
@@ -472,6 +483,13 @@ class MetricsCollector:
             self._prom["finish_reasons_total"].labels(
                 endpoint=endpoint,
                 finish_reason=str(finish_reason),
+            ).inc()
+        # #87: a "successful" request that produced NOTHING is the silent
+        # empty turn the gateway layers erase (llama-swap 200-on-dead,
+        # LiteLLM error→stop rewrite). Count it where ground truth lives.
+        if result == "success" and completion_tokens == 0:
+            self._prom["empty_completions_total"].labels(
+                endpoint=endpoint,
             ).inc()
         self._prom["inference_requests_total"].labels(
             endpoint=endpoint,
