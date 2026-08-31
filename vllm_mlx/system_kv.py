@@ -58,6 +58,15 @@ class CacheTimingRecorder:
     MAX_TOMBSTONES = 1024
     MAX_LIVE = 4096
 
+    # Durable verdict counters (#85). The histograms above reset with the
+    # process and are scraped by nothing (llama-swap recycles routes on
+    # every swap/TTL; the Go exporter mirrors /v1/status gauges only), so
+    # the landscape verdict's one deciding number — "did an evicted entry
+    # ever have to be re-prefilled" — could never accumulate. These three
+    # counters persist to a tiny locked JSON in the SSD system-KV dir
+    # (shared across routes on purpose: the LRU question is box-level).
+    _VERDICT_FILE = "timing-verdict.json"
+
     def __init__(self):
         self._lock = threading.Lock()
         # key -> (stored_at, last_used)
@@ -70,7 +79,96 @@ class CacheTimingRecorder:
             "reuse_gap": deque(maxlen=self.MAX_OBS),
             "evict_to_reuse_gap": deque(maxlen=self.MAX_OBS),
         }
+        # Session counters and the portion already merged into the file.
+        self._verdict = {"evictions": 0, "reuses": 0, "evict_to_reuse_events": 0}
+        self._verdict_flushed = dict(self._verdict)
         _TIMING_RECORDERS.add(self)
+
+    @staticmethod
+    def _verdict_path():
+        import os
+
+        base = os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_DIR", "")
+        if not base:
+            return None
+        return os.path.join(base, CacheTimingRecorder._VERDICT_FILE)
+
+    def _flush_verdict_locked(self) -> None:
+        """Merge session deltas into the shared file (advisory-locked
+        read-modify-write; multiple route processes may write). Caller
+        holds self._lock. Never raises — persistence must not break
+        serving."""
+        path = self._verdict_path()
+        if path is None:
+            return
+        delta = {
+            k: self._verdict[k] - self._verdict_flushed[k] for k in self._verdict
+        }
+        try:
+            import os as _os
+
+            # Zero-delta with the file already present: nothing to merge.
+            # But CREATE the file on the first zero-delta pass — a week of
+            # zero evictions must read as durable evidence ("collection
+            # was on and nothing fired"), not as a missing instrument.
+            if not any(delta.values()) and _os.path.exists(path):
+                return
+        except Exception:
+            return
+        try:
+            import fcntl
+            import json as _json
+            import os
+
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            lock_path = path + ".lock"
+            with open(lock_path, "w") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                try:
+                    data = {}
+                    try:
+                        with open(path) as f:
+                            data = _json.load(f)
+                    except (OSError, ValueError):
+                        data = {}
+                    if "since" not in data:
+                        data["since"] = time.time()
+                    for k, v in delta.items():
+                        data[k] = int(data.get(k, 0)) + v
+                    tmp = path + ".tmp"
+                    with open(tmp, "w") as f:
+                        _json.dump(data, f)
+                    os.replace(tmp, path)
+                    self._verdict_flushed = dict(self._verdict)
+                finally:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+    def verdict_totals(self) -> dict:
+        """Cumulative verdict counters: file (all processes, all time) plus
+        this recorder's unflushed session delta. Session-only (marked
+        durable=False) when no SSD dir is configured."""
+        path = self._verdict_path()
+        with self._lock:
+            self._flush_verdict_locked()
+            session = dict(self._verdict)
+        if path is None:
+            return {**session, "durable": False}
+        try:
+            import json as _json
+
+            with open(path) as f:
+                data = _json.load(f)
+            out = {
+                k: int(data.get(k, 0))
+                for k in ("evictions", "reuses", "evict_to_reuse_events")
+            }
+            out["since"] = data.get("since")
+            out["durable"] = True
+            return out
+        except (OSError, ValueError):
+            return {**session, "durable": False}
 
     def note_store(self, key) -> None:
         now = time.time()
@@ -78,6 +176,10 @@ class CacheTimingRecorder:
             evicted_at = self._tombstones.pop(key, None)
             if evicted_at is not None:
                 self._obs["evict_to_reuse_gap"].append(now - evicted_at)
+                # THE verdict event: an evicted entry came back — the
+                # eviction cost a re-prefill. Flush immediately (rare).
+                self._verdict["evict_to_reuse_events"] += 1
+                self._flush_verdict_locked()
             self._live[key] = (now, now)
             self._live.move_to_end(key)
             while len(self._live) > self.MAX_LIVE:
@@ -94,6 +196,7 @@ class CacheTimingRecorder:
                 return
             stored_at, last_used = entry
             self._obs["reuse_gap"].append(now - last_used)
+            self._verdict["reuses"] += 1
             self._live[key] = (stored_at, now)
 
     def note_evict(self, key) -> None:
@@ -104,6 +207,8 @@ class CacheTimingRecorder:
                 stored_at, last_used = entry
                 self._obs["lifetime"].append(now - stored_at)
                 self._obs["idle_before_evict"].append(now - last_used)
+            self._verdict["evictions"] += 1
+            self._flush_verdict_locked()
             self._tombstones[key] = now
             while len(self._tombstones) > self.MAX_TOMBSTONES:
                 self._tombstones.popitem(last=False)
@@ -1249,6 +1354,9 @@ class SystemKVManager:
             })
         result = {
             "enabled": True,
+            # Durable eviction-verdict counters (#85) — the number the
+            # landscape verdict waits on lives here, recycle-proof.
+            "timing_verdict": self.timing.verdict_totals(),
             # Legacy single-slot fields (describe ACTIVE slot):
             "tokens": self.token_count,
             "hash": self.system_hash,
