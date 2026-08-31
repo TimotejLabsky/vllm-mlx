@@ -184,6 +184,16 @@ class MetricsCollector:
                 "(VLLM_MLX_REPDETECT, scheduler stop-check).",
                 registry=registry,
             ),
+            "grammar_stop_suppressions_total": Counter(
+                "vllm_mlx_grammar_stop_suppressions_total",
+                "Stop terminators withheld because a structured-output "
+                "grammar was still mid-value (PATCHES.md #89). source="
+                "stop_string: a stop match inside the declared JSON was "
+                "ignored; source=repetition: a repetition stop was "
+                "downgraded to finish_reason=length.",
+                ["source"],
+                registry=registry,
+            ),
             "model_loaded": Gauge(
                 "vllm_mlx_model_loaded",
                 "Whether a generation model is currently loaded.",
@@ -438,6 +448,12 @@ class MetricsCollector:
         if not self._enabled or self._prom is None:
             return
         self._prom["repetition_stops_total"].inc()
+
+    def observe_grammar_stop_suppressed(self, *, source: str) -> None:
+        """Count a stop terminator withheld inside a live grammar (#89)."""
+        if not self._enabled or self._prom is None:
+            return
+        self._prom["grammar_stop_suppressions_total"].labels(source=source).inc()
 
     def observe_http_start(self, *, method: str, path: str) -> None:
         if not self._enabled or self._prom is None:
