@@ -26,7 +26,7 @@ directly against the PR/issue pages and the pinned `mlx_lm` tree in `.venv`.
 | P1-c | `usage.prompt_tokens_details.cached_tokens` (upstream PR #732) | adopt the API, re-implement over our stats | ~40 LOC | free observability on the client side; rebase hazard if taken as a diff |
 | P1-d | Grammar / thinking / stop ordering audit (vLLM #44993/#49227, llama.cpp #26252) | GO, audit-shaped | ½ day | our llguidance (#73), thinking processor (#79) and DRY/rep-stop (#77) now stack — nobody has checked the order |
 | P2-a | int8 SSM-state checkpoints (SGLang #30626) | measure fidelity first | 1 session | 2–4x checkpoint capacity per RAM budget on Qwen3.8 |
-| P2-b | mlx 0.32.2: `force_fused` SDPA (#4185) + GQA-8 2-pass decode (#4077/#4380) | measure when the pin moves | ladder rerun | first upstream movement on long-context decode; **pair with mlx-vlm ≥0.6.17** |
+| P2-b | ~~mlx 0.32.2 kernels~~ — **DEPLOYED + MEASURED NULL 2026-08-31** (infra PR #398): 0.32.2 + mlx-vlm 0.6.17 live, all gates green; #4077's GQA-8 gain is **−0.14% at n=6 on M1 Ultra** (claimed +3.5–9.5% is M5-only; 27B-4bit is GQA-6 and cannot even engage the kernel; only 5 fleet models are GQA-8). `force_fused` (#4185) needs fork code — written-up follow-up, not built | — | closed by measurement |
 | P2-c | Upstream PR #745 (exit before MLX teardown segfault), issue #746 (`engine_steps_executed` on MLLM) | adopt | tiny | matches the 08-17 "stale process squats the port" fingerprint |
 | P2-d | 08-18 survey items 10/11 (DRY holes, `vllm_mlx_empty_completions_total`) | still GO, unbuilt | ~40 LOC | unchanged |
 | watch | oMLX 0.6.4 boundary-diagnostic reason codes; LM Studio #367 static prefill-step autofit; vllm-metal 0.4.0 channel; upstream PRs #740/#742 (rebase landmines) | — | — | — |
