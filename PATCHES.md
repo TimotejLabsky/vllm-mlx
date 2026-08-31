@@ -2285,3 +2285,53 @@ resets (rate() handles resets fine; absence between scrapes is the gap).
 
 **Verification:** counter fires on the silent shape only (success+zero),
 not on non-empty or error finishes. Full suite green in the commit.
+
+## 88. `patch: message-boundary-checkpoints` — checkpoints where agent traffic actually diverges
+
+**Files:** `vllm_mlx/batched_system_kv.py` (boundary detection, split,
+capture flag), `vllm_mlx/system_kv.py` (`thin_checkpoints` + boundary-aware
+`append_checkpoint`), `vllm_mlx/scheduler.py` (one line: tokenizer into the
+insert hook), `tests/test_batched_system_kv.py` (+4),
+`tests/test_system_kv_partial.py` (+3)
+
+The 08-18 survey's item 2 — "the one clear build" — executed 2026-08-31.
+Agent histories diverge at MESSAGE boundaries (a re-rendered history
+changes where the next turn begins; thinking-stripped resends diverge at
+the assistant-turn start, patch #35's insight), but checkpoints were placed
+at content-blind 2048-multiples and thinned by content-blind
+drop-every-other. llama.cpp converged on the same design (its #24176
+checkpoints every user message on the token stream; #25472 fixed its
+thinning destroying the penultimate checkpoint).
+
+**Placement.** `insert_segmented` detects the prompt's template family
+(patch #20's `TEMPLATE_MARKERS` on the rendered string), encodes that
+family's turn markers to token-id sequences once per process, and scans
+the inserted tokens for marker starts — boundaries are added IN ADDITION
+to the uniform interval, which stays a hard upper bound on segment length
+(a 60K tool result can never become one giant prefill chunk; the #48/#53
+memory rails keep their tuned transient profile). `boundary_min_step`
+(`VLLM_MLX_BATCHED_KV_BOUNDARY_MIN_STEP`, default 2048) thins boundary
+bursts; the newest boundary bypasses it (llama.cpp's rule — it is the
+likeliest divergence point of the NEXT request). Detection failure of any
+kind degrades to the old uniform split.
+
+**Thinning.** `thin_checkpoints` replaces drop-every-other everywhere
+(append path AND the batched subsume-merge): evict the checkpoint whose
+removal loses the least coverage (smallest gap to predecessor), prefer
+evicting non-boundary checkpoints, never touch the last two. Checkpoints
+carry a `boundary` flag; entries from SSD or pre-#88 ladders lack it and
+are treated as non-boundary (graceful).
+
+**Semantics unchanged where it matters:** restore is untouched —
+`select_restore_pos` already picks the highest checkpoint ≤ divergence;
+boundary checkpoints simply exist at the positions divergence actually
+hits, turning "restore to the 2048-floor below the turn start, re-prefill
+the tail" into "restore AT the turn start".
+
+**Verification:** boundary scan (multi-marker, min-step from position 0,
+forced-last rule), boundary-cut splitting (reassembly, interval bound,
+boundary-aligned starts, legacy fallback), absolute-position bookkeeping +
+cleanup, per-family marker caching, thinning policy (non-boundary victim,
+last-two protection, flag carriage). Existing capture/restore/thinning
+suites green unchanged. NOT yet deployed — next deploy owes the standing
+T=0 byte-identical warm-vs-cold gate on a live route.
