@@ -2139,3 +2139,58 @@ armed thinking budget can force `</think>` into the middle of a tool call
 harmony control tokens on gpt-oss routes. Each needs its own patch + a
 live-route verification; see the audit record in the 08-30 research doc
 follow-ups.
+
+## 84. `patch: completion-token-ceiling` — the 499000 wall is upstream; clamp below it
+
+**Files:** `vllm_mlx/scheduler.py` (env clamp + stats keys + investigation
+note at the periodic-eval hook), `tests/test_batched_flip_enablement.py`
+(+3), `docs/fork/mlxlm-issue-499000-draft.md` (new — upstream issue draft
+with the pure-mlx-lm repro)
+
+**What the 2026-08-30 pin-lift gate actually found.** The long-decode probe
+(24K tokens, Qwen3.6-27B-4bit) died at ~10.5K decode steps with
+`[metal::malloc] Resource limit (499000) exceeded` — the crash the research
+doc predicted mlx-lm #1632 would fix. It does not. Eleven probes later, the
+full elimination matrix (recorded in the issue draft): the crash step is
+IDENTICAL across mlx-lm `9acef5f`/`74e7cf9`/`77c33b1`, mlx 0.32.1/0.32.2,
+fork features on/off, periodic `clear_cache` on/off, and every
+materialization strategy (tokens only, all cache states, metadata attrs) —
+and it reproduces with **pure mlx-lm, no vllm-mlx in the process**. A gc
+census shows Python-side array count dead flat while Metal's resource count
+climbs ~47/step (≈ one tiny per-layer allocation per step, bytes flat). The
+leak lives below mlx-lm's Python; nothing the fork can eval, clear, or pin
+reaches it.
+
+**Three prior beliefs corrected in the process:** (a) "#1632 is the 499000
+fix" (research doc P0-a) — it fixed A leak with that signature, not THIS
+one; (b) "the pin lift made it 2x faster" — the old 21K-step observation
+was a different model (8-bit) and workload; on the same workload the old
+pin crashes at the same ~10.5K (probe 7); (c) the #84 first cut (materialize
+everything reachable at the eval cadence) was probed ineffective and is
+deliberately NOT shipped — a NOTE at the hook records why, so nobody
+rebuilds it.
+
+**What ships instead.** `VLLM_MLX_MAX_COMPLETION_TOKENS` (default 0 = off):
+an admission-time CLAMP on `sampling_params.max_tokens` in
+`Scheduler.add_request`, right after the #50 prompt ceiling. Unlike #50 it
+does not reject — the request runs and finishes as `finish_reason="length"`
+below the wall instead of erroring at it mid-flight (the pre-existing
+recovery rail still catches anything that slips through: request errors,
+process survives — verified 3x live during the probes). Stats mirror the
+#50 pattern: `max_completion_tokens` + `completion_clamps` in
+`get_stats()`/`/v1/status`. Arming is per-route config: the wall is
+model-dependent (~10.5K on 27B-4bit; the 8-bit sibling was observed dying
+near ~21K on a deeper context), so set it from a measured probe, not
+globally.
+
+**Deploy note (2026-08-31):** the production pin stays mlx-lm `77c33b1` —
+probes proved the window is irrelevant to this crash, so the lift keeps all
+its wins (#1632's real fix, #1772, #1775, #1600, #1790) at no new risk.
+mlx stays 0.32.1 (0.32.2 was probed for this bug only — no fix, and a
+deploy would drag mlx-vlm 0.6.17 + the vision sweep; staged separately).
+
+**Verification:** 3 unit tests (clamp applied + counted, smaller requests
+untouched, inert by default); live spare-port check: clamp armed at 64 →
+24000-token request finishes `length` at 64. Full suite green in the
+commit. The 24K wall itself remains upstream's to fix — the issue draft is
+ready to file.
