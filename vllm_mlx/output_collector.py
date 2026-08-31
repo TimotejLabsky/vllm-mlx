@@ -157,6 +157,18 @@ class RequestOutputCollector:
             # the non-streaming path (generate() drains the collector last,
             # which has merged by then).
             cached_tokens=new.cached_tokens or existing.cached_tokens,
+            # #89: the merged chunk spans both positions, so it is mid-value
+            # if EITHER constituent was — a stop match anywhere inside it
+            # could land in an open JSON value. None only when neither side
+            # was stamped (no grammar / a producer that does not stamp).
+            grammar_unterminated=(
+                None
+                if existing.grammar_unterminated is None
+                and new.grammar_unterminated is None
+                else bool(
+                    existing.grammar_unterminated or new.grammar_unterminated
+                )
+            ),
         )
 
     def clear(self) -> None:

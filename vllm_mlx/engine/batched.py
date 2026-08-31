@@ -24,6 +24,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..grammar_guard import grammar_unterminated, has_grammar
 from ..stop_strings import StopStringScanner, truncate_at_stop
 from .base import (
     BaseEngine,
@@ -41,6 +42,63 @@ from ..utils.reasoning_effort import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _count_grammar_stop_suppressed(source: str) -> None:
+    """Best-effort counter for a stop withheld inside a grammar (#89)."""
+    try:
+        from ..metrics import metrics as _gg_metrics
+
+        _gg_metrics.observe_grammar_stop_suppressed(source=source)
+    except Exception:
+        pass
+
+
+class _GrammarStopGate:
+    """Per-stream stop-string scanning that defers to a live grammar (#89).
+
+    A schema-constrained stream legitimately contains the client's stop
+    string — a pretty-printed object emits ``"\\n\\n"`` between members — and
+    cutting there puts truncated JSON on the wire under
+    ``finish_reason="stop"``. While the grammar is mid-value the chunk is
+    passed through and the stop withheld.
+
+    **The verdict comes from the chunk, not from the processor.** Chunks are
+    drained from ``RequestOutputCollector``, a lag-tolerant buffer that also
+    MERGES outputs when the producer outruns the consumer, so the processor's
+    live state at drain time can be many tokens ahead of the text in hand —
+    at the end of a request it reads "finished" for every still-buffered
+    chunk, which would license exactly the mid-object cut this patch exists
+    to prevent. The scheduler stamps ``RequestOutput.grammar_unterminated``
+    when it produces the chunk (merges OR the flag). The live read survives
+    only as a fallback for producers that do not stamp.
+
+    The scanner is still advanced while deferring (``deferred_scan``) so its
+    carried tail stays correct for a later real scan.
+    """
+
+    def __init__(self, stop, logits_processors) -> None:
+        self._scanner = StopStringScanner(stop)
+        self._processors = logits_processors
+        self._counted = False
+
+    def scan(self, output) -> tuple[str, bool]:
+        new_text = output.new_text
+        stamped = getattr(output, "grammar_unterminated", None)
+        mid_value = (
+            stamped if stamped is not None else grammar_unterminated(self._processors)
+        )
+        if not mid_value:
+            return self._scanner.scan(new_text)
+        if self._scanner.deferred_scan(new_text) and not self._counted:
+            # Latched: one suppression per request. A stop string shorter
+            # than the longest one sits wholly inside the carried tail and
+            # re-matches for several chunks, and the parser's own stop
+            # tokens are merged into the user's list, so mixed lengths are
+            # the normal shape.
+            self._counted = True
+            _count_grammar_stop_suppressed("stop_string")
+        return new_text, False
 
 
 def _resolve_metal_buffer_cache_limit(
@@ -946,6 +1004,25 @@ class BatchedEngine(BaseEngine):
             )
         return processors or None
 
+    @staticmethod
+    def _truncate_at_stop_outside_grammar(
+        text: str, stop, logits_processors
+    ) -> tuple[str, bool]:
+        """Non-streaming stop truncation, deferring to a grammar (#89).
+
+        The complete text carries no per-position grammar state to consult,
+        but it does not need one: with a schema processor attached the whole
+        generated text IS the structured value (once the grammar accepts,
+        only EOS is unmasked), so every stop match lands inside it. Suppress
+        wholesale. ``server.py``'s re-parse still 422s genuinely broken JSON.
+        """
+        truncated, hit = truncate_at_stop(text, stop)
+        if has_grammar(logits_processors):
+            if hit:
+                _count_grammar_stop_suppressed("stop_string")
+            return text, False
+        return truncated, hit
+
     async def generate(
         self,
         prompt: str,
@@ -1015,7 +1092,9 @@ class BatchedEngine(BaseEngine):
             # enforce them here (fork patch #32). Truncate BEFORE
             # clean_output_text — stop strings are often special tokens
             # (<|im_end|>) that cleaning would strip from the scan.
-            text, stop_hit = truncate_at_stop(output.output_text, stop)
+            text, stop_hit = self._truncate_at_stop_outside_grammar(
+                output.output_text, stop, logits_processors
+            )
             return GenerationOutput(
                 text=clean_output_text(text),
                 raw_text=text,
@@ -1059,7 +1138,9 @@ class BatchedEngine(BaseEngine):
 
         # Truncate BEFORE clean_output_text — stop strings are often special
         # tokens (<|im_end|>) that cleaning would strip from the scan.
-        text, stop_hit = truncate_at_stop(output.output_text, stop)
+        text, stop_hit = self._truncate_at_stop_outside_grammar(
+            output.output_text, stop, logits_processors
+        )
 
         return GenerationOutput(
             text=clean_output_text(text),
@@ -1136,9 +1217,9 @@ class BatchedEngine(BaseEngine):
 
             # Stop STRINGS are token-id-blind in the batched schedulers;
             # enforce them here (fork patch #32).
-            scanner = StopStringScanner(stop)
+            gate = _GrammarStopGate(stop, logits_processors)
             async for output in self._mllm_scheduler.stream_outputs(request_id):
-                new_text, stop_hit = scanner.scan(output.new_text)
+                new_text, stop_hit = gate.scan(output)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
                     raw_text=output.output_text,
@@ -1187,10 +1268,10 @@ class BatchedEngine(BaseEngine):
             prefix_boundary=prefix_boundary,
         )
 
-        scanner = StopStringScanner(stop)
+        gate = _GrammarStopGate(stop, logits_processors)
         async for output in self._engine.stream_outputs(request_id):
             text = clean_output_text(output.output_text)
-            new_text, stop_hit = scanner.scan(output.new_text)
+            new_text, stop_hit = gate.scan(output)
 
             yield GenerationOutput(
                 text=text,

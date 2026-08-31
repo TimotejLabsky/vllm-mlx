@@ -327,6 +327,13 @@ runtime checks that remain:
    streaming has already sent the broken JSON. Fix model = vLLM #49227:
    mask the stop while the matcher is not accepting; repetition-stop inside
    a grammar should finish as `length`, never `stop`.
+   **FIXED 2026-08-31 as patch #89** (`vllm_mlx/grammar_guard.py`): both
+   schema processors publish `is_accepting()`; the four batched stop sites,
+   the SimpleEngine stop-check and the rep-stop branch consult it, and the
+   rep-stop downgrades to `finish_reason="length"` inside an open value.
+   Suppressions are counted in
+   `vllm_mlx_grammar_stop_suppressions_total{source}`. Live probe still
+   owed at deploy (JSON schema + `stop=["\n\n"]` on an llguidance route).
 3. **Think-terminator set — BUG, latent.** `</think>` is the ONLY THINK
    exit (`server.py:540-541`); a THINK → `<tool_call>` transition stays in
    THINKING, and an armed thinking budget's `_force_transition` then masks

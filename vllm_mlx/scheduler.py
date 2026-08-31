@@ -28,6 +28,7 @@ from . import batched_system_kv as _batched_kv
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
+from .grammar_guard import grammar_unterminated
 from .repetition_stop import RepetitionStopTracker
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -2958,6 +2959,17 @@ class Scheduler:
                 cached_tokens=request.cached_tokens,
             )
 
+            # Stamp the grammar verdict for THIS chunk (#89). It must be
+            # recorded here, at production time, not read by the consumer:
+            # RequestOutputCollector is a lag-tolerant aggregating buffer, so
+            # a consumer draining several chunks later would see a matcher
+            # that has since closed the value and let a stop cut an earlier
+            # chunk mid-object.
+            mid_grammar = grammar_unterminated(
+                request.sampling_params.logits_processors
+            )
+            output.grammar_unterminated = mid_grammar
+
             # Repetition-detection stop (env-gated VLLM_MLX_REPDETECT=1):
             # enforced here at the consumer so it works on both the legacy
             # (fork-patched) and native mlx-lm BatchGenerator layouts — a
@@ -2973,18 +2985,37 @@ class Scheduler:
                     # Reported as "stop" for OpenAI-client compatibility;
                     # the log line and vllm_mlx_repetition_stops_total
                     # carry the detail.
-                    finish_reason = "stop"
+                    #
+                    # EXCEPT inside an un-terminated grammar (PATCHES.md
+                    # #89): a schema-constrained request cut mid-value is
+                    # truncated JSON, and "stop" tells the client it is
+                    # complete. "length" is the honest reason — the request
+                    # ended without reaching a legal end of the value — and
+                    # it is what every OpenAI client already handles as
+                    # "retry or raise", the same shape a max_tokens cut
+                    # produces.
+                    finish_reason = "length" if mid_grammar else "stop"
                     logger.warning(
                         f"[repetition-stop] request={request_id[:12]} "
                         f"uid={response.uid}: period={rep_hit[0]} tokens "
                         f"x {rep_hit[1]} repeats at "
                         f"{request.num_output_tokens} generated tokens — "
-                        f"forcing stop"
+                        f"forcing {finish_reason}"
+                        + (
+                            " (schema grammar still mid-value; refusing to "
+                            "report truncated JSON as a clean stop)"
+                            if mid_grammar
+                            else ""
+                        )
                     )
                     try:
                         from .metrics import metrics as _rs_metrics
 
                         _rs_metrics.observe_repetition_stop()
+                        if mid_grammar:
+                            _rs_metrics.observe_grammar_stop_suppressed(
+                                source="repetition"
+                            )
                     except Exception:
                         pass
                     # Pull the sequence out of the generator now — mirrors

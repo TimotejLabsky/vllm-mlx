@@ -35,6 +35,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .grammar_guard import grammar_unterminated
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
@@ -785,6 +786,12 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                # Grammar verdict for THIS chunk, recorded at production time
+                # (#89) — see the field docstring on RequestOutput for why the
+                # consumer must not read it live off the collector.
+                grammar_unterminated=grammar_unterminated(
+                    request.sampling_params.logits_processors
+                ),
             )
 
             # Check if finished
