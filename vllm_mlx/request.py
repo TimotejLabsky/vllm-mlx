@@ -235,6 +235,14 @@ class RequestOutput:
     mtp_accepted: int = 0
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
+    # Was a structured-output grammar still mid-value when THIS chunk was
+    # produced (#89)? Stamped by the producer, because the consumer drains a
+    # lag-tolerant aggregating collector: reading the processor's live state
+    # at drain time can be many tokens AHEAD of the text being scanned, and
+    # "grammar has since finished" would license a stop that cuts an earlier
+    # chunk mid-object. ``None`` means unstamped — consumers fall back to a
+    # live read.
+    grammar_unterminated: Optional[bool] = None
 
     @property
     def usage(self) -> Dict[str, int]:

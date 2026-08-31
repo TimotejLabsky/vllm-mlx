@@ -447,6 +447,11 @@ class JSONSchemaLogitsProcessor:
         self._brace_depth: int = 0
         self._bracket_depth: int = 0
 
+        # Grammar state as of the last mask application, cached as a plain
+        # bool for the stop paths to read from another thread (PATCHES.md
+        # #89 — see vllm_mlx/grammar_guard.py for the protocol).
+        self._accepting: bool = False
+
         # Container nesting stack for distinguishing object vs array context.
         # Entries are ``"o"`` (object/brace) or ``"a"`` (array/bracket).
         # Used by ``_get_json_context`` to return ``"key_start"`` only when
@@ -858,6 +863,14 @@ class JSONSchemaLogitsProcessor:
             # generation produces garbage.  Without this cap the model would
             # generate up to max_tokens (often 262 K) of useless output,
             # blocking the slot for minutes/hours.
+            #
+            # No grammar is being enforced any more, so report the same
+            # verdict an absent grammar would (#89). Reporting "mid-value"
+            # here would suppress every stop terminator for the rest of the
+            # request, and _eos_logits_or_original returns the ORIGINAL
+            # logits when there is no EOS to force — nothing else would end
+            # it before max_tokens.
+            self._accepting = True
             return _eos_logits_or_original(
                 self._eos_set,
                 logits,
@@ -880,6 +893,8 @@ class JSONSchemaLogitsProcessor:
                 self._build_allow_mask,
             )
             if eos_logits is not None:
+                # Complete-and-valid JSON: the value is closed (PATCHES.md #89).
+                self._accepting = True
                 return eos_logits
 
             # Use prompt_len directly instead of O(n) list comparison.
@@ -899,6 +914,11 @@ class JSONSchemaLogitsProcessor:
                 allowed_list = self._filter_at_key_context(
                     context, suffix, allowed_list
                 )
+
+            # Publish the grammar state for the stop guard now that the
+            # bracket-depth counters are up to date (PATCHES.md #89). Cheap:
+            # the depth pre-check rejects ~99% of steps before json.loads.
+            self._accepting = self._suffix_is_complete_json(suffix)
 
             # --- EOS guard: only permit EOS when output is valid JSON ---
             if (
@@ -933,6 +953,18 @@ class JSONSchemaLogitsProcessor:
             raise ConstrainedDecodingError(
                 f"JSON schema logits processor failed: {exc}"
             ) from exc
+
+    def is_accepting(self) -> bool:
+        """Grammar state as of the last mask application (PATCHES.md #89).
+
+        Part of the stop-vs-grammar protocol in ``vllm_mlx.grammar_guard``:
+        ``False`` means the declared JSON value is still open, so no stop
+        terminator may end the request here. ``True`` here means the decoded
+        suffix parses as JSON *and* validates against the schema — the same
+        predicate that gates unmasking EOS, so the two terminators cannot
+        disagree about when the value is finished.
+        """
+        return self._accepting
 
     # Diagnostic helpers -------------------------------------------------
 
