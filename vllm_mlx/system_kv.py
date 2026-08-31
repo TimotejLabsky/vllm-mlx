@@ -533,21 +533,48 @@ def capture_checkpoint_states(prompt_cache, kinds=None):
     return states, metas
 
 
-def append_checkpoint(checkpoints, pos, states, metas, capacity):
-    """Append a {pos, states, metas} checkpoint, keeping the list sorted
-    and bounded. When the cap is exceeded, drop every other checkpoint
-    (geometric thinning — early positions stay covered at coarser
-    granularity, which is what divergence-point restore needs).
+def thin_checkpoints(checkpoints, capacity):
+    """Bound the ladder to ``capacity`` by evicting the checkpoint whose
+    removal loses the least coverage (#88): the one with the smallest gap
+    to its predecessor. Boundary-aligned checkpoints (message starts,
+    llama.cpp #24176's placement insight) are preferred survivors — evict
+    a non-boundary one whenever any exists. The last TWO checkpoints are
+    never evicted: the newest is the grow frontier, and the penultimate is
+    what a divergence just before the tip restores from (llama.cpp #25472
+    learned this the hard way — its final checkpoint destroyed the
+    penultimate one). Replaces the old content-blind drop-every-other
+    geometric thinning.
+    """
+    cap = max(1, capacity)
+    while len(checkpoints) > cap and len(checkpoints) > 2:
+        candidates = checkpoints[:-2]
+        pool = [c for c in candidates if not c.get("boundary")] or candidates
+        victim = None
+        victim_gap = None
+        for c in pool:
+            i = checkpoints.index(c)
+            prev_pos = checkpoints[i - 1]["pos"] if i > 0 else 0
+            gap = c["pos"] - prev_pos
+            if victim_gap is None or gap < victim_gap:
+                victim, victim_gap = c, gap
+        checkpoints.remove(victim)
+    return checkpoints
+
+
+def append_checkpoint(checkpoints, pos, states, metas, capacity, *, boundary=False):
+    """Append a {pos, states, metas, boundary} checkpoint, keeping the list
+    sorted and bounded (see ``thin_checkpoints`` for the eviction policy).
+    ``boundary=True`` marks a message-boundary-aligned position (#88) —
+    preferred survivor under thinning, because divergence points in agent
+    traffic land at message starts (a re-rendered history diverges where
+    the next turn begins), not at arbitrary 2048-multiples.
     """
     if checkpoints and checkpoints[-1]["pos"] >= pos:
         return checkpoints
-    checkpoints.append({"pos": pos, "states": states, "metas": metas})
-    if len(checkpoints) > max(1, capacity):
-        thinned = checkpoints[::2]
-        if thinned[-1] is not checkpoints[-1]:
-            thinned.append(checkpoints[-1])
-        checkpoints = thinned
-    return checkpoints
+    checkpoints.append(
+        {"pos": pos, "states": states, "metas": metas, "boundary": boundary}
+    )
+    return thin_checkpoints(checkpoints, capacity)
 
 
 def select_restore_pos(plan, cap):

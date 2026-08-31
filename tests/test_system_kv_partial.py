@@ -954,3 +954,37 @@ def test_verdict_persistence_failure_never_breaks_recording(tmp_path, monkeypatc
     t = r.verdict_totals()
     assert t["evictions"] == 1 and t["durable"] is False
     os.chmod(ro, 0o700)
+
+
+# ── boundary-aware checkpoint thinning (PATCHES.md #88) ──────────────────
+
+
+def test_thin_checkpoints_prefers_evicting_non_boundary():
+    from vllm_mlx.system_kv import thin_checkpoints
+
+    cps = [
+        {"pos": 100, "states": {}, "metas": {}, "boundary": True},
+        {"pos": 200, "states": {}, "metas": {}},          # smallest gap, no flag
+        {"pos": 500, "states": {}, "metas": {}, "boundary": True},
+        {"pos": 900, "states": {}, "metas": {}},
+        {"pos": 1000, "states": {}, "metas": {}},
+    ]
+    out = thin_checkpoints(cps, 4)
+    assert [c["pos"] for c in out] == [100, 500, 900, 1000]  # 200 evicted
+
+
+def test_thin_checkpoints_never_evicts_last_two():
+    from vllm_mlx.system_kv import thin_checkpoints
+
+    cps = [{"pos": p, "states": {}, "metas": {}} for p in (10, 20, 30)]
+    out = thin_checkpoints(list(cps), 1)
+    # capacity 1 but last two protected -> stops at 2
+    assert [c["pos"] for c in out] == [20, 30]
+
+
+def test_append_checkpoint_carries_boundary_flag():
+    cps = []
+    cps = append_checkpoint(cps, 100, {}, {}, capacity=8)
+    cps = append_checkpoint(cps, 300, {}, {}, capacity=8, boundary=True)
+    assert cps[0].get("boundary") is False
+    assert cps[1]["boundary"] is True
