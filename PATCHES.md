@@ -2233,3 +2233,31 @@ fail-soft everywhere — an unwritable dir can never break serving.
 **Verification:** 4 tests — accumulation across recorder lifetimes (the
 recycle), session-only fallback without the env, manager stats carry the
 block, unwritable-dir fail-soft. Full suite green in the commit.
+
+## 86. `patch: completions-dry-forwarding` — declared params must reach the engine
+
+**Files:** `vllm_mlx/server.py` (both completion handlers),
+`tests/test_server.py` (+2)
+
+Survey item 10(b) from the 2026-08-18 field survey, executed 2026-08-31.
+`CompletionRequest` DECLARES the five `dry_*` fields (`api/models.py`), so
+`/v1/completions` callers get a 200 and reasonably assume DRY took effect —
+but neither `create_completion` nor `stream_completion` forwarded them to
+`generate_kwargs`, unlike the chat handler and the Anthropic adapter. A
+declared-but-ignored parameter is worse than an absent one. Both handlers
+now forward the five keys with the same None-defers-to-env semantics as
+chat (`VLLM_MLX_DRY_*` per-model defaults); both engines already consume
+them via `_merge_dry_processor`.
+
+**Survey item 10(a) — the config half — is deliberately NOT done here and
+needs Tim's call:** the 35B-A3B routes carry no DRY config, but arming DRY
+there follows a 2026-08-18 recommendation that PREDATES the looping
+investigation's finding that DRY was an amplifier, not a fix (it is now
+OFF on the 8-bit production route). The better rail for the 35B family
+today is likely `VLLM_MLX_REPDETECT=1` (#77), which is currently armed
+only on the two 27B routes. Route-env decision, recorded here so the
+survey item doesn't resurface as-is.
+
+**Verification:** 2 forwarding tests (non-stream + stream, via the
+captured-kwargs DummyEngine harness the mllm_draft tests established).
+Full suite green in the commit.
