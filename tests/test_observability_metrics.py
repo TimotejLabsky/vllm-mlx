@@ -185,6 +185,31 @@ class TestCounterMirrors:
             in body.decode()
         )
 
+    def test_empty_completion_counter(self):
+        """#87: a "successful" zero-token completion is the silent empty
+        turn the gateway layers erase — count it at ground truth."""
+        collector = self._collector()
+        collector.observe_inference(
+            endpoint="chat",
+            stream=True,
+            result="success",
+            duration=0.1,
+            prompt_tokens=100,
+            completion_tokens=0,
+            finish_reason="stop",
+        )
+        # non-empty and non-success must NOT count
+        collector.observe_inference(
+            endpoint="chat", stream=True, result="success",
+            duration=0.1, prompt_tokens=1, completion_tokens=5,
+        )
+        collector.observe_inference(
+            endpoint="chat", stream=True, result="error",
+            duration=0.1, prompt_tokens=1, completion_tokens=0,
+        )
+        text = collector.render_metrics(engine=None, mcp_manager=None)[0].decode()
+        assert 'vllm_mlx_empty_completions_total{endpoint="chat"} 1.0' in text
+
 
 class TestHealthReady:
     @pytest.fixture()
