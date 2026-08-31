@@ -135,6 +135,10 @@ class LLGuidanceJSONSchemaLogitsProcessor:
         self._prompt_len: int | None = None
         self._consumed_suffix: list[int] = []
         self._terminal = False
+        # Grammar state as of the last mask application, cached as a plain
+        # bool for the stop paths to read from another thread (PATCHES.md
+        # #89 — see vllm_mlx/grammar_guard.py for the protocol).
+        self._accepting = False
 
     def _consume_suffix(self, suffix: list[int]) -> None:
         previous = self._consumed_suffix
@@ -169,6 +173,24 @@ class LLGuidanceJSONSchemaLogitsProcessor:
             )
         self._consumed_suffix = list(suffix)
 
+    def _matcher_is_accepting(self) -> bool:
+        try:
+            return bool(self._matcher.is_accepting())
+        except Exception:
+            # An unreadable matcher is not a reason to fail a generation that
+            # is otherwise progressing; report mid-value and let the stop
+            # guard stay conservative (PATCHES.md #89).
+            return False
+
+    def is_accepting(self) -> bool:
+        """Grammar state as of the last mask application (PATCHES.md #89).
+
+        Part of the stop-vs-grammar protocol in ``vllm_mlx.grammar_guard``:
+        ``False`` means the declared JSON value is still open, so no stop
+        terminator may end the request here.
+        """
+        return self._accepting
+
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         import llguidance.mlx
 
@@ -177,6 +199,7 @@ class LLGuidanceJSONSchemaLogitsProcessor:
             self._prompt_len = len(tokens_list)
         suffix = tokens_list[self._prompt_len :]
         self._consume_suffix(suffix)
+        self._accepting = self._terminal or self._matcher_is_accepting()
         if self._terminal:
             mask = mx.full(logits.shape, -float("inf"))
             for token in self._eos_tokens:

@@ -56,13 +56,32 @@ class StopStringScanner:
     def active(self) -> bool:
         return self.max_len > 0
 
+    def _advance(self, combined: str) -> None:
+        self._tail = combined[-(self.max_len - 1) :] if self.max_len > 1 else ""
+
     def scan(self, new_text: str) -> tuple[str, bool]:
         if not self.active or not new_text:
             return new_text, False
         combined = self._tail + new_text
         cut = _earliest_match(combined, self.stop_list)
         if cut == -1:
-            self._tail = combined[-(self.max_len - 1) :] if self.max_len > 1 else ""
+            self._advance(combined)
             return new_text, False
         emit_upto = cut - len(self._tail)
         return (new_text[:emit_upto] if emit_upto > 0 else ""), True
+
+    def deferred_scan(self, new_text: str) -> bool:
+        """Consume a chunk WITHOUT stopping; report whether a match was seen.
+
+        Used while a structured-output grammar is mid-value (PATCHES.md #89):
+        the stop must not fire, but the carried tail still has to advance so
+        that later chunks scan correctly, and a suppressed match is worth
+        counting. Because the tail is only ``max_len - 1`` characters, a
+        given match is reported once, never re-reported on the next chunk.
+        """
+        if not self.active or not new_text:
+            return False
+        combined = self._tail + new_text
+        cut = _earliest_match(combined, self.stop_list)
+        self._advance(combined)
+        return cut != -1
