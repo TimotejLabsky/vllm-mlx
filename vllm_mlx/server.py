@@ -1143,6 +1143,46 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     raise HTTPException(status_code=500, detail=detail)
 
 
+# PATCHES.md #91 — a streaming response commits HTTP 200 before generation
+# starts, so an exception raised later CANNOT become an error status. Without
+# an explicit error payload the body simply stops, and every layer downstream
+# reads that as a legitimate empty completion: llama-swap logs "no valid JSON
+# data found in stream" and still returns 200, LiteLLM rewrites it to
+# finish_reason=stop, and an agent client sees a well-formed empty turn and
+# quietly stops. The generic text is deliberate — the traceback goes to the
+# log (which is what #90 timestamps), never to the client.
+_STREAM_ERROR_MESSAGE = (
+    "Internal server error during streaming generation; the response is incomplete."
+)
+
+
+def _stream_error_chunk(response_id: str | None = None) -> str:
+    """Terminal SSE payload for an OpenAI-shaped stream that died mid-flight.
+
+    Matches the ``{"error": {...}}`` object OpenAI and vLLM both emit, which
+    LiteLLM already understands.
+    """
+    error: dict[str, str] = {
+        "message": _STREAM_ERROR_MESSAGE,
+        "type": "internal_error",
+        "code": "stream_failed",
+    }
+    if response_id:
+        # Already sent to the client on every prior chunk, so it leaks
+        # nothing — and it is what ties a client-side report to the log line.
+        error["request_id"] = response_id
+    return f"data: {json.dumps({'error': error})}\n\n"
+
+
+def _anthropic_stream_error_event() -> str:
+    """Same idea as :func:`_stream_error_chunk` in the Anthropic SSE dialect."""
+    payload = {
+        "type": "error",
+        "error": {"type": "api_error", "message": _STREAM_ERROR_MESSAGE},
+    }
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 def _raise_engine_busy(exc: EngineBusy) -> None:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
@@ -6813,10 +6853,17 @@ async def _stream_anthropic_messages(
         result_label = _metrics_result_from_status(exc.status_code)
         raise
     except (asyncio.CancelledError, GeneratorExit):
+        # Never yield here — see the note in stream_chat_completion.
         result_label = "cancelled"
         raise
     except Exception:
+        # PATCHES.md #91 — same silent-stream problem as the OpenAI path.
         result_label = "error"
+        logger.exception(
+            "Anthropic messages stream failed after %d token(s)",
+            completion_tokens,
+        )
+        yield _anthropic_stream_error_event()
         raise
     finally:
         if metrics_tracker is not None:
@@ -6842,6 +6889,7 @@ async def stream_completion(
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     result = "success"
+    closed = False  # #91: set when the generator is being torn down
     prompt_tokens = 0
     completion_tokens = 0
     generate_kwargs = {
@@ -6911,13 +6959,25 @@ async def stream_completion(
         result = _metrics_result_from_status(exc.status_code)
         raise
     except (asyncio.CancelledError, GeneratorExit):
+        # Never yield here — see the note in stream_chat_completion.
         result = "cancelled"
+        closed = True
         raise
     except Exception:
+        # PATCHES.md #91 — same silent-stream problem as the chat path.
         result = "error"
+        logger.exception(
+            "Streaming completion failed after %d token(s)", completion_tokens
+        )
+        yield _stream_error_chunk()
         raise
     finally:
-        yield "data: [DONE]\n\n"
+        # #91: yielding during GeneratorExit raises "async generator ignored
+        # GeneratorExit", which used to fire on every client disconnect here
+        # and skipped metrics_tracker.finish() below with it — so aborted
+        # completions went uncounted. The client is gone anyway; skip [DONE].
+        if not closed:
+            yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -7452,10 +7512,22 @@ async def stream_chat_completion(
         result_label = _metrics_result_from_status(exc.status_code)
         raise
     except (asyncio.CancelledError, GeneratorExit):
+        # Never yield here: the generator is being closed, and yielding during
+        # GeneratorExit raises "async generator ignored GeneratorExit".
         result_label = "cancelled"
         raise
     except Exception:
+        # PATCHES.md #91 — log the traceback (previously this path was silent,
+        # so a mid-stream failure left no record anywhere) and tell the client
+        # the stream failed instead of letting the body just stop.
         result_label = "error"
+        logger.exception(
+            "Streaming chat completion failed after %d token(s) (id=%s)",
+            completion_tokens,
+            response_id,
+        )
+        yield _stream_error_chunk(response_id)
+        yield "data: [DONE]\n\n"
         raise
     finally:
         if metrics_tracker is not None:
