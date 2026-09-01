@@ -2492,3 +2492,62 @@ suite 3391 passed / 31 skipped.
 `stop=["\n\n"]` against a route with llguidance active, asserting complete
 JSON plus the right finish_reason — plus the standing T=0 gate the #88
 deploy already owes.
+
+## 90. `patch: timestamped-logging` — make captured backend logs correlatable
+
+**Problem.** Backend log lines carried no timestamp. `server.py` called
+`logging.basicConfig(level=logging.INFO)` (default format `LEVEL:name:message`)
+and uvicorn's own loggers default to `%(levelprefix)s %(message)s`. That was
+survivable only while nothing read the logs — and nothing could, because
+llama-swap discards every route's stdout/stderr. Their fd 1/2 *are* pipes into
+llama-swap (verified with `lsof`), but none of it is surfaced: 0 `Traceback`
+and 0 `tok/s` across 962k lines of `llama-swap.log`, and `/logs/upstream`,
+`/logs/proxy`, `/api/logs/upstream` all 404 on v249. The infra side now
+captures each route to `/Users/ai/llm-stack/logs/<route>.log`
+(`route-log-wrapper.sh`, `personal-infratructure` PR #400), which makes the
+missing timestamps the binding constraint: an untimestamped file cannot be
+correlated with llama-swap's request log, the gateway, or a client transcript.
+
+Motivating incident (2026-09-01): an engine exception ~20 ms into a streaming
+chat completion, before any token. The SSE headers (HTTP 200) were already
+sent, so the raise could only truncate the body — llama-swap returned 200 with
+~230 bytes, LiteLLM passed it through as a normal completion, and the opencode
+client saw a well-formed empty turn with `finish=stop` and stopped. The only
+evidence that anything failed was
+`vllm_mlx_inference_requests_total{result="error"}`. The traceback was printed
+and discarded.
+
+**Fix.** New fork-owned `vllm_mlx/utils/logging_setup.py`:
+
+- `configure_root_logging()` — `basicConfig` with
+  `%(asctime)s %(levelname)s %(name)s: %(message)s`.
+- `timestamped_log_config()` — deep-copies uvicorn's `LOGGING_CONFIG` and
+  prepends `%(asctime)s` to each formatter's `fmt`.
+
+`basicConfig` alone is **not** sufficient, and this is the whole point of the
+second function: it configures the root logger, which the fork's own
+`getLogger(__name__)` loggers propagate to, but uvicorn installs its own
+handlers on `uvicorn`/`uvicorn.error`/`uvicorn.access` and those do **not**
+propagate. `uvicorn.error` is what emits "Exception in ASGI application" — the
+traceback for exactly the mid-stream failure above, i.e. the single most
+valuable line in the file.
+
+Millisecond precision is deliberate: a mid-stream exception and the request
+that caused it land in the same second (in the incident, 09:51:44.78 request →
+09:51:44.95 error).
+
+Kept in a fork-owned module so the upstream-owned files take one line each:
+`server.py` swaps `basicConfig` for `configure_root_logging` and passes
+`log_config=` to its `uvicorn.run`; `cli.py` passes `log_config=` to its
+`uvicorn.run` — the latter is the path **every llama-swap route takes**
+(`python -m vllm_mlx.cli serve`), so missing it would have left production
+unchanged.
+
+**Verification.** `dictConfig` accepts the generated config; both `default` and
+`access` formatters gain `%(asctime)s`; uvicorn's `LOGGING_CONFIG` module
+global is **not** mutated (deep copy — a shallow one would corrupt uvicorn for
+the whole process); the transform is idempotent (no double prefix); and both a
+fork logger and `uvicorn.error` emit timestamped lines at ms resolution.
+
+**NOT yet deployed.** Pairs with `personal-infratructure` PR #400 — the log
+capture and the timestamps are only useful together.
