@@ -395,8 +395,23 @@ class MetricsCollector:
                 "llama-swap returns a dead upstream as HTTP 200 with an "
                 "empty completion and LiteLLM rewrites upstream errors to "
                 "finish_reason=stop/content=None, so only this layer can "
-                "count them. Alert on any increase.",
+                "count them. Alert on any increase. NOTE: counts only "
+                "result=success — a stream that RAISED with zero tokens is "
+                "counted by stream_aborts_total (#91), not here.",
                 ["endpoint"],
+                registry=registry,
+            ),
+            "stream_aborts_total": Counter(
+                "vllm_mlx_stream_aborts_total",
+                "Streaming requests that did not finish successfully (#91). "
+                "phase=before_first_token is the dangerous one: the HTTP 200 "
+                "headers are already sent, so the client receives a "
+                "well-formed EMPTY response and an agent reads it as a "
+                "legitimate empty turn and silently stops — the 2026-09-01 "
+                "failure. #87's empty_completions_total cannot see these "
+                "because it only counts result=success. Alert on "
+                "result=error,phase=before_first_token.",
+                ["endpoint", "result", "phase"],
                 registry=registry,
             ),
             "metal_resource_limit": Gauge(
@@ -506,6 +521,19 @@ class MetricsCollector:
         if result == "success" and completion_tokens == 0:
             self._prom["empty_completions_total"].labels(
                 endpoint=endpoint,
+            ).inc()
+        # #91: the other half of the same blind spot. A stream that aborted
+        # after the 200 headers went out never reaches the branch above
+        # (result != "success"), yet the client still receives a well-formed
+        # empty body. Split by phase so the silent-stop signature
+        # (result=error, phase=before_first_token) is directly alertable.
+        if stream and result != "success":
+            self._prom["stream_aborts_total"].labels(
+                endpoint=endpoint,
+                result=result,
+                phase=(
+                    "before_first_token" if completion_tokens == 0 else "mid_stream"
+                ),
             ).inc()
         self._prom["inference_requests_total"].labels(
             endpoint=endpoint,
