@@ -2617,3 +2617,64 @@ clean on the added code (`metrics.py`'s two drift hunks are pre-existing —
 confirmed by re-running against a stash — and stay unfixed per fork policy).
 
 **NOT yet deployed.** Stacked on #90.
+
+## 92. `patch: tool-argument-type-coercion` — arguments must land on their declared type
+
+**Problem.** `_coerce_tool_arguments` coerced in **one direction only**: schema
+says `string`, model produced a dict/list -> JSON-stringify it. There was no
+reverse case, and the reverse is the one the production coding route hits.
+
+The XML-ish tool dialects (`qwen3_coder`, live on Qwen3.8-27B-8bit; `hermes`
+and the other `<parameter=...>` formats behave the same) carry every parameter
+value as raw **text**. So an `array`- or `object`-typed parameter arrives as a
+**string** even when the model wrote perfectly good JSON — and the client gets
+a string where its own schema declares an array and rejects the call. The
+failure presents as the model's fault when the JSON was in fact fine.
+
+Found while investigating an opencode session whose `todowrite` calls failed
+four times in a row until the model gave up ("The todo tool is having issues;
+I'll proceed without it"). Measured on the live route: a 2-item list parsed
+into a real array and worked; a 4-item list came back as
+`{"todos": "\n[{...}]\n"}` — a string — and did not.
+
+**Fix.** `_decode_json_parameter()` parses the text back when the declared type
+is `array`/`object`, plus `_declared_types()` so a union `"type": ["array",
+"null"]` is handled rather than silently skipped (the old `== "string"` scalar
+compare missed those on the existing direction too).
+
+**Deliberately narrow.** It only acts when the text opens with `[` or `{`, and
+only accepts the result if it lands on the declared type — so `"123"` does not
+become an int, prose is untouched, and an object for an `array` field is left
+alone. Type agreement is the contract the client's parser needs; deeper
+semantic validation stays the client's job, so a structurally sound but
+incomplete object is still handed over as a structure rather than downgraded
+to a string.
+
+**What this does NOT fix — stated plainly.** Malformed generation. The live
+failure's inner JSON was genuinely broken (`{"content": "Open PR to main",
+"status": "pending", "priority"}` — a dangling key, closing brackets intact),
+and `_repair_truncated_json` correctly returns `None` for it because nothing
+was truncated. Repairing that would mean **inventing arguments**, so #92
+leaves malformed values verbatim, with a test pinning that. The real fix for
+malformed tool JSON is constrained decoding — the strict tool-argument schemas
+recorded as the follow-up under #73, which needs a region-scoped
+(TagDispatch-style) processor that does not exist yet: today's
+`LLGuidanceJSONSchemaLogitsProcessor` constrains from token 0, which would
+mask the reasoning block and all free text.
+
+**Also ruled out while investigating** (so nobody re-runs these): the
+`qwen3_coder` parser is faithful — exact round-trip non-streaming, 0 failures
+across all 40 streaming chunk sizes, and exact on adversarial `:` `>` `<` `&`
+`'`, escaped quotes and pre-existing `&quot;` entities; sampling is not the
+cause (identical malformation at T=0, and 6 T=0 runs byte-identical);
+streaming is not the cause (streaming and non-streaming byte-identical); and
+the prefix cache is not implicated (the corruption survives a nonce-forced
+cold prefix). One real parser bug was found and NOT fixed here: a literal
+`<parameter=x>` inside a value truncates the value.
+
+**Verification.** 20 new tests — both coercion directions, whitespace-wrapped
+values (the parser hands the newlines over), union types, nested structures,
+idempotence, and the negative cases (malformed left verbatim, type mismatch,
+prose, `"123"`, empty string, string-typed field, unknown key, no tools,
+unknown tool, non-JSON arguments). Full suite **3424 passed / 31 skipped / 30
+deselected**. `ruff` and `black` clean.
