@@ -2551,3 +2551,69 @@ fork logger and `uvicorn.error` emit timestamped lines at ms resolution.
 
 **NOT yet deployed.** Pairs with `personal-infratructure` PR #400 — the log
 capture and the timestamps are only useful together.
+
+## 91. `patch: stream-error-visibility` — a dead stream must not read as an empty answer
+
+**Problem.** A streaming response commits HTTP 200 **before** generation
+starts, so an exception raised afterwards cannot become an error status.
+`stream_chat_completion` handled that by setting a metrics label and
+re-raising — nothing logged, nothing emitted. The body simply stopped, and
+every layer downstream read that as a legitimate empty completion: llama-swap
+logged `no valid JSON data found in stream` and still returned **200 with ~230
+bytes**, LiteLLM rewrote it to `finish_reason=stop`, and the opencode client
+saw a well-formed empty turn and quietly ended the session (2026-09-01). The
+only trace anywhere was
+`vllm_mlx_inference_requests_total{result="error"}`; the traceback was printed
+to stderr, which llama-swap discards (see #90).
+
+**Three parts.**
+
+1. **Tell the client.** `_stream_error_chunk()` emits the
+   `{"error": {...}}` object OpenAI and vLLM both use (LiteLLM already
+   understands it) and `_anthropic_stream_error_event()` does the same in the
+   Anthropic `event: error` dialect. Applied to all three streaming
+   generators. The message is **generic** — the traceback goes to the log,
+   never to the client, matching `_log_and_raise_internal_error`'s posture —
+   but it carries the `request_id` already sent on every prior chunk, which is
+   what ties a client-side report to the log line.
+
+2. **Log the traceback.** `logger.exception()` on the generic-`Exception`
+   branch of each generator. This is deliberately a traceback and not
+   `_sanitize_log_text`: this is the one path where the failure can never
+   become a logged HTTP 500, and the traceback is the entire diagnostic value.
+   Pairs with #90 — an untimestamped traceback is much less useful.
+
+   Note the cancellation branch stays silent and yields **nothing**: yielding
+   during `GeneratorExit` raises `async generator ignored GeneratorExit`, and
+   a client hanging up is not a server error.
+
+3. **Count it.** New `vllm_mlx_stream_aborts_total{endpoint,result,phase}`.
+   #87's `empty_completions_total` gates on `result == "success"`, so a stream
+   that *raised* with zero tokens — exactly this failure — was **uncounted**;
+   the existing #87 test even exercises that case and asserts it does not
+   count. `phase=before_first_token` is the alertable silent-stop signature
+   (200 headers already sent, client receives a well-formed EMPTY body);
+   `phase=mid_stream` is at least visible as truncation. #87's help text now
+   cross-references this so nobody assumes it covers everything.
+
+**Latent bug found and fixed in the same block.** `stream_completion` yielded
+`data: [DONE]` from its `finally`. On every client disconnect that raised
+`RuntimeError: async generator ignored GeneratorExit` — and because the
+`yield` came first, `metrics_tracker.finish()` below it **never ran**, so
+aborted completions went uncounted. Verified with a standalone repro of the
+old shape. Now guarded by a `closed` flag set on the cancellation branch.
+
+**Verification.** 13 new tests: error-chunk shape for both dialects (valid SSE
++ JSON, `request_id` present/absent), raise-before-first-token and
+raise-mid-stream on the chat path (error chunk emitted exactly once, stream
+still terminates with `[DONE]`, exception still propagates, traceback in the
+log, **and the exception text absent from the client body**), the same on the
+completions path, cancellation emitting no error chunk and `aclose()` not
+raising, the disconnect regression above still reaching `finish()`, and the
+counter across all five gates (before_first_token / mid_stream / cancelled
+distinguishable / success and non-streaming not counted / #87 unchanged).
+Full suite **3404 passed / 31 skipped / 30 deselected**. `ruff` clean; `black`
+clean on the added code (`metrics.py`'s two drift hunks are pre-existing —
+confirmed by re-running against a stash — and stay unfixed per fork policy).
+
+**NOT yet deployed.** Stacked on #90.
