@@ -2678,3 +2678,76 @@ idempotence, and the negative cases (malformed left verbatim, type mismatch,
 prose, `"123"`, empty string, string-typed field, unknown key, no tools,
 unknown tool, non-JSON arguments). Full suite **3424 passed / 31 skipped / 30
 deselected**. `ruff` and `black` clean.
+
+## 93. `patch: dry-vs-structured-output` — DRY may not police declared structure
+
+**Problem.** DRY penalises exact repeated token sequences; it exists to break
+prose loops. Structured output *legitimately* repeats — a JSON array re-emits
+`{"content": "` for every element, and a tool-call envelope re-emits its
+parameter scaffolding every time.
+
+The sequence breakers cannot prevent this, and that is the non-obvious part.
+They resolve to **single-character token ids** (`"\n" ":" '"' "*"`), while BPE
+merges JSON punctuation into tokens like `' {"'`, `'":'` and `'",'`. Measured
+on the Qwen3.8 tokenizer, the fragment
+
+    }, {"content": "Add new Celery task", "status": "pending"
+
+tokenizes as `['},', ' {"', 'content', '":', ' "', 'Add', …, '"']` — **17
+tokens containing exactly ONE breaker**, leaving a 16-token breaker-free run.
+DRY caps match length at the breaker-free run, so the cap never engages.
+
+At the deployed gateway values (`multiplier=0.8`, `base=1.75`,
+`allowed_length=4`) the penalty is `0.8 * 1.75**(16-4)` ≈ **660** subtracted
+from the correct next token's logit. That is not a nudge, it is a prohibition:
+the model cannot emit `: "` and derails onto `>`, a dropped quote, or `[\"` —
+reliably at the **third** array element, because a 2-element list stays under
+water (`0.8 * 1.75**2` ≈ 2.5).
+
+**How it was found.** A live opencode session whose `todowrite` failed three
+times in a row, each attempt breaking at the same structural position in a
+different way. The `DRY sampler active (batched): multiplier=0.80 base=1.75
+allowed=4 window=8192` line appears 55x in the route log — and was only
+readable because of #90's log capture, deployed the same morning.
+
+**Two config-vs-reality gaps this exposed.** The llama-swap route comment says
+*"DRY REMOVED on this route 2026-08-22"* — it was removed at that layer, but
+the **LiteLLM gateway re-injects it per request** via `extra_body`. And the
+gateway comment already anticipated the hazard ("4 is the published guidance
+for code/structured output, which legitimately repeats indentation and
+punctuation") — the breakers were meant to cover it and structurally cannot.
+The 2026-08-20 revert of `,`/`{`/`}` breakers was moot for the same reason:
+`'},'` and `' {"'` are merged tokens, so those single chars never matched
+either.
+
+**Fix.** `_dry_suppressed_for_structure()` + `_apply_dry_structure_suppression()`
+force `dry_multiplier = 0.0` when the request declares `tools` (and
+`tool_choice != "none"`) or a `json_object`/`json_schema` `response_format`.
+Applied in **both** chat kwargs builders — OpenAI and Anthropic. Setting an
+explicit `0.0` is deliberate: `multiplier <= 0` is DRY's own off switch in
+`build_dry_processor`, and an explicit request value also overrides the
+per-model `VLLM_MLX_DRY_*` env defaults, so this closes the gateway-injected
+path *and* the env path in one move.
+
+Placed at the server layer because `tools` never reaches the engine —
+`chat_kwargs` carries the `dry_*` values but not the tool list — so this also
+covers SimpleEngine and BatchedEngine without touching either.
+
+Same principle as #89 (a stop terminator may not cut an open JSON value): a
+generic repetition mechanism must not police output whose structure the caller
+declared. DRY is untouched for prose, which is the case it exists for.
+
+**Verification.** 18 new tests: suppression on declared tools and both JSON
+response formats (dict and object-shaped), DRY preserved for prose /
+`tool_choice: "none"` / empty tool list / `text` format, the in-place
+application overriding both gateway-injected and env-default values,
+idempotence, `build_dry_processor(multiplier=0.0) is None` pinning the off
+switch, and the penalty arithmetic itself — >500 at a 16-token run, <3 at a
+6-token run, which is exactly why short lists worked and the third element
+failed. Full suite **3442 passed / 31 skipped / 30 deselected**. `ruff` and
+`black` clean.
+
+**Paired gateway change:** `personal-infratructure` — token-aware
+`dry_sequence_breakers` for the Qwen3.8 routes as defence in depth. #93 is the
+real fix; the breakers are the belt-and-braces layer for any path that reaches
+the engine without declared tools.
