@@ -1970,15 +1970,64 @@ def get_engine() -> BaseEngine:
     return _engine
 
 
+def _declared_types(prop_schema: dict) -> set[str]:
+    """JSON Schema allows ``type`` to be a string or a list of strings."""
+    declared = prop_schema.get("type")
+    if isinstance(declared, str):
+        return {declared}
+    if isinstance(declared, list):
+        return {t for t in declared if isinstance(t, str)}
+    return set()
+
+
+def _decode_json_parameter(raw: str, expected: set[str]) -> list | dict | None:
+    """Parse a JSON-in-a-string tool parameter back to its declared type.
+
+    PATCHES.md #92. The XML-ish tool dialects (``qwen3_coder``, the parser on
+    the production coding route) carry every ``<parameter=name>`` value as raw
+    TEXT, so an ``array``/``object`` parameter arrives as a *string* even when
+    the model wrote perfectly good JSON. ``_coerce_tool_arguments`` only ever
+    handled the opposite direction (schema wants string, model gave a
+    structure), so the client received a string where its schema declares an
+    array and rejected the call — the failure looks like the model's fault
+    when the JSON was in fact fine.
+
+    Returns ``None`` — leaving the original value untouched — unless the text
+    parses AND lands on the declared type. Type agreement is the contract the
+    client's own parser needs; deeper semantic validation stays the client's
+    job, so a structurally sound but incomplete object is still handed over as
+    a structure rather than silently downgraded to a string.
+    """
+    text = raw.strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        decoded = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # Deliberately NOT repaired here. Malformed generation is a decoding
+        # problem, not a parsing one — guessing at the model's intent would
+        # hand the client fabricated arguments. See the #92 entry.
+        return None
+    if isinstance(decoded, list) and "array" in expected:
+        return decoded
+    if isinstance(decoded, dict) and "object" in expected:
+        return decoded
+    return None
+
+
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
     """
     Coerce tool call arguments to match the tool schema.
 
-    If a schema field expects "string" but the model produced an object/array,
-    JSON-stringify the value. This fixes a common LLM failure mode where models
-    output raw JSON objects instead of JSON strings for file content, etc.
+    Two directions, both driven by the declared parameter schema:
+
+    * schema expects ``string`` but the model produced an object/array —
+      JSON-stringify it (models emit raw JSON for file content, etc.);
+    * schema expects ``array``/``object`` but the model produced a string of
+      JSON — parse it back (#92; the XML tool dialects deliver every
+      parameter as text).
     """
     if not tools:
         return arguments_json
@@ -2006,10 +2055,15 @@ def _coerce_tool_arguments(
 
     for key, value in arguments.items():
         if key in properties:
-            expected_type = properties[key].get("type")
-            if expected_type == "string" and isinstance(value, (dict, list)):
+            expected = _declared_types(properties[key])
+            if "string" in expected and isinstance(value, (dict, list)):
                 arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
                 changed = True
+            elif isinstance(value, str) and expected & {"array", "object"}:
+                decoded = _decode_json_parameter(value, expected)
+                if decoded is not None:
+                    arguments[key] = decoded
+                    changed = True
 
     if changed:
         return json.dumps(arguments, ensure_ascii=False)
