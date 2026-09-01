@@ -192,12 +192,10 @@ from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .reasoning.base import ReasoningParser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .utils.logging_setup import configure_root_logging, timestamped_log_config
 from .utils.reasoning_effort import EFFORT_FALLBACK_KEY
 
-if TYPE_CHECKING:
-    from .tool_parsers.abstract_tool_parser import ToolParserTokenizer
-
-logging.basicConfig(level=logging.INFO)
+configure_root_logging(logging.INFO)  # PATCHES.md #90 — timestamped log lines
 logger = logging.getLogger(__name__)
 
 _IMPORTED_SIMPLE_ENGINE = SimpleEngine
@@ -8489,6 +8487,7 @@ def main():
         host=args.host,
         port=args.port,
         http=_make_keepalive_http_protocol(),
+        log_config=timestamped_log_config(),  # PATCHES.md #90
     )
 
 
