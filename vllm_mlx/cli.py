@@ -463,7 +463,17 @@ def serve_command(args):
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # PATCHES.md #90 — timestamped uvicorn logs (incl. the "Exception in ASGI
+    # application" traceback). This is the path every llama-swap route takes.
+    from .utils.logging_setup import timestamped_log_config
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        log_config=timestamped_log_config(),
+    )
 
 
 def download_command(args):
