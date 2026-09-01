@@ -776,6 +776,55 @@ def _attach_logit_bias_processor(
         chat_kwargs["logits_processors"] = list(existing) + list(processors)
 
 
+def _dry_suppressed_for_structure(request) -> str | None:
+    """Why DRY must not run for this request, or ``None`` to leave it alone.
+
+    PATCHES.md #93. DRY penalises exact repeated token sequences; it exists to
+    break prose loops. Structured output legitimately repeats — a JSON array
+    re-emits ``{"content": "`` for every element, and a tool-call envelope
+    re-emits its parameter scaffolding every time.
+
+    The sequence breakers cannot save it. They resolve to SINGLE-CHARACTER
+    token ids (``"\\n" ":" '"' "*"``) while BPE merges JSON punctuation into
+    tokens like ``' {"'``, ``'":'`` and ``'",'``. Measured on Qwen3.8: a
+    17-token JSON element contains exactly ONE breaker, leaving a 16-token
+    breaker-free run. At the deployed multiplier=0.8 / base=1.75 /
+    allowed_length=4 the penalty is ``0.8 * 1.75**12`` — about **660** on the
+    correct next token. That is not a nudge, it is a prohibition: the model
+    cannot emit ``: "`` and derails onto ``>`` or a dropped quote, reliably at
+    the third array element. Diagnosed 2026-09-01 from a live opencode session
+    whose ``todowrite`` failed three times in a row.
+
+    Same principle as #89 (a stop terminator may not cut an open JSON value):
+    a generic repetition mechanism must not police output whose structure the
+    caller has declared.
+    """
+    tools = getattr(request, "tools", None)
+    if tools and getattr(request, "tool_choice", None) != "none":
+        return "tools"
+    response_format = getattr(request, "response_format", None)
+    fmt = getattr(response_format, "type", None)
+    if fmt is None and isinstance(response_format, dict):
+        fmt = response_format.get("type")
+    if fmt in ("json_object", "json_schema"):
+        return "response_format"
+    return None
+
+
+def _apply_dry_structure_suppression(chat_kwargs: dict, request) -> None:
+    """Turn DRY off in-place when the request declares structured output."""
+    reason = _dry_suppressed_for_structure(request)
+    if reason is None:
+        return
+    # multiplier <= 0 is DRY's own off switch (build_dry_processor), and an
+    # explicit request value also overrides the per-model VLLM_MLX_DRY_* env
+    # defaults — so this closes the gateway-injected path AND the env path.
+    if chat_kwargs.get("dry_multiplier") == 0:
+        return
+    chat_kwargs["dry_multiplier"] = 0.0
+    logger.info("[dry] suppressed for structured output (%s)", reason)
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -811,6 +860,7 @@ def _prepare_chat_completion_invocation(
         "dry_range": getattr(request, "dry_range", None),
         "dry_sequence_breakers": getattr(request, "dry_sequence_breakers", None),
     }
+    _apply_dry_structure_suppression(chat_kwargs, request)  # PATCHES.md #93
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
 
     if has_media:
@@ -992,6 +1042,7 @@ def _prepare_anthropic_invocation(
         "dry_range": getattr(openai_request, "dry_range", None),
         "dry_sequence_breakers": getattr(openai_request, "dry_sequence_breakers", None),
     }
+    _apply_dry_structure_suppression(chat_kwargs, openai_request)  # PATCHES.md #93
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         openai_request.chat_template_kwargs
     )
