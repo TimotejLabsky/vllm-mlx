@@ -2031,7 +2031,11 @@ def _declared_types(prop_schema: dict) -> set[str]:
     return set()
 
 
-def _decode_json_parameter(raw: str, expected: set[str]) -> list | dict | None:
+_JSON_SCALAR_TYPES = frozenset({"number", "integer", "boolean"})
+_COERCIBLE_TYPES = frozenset({"array", "object"}) | _JSON_SCALAR_TYPES
+
+
+def _decode_json_parameter(raw: str, expected: set[str]):
     """Parse a JSON-in-a-string tool parameter back to its declared type.
 
     PATCHES.md #92. The XML-ish tool dialects (``qwen3_coder``, the parser on
@@ -2043,6 +2047,12 @@ def _decode_json_parameter(raw: str, expected: set[str]) -> list | dict | None:
     array and rejected the call — the failure looks like the model's fault
     when the JSON was in fact fine.
 
+    PATCHES.md #94 extends this to scalars for the same reason: the dialect
+    carries EVERY value as text, so a ``number``/``integer``/``boolean`` field
+    arrives as ``"440"`` / ``"true"`` too. Observed live as
+    ``SchemaError(Expected number | undefined, got "440" at ["offset"])`` on
+    read/bash calls — the last real tool-failure class left after #93.
+
     Returns ``None`` — leaving the original value untouched — unless the text
     parses AND lands on the declared type. Type agreement is the contract the
     client's own parser needs; deeper semantic validation stays the client's
@@ -2050,19 +2060,48 @@ def _decode_json_parameter(raw: str, expected: set[str]) -> list | dict | None:
     a structure rather than silently downgraded to a string.
     """
     text = raw.strip()
-    if not text or text[0] not in "[{":
+    if not text:
         return None
-    try:
-        decoded = json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        # Deliberately NOT repaired here. Malformed generation is a decoding
-        # problem, not a parsing one — guessing at the model's intent would
-        # hand the client fabricated arguments. See the #92 entry.
+
+    def _load(t):
+        try:
+            return json.loads(t), True
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # Deliberately NOT repaired. Malformed generation is a decoding
+            # problem, not a parsing one — guessing at the model's intent
+            # would hand the client fabricated arguments. See #92.
+            return None, False
+
+    # Structural: only "[" or "{" opens one.
+    if text[0] in "[{":
+        decoded, ok = _load(text)
+        if not ok:
+            return None
+        if isinstance(decoded, list) and "array" in expected:
+            return decoded
+        if isinstance(decoded, dict) and "object" in expected:
+            return decoded
         return None
-    if isinstance(decoded, list) and "array" in expected:
-        return decoded
-    if isinstance(decoded, dict) and "object" in expected:
-        return decoded
+
+    # Scalars (#94). Never when the schema also permits a string: there the
+    # text already IS a valid value, and converting would change its meaning.
+    if "string" in expected or not (expected & _JSON_SCALAR_TYPES):
+        return None
+    decoded, ok = _load(text)
+    if not ok:
+        return None
+    # bool is a subclass of int in Python — check it FIRST, or `true` would
+    # satisfy an integer schema.
+    if isinstance(decoded, bool):
+        return decoded if "boolean" in expected else None
+    if isinstance(decoded, int):
+        return decoded if expected & {"integer", "number"} else None
+    if isinstance(decoded, float):
+        if "number" in expected:
+            return decoded
+        # "4.0" for an integer field is unambiguous; "4.5" is not.
+        if "integer" in expected and decoded.is_integer():
+            return int(decoded)
     return None
 
 
@@ -2078,7 +2117,10 @@ def _coerce_tool_arguments(
       JSON-stringify it (models emit raw JSON for file content, etc.);
     * schema expects ``array``/``object`` but the model produced a string of
       JSON — parse it back (#92; the XML tool dialects deliver every
-      parameter as text).
+      parameter as text);
+    * schema expects ``number``/``integer``/``boolean`` and the model produced
+      a string — parse it back too (#94), unless the schema also permits a
+      string, where the text is already a valid value.
     """
     if not tools:
         return arguments_json
@@ -2110,7 +2152,7 @@ def _coerce_tool_arguments(
             if "string" in expected and isinstance(value, (dict, list)):
                 arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
                 changed = True
-            elif isinstance(value, str) and expected & {"array", "object"}:
+            elif isinstance(value, str) and expected & _COERCIBLE_TYPES:
                 decoded = _decode_json_parameter(value, expected)
                 if decoded is not None:
                     arguments[key] = decoded
