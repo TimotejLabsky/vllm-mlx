@@ -663,6 +663,14 @@ class BatchedEngine(BaseEngine):
 
         realize_module_arrays(self._model)
 
+        # MoE gate/up fusion (fork patch #96, env-gated
+        # VLLM_MLX_MOE_GATEUP_FUSION): one gather_qmm per expert MLP
+        # instead of two. Runs after realize (arrays concrete) and before
+        # compile (the fused forward is what should get compiled).
+        from ..moe_fusion import maybe_fuse
+
+        maybe_fuse(self._model, self._model_name)
+
         # --compile: wrap forward pass with mx.compile for fused Metal kernels.
         # See vllm_mlx/compile.py (ported from upstream PR #270).
         if getattr(self, "_compile_on_start", False):
