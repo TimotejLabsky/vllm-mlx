@@ -2822,3 +2822,46 @@ the "LM Studio measured 1.5x" lead.
 **Verification:** regression test drives `serve_command` end-to-end on the
 continuous-batching path and asserts `scheduler_config.prefill_step_size`
 carries the flag. Full suite green in the commit.
+
+## 96. `patch: moe-gateup-fusion` — one gather_qmm per expert MLP, env-gated
+
+**Files:** `vllm_mlx/moe_fusion.py` (new), `vllm_mlx/engine/batched.py` +
+`vllm_mlx/engine/simple.py` (load hooks), `tests/test_moe_fusion.py` (new, 5)
+
+The last lever of the 2026-09-02 ranked list, and the only positive one
+after five nulls. At decode shapes the expert MLP is dispatch-bound: two
+back-to-back `gather_qmm` calls (gate, up) where one suffices. Microbench
+at Qwen3.6-35B-A3B production shapes (2048→256×512, top-8, 4-bit g64) on
+the M1 Ultra: fusing saves 29–50µs per MoE layer → 1.2–2.0ms per decode
+step over 40 layers, ~10–15% of an ~11.5ms step. This is mlx-lm #956
+(+8.6% measured upstream), implemented fork-side at load time until it
+lands there.
+
+**Mechanism.** `FusedSwitchGLU` concatenates gate/up quantized tensors
+(weight/scales/biases, and a linear bias when present) along the output-row
+axis — `[up; gate]` so the split maps onto `activation(x_up, x_gate)` —
+and replays `SwitchGLU.__call__`'s sort logic verbatim around a single
+`gather_qmm` + `mx.split`. Quantized rows are independent, so the fused
+matmul computes identical per-row dot products: tests assert **exact**
+`mx.array_equal` with the stock module on both the decode path and the
+`indices.size >= 64` gather-sort path.
+
+**Safety rails** (the pin-ceiling discipline): env-gated
+`VLLM_MLX_MOE_GATEUP_FUSION=1`, default OFF; fuses only when gate/up match
+in shape/group_size/bits/mode/bias-ness — anything else is skipped and
+counted, model runs stock; walk failures degrade to unfused; mlx-lm
+imports guarded + class-name matched so an upstream restructuring is a
+no-op, not an ImportError. `FusedSwitchGLU` is deliberately NOT an
+nn.Module: it stays out of the parameter tree so `model.parameters()`/
+sanitize/quantize flows remain exactly upstream's. Hook runs after
+`realize_module_arrays` and before `--compile` on the batched engine;
+SimpleEngine fuses the inner model after `load()`.
+
+**Applies to** every SwitchGLU-based MoE on the fleet: Qwen3.6-35B-A3B
+(both routes), Coder-Next, gpt-oss-20b, gemma-4-26B-A4B, GLM-4.7-Flash.
+NOT the vision path (mlx-vlm classes).
+
+**Verification:** 5 unit tests (exact equality ×2 paths, nested/listed
+walk replacement, env gate default-off, quant-mismatch skip); full suite
+green in the commit; live A/B on the Studio recorded in the deploy row —
+arming is per-route config after that gate.
