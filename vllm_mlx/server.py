@@ -2424,6 +2424,13 @@ def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
         normalized = _decode_tool_argument_string(value, kind)
         if _tool_argument_matches_type(normalized, kind):
             return normalized
+        # Fork #94: "4.0" for an integer field is unambiguous; "4.5" is not.
+        if (
+            kind == "integer"
+            and isinstance(normalized, float)
+            and normalized.is_integer()
+        ):
+            return int(normalized)
     return value
 
 
