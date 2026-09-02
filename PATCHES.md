@@ -2798,3 +2798,27 @@ unrelated upstream-owned code, which this fork deliberately leaves drifted. The
 change was reverted and re-applied without it; the added code is black-clean on
 its own and the pre-existing drift is byte-for-byte unchanged (same 3 hunks,
 shifted by this patch's line count). Do not run `black` across `server.py`.
+
+## 95. `patch: prefill-step-size-threading` — the CLI knob must reach the batched scheduler
+
+**Files:** `vllm_mlx/cli.py` (both `SchedulerConfig(...)` sites),
+`tests/test_cli.py` (+1)
+
+Upstream issue #729, verified live on 2026-09-02 the hard way: a prefill
+step-size sweep (2048/4096/8192, fresh process per rung, 25K-token cold
+prompts) returned byte-identical prefill rates (201–206 tok/s) — because
+`serve` threaded `mllm_prefill_step_size` into `SchedulerConfig` but never
+plain `prefill_step_size`, so every continuous-batching route has always
+run the 2048 default regardless of the flag. One line per site; the #48
+relief path is unaffected (it overrides `batch_gen.prefill_step_size`
+downward at runtime and now starts from the operator's value instead of a
+silent constant).
+
+The corrected sweep (post-fix, same protocol, plus a 512 rung as a
+threading canary) is recorded in the deployed-state row: the canary proves
+the flag lands, and the 2048-vs-4096/8192 comparison is the real answer to
+the "LM Studio measured 1.5x" lead.
+
+**Verification:** regression test drives `serve_command` end-to-end on the
+continuous-batching path and asserts `scheduler_config.prefill_step_size`
+carries the flag. Full suite green in the commit.
