@@ -472,6 +472,15 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
+        # MoE gate/up fusion (fork patch #96, env-gated). The wrapper is
+        # not an nn.Module — hand the walk the inner mlx model.
+        from ..moe_fusion import maybe_fuse
+
+        maybe_fuse(
+            getattr(self._model, "model", None) or self._model,
+            self._model_name,
+        )
+
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
         method = getattr(self.prepare_for_start, "__func__", None)
