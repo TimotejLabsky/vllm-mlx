@@ -2751,3 +2751,50 @@ failed. Full suite **3442 passed / 31 skipped / 30 deselected**. `ruff` and
 `dry_sequence_breakers` for the Qwen3.8 routes as defence in depth. #93 is the
 real fix; the breakers are the belt-and-braces layer for any path that reaches
 the engine without declared tools.
+
+## 94. `patch: tool-scalar-type-coercion` — the same gap, for scalars
+
+**Problem.** #92 taught `_coerce_tool_arguments` to recover `array`/`object`
+parameters delivered as JSON text. It stopped there — but the XML-ish tool
+dialects carry **every** `<parameter=name>` value as raw text, so
+`number`/`integer`/`boolean` fields arrive as strings too.
+
+Found by auditing a live opencode session after the #93 deploy. The DRY
+corruption classes were gone (tool failures 27% -> 7%, `edit` 2/7 failing ->
+13/13 clean), and 3 of the 4 remaining failures were all one thing:
+
+    SchemaError(Expected number | undefined, got "440"    at ["offset"])
+    SchemaError(Expected number | undefined, got "300000" at ["timeout"])
+    SchemaError(Expected number | undefined, got "600000" at ["timeout"])
+
+`read` with `offset="440"`, `bash` with `timeout="300000"` — the model's values
+were correct, only their JSON type was wrong. (The 4th was the user declining a
+permission prompt, not a failure.)
+
+**Fix.** `_decode_json_parameter` now splits structural from scalar. Structural
+is unchanged: only `[`/`{` opens one. Scalars parse back when the declared type
+is `number`/`integer`/`boolean`.
+
+**Guards, all pinned by tests:**
+
+- **`bool` is checked before `int`** — it is an `int` subclass in Python, so
+  without this `"true"` would satisfy an `integer` schema.
+- **Never coerce when the schema also permits a `string`** (`["string",
+  "number"]`): there the text already IS a valid value and converting would
+  change its meaning.
+- `"4.0"` is accepted for an `integer` (unambiguous); `"4.5"` is not.
+- `"0"` and `"false"` coerce correctly — falsy results must not read as "no
+  coercion", which is why the caller tests `is not None`.
+- `"0x10"`, `"007"`, `"1,000"`, `"null"`, prose and empty strings are all left
+  verbatim. Same no-fabrication rule as #92.
+
+**Verification.** 22 new tests, including the three live failures verbatim and
+every guard above, plus #92 regression coverage (arrays/objects still coerced,
+malformed arrays still left alone, string-schema stringification intact). Full
+suite **3464 passed / 31 skipped / 30 deselected**. `ruff` clean.
+
+**Note on `black`:** running it over `server.py` reformats 33 lines of
+unrelated upstream-owned code, which this fork deliberately leaves drifted. The
+change was reverted and re-applied without it; the added code is black-clean on
+its own and the pre-existing drift is byte-for-byte unchanged (same 3 hunks,
+shifted by this patch's line count). Do not run `black` across `server.py`.
