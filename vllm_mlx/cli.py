@@ -299,6 +299,11 @@ def serve_command(args):
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
+            # #95: --prefill-step-size was silently dropped on this path
+            # (only the mllm variant was threaded) — upstream issue #729,
+            # verified live: a 2048/4096/8192 sweep produced identical
+            # prefill rates because every rung ran the 2048 default.
+            prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
@@ -607,6 +612,11 @@ def bench_command(args):
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
+            # #95: --prefill-step-size was silently dropped on this path
+            # (only the mllm variant was threaded) — upstream issue #729,
+            # verified live: a 2048/4096/8192 sweep produced identical
+            # prefill rates because every rung ran the 2048 default.
+            prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,

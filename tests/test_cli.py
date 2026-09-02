@@ -187,3 +187,52 @@ models:
 
     assert server._model_manager is not None
     assert server._model_manager.memory_budget_bytes == int(6.5 * (1024**3))
+
+
+def test_serve_command_threads_prefill_step_size_into_scheduler_config(monkeypatch):
+    """#95: --prefill-step-size was silently dropped on the serve path
+    (only mllm_prefill_step_size was threaded into SchedulerConfig) —
+    upstream issue #729, verified live when a 2048/4096/8192 sweep
+    produced byte-identical prefill rates."""
+    from vllm_mlx import cli, server
+    from vllm_mlx.utils import download
+
+    loaded = {}
+    monkeypatch.setattr(
+        download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
+    )
+    monkeypatch.setattr(
+        server,
+        "load_model",
+        lambda *args, **kwargs: loaded.update({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    cli.serve_command(
+        _serve_args(
+            prefill_step_size=4096,
+            continuous_batching=True,
+            # attrs only the continuous-batching branch reads
+            completion_batch_size=32,
+            prefill_batch_size=8,
+            prefix_cache_size=100,
+            no_memory_aware_cache=False,
+            use_paged_cache=False,
+            paged_cache_block_size=16,
+            max_cache_blocks=1000,
+            mtp_num_draft_tokens=1,
+            mtp_optimistic=False,
+            kv_cache_quantization=False,
+            kv_cache_quantization_bits=8,
+            kv_cache_quantization_group_size=64,
+            kv_cache_min_quantize_tokens=0,
+            mllm_prefill_step_size=0,
+            ssd_cache_dir=None,
+            ssd_cache_max_gb=10.0,
+            max_kv_size=None,
+            stream_interval=1,
+        )
+    )
+
+    sc = loaded["kwargs"]["scheduler_config"]
+    assert sc.prefill_step_size == 4096
