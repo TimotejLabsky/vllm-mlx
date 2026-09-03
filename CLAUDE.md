@@ -25,6 +25,11 @@ feature branch — read this before changing anything.
     optimisation axes are structurally N/A on a single-user unified-memory box
     (offload tiers, cross-user sharing), and the one real gap in ours:
     recency-only eviction. Verdict is instrument-first, don't build yet.
+  - [`speed-lever-ledger-2026-09.md`](docs/fork/speed-lever-ledger-2026-09.md)
+    — **read before proposing any performance work**: every speed lever
+    measured on this box (10 refuted, 5 shipped), the methodology lessons,
+    and the watch list (mlx #4020 gated-delta kernels = the pending big win,
+    taken via mlx release, never vendored). Update it with every new verdict.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
   - [`vision-caching.md`](docs/fork/vision-caching.md) — which caches apply on
