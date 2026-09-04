@@ -90,6 +90,32 @@ inside mlx's Metal kernels:
   prefill par. Ollama trails llama-server on every metric (same engine, more
   wrapper). No lever here.
 
+### 2026-09-04 (later) — decode-burst (oMLX-style step chaining): MEASURED, NOT SHIPPING
+
+oMLX's "burst decode" decoded: not speculation — it chains several
+`scheduler.step()` calls per event-loop→MLX-thread hand-off to avoid
+per-token GIL ping-pong with uvicorn (their comment claims 74→80 tok/s on
+their engine). Our engine loop has the identical per-token
+`run_in_executor` shape, so it ports as a ~32-line env-gated prototype
+(`VLLM_MLX_DECODE_BURST=K`, budget-bounded, SchedulerOutputs merged) — built
+and A/B'd on the Studio (branch `exp/decode-burst` = `4813f27` on
+`/Users/ai/vllm-mlx-src`, burst-env, 35B-A3B production env incl. fusion):
+
+- single-stream decode: 78.9 → 80.4 (K=4) → 81.2 (K=8) tok/s = **+2–3 %**
+- TTFT: **+(K−1)·step** exactly (0.16 → 0.19 → 0.24 s) — first token waits
+  out its burst; abort/stop servicing lags the same way
+- 4-stream aggregate: **flat** (172–177 tok/s at every K)
+- T=0 output hash identical across K — behaviorally safe
+- end bracket showed −8 % thermal droop on single-stream, so the gain is
+  honest-to-understated; conclusion unchanged under either reading
+
+Verdict: our loop already loses almost nothing to the async hand-off
+(server decode ≈ in-process mlx-lm: 78.7 vs 77.5), so the trick buys +2–3 %
+at a real latency/responsiveness cost — **not worth shipping**. Together
+with the #4020 kernel result (+~2 % ceiling), oMLX's remaining ~+10 % edge
+lives in its custom model runner internals, not in anything portable via a
+scheduler or kernel tweak.
+
 ## Watch list / open items
 
 - **mlx PR #4020 — gated-delta Metal kernels: DOWNGRADED 2026-09-04 from
