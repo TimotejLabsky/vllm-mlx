@@ -92,14 +92,35 @@ inside mlx's Metal kernels:
 
 ## Watch list / open items
 
-- **mlx PR #4020 — gated-delta Metal kernels: the one big pending win**
-  (1.3–2.2× on the GDN forward, measured on M1 Max, bitwise-identical;
-  approved with corrections). Arrives via the next mlx release (0.32.2 still
-  latest as of 2026-09-03) — a rebase-day must-take. Do NOT vendor mlx for it.
-  Related later-stage draft: mlx #4409. **2026-09-04: oMLX ships this class of
-  kernel vendored; measured +13 % end-to-end on our 35B-A3B at short context —
-  real but far below the isolated-kernel headline. Temper expectations
-  accordingly.**
+- **mlx PR #4020 — gated-delta Metal kernels: DOWNGRADED 2026-09-04 from
+  "big pending win" to routine pin-bump.** Tested pre-release on this box via
+  the PR's own CI wheel (head `c7e1a2a`, merge-ref build) + a 3-line
+  env-gated dispatch shim in mlx-lm's `gated_delta.py`:
+  - **Semantics verified**: `mx.fast.gated_delta_update(q,k,v,g,beta,
+    initial_state,mask)` matches mlx-lm's existing kernel bit-exactly at
+    T=1 and to fp32 epsilon at prefill shapes, straight pass-through (no
+    q-scaling — the model scales, same contract mlx-lm #1823 documents).
+    Integration when it lands is trivial.
+  - **Speedup on our stack ≈ nil**: kernel-vs-kernel inside the same wheel
+    (both paths share identical host overhead) at Qwen3.6-35B GDN shapes
+    (Hk16/Hv32/D128, M1 Ultra): decode T=1 **1.12×** wall, prefill T=4096
+    **0.98×** (parity). The old kernel is ~1–2 % of a release-build decode
+    step, so end-to-end expect **≤ ~3 % decode, nothing on prefill**. The
+    PR's 1.3–2.2× headline is against a baseline we don't have — mlx-lm's
+    own JIT gated-delta kernels (which our pin ships) already sit within
+    ~12 % of the fused kernels on this hardware. Corollary: oMLX's +13 %
+    is mostly its burst-decode pipeline, not GDN kernels.
+  - **T=0 outputs shift** (argmax-tie cascade from 1e-8 prefill drift;
+    diverged at token ~100–150 on the 35B). The byte-identity gate WILL
+    flag the pin bump that picks this up — expected, not a bug.
+  - **CI artifact wheels are debug-slow** (25 vs 77.5 tok/s on identical
+    setup) — usable for semantics and same-wheel kernel ratios, never for
+    absolute end-to-end numbers. (No Metal toolchain on the Studio or the
+    laptop — CLT only, no Xcode — so building release wheels locally is
+    blocked; the CI artifact route is the pre-release test path.)
+  Still take it at the next mlx release (free ~1–2 %, upstream-maintained),
+  just not as an event. Test residue: `~/bench-2026-09-04/{gdn-env,ctl-env}`
+  on the Studio, harness `gdn_test.py`. Related draft: mlx #4409.
 - **DRY-off-on-4bit** — pending config call (worth the measured 3.7% on that
   route; recommendation on record 2026-09-02).
 - **mlx-qsdpa** (fused quantized-KV SDPA, claims 1.56–1.71× at 64–128K on
