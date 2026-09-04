@@ -7,6 +7,41 @@
 > For general use you almost certainly want
 > [upstream](https://github.com/waybarrios/vllm-mlx), not this fork.
 
+## How it compares (measured 2026-09-04)
+
+Cross-engine serving benchmark on the production box (M1 Ultra 64 GB), vLLM
+`benchmark_serving` (1024-in/256-out, T=0) plus load/warm-cache/prefill probes.
+Full method, tables and caveats:
+[`docs/fork/engine-benchmarks-2026-09.md`](docs/fork/engine-benchmarks-2026-09.md).
+
+**MoE — Qwen3.6-35B-A3B-4bit (production route config per engine):**
+
+| engine | decode tok/s (serial) | 4-way agg tok/s | TTFT ms | warm 7.2K-prefix TTFT |
+|---|---|---|---|---|
+| **this fork, batched** | **65.6** | **131.5** | **659** | **0.06 s** |
+| upstream `f2d3ad3`, batched | 57.7 | 120.5 | 773 | 4.7 s (= cold) |
+| raw `mlx_lm.server` | 50.4 | 101.4 | 825 | 0.19 s |
+| oMLX 0.6.4 | 132.1¹ | 204.9¹ | 995 | 2.3 s |
+
+**Dense — Qwen3.8-27B-8bit:**
+
+| engine | decode tok/s (serial) | 4-way agg tok/s | TTFT ms | warm 7.2K-prefix TTFT |
+|---|---|---|---|---|
+| **this fork, batched** | **14.5** | **25.2** | **4235** | **0.15 s** |
+| upstream `f2d3ad3`, batched | 14.0 | 21.6 | 4959 | 32.6 s (= cold) |
+| raw `mlx_lm.server` | 13.5 | 20.7 | 4354 | 0.28 s |
+| oMLX 0.6.4 | 26.1¹ | 28.6¹ | 5117 | 14.4 s |
+
+At matched ~4-bit quant on the dense model, the fork decodes **+33 % over
+llama.cpp** (20.0 vs 15.0 tok/s) with prefill at par, and Ollama trails
+llama.cpp on every metric.
+
+¹ oMLX's speculative burst decode dominates the random-token benchmark
+workload; on a natural prompt at T=0 it is **+13 %** over fork-batched
+(88.9 vs 78.7 tok/s), with worse TTFT and a far weaker warm-prefix cache. It
+gets its decode edge from vendored gated-delta Metal kernels (the mlx #4020
+class of win this fork waits to take via an mlx release rather than vendor).
+
 ## What this fork is
 
 A **patch stack**, not a feature branch. `main` carries ~137 local patches on top
@@ -64,33 +99,6 @@ thread (the cross-thread stream crash that took out gpt-oss and Gemma text
 routes), a `GET /` route for llama-swap's preload probe, and extra `/v1/status`
 + Prometheus gauges for cache hit rate, memory pressure, eviction timing, and
 admission.
-
-## How it compares (measured 2026-09-04)
-
-Cross-engine serving benchmark on the production box (M1 Ultra 64 GB), vLLM
-`benchmark_serving` (1024-in/256-out, T=0) plus load/warm-cache/prefill probes.
-Full method, tables and caveats:
-[`docs/fork/engine-benchmarks-2026-09.md`](docs/fork/engine-benchmarks-2026-09.md).
-
-**MoE — Qwen3.6-35B-A3B-4bit (production route config per engine):**
-
-| engine | decode tok/s (serial) | 4-way agg tok/s | TTFT ms | warm 7.2K-prefix TTFT |
-|---|---|---|---|---|
-| **this fork, batched** | **65.6** | **131.5** | **659** | **0.06 s** |
-| upstream `f2d3ad3`, batched | 57.7 | 120.5 | 773 | 4.7 s (= cold) |
-| raw `mlx_lm.server` | 50.4 | 101.4 | 825 | 0.19 s |
-| oMLX 0.6.4 | 132.1¹ | 204.9¹ | 995 | 2.3 s |
-
-**Dense — Qwen3.8-27B-8bit:** fork-batched 14.5 / 25.2 tok/s, warm-prefix
-TTFT **0.15 s** where upstream re-prefills for **32.6 s** (~215×); at matched
-~4-bit the fork decodes **+33 % over llama.cpp** (20.0 vs 15.0 tok/s) with
-prefill at par, and Ollama trails llama.cpp.
-
-¹ oMLX's speculative burst decode dominates the random-token benchmark
-workload; on a natural prompt at T=0 it is **+13 %** over fork-batched
-(88.9 vs 78.7 tok/s), with worse TTFT and a far weaker warm-prefix cache. It
-gets its decode edge from vendored gated-delta Metal kernels (the mlx #4020
-class of win this fork waits to take via an mlx release rather than vendor).
 
 ## Recent changes
 
