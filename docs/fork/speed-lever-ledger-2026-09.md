@@ -111,13 +111,54 @@ and A/B'd on the Studio (branch `exp/decode-burst` = `4813f27` on
 
 Verdict: our loop already loses almost nothing to the async hand-off
 (server decode ≈ in-process mlx-lm: 78.7 vs 77.5), so the trick buys +2–3 %
-at a real latency/responsiveness cost — **not worth shipping**. Together
-with the #4020 kernel result (+~2 % ceiling), oMLX's remaining ~+10 % edge
-lives in its custom model runner internals, not in anything portable via a
-scheduler or kernel tweak.
+at a real latency/responsiveness cost — **not worth shipping**.
+
+**CORRECTION (same evening): oMLX's "+13 %" was partly a measurement
+artifact — its true edge is ≈ +7 %, and it is fully decomposed.** The +13 %
+subtracted oMLX's streamed TTFT, which its burst-holding inflates
+(first token is held while later tokens compute), flattering the decode
+window. Honest total-request rate on the natural-prompt A/B: oMLX 400 tok /
+4.87 s = 82.1 tok/s vs fork 76.6 = **+7 %**. Composition ≈ burst (+2–3 %,
+measured on our loop, declined) + GDN kernel deltas (+~2 %, measured via
+#4020) + host-work-behind-GPU scheduling (+~2 %, our 09-02 host audit
+already found our path near-clean). Chased to ground and closed. Also
+eliminated by direct test: no mlx-lm 0.31.3→0.32.0 decode regression
+(0.31.3 in-process = 72–77 tok/s, same as our pin); no MTP head in the
+35B checkpoint; oMLX's five qwen3.5 model patches are all prefill-only and
+its native SDPA ext was not even built on this box. What oMLX leaves on
+the table for us to consider is its **prefill** kernel drawer — see the
+watch list (GDN blocked_seq).
 
 ## Watch list / open items
 
+- **GDN blocked_seq prefill kernel (from oMLX, Apache-2.0) — the one new
+  untested lever from the 2026-09-04 engine round.** oMLX ships a pure
+  `mx.fast.metal_kernel` JIT rewrite of the exact GDN sequential recurrence
+  (threadgroup-staged q/k/v blocks, register-resident state, Dv/32 split;
+  `omlx/custom_kernels/qwen35_prefill/gdn.py`) claiming **~2× per-layer at
+  16K prefill** (14.9 vs 29.7 ms) with fp32-exact state (rel-err ~5e-8);
+  prefill-only, decode falls through. Our worst UX number is deep-context
+  cold prefill on hybrids (32 s at 7.2K on 27B-8bit, 911 s at 91K), so if
+  GDN layers carry a meaningful share of hybrid prefill time this is the
+  first credible prefill kernel lever (the refuted ones were step-size and
+  proj-fusion, different classes). Trial shape: measure GDN share of an 8K/
+  32K prefill first (kill if <20 %), then port the kernel file + rebind
+  mlx-lm's `gated_delta_update` prefill path in a bench venv, T=0 gate +
+  prefill ladder. No toolchain blocker (JIT), no mlx vendoring (mlx-lm
+  layer). Note oMLX's own serve path didn't have it active for text models
+  in our bench (it patches the mlx_vlm class), so its benefit is unproven
+  end-to-end anywhere — instrument first.
+- **Metal toolchain absent on the Studio AND the laptop** (CLT only, no
+  Xcode): blocks building mlx PRs from source, oMLX's native steel-attention
+  /weighted-sum/q4-mlp extensions, and any custom AOT kernel work. One-time
+  manual fix if kernel experimentation continues: install Xcode + Metal
+  toolchain component on the Studio (Tim's call — CI artifact wheels cover
+  semantics-only testing meanwhile).
+- **KV-cache quantization for long-context decode** (TurboQuant reference
+  implementation in oMLX, 2–8 bit): our 96–112K ladders decode at ~12 tok/s
+  where KV bandwidth dominates — the one regime where KV quant could bite.
+  Existing ledger doctrine applies: instrument KV-read share at 96K before
+  building anything.
 - **mlx PR #4020 — gated-delta Metal kernels: DOWNGRADED 2026-09-04 from
   "big pending win" to routine pin-bump.** Tested pre-release on this box via
   the PR's own CI wheel (head `c7e1a2a`, merge-ref build) + a 3-line
