@@ -131,23 +131,20 @@ watch list (GDN blocked_seq).
 
 ## Watch list / open items
 
-- **GDN blocked_seq prefill kernel (from oMLX, Apache-2.0) — the one new
-  untested lever from the 2026-09-04 engine round.** oMLX ships a pure
-  `mx.fast.metal_kernel` JIT rewrite of the exact GDN sequential recurrence
-  (threadgroup-staged q/k/v blocks, register-resident state, Dv/32 split;
-  `omlx/custom_kernels/qwen35_prefill/gdn.py`) claiming **~2× per-layer at
-  16K prefill** (14.9 vs 29.7 ms) with fp32-exact state (rel-err ~5e-8);
-  prefill-only, decode falls through. Our worst UX number is deep-context
-  cold prefill on hybrids (32 s at 7.2K on 27B-8bit, 911 s at 91K), so if
-  GDN layers carry a meaningful share of hybrid prefill time this is the
-  first credible prefill kernel lever (the refuted ones were step-size and
-  proj-fusion, different classes). Trial shape: measure GDN share of an 8K/
-  32K prefill first (kill if <20 %), then port the kernel file + rebind
-  mlx-lm's `gated_delta_update` prefill path in a bench venv, T=0 gate +
-  prefill ladder. No toolchain blocker (JIT), no mlx vendoring (mlx-lm
-  layer). Note oMLX's own serve path didn't have it active for text models
-  in our bench (it patches the mlx_vlm class), so its benefit is unproven
-  end-to-end anywhere — instrument first.
+- **GDN blocked_seq prefill kernel (from oMLX): REFUTED at the kill gate
+  same day (2026-09-04).** The trial's instrument-first step killed it in
+  20 minutes: stock kernel at chunk shape (T=2048, Hk16/Hv32/D128, release
+  mlx 0.32.2) = 3.51 ms/layer-call, so an 8K MoE prefill spends
+  4 chunks × 30 GDN layers × 3.51 ms ≈ 0.42 s of 4.75 s = **~9 % GDN
+  share** (kill gate was <20 %); dense 27B-8bit ≈ **2 %** (its 32.7 s
+  prefill is 8-bit matmul-bound). GDN is linear in T vs quadratic
+  attention, so the share *shrinks* exactly where prefill hurts (~4 % at
+  32K, ~2 % at 91K). A perfect free kernel caps at +9 %; oMLX's ~2× claim
+  nets ~4 %/~1 % — and our stock kernel at 16K (18.75 ms) is already
+  faster than the 29.7 ms "stock" oMLX benchmarked against on its
+  hardware. Also explains why oMLX's own E2E prefill (1483 tok/s) didn't
+  beat ours (1512). Hybrid prefill levers must attack attention or the
+  quantized matmuls, not the GDN recurrence.
 - **Metal toolchain absent on the Studio AND the laptop** (CLT only, no
   Xcode): blocks building mlx PRs from source, oMLX's native steel-attention
   /weighted-sum/q4-mlp extensions, and any custom AOT kernel work. One-time
