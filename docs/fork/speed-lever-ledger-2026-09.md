@@ -65,13 +65,41 @@ inside mlx's Metal kernels:
 - **A/B throughput claims from tiny models don't scale down-column** — an
   overhead that is 11.6% at 2370 tok/s is 0.5% at 78 tok/s (lever 9).
 
+### 2026-09-04 — cross-engine benchmark round (see engine-benchmarks-2026-09.md)
+
+- **oMLX 0.6.4 measured on this box**: vendored GDN Metal kernels
+  (`custom_kernels/qwen35_prefill/gdn.py`) + burst/MTP decode. Natural-prompt
+  T=0 usage-counted A/B on 35B-A3B: **88.9 vs our 78.7 tok/s = +13 %
+  single-stream** — a live, on-box floor estimate for what the mlx #4020 class
+  of kernels is worth at short context (its 1.3–2.2× was the isolated GDN
+  forward, not end-to-end). Its 2× showing on the serving benchmark is a
+  workload artifact (below). Prefill par, TTFT worse, warm-prefix cache far
+  weaker than ours. Verdict: no action for us beyond the existing
+  #4020-at-next-mlx-release plan; oMLX is the engine to re-check after that
+  lands.
+- **New methodology lesson: random-token serving benchmarks structurally
+  favor speculative decoders** — degenerate loopy outputs give the draft path
+  near-free acceptances (oMLX showed 132 tok/s there vs 88.9 real). Any
+  speculative engine must be cross-checked with a natural-prompt
+  usage-counted run before believing its serving numbers.
+- **Fork-batched vs upstream-batched at identical kernels**: +13.7 % MoE
+  serial (fusion #96 reproducing), +9 % MoE / +17 % dense at 4-way, TTFT
+  better everywhere; upstream warm-prefix = cold on hybrid models re-confirmed
+  on 2026-09-04 main (32.6 s vs our 0.15 s at 7.2K on 27B-8bit).
+- **MLX vs llama.cpp at matched ~4-bit (27B dense)**: +33 % decode for us,
+  prefill par. Ollama trails llama-server on every metric (same engine, more
+  wrapper). No lever here.
+
 ## Watch list / open items
 
 - **mlx PR #4020 — gated-delta Metal kernels: the one big pending win**
   (1.3–2.2× on the GDN forward, measured on M1 Max, bitwise-identical;
   approved with corrections). Arrives via the next mlx release (0.32.2 still
   latest as of 2026-09-03) — a rebase-day must-take. Do NOT vendor mlx for it.
-  Related later-stage draft: mlx #4409.
+  Related later-stage draft: mlx #4409. **2026-09-04: oMLX ships this class of
+  kernel vendored; measured +13 % end-to-end on our 35B-A3B at short context —
+  real but far below the isolated-kernel headline. Temper expectations
+  accordingly.**
 - **DRY-off-on-4bit** — pending config call (worth the measured 3.7% on that
   route; recommendation on record 2026-09-02).
 - **mlx-qsdpa** (fused quantized-KV SDPA, claims 1.56–1.71× at 64–128K on
