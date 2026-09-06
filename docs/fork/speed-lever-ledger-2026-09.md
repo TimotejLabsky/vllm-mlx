@@ -151,11 +151,26 @@ watch list (GDN blocked_seq).
   manual fix if kernel experimentation continues: install Xcode + Metal
   toolchain component on the Studio (Tim's call — CI artifact wheels cover
   semantics-only testing meanwhile).
-- **KV-cache quantization for long-context decode** (TurboQuant reference
-  implementation in oMLX, 2–8 bit): our 96–112K ladders decode at ~12 tok/s
-  where KV bandwidth dominates — the one regime where KV quant could bite.
-  Existing ledger doctrine applies: instrument KV-read share at 96K before
-  building anything.
+- **KV-cache quantization for long-context decode: REFUTED 2026-09-05**
+  (mlx-lm built-in `kv_bits`, in-process ladder on Qwen3.8-27B-8bit,
+  release mlx 0.32.2, T=0, 128-tok decode after real prefill):
+
+  | ctx | fp16 | 8-bit | 4-bit | fp16 peak | 8-bit | 4-bit |
+  |---|---|---|---|---|---|---|
+  | 32K | 17.43 | 15.72 (−10 %) | 15.78 (−9 %) | 36.1 GB | 35.1 | 34.7 |
+  | 64K | 15.69 | 13.25 (−16 %) | 13.08 (−17 %) | 41.1 GB | 39.3 | 38.3 |
+  | 96K | 15.02 | 11.40 (−24 %) | 11.27 (−25 %) | 46.3 GB | 43.5 | 42.0 |
+
+  Quantized-KV decode is a **regression that worsens with context** — the
+  exact opposite of the bandwidth hypothesis: mlx's quantized-SDPA path is
+  compute-bound on M1 Ultra and its dequant work scales with context faster
+  than the read savings. Prefill unaffected (~200/177/155 tok/s in every
+  config). Memory saving is real but small (−2.8…−4.3 GB at 96K vs a
+  46 GB peak) and 4-bit already shifts T=0 output at 32K (quality risk).
+  Only revisit if a fused quantized-KV SDPA lands in mlx (the mlx-qsdpa
+  claim, still n=1 unreplicated) or on M5-class hardware. Note: hybrid
+  models were the wrong target anyway — only 16 of 64 layers carry KV;
+  the same math rules out a big win a priori (~8–12 % read share).
 - **mlx PR #4020 — gated-delta Metal kernels: DOWNGRADED 2026-09-04 from
   "big pending win" to routine pin-bump.** Tested pre-release on this box via
   the PR's own CI wheel (head `c7e1a2a`, merge-ref build) + a 3-line
