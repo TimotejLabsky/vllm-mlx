@@ -36,6 +36,7 @@ from .mllm_batch_generator import (
     MLLMBatchResponse,
 )
 from .grammar_guard import grammar_unterminated
+from .repetition_stop import RepetitionStopTracker
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
@@ -237,6 +238,13 @@ class MLLMScheduler:
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
+
+        # Repetition-detection stop (env-gated VLLM_MLX_REPDETECT=1), same
+        # rail as the text scheduler's (PATCHES.md #98): the MLLM path was
+        # the one generation path without it, found live on the qwen4_exp
+        # route — an unknown entity drove an exact T=0 reasoning loop to
+        # every cap with the env armed and silently ignored.
+        self._repstop = RepetitionStopTracker()
 
         # Output queues for async streaming
         self.output_queues: Dict[str, asyncio.Queue] = {}
@@ -606,6 +614,9 @@ class MLLMScheduler:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
                 self.batch_generator.schedule_removal([uid])
+            _repstop = getattr(self, "_repstop", None)
+            if _repstop is not None:
+                _repstop.discard(uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
 
@@ -756,6 +767,59 @@ class MLLMScheduler:
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
+
+            # Repetition-detection stop (env-gated VLLM_MLX_REPDETECT=1):
+            # consumer-side hook mirroring the text scheduler's (PATCHES.md
+            # #98) — the MLLM path was the one generation path without the
+            # rail. #89 semantics preserved: a hit while a schema grammar is
+            # mid-value reports "length" (truncated JSON must not read as a
+            # clean stop), otherwise "stop".
+            forced_finish_reason = None
+            # getattr: fork tests build schedulers via __new__ and set only
+            # what they exercise.
+            _repstop = getattr(self, "_repstop", None)
+            if (
+                response.finish_reason is None
+                and _repstop is not None
+                and _repstop.enabled
+            ):
+                rep_hit = _repstop.observe(
+                    response.uid, response.token, request.num_output_tokens
+                )
+                if rep_hit is not None:
+                    rep_mid_grammar = grammar_unterminated(
+                        request.sampling_params.logits_processors
+                    )
+                    forced_finish_reason = "length" if rep_mid_grammar else "stop"
+                    logger.warning(
+                        f"[repetition-stop] request={request_id[:12]} "
+                        f"uid={response.uid}: period={rep_hit[0]} tokens "
+                        f"x {rep_hit[1]} repeats at "
+                        f"{request.num_output_tokens} generated tokens — "
+                        f"forcing {forced_finish_reason} (mllm path)"
+                        + (
+                            " (schema grammar still mid-value; refusing to "
+                            "report truncated JSON as a clean stop)"
+                            if rep_mid_grammar
+                            else ""
+                        )
+                    )
+                    try:
+                        from .metrics import metrics as _rs_metrics
+
+                        _rs_metrics.observe_repetition_stop()
+                        if rep_mid_grammar:
+                            _rs_metrics.observe_grammar_stop_suppressed(
+                                source="repetition"
+                            )
+                    except Exception:
+                        pass
+                    # The generator does not know about consumer-forced
+                    # stops — retire the row at the next safe boundary
+                    # (same deferred mechanism as abort_request; an eager
+                    # remove() from here could race an open Metal encoder).
+                    if self.batch_generator is not None:
+                        self.batch_generator.schedule_removal([response.uid])
             if response.mtp_attempted:
                 request.mtp_drafts += response.mtp_attempted_count
             if response.from_draft:
@@ -794,15 +858,17 @@ class MLLMScheduler:
                 ),
             )
 
-            # Check if finished
-            if response.finish_reason is not None:
-                if response.finish_reason == "stop":
+            # Check if finished (a repetition-stop hit forces completion the
+            # same way a generator-reported reason does)
+            effective_finish_reason = response.finish_reason or forced_finish_reason
+            if effective_finish_reason is not None:
+                if effective_finish_reason == "stop":
                     request.status = RequestStatus.FINISHED_STOPPED
-                elif response.finish_reason == "length":
+                elif effective_finish_reason == "length":
                     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
 
                 output.finished = True
-                output.finish_reason = response.finish_reason
+                output.finish_reason = effective_finish_reason
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
@@ -813,13 +879,13 @@ class MLLMScheduler:
                 else:
                     output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
-                request.finish_reason = response.finish_reason
+                request.finish_reason = effective_finish_reason
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
 
                 logger.debug(
-                    f"Request {request_id} finished: {response.finish_reason}, "
+                    f"Request {request_id} finished: {effective_finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
 
@@ -840,6 +906,9 @@ class MLLMScheduler:
             # Remove UID mappings
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
+                _repstop = getattr(self, "_repstop", None)
+                if _repstop is not None:
+                    _repstop.discard(uid)
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
@@ -994,6 +1063,9 @@ class MLLMScheduler:
     async def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
+        _repstop = getattr(self, "_repstop", None)
+        if _repstop is not None:
+            _repstop.clear()
         if self._processing_task:
             self._processing_task.cancel()
             try:

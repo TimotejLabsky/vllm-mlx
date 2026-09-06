@@ -321,3 +321,136 @@ def test_metrics_observe_exists():
 
     # must not raise even when metrics collection is disabled
     metrics.observe_repetition_stop()
+
+
+# ------------------------------------------------------- MLLM consumer (#98)
+
+
+def _bare_mllm_scheduler_with_request(cfg):
+    """Minimal MLLMScheduler for _process_batch_responses, mirroring the
+    text-path fixture above. This is the qwen4_exp-route gap found live
+    2026-09-06: the MLLM path had no repetition rail at all (PATCHES.md #98)."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_mlx.mllm_scheduler import MLLMScheduler
+    from vllm_mlx.request import SamplingParams
+
+    sched = MLLMScheduler.__new__(MLLMScheduler)
+    request = SimpleNamespace(
+        request_id="mllm-loop-1",
+        output_tokens=[],
+        num_output_tokens=0,
+        mtp_drafts=0,
+        mtp_accepted=0,
+        first_token_time=0.0,
+        num_prompt_tokens=3,
+        sampling_params=SamplingParams(max_tokens=4096),
+        status=None,
+        output_text=None,
+        finish_reason=None,
+    )
+    detok = SimpleNamespace(
+        add_token=lambda t: None,
+        last_segment="",
+        finalize=lambda: None,
+        text="",
+    )
+    sched.processor = SimpleNamespace(tokenizer=SimpleNamespace(decode=lambda ids: ""))
+    sched.uid_to_request_id = {21: "mllm-loop-1"}
+    sched.running = {"mllm-loop-1": request}
+    sched._repstop = RepetitionStopTracker(cfg)
+    sched.batch_generator = Mock()
+    sched._detokenizer_pool = {"mllm-loop-1": detok}
+    sched.total_completion_tokens = 0
+    sched.num_requests_processed = 0
+    return sched, request
+
+
+def _mllm_resp(token, finish_reason=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        uid=21,
+        token=token,
+        finish_reason=finish_reason,
+        mtp_attempted=False,
+        mtp_attempted_count=0,
+        from_draft=False,
+        error_kind=None,
+    )
+
+
+def _small_cfg():
+    return RepetitionStopConfig(
+        enabled=True, window=128, min_period=1, max_period=16,
+        min_repeats=3, min_span=16, interval=4, min_tokens=16,
+    ).sanitized()
+
+
+def test_mllm_consumer_forces_stop_on_repeating_stream():
+    sched, request = _bare_mllm_scheduler_with_request(_small_cfg())
+
+    finished = None
+    for _ in range(200):
+        outputs, finished_ids = sched._process_batch_responses([_mllm_resp(7)])
+        if finished_ids:
+            finished = outputs[0]
+            break
+    assert finished is not None, "detector never fired on the MLLM path"
+    assert finished.finish_reason == "stop"
+    assert finished.finished is True
+    assert request.finish_reason == "stop"
+    cfg = sched._repstop.cfg
+    assert request.num_output_tokens <= cfg.min_tokens + cfg.interval
+    # The generator must be told to retire the row — via the DEFERRED
+    # removal (an eager remove() can race an open Metal encoder).
+    sched.batch_generator.schedule_removal.assert_called_once_with([21])
+    sched.batch_generator.remove.assert_not_called()
+
+
+def test_mllm_consumer_leaves_varied_stream_alone():
+    sched, request = _bare_mllm_scheduler_with_request(_small_cfg())
+
+    for i in range(150):
+        outputs, finished_ids = sched._process_batch_responses(
+            [_mllm_resp(1000 + i)]
+        )
+        assert not finished_ids
+    sched.batch_generator.schedule_removal.assert_not_called()
+
+
+def test_mllm_consumer_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_REPDETECT", raising=False)
+    reset_config_cache()
+    try:
+        sched, request = _bare_mllm_scheduler_with_request(None)
+        assert not sched._repstop.enabled
+        for _ in range(200):
+            outputs, finished_ids = sched._process_batch_responses([_mllm_resp(7)])
+            assert not finished_ids
+    finally:
+        reset_config_cache()
+
+
+def test_mllm_generator_finish_wins_over_detector():
+    # A generator-reported finish on the same token must be preserved
+    # verbatim (the detector only fills in when the reason is None).
+    sched, request = _bare_mllm_scheduler_with_request(_small_cfg())
+    outputs, finished_ids = sched._process_batch_responses(
+        [_mllm_resp(7, finish_reason="length")]
+    )
+    assert finished_ids == {"mllm-loop-1"}
+    assert outputs[0].finish_reason == "length"
+
+
+def test_mllm_cleanup_discards_tracker_buffer():
+    sched, request = _bare_mllm_scheduler_with_request(_small_cfg())
+    # Seed a buffer, then run the cleanup path a finished request takes.
+    sched._repstop.observe(21, 7, 1)
+    assert sched._repstop._buffers
+    sched.requests = {}
+    sched.request_id_to_uid = {"mllm-loop-1": 21}
+    sched.finished_req_ids = set()
+    sched._cleanup_finished({"mllm-loop-1"})
+    assert sched._repstop._buffers == {}
