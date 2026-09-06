@@ -2947,3 +2947,46 @@ not a regression. Three cross-build guards were added during the smoke
 oMLX prompt-priming import guarded) — all three exist because "mlx-vlm
 0.6.17" is not one build: the laptop wheel and the Studio wheel differ in
 BOTH directions under the same version string.
+
+## 98. `patch: mllm-repetition-stop` — the MLLM path gets the repetition rail
+
+**Files:** `vllm_mlx/mllm_scheduler.py`, `tests/test_repetition_stop.py` (+6).
+
+Found live on the qwen4_exp route the day it shipped: asking about an
+entity the REAP-pruned model doesn't know ("Kosice") drove an exact T=0
+reasoning loop (`'"Kosice" is a typo for "Kosice"?'`) to every cap with
+`VLLM_MLX_REPDETECT=1` armed and silently ignored — the MLLM scheduler was
+the one generation path without the #consumer-side repetition hook the
+text scheduler has carried since the rail landed.
+
+**Correction recorded here for the deploy-day claim:** the thinking-token
+budget was reported "verified inert" on this path alongside REPDETECT —
+that was WRONG. The budget's logits-processor pipeline is fully plumbed
+through the MLLM engine (`chat_kwargs["logits_processors"]` →
+`MLLMScheduler.add_request` → per-request processors applied in the
+generator's decode step), and a live per-request probe
+(`thinking_token_budget: 256` on the looping prompt) force-closed the
+think block at ~256 tokens and produced a clean tool call. The earlier
+"inert" read came from probes that never crossed the armed 8192 budget.
+Only REPDETECT was genuinely missing; this patch adds it.
+
+**Mechanism.** `MLLMScheduler._process_batch_responses` mirrors the text
+scheduler's consumer hook: per generated token, `RepetitionStopTracker.
+observe(uid, token, n)`; on a hit the request is force-finished — "stop",
+or "length" while a schema grammar is mid-value (#89 semantics, the MLLM
+path shares `grammar_unterminated`) — with the same log line and
+`vllm_mlx_repetition_stops_total` metric. Because the generator never
+learns about consumer-forced stops, the row is retired via
+`schedule_removal([uid])` — the DEFERRED mechanism `abort_request` uses
+(an eager `remove()` from the consumer can race an open Metal encoder
+cross-thread; see the threading note above `abort_request`). Tracker
+buffers are discarded in `_cleanup_finished` and `abort_request`, cleared
+on `stop()`. Env knobs unchanged (`VLLM_MLX_REPDETECT=1` + the
+repetition_stop.py tuning set); default OFF, armed per route.
+
+**Verification:** 6 new consumer-level tests on a bare `MLLMScheduler`
+(force-stop on a repeating stream incl. deferred-removal assertion,
+varied stream untouched, disabled-by-default, generator-reported finish
+wins, cleanup discards buffers); full suite green; live gate = the
+"Kosice" recipe on the deployed route cutting the loop instead of burning
+to max_tokens.
