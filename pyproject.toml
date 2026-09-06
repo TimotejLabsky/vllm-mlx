@@ -161,6 +161,9 @@ target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 88
+# Vendored third-party code stays byte-close to its upstream (PATCHES.md #97);
+# style fixes there would be pure re-vendoring conflict surface.
+extend-exclude = ["vllm_mlx/vendored"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
