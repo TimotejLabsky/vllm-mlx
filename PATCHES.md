@@ -2865,3 +2865,85 @@ NOT the vision path (mlx-vlm classes).
 walk replacement, env gate default-off, quant-mismatch skip); full suite
 green in the commit; live A/B on the Studio recorded in the deploy row —
 arming is per-route config after that gate.
+
+## 97. `patch: vendored-qwen4-exp` — Qwen3.8-Flash-Next on a 64 GB box
+
+**Files:** `vllm_mlx/vendored/qwen4_exp/` (new: registration module +
+`vendor/mlx_vlm/models/qwen4_exp/` — 8 files vendored from oMLX),
+`vllm_mlx/models/mllm.py` (load hook), `tests/test_qwen4_exp_vendored.py`
+(new, 10), `tests/fixtures/qwen4_exp_reap288_config.json`.
+
+mlx-lm at the pin (`f4f3b57`) does not know the `qwen4_exp` architecture,
+and mlx-vlm "0.6.17" turns out to exist in at least two different builds
+under the same version number — the laptop wheel has no `qwen4_exp` at
+all, while the Studio's ships a **resident-only** one (no
+`configure_ple_runtime`, no `DiskBackedShardedEmbedding` — found live
+2026-09-06 when it shadowed the vendor tree and broke the first smoke).
+The registration therefore PREPENDS the vendor paths and purges any
+pre-imported `mlx_vlm.models.qwen4_exp` from `sys.modules`, then verifies
+the import resolved inside the vendor tree — the fork's implementation
+must win regardless of the installed build, because only it carries the
+SSD-backed PLE mode. The architecture in question (Qwen3.8-Flash-Next, 180B-A6B, hybrid 3:1
+GDN:qwen-sparse-attention, 262K ctx, multimodal) — and its REAP-pruned
+variants are the first 180B-class checkpoints that fit this box: the arch
+carries a ~29 GB hashed n-gram PLE embedding table that can stay on SSD
+(mmap + per-token row gathers), so `Qwen3.8-Flash-Next-REAP-288-MLX-4bit`
+(68 GB on disk) runs in ~40 GB resident. Verified end-to-end on the Studio
+via oMLX 2026-09-06 before porting: 24.7 tok/s decode short-ctx / 22.8 @7K,
+312 tok/s cold prefill, needle + bug-hunt quality checks sharp (see
+`docs/fork/` ledger and the infra README deploy log for the smoke).
+
+**Provenance.** Vendored from oMLX (jundot/omlx, Apache-2.0) at
+`v0.6.4-35-ge69d707`, `omlx/patches/mlx_vlm_qwen4_exp_compat/`. Local
+edits, kept deliberately minimal so re-vendoring is a copy: (1) the
+top-level `dequantize_fp8_weights` import (oMLX-internal) is replaced by a
+`weight_scale_inv`-signature guard that raises `NotImplementedError` for
+FP8 checkpoints — BF16/MLX-quantized conversions never hit it; (2) PLE
+mode env var is `VLLM_MLX_QWEN4_PLE_MODE` (`auto`/`resident`/`mmap`,
+default auto = mmap when checkpoint > 70% of RAM), with the oMLX name as
+fallback; (3) nothing else — the oMLX custom-kernel imports in
+`qsa_fast.py` are already try/except-guarded upstream and fail soft to
+pure-MLX paths here, and the Lightning-MTP hooks stay dormant because the
+fork never binds an MTP owner (spec decode is refuted on this hardware,
+ledger entry). `residency.py`/`virtual_ple.py` (oMLX UI estimates, FP8→oQ
+conversion) deliberately not vendored.
+
+**Mechanism.** `vllm_mlx.vendored.qwen4_exp.apply_qwen4_exp_compat_patch()`
+appends the vendor tree to `mlx_vlm.__path__`/`mlx_vlm.models.__path__`,
+so `mlx_vlm.models.qwen4_exp` resolves from the fork while the vendored
+module's `..qwen3_5`/`..qwen3_vl`/`..base` relative imports resolve
+against installed mlx-vlm 0.6.17 (all symbols verified present), plus a
+`prompt_utils.get_message_json` shim mapping `qwen4_exp` →
+`qwen3_5_moe`'s media layout. `MLXMultimodalLM.load()` (both engines
+construct it) reads `config.json` first and, for `model_type ==
+"qwen4_exp"`, registers + binds the PLE storage mode to the resolved
+checkpoint dir before `mlx_vlm.load()` picks a model class.
+
+**Verification:** 10 unit tests — registration idempotence, vendor-tree
+resolution, prompt shim equivalence, real REAP-288 config parse (288
+experts, 48 layers, 12 QSA + 36 GDN), PLE mode thresholds + env
+precedence, SSD-backed gather == resident reference (dense BF16 and
+affine 4-bit paths, byte-exact / 1e-2), out-of-range rejection, FP8
+rejection. Full-model load/generation is a Studio gate (68 GB checkpoint)
+— record it in the infra deploy log before any route change. Known
+follow-ups, deliberately not in this patch: per-call host sync in the PLE
+gather (`mx.eval` + `tolist` per token — hot-row LRU cache, async
+next-step prefetch and prefill read-coalescing are the measured-improvement
+candidates), batched-engine cache integration for the QSA/GDN/PLE state
+tuple (the #80 unknown-shape tripwire will classify it opaque = no partial
+restore until taught), and tool/reasoning parser wiring at route setup.
+
+**Live smoke (Studio, 2026-09-06, source-tree via PYTHONPATH on port 9701,
+fork untouched in the production venv):** BatchedEngine + MLLM path, PLE
+mode auto→mmap, **39 GB phys_footprint**, T=0 generation correct with clean
+reasoning/content separation, and — the capability oMLX's own serving
+lacks — **`finish_reason=tool_calls` with well-formed arguments via the
+`qwen3_coder` parser**. ~20 tok/s incl. prefill (a few tok/s under oMLX:
+its vendored GDN/QSA Metal kernels and fused-decode shims don't run here —
+that delta is the follow-up list). Warm resend showed no `cached_tokens`:
+prefix reuse on the qwen4_exp MLLM path is the documented follow-up above,
+not a regression. Three cross-build guards were added during the smoke
+(`_target_verify_linear(s)` fallback, MTP-kwargs passed only when set,
+oMLX prompt-priming import guarded) — all three exist because "mlx-vlm
+0.6.17" is not one build: the laptop wheel and the Studio wheel differ in
+BOTH directions under the same version string.

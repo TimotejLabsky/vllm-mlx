@@ -1367,8 +1367,19 @@ class MLXMultimodalLM:
 
             logger.info(f"Loading MLLM: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+            if self.config.get("model_type") == "qwen4_exp":
+                # Arch absent from mlx-vlm at the pin; served by the fork's
+                # vendored implementation. Must be registered (and the PLE
+                # storage mode bound to the resolved checkpoint dir) BEFORE
+                # mlx_vlm.load() resolves the model class. See PATCHES.md.
+                from mlx_vlm.utils import get_model_path
+
+                from ..vendored.qwen4_exp import configure_qwen4_exp_runtime
+
+                configure_qwen4_exp_runtime(get_model_path(self.model_name))
+
+            self.model, self.processor = load(self.model_name)
 
             # Realize lazy init-time arrays on THIS (load) thread — defensive
             # parity with the plain-LLM path; SimpleEngine runs MLLM generation
