@@ -128,10 +128,13 @@ process group. Client ran on the same box. Harness:
 
 ## Rerunning
 
-Everything lives on the Studio in `~/bench-2026-09-04/` (orchestrator
-`bench_engines.py`, patched vLLM client in `client/`, per-cell server logs in
-`logs/`, upstream + oMLX + client venvs). Single cell:
-`python3 bench_engines.py --only fork-batched/moe`. The harness copy in this
-repo is `scripts/fork/engine_bench/`. Before a rerun: `touch
-~/bench-2026-09-04/BENCH_ACTIVE` (pauses the HA auto-reload daemon — its
-bench-guard reads that flag), and remove the flag afterwards.
+The Studio bench dir (`~/bench-2026-09-04/`: venvs, patched vLLM client,
+server logs, Ollama model store) was **cleaned up 2026-09-06** (~21 GB).
+The full harness lives in this repo under `scripts/fork/engine_bench/`
+(orchestrator, A/B probes, GDN/KV-quant/burst trial scripts); rebuilding
+the venvs takes ~15 min following the Setup table above. The vLLM client
+needs the two compat patches described under Measurement. Before a rerun:
+`mkdir -p ~/bench-2026-09-04 && touch ~/bench-2026-09-04/BENCH_ACTIVE`
+(pauses the HA auto-reload daemon — its bench-guard reads that flag), and
+remove the flag afterwards. The declined decode-burst prototype survives as
+branch `exp/decode-burst` on `/Users/ai/vllm-mlx-src`.
