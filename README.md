@@ -110,6 +110,12 @@ admission.
 
 ## Recent changes
 
+> **2026-09-06 (2) — the MLLM path gets the repetition rail** (PATCHES.md #98):
+> REPDETECT was silently ignored on the multimodal scheduler — found when the
+> new 180B route looped forever on an unknown entity at T=0. Consumer-side
+> hook mirrors the text scheduler's; verified live cutting the loop at 800
+> tokens. Also corrected: the thinking budget was never inert on this path.
+>
 > **2026-09-06 — Qwen3.8-Flash-Next (qwen4_exp) vendored** (PATCHES.md #97):
 > first 180B-class checkpoint served from this box — REAP-288 at ~39 GB
 > resident via the SSD-backed n-gram PLE table. Live smoke green through the
