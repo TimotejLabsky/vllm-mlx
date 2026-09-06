@@ -60,6 +60,14 @@ loudly instead of hanging.**
 
 ## What the patches actually add
 
+**180B-class models on a 64 GB box (`qwen4_exp`, PATCHES.md #97).** The fork
+vendors the Qwen3.8-Flash-Next architecture (missing or resident-only in the
+mlx-vlm builds at the pins) including its SSD-backed PLE mode: the arch's
+~29 GB hashed n-gram embedding table stays on disk (mmap, per-token row
+gathers), so the REAP-pruned `Flash-Next-REAP-288` (180B→288/512 experts,
+68 GB on disk) serves in ~39 GB resident at ~20 tok/s.
+`VLLM_MLX_QWEN4_PLE_MODE=auto|resident|mmap`.
+
 **Hybrid-safe prefix caching ("system-KV").** Upstream's prefix cache gets zero
 hits on hybrid attention+SSM models (Qwen3-Next, Qwen3.5/3.6/3.8 — most of the
 lineup here) because their `ArraysCache` state can't be hashed or sliced the way
@@ -102,6 +110,12 @@ admission.
 
 ## Recent changes
 
+> **2026-09-06 — Qwen3.8-Flash-Next (qwen4_exp) vendored** (PATCHES.md #97):
+> first 180B-class checkpoint served from this box — REAP-288 at ~39 GB
+> resident via the SSD-backed n-gram PLE table. Live smoke green through the
+> batched engine, and tool calls work via the fork's `qwen3_coder` parser —
+> which oMLX's own serving of this model cannot do.
+>
 > **2026-09-04 — cross-engine benchmark round** (see table above): fork-batched
 > leads every MLX serving configuration measured on this box; upstream's
 > prefix cache re-confirmed zero-hit on hybrid models on current main; oMLX
