@@ -21,6 +21,12 @@ import mlx.utils
 
 logger = logging.getLogger(__name__)
 
+# These architectures are not compatible with the generic Qwen3.5 text
+# skeleton. Returning no extracted TextModel keeps SimpleEngine on the loaded
+# mlx-vlm path for text as well as media instead of silently serving incorrect
+# logits from a mechanically compatible but architecturally different model.
+_VLM_ONLY_TEXT_MODEL_PREFIXES = ("qwen4_exp",)
+
 
 def _import_text_model_classes(model_type: str):
     """Return ``(Model, ModelArgs)`` classes for a text config ``model_type``.
@@ -115,6 +121,13 @@ def build_text_model(
         model_type = str(
             text_config.get("model_type") or config.get("model_type") or ""
         )
+        if model_type.startswith(_VLM_ONLY_TEXT_MODEL_PREFIXES):
+            logger.info(
+                "Keeping model_type=%r on the mlx-vlm text path; no compatible "
+                "mlx-lm TextModel is registered",
+                model_type,
+            )
+            return None
         # Class selection lives in _import_text_model_classes: Qwen3.5/3.6
         # short-circuit plus explicit module candidates with family-prefix
         # fallbacks; raises on unknown families. Previously this function fed
