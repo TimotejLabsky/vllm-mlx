@@ -380,3 +380,45 @@ def test_reconcile_sweeps_orphans_and_backfills_bytes():
         store2.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_upstream_index_schema_bump_keeps_existing_spills():
+    """Upstream #740 bumped ``SSDIndex._SCHEMA_VERSION`` 1 -> 2 for its
+    CacheList serializer, and a version mismatch drops every row. Our entries
+    are not written by those serializers, so an index written by the deployed
+    build (version 1) must survive the upgrade — without the pin, the rows are
+    purged and reconcile then deletes every data dir as an orphan."""
+    import sqlite3
+
+    from vllm_mlx.ssd_cache import SSDIndex, _blob_to_tokens
+    from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+    d = tempfile.mkdtemp(prefix="skv-schema-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d))
+        toks = tuple(range(40))
+        snap = _make_hybrid_snapshot(seq=32)
+        tensors, meta = flatten_snapshot(snap)
+        store._write_entry(toks, tensors, meta, [], None, None, _snapshot_nbytes(snap))
+        (row,) = store._index.all_entries()
+        entry_dir = os.path.join(store._data_dir, row["file_path"])
+        store.close()
+
+        # The index as the pre-#740 deployed build left it on disk.
+        conn = sqlite3.connect(os.path.join(d, "index.db"))
+        conn.execute("UPDATE schema_version SET version = 1")
+        conn.commit()
+        conn.close()
+        assert SSDIndex._SCHEMA_VERSION != 1  # the bump this test guards
+
+        store2 = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d))
+        store2._reconcile()
+        assert store2._index.migrated_from is None
+        assert [
+            tuple(_blob_to_tokens(e["tokens_blob"]))
+            for e in store2._index.all_entries()
+        ] == [toks]
+        assert os.path.isdir(entry_dir)
+        store2.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
