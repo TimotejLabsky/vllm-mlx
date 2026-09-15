@@ -3007,3 +3007,61 @@ varied stream untouched, disabled-by-default, generator-reported finish
 wins, cleanup discards buffers); full suite green; live gate = the
 "Kosice" recipe on the deployed route cutting the loop instead of burning
 to max_tokens.
+
+
+## 99. `patch: qwen3-xml-double-lt` — a `<` followed by `<` must not stall the element splitter
+
+**Files:** `vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py` (two call sites + comment), `tests/test_qwen3_xml_double_lt.py` (+72).
+
+Found live 2026-09-15 during the infra AI-stack audit. A step-by-step replay of a
+recorded openclaw Morning Digest came back with its state save as
+`{"command": "cat > …/digest-state.json "}` — the `<< 'ENDSTATE'` heredoc body
+gone. Reproduced on the live `Qwen3.6-35B-A3B-4bit` route (`qwen3_coder`): the
+`heredoc` / `cpp_shift` harness cases went 0/4, versus 4/4 on `hermes`.
+**Every `qwen3_coder` route was affected** — on the fleet that means the
+Qwen3.8-27B routes (on this parser since 2026-08-22, infra 5b53053) and
+REAP-288. Any tool argument containing `<<` was cut at the first `<`: bash
+heredocs, here-strings `<<<`, `<<=`, C++ `std::cout <<`. Plain assistant text
+containing `<<` was swallowed the same way.
+
+**Mechanism.** `StreamingXMLToolCallParser._find_next_complete_element` holds
+back a buffer fragment that `_looks_like_partial_tool_open` says could still
+grow into a tool tag head (`<tool_call>`, `<function=`, `<parameter=` and their
+closers). That is the guard that lets a bare `<function=Name` head arrive across
+chunks without leaking as text. In the two branches where a second `<` is
+already buffered before any `>`, it checked `buffer[:tag_end]`. For `<<` that
+fragment is exactly `"<"`, a prefix of every tag head, so the splitter answered
+"wait" on every call and never advanced. The text before the first `<` had
+already been emitted as the parameter value, and everything after it was
+dropped at end of stream. `extract_tool_calls` runs the same splitter over the
+whole text, so non-streaming truncated identically. A single `<` was unaffected
+(`< 3` is not a tag-head prefix).
+
+**Fix.** Check the fragment *including* its terminating `<` (`buffer[: tag_end + 1]`).
+No tag head contains `<` after its first character, so a `<`-terminated
+fragment can never match the prefix form. Genuine partial heads are unaffected
+for two reasons. First, a lone trailing `<` or `<func` with nothing buffered
+after it goes through the untouched no-second-`<` branch and still waits.
+Second, the `fragment.startswith(prefix)` form (`<function=Ag…`) still matches.
+
+**Upstream:** the same code sits on `waybarrios/vllm-mlx` main
+(`_looks_like_partial_tool_open(buffer[:tag_end])` at both sites). **Upstream PR
+candidate** — a two-line change in an upstream-owned file; retire on merge.
+
+**Verification:**
+- **New module, red then green.** Red before the fix: 58/72 failing — non-streaming
+  7/9 values, streaming 42/54 across chunk sizes 1–13, a typed parameter after
+  a heredoc, plain content, and the partial-head hold-back. Green after.
+- **Existing tests.** The qwen3-XML parser, chunk-boundary (incl. bare-`<function=`),
+  registration, tool-call promotion, argument coercion and tool-parser tests all
+  pass: 328 passed together with the new module.
+- **Full suite:** 3673 passed / 31 skipped / 30 deselected (= the 2026-09-15 rebase baseline of 3601 + the 72 new cases). `ruff` clean; `black` clean on the new test module
+  (the parser file is left unformatted per policy).
+- **The original offline repro against this tree:** the recorded openclaw heredoc,
+  `<<EOF` and `std::cout <<` now parse intact in both paths.
+- **Live gate after deploy:** `mac-studio/benchmark/tool_parser_ab.py --cases
+  heredoc,cpp_shift` (infra repo) on the Qwen3.8 routes.
+
+**Not addressed (format-level, separate):** a literal `</parameter>` inside an
+argument value still closes the parameter. Qwen-XML has no escaping, and every
+parser measured mis-splits it.
