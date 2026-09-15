@@ -45,7 +45,7 @@ class of win this fork waits to take via an mlx release rather than vendor).
 ## What this fork is
 
 A **patch stack**, not a feature branch. `main` carries ~137 local patches on top
-of upstream [`22efb47`](https://github.com/waybarrios/vllm-mlx/commit/22efb47);
+of upstream [`ec8e493`](https://github.com/waybarrios/vllm-mlx/commit/ec8e493);
 each is a separate commit prefixed `patch:`, and the branch is periodically
 rebased onto `waybarrios/main` to pick up upstream changes. Fixes that are
 generally useful get cherry-picked from upstream PRs or prepared as upstreaming
