@@ -51,6 +51,21 @@ _SNAPSHOT_FILE = "snapshot.safetensors"
 _META_FILE = "meta.json"
 
 
+class _SystemKVIndex(SSDIndex):
+    """``SSDIndex`` with this store's own schema version.
+
+    Upstream bumps ``SSDIndex._SCHEMA_VERSION`` when *its* layer serializers
+    change (2 = CacheList, #740) and a mismatch drops every row. Our entries
+    are MLX-native safetensors written by ``flatten_checkpoints`` — that
+    format is versioned in ``meta.json``, not by upstream's serializers — so
+    inheriting the bump would wipe every route's spills on deploy (reconcile
+    then deletes the data dirs as orphans) for no format change. Bump this
+    only when the index rows themselves become unreadable to this module.
+    """
+
+    _SCHEMA_VERSION = 1
+
+
 @dataclass
 class SystemKVSSDStats:
     """Counters for the system-KV SSD store. Surfaced via get_stats()."""
@@ -272,7 +287,7 @@ class SystemKVSSDStore:
         self._data_dir = os.path.join(self._cache_dir, "data")
         os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
         os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
-        self._index = SSDIndex(self._cache_dir)
+        self._index = _SystemKVIndex(self._cache_dir)
         self._stats = SystemKVSSDStats()
         self._lock = threading.Lock()
         self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
