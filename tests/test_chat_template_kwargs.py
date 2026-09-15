@@ -430,7 +430,8 @@ async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
 
     class _EatsEverythingAsReasoning:
         # Mimics BaseThinkingReasoningParser's implicit-mode default.
-        def reset_state(self):
+        # Signature tracks the ReasoningParser contract (upstream #740).
+        def reset_state(self, implicit_mode=False):
             pass
 
         def extract_reasoning_streaming(self, prev, cur, delta):
@@ -729,3 +730,141 @@ async def test_stream_responses_strips_markers_when_thinking_disabled():
     # Thinking was disabled — no reasoning item, only cleaned content.
     assert "reasoning_text.delta" not in body
     assert "The answer is 42." in body
+
+
+# Upstream #740's implicit-<think> probe on the fork's own latch sites. GLM-4.7
+# opens <think> in the generation prompt, so the model emits only the closer.
+# Upstream reaches the probe through _prepare_streaming_reasoning_parser; the
+# Anthropic/Responses paths above build their parser directly (for the latch),
+# so they must pass it themselves — and only with thinking on.
+
+_GLM47_DELTAS = ("Let me think.", "</think>", "The answer is 42.")
+
+
+def _implicit_think_engine():
+    """GLM-4.7-shaped engine: the rendered prompt ends in an open <think>."""
+    probe_calls = []
+
+    async def fake_stream_chat(messages, **kwargs):
+        for i, piece in enumerate(_GLM47_DELTAS):
+            yield SimpleNamespace(
+                new_text=piece,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+                finish_reason="stop" if i == len(_GLM47_DELTAS) - 1 else None,
+            )
+
+    def fake_apply_chat_template(messages, **kwargs):
+        probe_calls.append(kwargs)
+        return "[gMASK]<sop><|user|>hi<|assistant|><think>"
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    engine._apply_chat_template = fake_apply_chat_template
+    engine.tokenizer = SimpleNamespace(chat_template="<|assistant|><think>")
+    engine._processor = None
+    return engine, probe_calls
+
+
+def _use_glm_parser(monkeypatch):
+    from vllm_mlx.reasoning.glm4_parser import Glm4ReasoningParser
+
+    monkeypatch.setattr(srv, "_reasoning_parser", Glm4ReasoningParser())
+    monkeypatch.setattr(srv, "_reasoning_parser_name", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    srv._implicit_thinking_cache.clear()
+
+
+def _sse_data(body):
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+
+
+async def _run_anthropic(engine, chat_kwargs):
+    msgs = [{"role": "user", "content": "What is the answer?"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model", max_tokens=8, messages=msgs
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=msgs,
+        chat_kwargs=chat_kwargs,
+        response_format=None,
+        json_logits_processor=None,
+    )
+    return "".join(
+        [
+            c
+            async for c in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_routes_implicit_think_to_thinking_block(monkeypatch):
+    engine, probe_calls = _implicit_think_engine()
+    _use_glm_parser(monkeypatch)
+
+    body = await _run_anthropic(engine, {})
+
+    deltas = [e["delta"] for e in _sse_data(body) if e["type"] == "content_block_delta"]
+    thinking = "".join(d["thinking"] for d in deltas if d["type"] == "thinking_delta")
+    text = "".join(d["text"] for d in deltas if d["type"] == "text_delta")
+    assert probe_calls, "the fork's Anthropic site must consult the probe"
+    assert "Let me think." in thinking
+    assert "Let me think." not in text and "</think>" not in text
+    assert "The answer is 42." in text
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_thinking_off_never_probes(monkeypatch):
+    """#27 latch semantics: thinking off must not flip untagged text to reasoning."""
+    engine, probe_calls = _implicit_think_engine()
+    _use_glm_parser(monkeypatch)
+
+    body = await _run_anthropic(
+        engine, {"chat_template_kwargs": {"enable_thinking": False}}
+    )
+
+    assert probe_calls == []
+    assert "thinking_delta" not in body
+
+
+@pytest.mark.anyio
+async def test_stream_responses_routes_implicit_think_to_reasoning_item(monkeypatch):
+    engine, probe_calls = _implicit_think_engine()
+    _use_glm_parser(monkeypatch)
+    request = srv.ResponsesRequest(
+        model="test-model", input="What is the answer?", stream=True
+    )
+    chat_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="What is the answer?")],
+        max_tokens=8,
+    )
+    msgs = [{"role": "user", "content": "What is the answer?"}]
+
+    with patch.object(
+        srv,
+        "_prepare_streaming_responses_request",
+        return_value=(engine, chat_request, msgs, {}),
+    ):
+        body = "".join([c async for c in srv._stream_responses_request(request)])
+
+    events = _sse_data(body)
+    reasoning = "".join(
+        e["delta"] for e in events if e["type"] == "response.reasoning_text.delta"
+    )
+    output = "".join(
+        e["delta"] for e in events if e["type"] == "response.output_text.delta"
+    )
+    assert probe_calls, "the fork's Responses site must consult the probe"
+    assert "Let me think." in reasoning
+    assert "Let me think." not in output and "</think>" not in output
+    assert "The answer is 42." in output

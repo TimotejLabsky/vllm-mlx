@@ -3097,7 +3097,15 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
     reasoning_parser = _build_reasoning_parser(engine)
     if reasoning_parser:
-        reasoning_parser.reset_state()
+        # Upstream #740's implicit-<think> probe (GLM-4.7 opens <think> in
+        # the generation prompt). Upstream gets it via
+        # _prepare_streaming_reasoning_parser, which only builds a parser with
+        # thinking ON; the fork builds unconditionally for the latch below, so
+        # gate the same way — with thinking off, untagged text stays content.
+        reasoning_parser.reset_state(
+            implicit_mode=not _thinking_disabled(request, chat_kwargs)
+            and _detect_implicit_thinking(engine, chat_kwargs)
+        )
 
     # Streaming counterpart of the explicit-marker guard in
     # _extract_reasoning_and_tool_calls: with thinking disabled the parser
@@ -6931,7 +6939,13 @@ async def _stream_anthropic_messages(
     disabled_reasoning_latched = False
 
     if parser_eligible:
-        reasoning_parser.reset_state()
+        # Upstream #740 implicit-<think> probe, gated like upstream's
+        # _prepare_streaming_reasoning_parser: thinking ON only (see the
+        # matching note in _stream_responses_request).
+        reasoning_parser.reset_state(
+            implicit_mode=use_reasoning
+            and _detect_implicit_thinking(engine, chat_kwargs)
+        )
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
