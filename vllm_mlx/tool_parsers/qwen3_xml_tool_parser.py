@@ -532,14 +532,21 @@ class StreamingXMLToolCallParser:
                     # leak as text or crash expat). Required so the model can
                     # drop the <tool_call> wrapper and emit a bare <function=>
                     # block; without it, partial <function=Name fragments leak.
-                    if self._looks_like_partial_tool_open(buffer[:tag_end]):
+                    # Check the fragment INCLUDING the '<' that ends it: no tag
+                    # head contains '<' after its first char, so a fragment
+                    # followed by another '<' can never complete into one.
+                    # Checking buffer[:tag_end] alone made '<<' ('<' is a
+                    # prefix of every tag head) wait forever and truncated
+                    # heredocs / C++ shifts at the first '<' (fork patch #99).
+                    if self._looks_like_partial_tool_open(buffer[: tag_end + 1]):
                         return None, start_pos
                     return buffer[:tag_end], start_pos + tag_end
                 # Next nearest is >, means found XML element
                 else:
                     return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
             elif tag_end != -1:
-                if self._looks_like_partial_tool_open(buffer[:tag_end]):
+                # Same '<'-terminated fragment rule as above (patch #99).
+                if self._looks_like_partial_tool_open(buffer[: tag_end + 1]):
                     return None, start_pos
                 return buffer[:tag_end], start_pos + tag_end
             elif tag_end2 != -1:
