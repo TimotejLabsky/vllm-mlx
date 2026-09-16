@@ -736,6 +736,63 @@ def test_cleanup_finished_stores_into_hybrid_kv(monkeypatch):
     assert request._extracted_cache is None
 
 
+def test_concurrent_hybrid_requests_each_store_at_finish(monkeypatch):
+    """Regression (#100): two hybrid requests finishing in the same step must
+    BOTH leave an entry. The boundary store is solo-only, so under concurrency
+    the finish store is the only path — and upstream #683's
+    ``_prompt_output_entry_is_useless`` gate (non-trimmable => drop the
+    prompt+output cache) silently killed it for every hybrid model, because
+    ArraysCache is never trimmable. The hybrid bag restores via slices +
+    checkpoints and never trims, so the extraction must be kept. Drives the
+    REAL response path (the pre-existing cleanup test set _extracted_cache by
+    hand and could not see the gate)."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.request import Request, SamplingParams
+
+    scheduler = _make_scheduler(monkeypatch)
+    kv = scheduler.hybrid_kv
+    assert isinstance(kv, BatchedSystemKV)
+    scheduler._decode_tokens = lambda ids: ""
+
+    responses = []
+    for n, (rid, uid, base) in enumerate([("req-a", 11, 1000), ("req-b", 12, 5000)]):
+        prompt = list(range(base, base + 800))
+        request = Request(
+            request_id=rid,
+            prompt="x",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=prompt,
+            num_prompt_tokens=len(prompt),
+        )
+        request.first_token_time = 0.0
+        request.append_output_token(base + 900)  # past the prompt-only hook
+        scheduler.running[rid] = request
+        scheduler.requests[rid] = request
+        scheduler.uid_to_request_id[uid] = rid
+        cache = _donor_at(len(prompt) + 2, seed=float(n))
+        responses.append(
+            SimpleNamespace(
+                uid=uid, token=base + 901, finish_reason="stop", prompt_cache=cache
+            )
+        )
+    assert len(scheduler.running) == 2  # concurrent: boundary store is off
+
+    _outputs, finished = scheduler._process_batch_responses(responses)
+    assert finished == {"req-a", "req-b"}
+    for rid in finished:
+        assert (
+            getattr(scheduler.running[rid], "_extracted_cache", None) is not None
+        ), rid
+
+    scheduler._cleanup_finished(finished)
+
+    assert len(kv._entries) == 2
+    stored = sorted(e["tokens"][0] for e in kv._entries.values())
+    assert stored == [1000, 5000]
+    assert kv.boundary_stores == 0 and kv.pressure_skipped_stores == 0
+
+
 def test_add_request_marks_ssd_pending_on_miss(monkeypatch):
     from vllm_mlx.request import Request, SamplingParams
 
