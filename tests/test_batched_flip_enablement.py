@@ -307,6 +307,46 @@ def test_kv_budget_uses_measured_bytes_on_cold_cache(monkeypatch):
     assert bkv.should_defer_cobatch(scheduler, _req("c2", 100_000)) is False
 
 
+def test_kv_budget_not_fooled_by_unprefilled_rows_after_recovery(monkeypatch):
+    """#102 live finding: after generation_error_recovery recreates the batch
+    generator, 'measured' bytes/token = allocated KV / FULL logical lengths
+    collapses (rows admitted but not prefilled hold ~no KV yet), so a
+    45K+66K+46K burst was admitted in one pass and OOMed again. The learned
+    KV bytes/token must win when it is larger."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_PAD_WASTE_MB", raising=False)
+    # budget sized so 2 rows of 1000 tokens pass at the real bpt, 3 don't
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    real_bpt = kv.bytes_per_token()
+    assert real_bpt > 0
+    budget_mb = 2.5 * 1000 * real_bpt / (1024 * 1024)
+    kv.kv_budget_mb = budget_mb
+    # 1 byte of allocated KV over 1000 running tokens -> ~0 measured bpt
+    scheduler = _guard_scheduler_with_generator(kv, [1000, 1000], 1)
+    assert bkv.should_defer_cobatch(scheduler, _req("burst", 1000)) is True
+    assert kv.admission_deferrals == 1
+
+
+def test_kv_budget_bpt_floor_arms_a_cold_process(monkeypatch):
+    """#102: a freshly spawned process has neither a learned estimate nor a
+    real measurement — the env floor keeps the gate armed for the first
+    burst (llama-swap restart with a waiting queue)."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_PAD_WASTE_MB", raising=False)
+    monkeypatch.setenv("VLLM_MLX_BATCHED_KV_BUDGET_MB", "1")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB", "64")
+    kv = BatchedSystemKV(_FakeModel())  # cold: no learned estimate
+    assert kv.bytes_per_token() == 0
+    scheduler = _guard_scheduler_with_generator(kv, [45_000], 1)
+    # 2 seats x 66K x 64 KB ~ 8 GB >> 1 MB budget
+    assert bkv.should_defer_cobatch(scheduler, _req("deep", 66_000)) is True
+
+    monkeypatch.delenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB")
+    kv2 = BatchedSystemKV(_FakeModel())
+    scheduler = _guard_scheduler_with_generator(kv2, [45_000], 1)
+    # without the floor the collapsed measurement still admits (old hole)
+    assert bkv.should_defer_cobatch(scheduler, _req("deep", 66_000)) is False
+
+
 def test_measured_bpt_helper_guards():
     kv = BatchedSystemKV(_FakeModel())
     # no batch_generator attribute (unit-test schedulers) -> 0.0
