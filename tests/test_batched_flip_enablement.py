@@ -550,6 +550,68 @@ def test_short_entry_does_not_poison_the_overshoot_gate(monkeypatch):
     assert kv2.stats()["pressure_skipped_stores"] == 1
 
 
+# ------------------------------------------------ dynamic RAM budget (#101)
+
+
+def _dynamic(monkeypatch, active_mb, floor_mb=2, max_mb=0, reserve_mb=10):
+    """Dynamic-budget bag on the mocked allocator: 100 MB ceiling, 90%
+    watermark (threshold 90 MB). Entries from _heavy_recurrent_chain are
+    ~0.97 MB each."""
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_MB", str(floor_mb))
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_DYNAMIC", "1")
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_MAX_MB", str(max_mb))
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_RESERVE_MB", str(reserve_mb))
+    return _watermarked(monkeypatch, active_mb=active_mb, ceiling_mb=100)
+
+
+def _store_distinct(kv, n):
+    for i in range(n):
+        toks = list(range(1_000_000 * (i + 1), 1_000_000 * (i + 1) + 300))
+        assert kv.store(f"r{i}", toks, _heavy_recurrent_chain(len(toks))) is True
+
+
+def test_dynamic_budget_grows_into_idle_headroom(monkeypatch):
+    """#101: idle box (20 MB active of a 90 MB threshold, 10 MB reserve) —
+    the bag keeps all 4 ~1 MB entries although the static floor is 2 MB."""
+    kv, _ = _dynamic(monkeypatch, active_mb=20)
+    _store_distinct(kv, 4)
+    s = kv.stats()
+    assert s["entry_count"] == 4 and s["evictions"] == 0
+    assert s["ram_budget_mode"] == "dynamic"
+    assert s["max_memory_mb"] > 50  # ~bag + (90 - 20 - 10)
+
+
+def test_dynamic_budget_falls_to_floor_under_load(monkeypatch):
+    """#101: busy box (85 MB active, headroom below the reserve) — the
+    budget clamps to the static floor and the bag evicts down to it."""
+    kv, _ = _dynamic(monkeypatch, active_mb=85)
+    _store_distinct(kv, 4)
+    s = kv.stats()
+    assert s["entry_count"] == 2  # 2 x ~0.97 MB fits the 2 MB floor
+    assert s["evictions"] == 2
+    assert s["max_memory_mb"] == pytest.approx(2.0)
+
+
+def test_dynamic_budget_respects_ceiling(monkeypatch):
+    kv, _ = _dynamic(monkeypatch, active_mb=20, max_mb=3)
+    _store_distinct(kv, 4)
+    s = kv.stats()
+    assert s["entry_count"] == 3
+    assert s["max_memory_mb"] == pytest.approx(3.0)
+
+
+def test_dynamic_budget_is_static_without_watermark(monkeypatch):
+    """No watermark => no headroom signal => behave exactly like RAM_MB."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", raising=False)
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_MB", "2")
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_DYNAMIC", "1")
+    kv = BatchedSystemKV(_FakeModel())
+    _store_distinct(kv, 4)
+    s = kv.stats()
+    assert s["entry_count"] == 2
+    assert s["max_memory_mb"] == pytest.approx(2.0)
+
+
 def test_overshoot_gate_survives_an_emptied_bag(monkeypatch):
     """Live 2026-07-09 round-2 finding: relief evicts the WHOLE bag mid-
     prefill, so the deep final store that follows priced itself against a
