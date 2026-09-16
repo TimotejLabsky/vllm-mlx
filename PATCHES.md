@@ -3065,3 +3065,99 @@ candidate** — a two-line change in an upstream-owned file; retire on merge.
 **Not addressed (format-level, separate):** a literal `</parameter>` inside an
 argument value still closes the parameter. Qwen-XML has no escaping, and every
 parser measured mis-splits it.
+
+## 100. `patch: hybrid-finish-store` — concurrent hybrid chains must store at finish again
+
+**Files:** `vllm_mlx/scheduler.py` (one gate in `_process_batch_responses`), `tests/test_batched_system_kv.py` (+1 wiring-level regression test).
+
+Found live 2026-09-16 from idealplace's parallel opencode CI reviewers on
+`Qwen3.8-27B-4bit`: `/v1/status` read misses 14, hits 0, **`entry_count` 0**, and
+every store counter at 0 (`boundary_stores`, `grown_stores`,
+`pressure_skipped_stores`, `evictions`, SSD `spill_count`). Route logs had **zero
+`[batched_system_kv] store request=` lines ever** on both Qwen3.8-27B routes
+(49 and 214 finishes). Interactive single-session use kept hitting, so it looked
+healthy.
+
+**Mechanism.** The batched hybrid bag (#34) has two store paths:
+- **Prompt-boundary store** (#35): solo-only by design (`len(scheduler.running) <= 1`),
+  so its snapshot doesn't inflate batch TTFT.
+- **Finish store** (`store_finished`): the path concurrent chains rely on. It needs
+  `request._extracted_cache`.
+
+Upstream #683 (`e846727`, taken in the 2026-08-18 v0.4.1 rebase) gated that
+extraction on `not _prompt_output_entry_is_useless(raw_cache)`, i.e.
+`can_trim_prompt_cache`. Its reasoning holds for upstream's
+`memory_aware_cache`: a prompt+output key is only reusable after a trim.
+`ArraysCache` is never trimmable, so on **every hybrid model** (Qwen3.5/3.6/3.8,
+Qwen3-Next) the extraction was skipped. The finish store no-oped, and any
+concurrent traffic left the bag empty. The hybrid bag never trims anyway: it
+restores a shorter prefix by slicing attention KV and replaying the nearest
+recurrent checkpoint (#19/#34). The #34 docstring "concurrent chains still store
+at finish" had been false since that rebase.
+
+**Fix.** Keep the extraction whenever `self.hybrid_kv is not None`. Upstream's
+gate still applies unchanged to the non-hybrid-bag paths.
+
+**Safety re-check (#48 / #683 buffer exhaustion):**
+- **Pressure gate still applies.** `BatchedSystemKV.store()` still runs the
+  `under_pressure()` / `_store_would_overshoot()` gate before materializing a
+  non-grown full-chain copy.
+- **Buffer count stays bounded.** #683's failure was unbounded entry
+  accumulation (45 entries, `[metal::malloc] Resource limit (499000) exceeded`).
+  The hybrid bag is capped by `VLLM_MLX_SYSTEM_KV_SLOTS` (default 4) plus the RAM
+  budget, and grown stores reference donor segments with
+  `_SEGMENT_CONSOLIDATE_AT` consolidation.
+- **Snapshot path doesn't reach hybrid routes.** The prompt-only snapshot path
+  (`_store_prompt_only_cache`) returns early without `memory_aware_cache`, which
+  the hybrid bag replaces.
+
+**Second half: what reopening the finish store exposed** (first live deploy of
+the gate fix, `e2c3fad`, 2026-09-16). The concurrent finish store worked: a CI
+chain that overlapped two probe requests logged `store … tokens=4504
+stored=True`. But the two ~5.2K-token probes and their follow-up were all
+refused (`skipping store under memory pressure`, `pressure_skipped_stores`
+0→3), at 25 GB active on a 64 GB box. Cause:
+- **Tiny entries got stored.** A 17-token warmup had just been stored at finish
+  (`tokens=17 stored=True`). Before this patch that was unreachable: boundary
+  stores already skip under `partial_min` new tokens, and the finish store never
+  ran on hybrids.
+- **The overshoot gate priced from it.** `_store_would_overshoot` learns
+  bytes/token as `entry bytes / tokens` from the newest entry. A hybrid entry's
+  bytes are dominated by FIXED checkpoint-class state (hundreds of MB of
+  deltanet state on a 27B), so a 17-token entry taught roughly MB/token. A
+  ~5K-token store then priced itself at tens of GB. Grown stores bypass the gate,
+  which is why the CI chain got through.
+
+Fixes, both in `batched_system_kv.py`:
+- **`store()` skips chains below `partial_min`.** `fetch` needs an LCP ≥
+  `partial_min`, so such an entry can never serve a restore. It only burns a slot
+  of the 4-entry bag and teaches the estimator.
+- **Per-token cost counts trim-class bytes only.** Entries now record
+  `trim_bytes` / `fixed_bytes`. `bytes_per_token()` returns attention-KV
+  bytes/token, and the overshoot gate prices `tokens × bpt + fixed_store_bytes()`.
+  Pure-attention models have `fixed = 0`, and their per-token figure is unchanged
+  (no checkpoint ladder). The admission gate's learned-bpt FALLBACK also gets
+  KV-only bytes/token, which is what padded KV actually costs; its primary input
+  (`_measured_bytes_per_token`) is unchanged.
+  - **2026-07-09 crash math still holds:** 94K tokens × ~64 KB + fixed state ≈ the
+    measured 7 GB copy, so that store is still refused.
+
+**Upstream:** N/A. The batched hybrid bag is fork-owned.
+
+**Verification:**
+- **Red then green.** `test_concurrent_hybrid_requests_each_store_at_finish`
+  drives two real hybrid caches (KVCache + ArraysCache) through
+  `_process_batch_responses` then `_cleanup_finished` on a real scheduler +
+  `BatchedSystemKV`. Before the fix it was red (`_extracted_cache` never set);
+  after, green with 2 entries. The old `test_cleanup_finished_stores_into_hybrid_kv`
+  set `_extracted_cache` by hand and could not catch this.
+- **New estimator tests.** `test_sub_floor_chain_is_not_stored` checks that a
+  17-token chain takes no slot and teaches nothing.
+  `test_short_entry_does_not_poison_the_overshoot_gate` stores a 300-token entry
+  with ~1 MB of fixed recurrent state, then a 5K store under a 9 MB watermark:
+  stored, 0 pressure skips. A copy whose FIXED part really crosses the watermark
+  is still refused.
+- **Full suite:** 3676 passed / 31 skipped / 30 deselected (#99 baseline 3673 + 3). `ruff` clean.
+- **Live gate after deploy:** two concurrent ≥2K-token prompts should produce
+  `store request=… stored=True` twice and `entry_count` 2, then a hit on a
+  follow-up turn.

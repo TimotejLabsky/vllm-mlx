@@ -494,6 +494,62 @@ def test_final_store_skipped_when_the_copy_would_overshoot(monkeypatch):
     assert kv.stats()["entry_count"] == 1  # the seed entry is untouched
 
 
+def _heavy_recurrent_chain(n_tokens, fixed_elems=250_000):
+    """A hybrid cache whose recurrent state is FIXED and large (~1 MB) while
+    its attention KV is tiny per token — the real 27B shape in miniature
+    (hundreds of MB of deltanet state vs ~64 KB/token of KV)."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    kv1, rec, kv2 = KVCache(), ArraysCache(size=2), KVCache()
+    for c, seed in ((kv1, 0.0), (kv2, 100.0)):
+        keys = mx.arange(n_tokens, dtype=mx.float32).reshape(1, 1, n_tokens, 1) + seed
+        c.update_and_fetch(keys, keys + 0.5)
+    rec[0] = mx.zeros((1, fixed_elems))
+    rec[1] = mx.zeros((1, 2, 3))
+    return [kv1, rec, kv2]
+
+
+def test_sub_floor_chain_is_not_stored(monkeypatch):
+    """#100: the finish store now runs for every hybrid request, including
+    warmups and title calls far below partial_min. Such an entry can never
+    serve a restore, so it must not take a slot or teach the estimator."""
+    kv = BatchedSystemKV(_FakeModel())
+    tiny = list(range(17))
+    assert kv.store("tiny", tiny, _heavy_recurrent_chain(len(tiny))) is False
+    assert kv.stats()["entry_count"] == 0
+    assert kv._bpt_hint == 0.0 and kv._fixed_hint == 0.0
+
+
+def test_short_entry_does_not_poison_the_overshoot_gate(monkeypatch):
+    """#100 live finding (2026-09-16, Qwen3.8-27B-4bit): with bytes/token
+    learned as (whole entry)/tokens, a short entry's fixed recurrent state
+    inflated the estimate by orders of magnitude and every ordinary ~5K
+    store was refused as an 'overshoot'. Per-token cost must count the
+    attention KV only, with the fixed state priced once."""
+    kv, mem = _watermarked(monkeypatch, active_mb=5, ceiling_mb=10)
+    short = list(range(300))
+    assert kv.store("short", short, _heavy_recurrent_chain(len(short))) is True
+    # old estimator: ~1 MB / 300 tokens ≈ 3.5 KB/token; new: KV bytes only
+    assert kv.bytes_per_token() < 64
+    assert kv.fixed_store_bytes() >= _mb(0.9)
+
+    deep = list(range(10_000, 15_000))
+    assert kv.store("deep", deep, _heavy_recurrent_chain(len(deep))) is True
+    assert kv.stats()["pressure_skipped_stores"] == 0
+    assert kv.stats()["entry_count"] == 2
+
+    # ...and a copy that really would cross the watermark is still refused:
+    # ~4.6 MB of fixed state (1.2M float32) from 5 MB active against the
+    # 9 MB threshold — the fixed part alone must be priced in.
+    huge = 1_200_000
+    kv2, _ = _watermarked(monkeypatch, active_mb=5, ceiling_mb=10)
+    assert kv2.store("seed", deep, _heavy_recurrent_chain(len(deep), huge)) is True
+    other = list(range(50_000, 55_000))
+    assert kv2.store("other", other, _heavy_recurrent_chain(len(other), huge)) is False
+    assert kv2.stats()["pressure_skipped_stores"] == 1
+
+
 def test_overshoot_gate_survives_an_emptied_bag(monkeypatch):
     """Live 2026-07-09 round-2 finding: relief evicts the WHOLE bag mid-
     prefill, so the deep final store that follows priced itself against a
