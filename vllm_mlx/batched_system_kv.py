@@ -102,6 +102,22 @@ def _entry_nbytes(snapshot: list) -> int:
     return n
 
 
+def _trim_nbytes(snapshot: list, kinds: list) -> int:
+    """Bytes of the trim-class (attention KV) layers only — the part of an
+    entry that scales with chain length. Checkpoint-class layers (recurrent
+    ArraysCache, Rotating windows) are fixed-size per entry (#100)."""
+    n = 0
+    for i, layer in enumerate(snapshot):
+        if kinds[i] != "trim":
+            continue
+        if _is_segments(layer):
+            for k, v in layer:
+                n += k.nbytes + v.nbytes
+        else:
+            n += sum(a.nbytes for a in state_arrays(layer))
+    return n
+
+
 def _segments_upto(segments: list, pos: int):
     """Store-side prefix reuse: whole segments by REFERENCE up to ``pos``;
     a boundary segment that straddles ``pos`` is sliced and EVALUATED on the
@@ -242,6 +258,9 @@ class BatchedSystemKV:
         # this bag contributes its LRU eviction and keeps the counters.
         self._pressure = PressureManager(self.mem_watermark_pct)
         self._bpt_hint = 0.0  # survives an emptied bag (see bytes_per_token)
+        # Fixed per-entry bytes of checkpoint-class layer state (#100) —
+        # priced once per store copy, not per token.
+        self._fixed_hint = 0.0
         self.pressure_evictions = 0
         self.pressure_skipped_stores = 0
         self.pressure_cache_clears = 0  # watermark breaches relieved (#53)
@@ -519,19 +538,28 @@ class BatchedSystemKV:
             [layer] if kinds[i] == "trim" and not _is_segments(layer) else layer
             for i, layer in enumerate(snapshot)
         ]
+        snapshot_bytes = _entry_nbytes(snapshot)
+        trim_bytes = _trim_nbytes(snapshot, kinds)
         entry = {
             "tokens": tokens_list,
             "snapshot": snapshot,
             "metas": metas,
             "kinds": kinds,
             "checkpoints": checkpoints,
-            "bytes": _entry_nbytes(snapshot) + ckpt_bytes(checkpoints),
+            "bytes": snapshot_bytes + ckpt_bytes(checkpoints),
+            "trim_bytes": trim_bytes,
+            "fixed_bytes": snapshot_bytes - trim_bytes,
         }
         if tokens_list:
             # Learn bytes/token AT insert — a lazily-learned hint misses the
             # serial workload where relief empties the bag before anything
-            # reads it (live 2026-07-09 round 3).
-            self._bpt_hint = entry["bytes"] / len(tokens_list)
+            # reads it (live 2026-07-09 round 3). Per-token cost counts the
+            # attention KV only (#100): folding a hybrid's fixed recurrent
+            # state (~hundreds of MB on a 27B) into bytes/len inflated the
+            # estimate by orders of magnitude after a short entry, and the
+            # overshoot gate then refused every ordinary store.
+            self._bpt_hint = trim_bytes / len(tokens_list)
+            self._fixed_hint = float(entry["fixed_bytes"])
         self._entry_seq += 1
         self._entries[self._entry_seq] = entry
         self._timing.note_store(timing_key(tokens_list))
@@ -545,6 +573,14 @@ class BatchedSystemKV:
         grown entries do NOT re-spill — SimpleEngine's policy: a restart
         promotes the stored prefix and re-grows cheaply."""
         tokens_list = list(tokens)
+        if len(tokens_list) < self.partial_min:
+            # A sub-floor chain can never serve a restore (fetch needs an
+            # LCP >= partial_min) — storing it only burns a slot of the bag
+            # and skews the learned footprint. Before #100 the finish store
+            # never ran on hybrids, so this case was unreachable; now every
+            # short request (warmups, titles) would otherwise land here.
+            self.discard_pending(request_id)
+            return False
         if (
             self.under_pressure() or self._store_would_overshoot(tokens_list)
         ) and not self._may_grow(request_id, tokens_list):
@@ -881,8 +917,18 @@ class BatchedSystemKV:
             for entry in reversed(self._entries.values()):
                 n = len(entry["tokens"])
                 if n > 0:
-                    return entry["bytes"] / n
+                    return entry.get("trim_bytes", entry["bytes"]) / n
             return self._bpt_hint
+
+    def fixed_store_bytes(self) -> float:
+        """Fixed (length-independent) bytes a full snapshot copy materializes:
+        the checkpoint-class layer state of the newest entry, or the hint
+        learned at insert once the bag has emptied (#100)."""
+        with self._lock:
+            for entry in reversed(self._entries.values()):
+                if entry["tokens"]:
+                    return float(entry.get("fixed_bytes", 0))
+            return self._fixed_hint
 
     # ------------------------------------------------- memory pressure (#48)
 
@@ -918,7 +964,8 @@ class BatchedSystemKV:
         try:
             import mlx.core as mx
 
-            return mx.get_active_memory() + len(tokens_list) * bpt > threshold
+            copy_bytes = len(tokens_list) * bpt + self.fixed_store_bytes()
+            return mx.get_active_memory() + copy_bytes > threshold
         except Exception:
             return False
 
