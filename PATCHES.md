@@ -3161,3 +3161,53 @@ Fixes, both in `batched_system_kv.py`:
 - **Live gate after deploy:** two concurrent ≥2K-token prompts should produce
   `store request=… stored=True` twice and `entry_count` 2, then a hit on a
   follow-up turn.
+
+## 101. `patch: dynamic-kv-budget` — the system-KV bag grows into idle headroom
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`effective_ram_bytes`, budget enforcement, stats), `tests/test_batched_flip_enablement.py` (+4).
+
+**Why.** `VLLM_MLX_SYSTEM_KV_RAM_MB` is one static number, so it is always wrong
+for one of the two regimes the Studio serves.
+- **Single-session regime:** one opencode session on the 64 GB box (Qwen3.8-27B-4bit
+  ≈ 15 GB weights + one deep row) leaves 20+ GB of the 60 GiB working set idle,
+  while the bag evicts at a few GB.
+- **Concurrent regime:** 2026-09-16, after #100 made hybrid stores work under
+  concurrency, 4 deep idealplace CI rows hit a real Metal OOM (peak 55.9 → 62.6 GB
+  in one 16K-token prefill step) even with the bag already emptied by #48 relief.
+  A large static budget is unsafe there.
+
+Measured entry size (SSD index `memory_bytes`, exact): 65,536 B/token attention
+KV + 146.8 MiB per recurrent-state copy (≤ ~9 copies at depth), i.e. ~2.4 GiB
+@18K and ~3.7 GiB @40K.
+
+**Design (opt-in, `VLLM_MLX_SYSTEM_KV_RAM_DYNAMIC=1`).** `RAM_MB` becomes the
+floor, and at every budget enforcement (each entry insert):
+
+    budget = clamp(bag + (watermark_bytes − active − RAM_RESERVE_MB), RAM_MB, RAM_MAX_MB)
+
+- **Stable across an eviction pass.** `bag` is inside `active`, so evicting an
+  entry lowers both sides equally.
+- **Two regimes.** Idle, the bag keeps chains up to the free headroom minus a
+  reserve. Under concurrent load the budget clamps to the floor, and #48 relief
+  keeps shrinking the bag between steps.
+- **Reserve** (default 8192 MB) covers the next prefill/batch spike; the measured
+  single-step jump was +6.7 GB.
+- **Static fallback.** Without an armed watermark (no headroom signal) or Metal,
+  the static budget applies unchanged.
+- **Cost:** one `mx.get_active_memory()` call per insert.
+- **Unchanged:** the store overshoot gate (#48/#100) still prices each copy
+  against the watermark, and slots still cap entry count (#683 buffer bound).
+
+**Stats.** `max_memory_mb` now reports the CURRENT effective budget (equal to
+`RAM_MB` in static mode). New fields: `ram_budget_mode`, `ram_floor_mb`,
+`ram_max_mb`, `ram_reserve_mb`.
+
+**Upstream:** N/A. The batched hybrid bag is fork-owned.
+
+**Verification:**
+- **Unit tests (mocked allocator, ~1 MB hybrid entries, 90 MB threshold).**
+  Idle (20 MB active) keeps 4 entries over a 2 MB floor. Busy (85 MB) evicts to
+  the floor (2 entries). `RAM_MAX_MB=3` caps at 3 entries. No watermark means
+  static behavior (2 entries).
+- **Full suite:** 3680 passed / 31 skipped / 30 deselected (#100 baseline 3676 + 4). `ruff` clean; no new `black` findings in touched files.
+- **Live gate after deploy:** on Qwen3.8-27B-4bit (floor 8192, reserve 8192, max 20480), a solo session's `/v1/status` `max_memory_mb` should float well above the floor. Under 2+ deep CI rows it should return to 8192 with no pressure crash.
