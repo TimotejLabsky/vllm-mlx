@@ -3211,3 +3211,29 @@ floor, and at every budget enforcement (each entry insert):
   static behavior (2 entries).
 - **Full suite:** 3680 passed / 31 skipped / 30 deselected (#100 baseline 3676 + 4). `ruff` clean; no new `black` findings in touched files.
 - **Live gate after deploy:** on Qwen3.8-27B-4bit (floor 8192, reserve 8192, max 20480), a solo session's `/v1/status` `max_memory_mb` should float well above the floor. Under 2+ deep CI rows it should return to 8192 with no pressure crash.
+
+## 102. `patch: admission-bpt-floor` — a recreated generator must not wave the whole queue through
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`should_defer_cobatch` pricing + `VLLM_MLX_BATCHED_BPT_FLOOR_KB`), `tests/test_batched_flip_enablement.py` (+2).
+
+**Found live 2026-09-16** on Qwen3.8-27B-4bit under idealplace opencode CI (46–66K-token agent turns), with the #40 KV-budget gate armed at `VLLM_MLX_BATCHED_KV_BUDGET_MB=4096`:
+- **Recovery loop.** Metal OOMs at 11:33:44Z and 11:44:49Z (peaks 63.9 / 63.2 GB). Each time `generation_error_recovery` aborted 4 requests and cleared the bag, then the next scheduling pass admitted the queue again: `running=1→2→3` for 45,351 + 66,304 + 46,321-token rows **within 2 ms**, with no defer line, and OOM followed.
+- **The gate works with sane pricing.** In between, it deferred correctly whenever it priced sanely (`≈ 6514 MB > 4096 MB at 2 seats [bpt 53.8 KB/tok, measured]`).
+
+**Mechanism.**
+- **Measured wins whenever it's non-zero.** `_measured_bytes_per_token` = `BatchGenerator.prompt_cache_nbytes` / Σ logical tokens of the running set. The gate used it and fell back to the learned estimate only when it was exactly 0.
+- **After a recreate it collapses.** Right after the generator is recreated (recovery, cold spawn), freshly admitted rows count their FULL prompt in the denominator while holding almost no allocated KV (only a restored prefix, e.g. 3,324 tokens). The ratio collapses toward 0 without reaching it, so each successive admission in the same pass is priced at a few KB/token.
+- **Unbounded admission.** The whole waiting queue passes up to `--max-num-seqs`.
+- **The #52 docstring's biases don't cover it.** Its "conservative" bias (padding charged to logical tokens) assumed rows are prefilled; unprefilled rows bias the other way.
+
+**Fix.** Price with the LARGEST of three estimates:
+- **measured** (unchanged).
+- **learned:** `bytes_per_token()`, the #100 KV-only exact figure from the newest entry. It persists across an emptied bag, so it survives recoveries within the process.
+- **floor:** new env `VLLM_MLX_BATCHED_BPT_FLOOR_KB` (default 0), for a cold process that has neither (e.g. a llama-swap restart with a waiting queue). Set to the model's KV bytes/token: Qwen3.8-27B = 64 KiB (16 attention layers × 2 × 4 KV heads × 256 × bf16).
+
+Defaults unchanged when the floor is unset and nothing is learned (the existing cold-cache test still admits).
+
+**Verification:**
+- **Red then green.** `test_kv_budget_not_fooled_by_unprefilled_rows_after_recovery` uses a learned bpt with a 1-byte measurement and a burst that must defer. `test_kv_budget_bpt_floor_arms_a_cold_process` checks a 66K candidate defers with the floor, and still admits without it (old behavior pinned).
+- **Full suite:** 3682 passed / 31 skipped / 30 deselected (#101 baseline 3680 + 2). `ruff` clean; no new `black` findings in touched files.
+- **Live gate after deploy** (route env `VLLM_MLX_BATCHED_BPT_FLOOR_KB=64`): no multi-row admission of deep rows right after a `generation_error_recovery` or respawn. Defer lines should show `bpt 64.0 KB/tok, learned|floor`, and no Metal OOM should occur under the same CI load.
