@@ -221,6 +221,13 @@ class BatchedSystemKV:
 
         self.slots = max(1, _env_int("VLLM_MLX_SYSTEM_KV_SLOTS", 4))
         self.ram_mb = _env_int("VLLM_MLX_SYSTEM_KV_RAM_MB", 0)
+        # Dynamic RAM budget (#101): RAM_MB becomes the FLOOR; the bag may grow
+        # into free headroom under the watermark (minus a prefill reserve), up
+        # to RAM_MAX_MB. Needs RAM_MB > 0 and the watermark armed; otherwise
+        # the static budget applies unchanged.
+        self.ram_dynamic = _env_int("VLLM_MLX_SYSTEM_KV_RAM_DYNAMIC", 0) > 0
+        self.ram_max_mb = _env_int("VLLM_MLX_SYSTEM_KV_RAM_MAX_MB", 0)
+        self.ram_reserve_mb = _env_int("VLLM_MLX_SYSTEM_KV_RAM_RESERVE_MB", 8192)
         self.ckpt_capacity = max(1, _env_int("VLLM_MLX_SYSTEM_KV_CHECKPOINTS", 8))
         self.partial_min = max(1, _env_int("VLLM_MLX_SYSTEM_KV_PARTIAL_MIN", 256))
         self.ckpt_interval = max(
@@ -753,6 +760,41 @@ class BatchedSystemKV:
             self.ssd_promotes += 1
         return True
 
+    def effective_ram_bytes(self, bag_bytes: float) -> float:
+        """RAM budget for the bag right now (#101).
+
+        Static mode: ``RAM_MB``. Dynamic mode: the bag may keep what it holds
+        plus the free headroom under the memory watermark, minus a reserve for
+        the next prefill/batch spike, clamped to ``[RAM_MB, RAM_MAX_MB]``:
+
+            budget = bag + (watermark - active - reserve)
+
+        ``bag`` is inside ``active``, so evicting an entry lowers both sides
+        equally — the budget is stable across one enforcement pass. Idle, a
+        single session's chains grow into the free working set; under
+        concurrent load the budget falls back to the floor and #48 relief keeps
+        shrinking the bag between steps. Falls back to static whenever the
+        watermark is disabled or Metal is unavailable (e.g. unit schedulers).
+        """
+        static = float(self.ram_mb) * 1024 * 1024
+        if not self.ram_dynamic or self.ram_mb <= 0:
+            return static
+        threshold = self._pressure.threshold_bytes()
+        if threshold is None:
+            return static
+        try:
+            import mlx.core as mx
+
+            active = float(mx.get_active_memory())
+        except Exception:
+            return static
+        budget = bag_bytes + (
+            threshold - active - float(self.ram_reserve_mb) * 1024 * 1024
+        )
+        if self.ram_max_mb > 0:
+            budget = min(budget, float(self.ram_max_mb) * 1024 * 1024)
+        return max(budget, static)
+
     def _enforce_budgets_locked(self) -> None:
         evicted = False
         while len(self._entries) > self.slots:
@@ -761,7 +803,9 @@ class BatchedSystemKV:
             self.evictions += 1
             evicted = True
         if self.ram_mb > 0:
-            budget = self.ram_mb * 1024 * 1024
+            budget = self.effective_ram_bytes(
+                sum(e["bytes"] for e in self._entries.values())
+            )
             while (
                 len(self._entries) > 1
                 and sum(e["bytes"] for e in self._entries.values()) > budget
@@ -1028,6 +1072,7 @@ class BatchedSystemKV:
         with self._lock:
             total = self.hits + self.misses
             mem = sum(e["bytes"] for e in self._entries.values())
+            budget = self.effective_ram_bytes(mem) if self.ram_mb > 0 else 0.0
             return {
                 "type": "batched_system_kv",  # bench-serve cache provenance
                 "enabled": True,
@@ -1052,12 +1097,14 @@ class BatchedSystemKV:
                 "current_memory_mb": mem / (1024 * 1024),
                 # exporter compatibility: mac-studio-exporter reads these
                 # from /v1/status → cache; 0 budget = unlimited
-                "max_memory_mb": float(self.ram_mb),
-                "memory_utilization": (
-                    mem / (self.ram_mb * 1024 * 1024)
-                    if self.ram_mb > 0
-                    else 0.0
-                ),
+                # (#101) the CURRENT effective budget — equals RAM_MB in
+                # static mode; floats with free headroom in dynamic mode
+                "max_memory_mb": budget / (1024 * 1024),
+                "memory_utilization": (mem / budget) if budget > 0 else 0.0,
+                "ram_budget_mode": "dynamic" if self.ram_dynamic else "static",
+                "ram_floor_mb": float(self.ram_mb),
+                "ram_max_mb": float(self.ram_max_mb),
+                "ram_reserve_mb": float(self.ram_reserve_mb),
                 "checkpoint_interval": self.ckpt_interval,
                 **(
                     {"ssd": self._ssd.get_stats()}
