@@ -3077,8 +3077,14 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
-                        if raw_cache and not self._prompt_output_entry_is_useless(
-                            raw_cache
+                        # Fork #100: the hybrid bag never trims — it restores
+                        # by slicing attention KV and replaying the nearest
+                        # recurrent checkpoint — so a non-trimmable cache is
+                        # NOT useless to it. Without this, every hybrid model
+                        # (ArraysCache) lost its only concurrent store path.
+                        if raw_cache and (
+                            self.hybrid_kv is not None
+                            or not self._prompt_output_entry_is_useless(raw_cache)
                         ):
                             # For paged cache, extract actual tensor states
                             # This allows cache to survive BatchGenerator recreation
