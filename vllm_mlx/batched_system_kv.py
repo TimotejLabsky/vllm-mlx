@@ -255,6 +255,11 @@ class BatchedSystemKV:
         # request mix instead of a fixed --max-num-seqs (deep contexts
         # serialize themselves, short ones batch up to the hard cap).
         self.kv_budget_mb = _env_int("VLLM_MLX_BATCHED_KV_BUDGET_MB", 0)
+        # (#102) floor for the admission gates' bytes/token: a freshly spawned
+        # (or just-recovered) generator measures only the KV already
+        # allocated, which prices not-yet-prefilled rows near zero. Set it to
+        # the model's KV bytes/token (Qwen3.8-27B: 64 KiB).
+        self.bpt_floor_kb = _env_int("VLLM_MLX_BATCHED_BPT_FLOOR_KB", 0)
         # Ground-truth backstop: defer co-batching while MLX active memory
         # exceeds this percentage of the device's recommended working set.
         self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
@@ -1451,11 +1456,21 @@ def should_defer_cobatch(scheduler, request) -> bool:
         return False
 
     reason = None
-    bpt = _measured_bytes_per_token(scheduler)
-    bpt_source = "measured"
-    if bpt <= 0:
-        bpt = hybrid_kv.bytes_per_token()
-        bpt_source = "learned"
+    # (#102) Price with the LARGEST of the three estimates. "measured" is
+    # allocated KV over the running set's LOGICAL tokens, so right after the
+    # generator is recreated (generation_error_recovery, cold spawn) rows that
+    # are admitted but not yet prefilled count their full prompt with ~no bytes
+    # — the ratio collapses and the whole waiting queue passes in one pass.
+    # Live 2026-09-16: 45K + 66K + 46K-token rows admitted within 2 ms after a
+    # recovery -> Metal OOM again (peaks 63.2-63.9 GB), a recovery loop.
+    # "learned" (#100: exact KV-only bytes/token from the newest entry,
+    # persisting across an emptied bag) and the env floor cannot collapse.
+    candidates = [
+        ("measured", _measured_bytes_per_token(scheduler)),
+        ("learned", hybrid_kv.bytes_per_token()),
+        ("floor", float(hybrid_kv.bpt_floor_kb) * 1024),
+    ]
+    bpt_source, bpt = max(candidates, key=lambda c: c[1])
     if bpt > 0 and (hybrid_kv.pad_waste_mb > 0 or hybrid_kv.kv_budget_mb > 0):
         lengths = [
             r.num_prompt_tokens + len(r.output_token_ids)
