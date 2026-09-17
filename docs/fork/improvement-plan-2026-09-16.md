@@ -118,10 +118,18 @@ empty output; LiteLLM (`num_retries: 0` in our config) rewrites a clean EOF to
   The landscape doc's gate ("if it stays near zero, close the item") is
   answered: **funded.**
 - SSD tier: 11 entries, 19.05 GB of a 20 GB cap — **full**, churns within one
-  working day. Disk copies are ~2.4× the RAM footprint (a 5240-token entry =
-  1267 MB on disk vs ~105 KB/tok in RAM). Promote latency 59 ms–5.2 s.
-  Eviction never spills (grown entries are simply gone,
-  `batched_system_kv.py:1023-1030`).
+  working day. Promote latency 59 ms–5.2 s. Eviction never spills (grown
+  entries are simply gone, `batched_system_kv.py:1023-1030`).
+  **Corrected 2026-09-17:** the "disk copies are ~2.4× RAM" line that stood
+  here was a bad comparison, not inflation — on-disk size equals the indexed
+  `memory_bytes`. What the safetensors header of a 4,395-token entry
+  (1,212 MB) actually shows: **BF16 306 MB** (attention KV, 4,395 × 64 KiB,
+  plus conv state) and **F32 906 MB** = GDN recurrent state `(1,48,128,128)`
+  at 151 MB per copy × **6 copies** (snapshot + 5 checkpoints). Three quarters
+  of a short entry is ladder state, not KV. All 11 SSD entries share ONE
+  `prefix_hash` (the 3,324-token system prompt), so every one re-serialises
+  the same system-prompt checkpoints that the RAM bag shares by reference
+  (~0.3 GB × 11). Disk free on the Studio: 146 GiB.
 - Deployed route env (infra `origin/main`): `KV_BUDGET_MB=4096`,
   `BPT_FLOOR_KB=64`, `PAD_WASTE_MB=4096`, `MEM_WATERMARK_PCT=85`,
   `MAX_QUEUE=8`, `MAX_PROMPT_TOKENS=170000`, RAM floor 8192 / dynamic / reserve
@@ -242,14 +250,31 @@ entries, grown entries never spill. Under CI the `#101` budget clamps to the
 8 GB floor = 2–3 deep chains while 5–8 are live; LRU then evicts the chain that
 is *about to be extended*.
 
+**Re-scoped 2026-09-17, after #103/#104 went live.** Every number in the
+evidence line above was taken while relief was wiping the bag (61× in one
+3 h process) — it measures the bug, not the cache. Baseline for the clean
+process, `timing-verdict.json` at 2026-09-17 10:39 local: **evictions 725,
+reuses 1,244, evict_to_reuse 201**. Read the DELTA after ≥ 1 working day of
+CI before building stages 2–3; if `Δevict_to_reuse / Δevictions` falls well
+under the old 0.25, the policy work shrinks to the tiebreak or closes. First
+clean soak (12 min): 0 pressure evictions, bag pinned at the **slot cap
+(4 entries, 5–11 GB) with a 15–20 GB budget idle** — evictions are now
+slot-bound, so the cheapest lever is `VLLM_MLX_SYSTEM_KV_SLOTS` 4 → 8 (config,
+idle window; buffer count is not the constraint, see §0.4).
+
 **Approach, staged so each step is measurable on its own:**
+0. **Config first (no code):** slots 4 → 8 and `VLLM_MLX_SSD_SYSTEM_KV_GB`
+   20 → 60 (146 GiB free). Both need a reload = Tim's window.
 1. **Spill-on-evict for grown entries** (fork-owned `batched_system_kv.py`):
    consolidate segments and write the blob on eviction (today only non-grown
    entries write through at store). Turns an eviction from "re-prefill 19K
-   tokens" (~15–40 s) into "promote 0.06–5 s". Needs the SSD cap raised (disk
-   is cheap; check free space) and the **2.4× disk inflation investigated**
-   first — likely full-precision ladder copies; a 20 GB tier should hold ~4×
-   what it does.
+   tokens" (~15–40 s) into "promote 0.06–5 s". #103's bounded busy-write is
+   what makes this safe under load (before it, the spill would just have
+   joined a pinned backlog). Worth pairing with **checkpoint dedup on SSD**
+   (content-address the ladder blobs: every entry under one system prompt
+   currently rewrites the same ~0.3 GB) — do NOT reach for bf16 state to
+   shrink entries: GDN state is fp32 for a reason and a narrower restore
+   would fail the T=0 byte-identity gate.
 2. **Session-affine soft protection** (SGLang's session radix cache idea): an
    entry whose chain has a running or waiting request, or finished within the
    last N minutes, is evicted after all unprotected entries. Key: no header
