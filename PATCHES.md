@@ -1564,6 +1564,10 @@ Conflicts that come up are usually in the same files (especially `vllm_mlx/engin
 
 **A rebase is not done until `tests/test_fork_invariants.py` is green AND its assertions were re-read against upstream's diff of the functions they touch.** A clean auto-merge proves nothing: upstream #683 merged without a conflict (2026-08-18 rebase) and silently disabled the hybrid bag's only concurrent store path for a month (#100), while every feature-level suite stayed green. That module pins the *conditions* fork semantics rest on — each test is named for its PATCHES.md number, and the #100 one is mutation-checked (it goes red when the carve-out is reverted to upstream's form). When a patch adds a guarantee upstream cannot see — a carve-out inside upstream's control flow, a cleanup upstream's error paths skip, a cross-thread assumption — add its test there in the same commit.
 
+### Lint in CI checks changed lines only
+
+`scripts/fork/black_changed_lines.py` replaces the whole-tree `black --check` in the `lint` job: ~44 files carry formatting drift from upstream rebases, reformatting them wholesale would be pure rebase-conflict surface, and a job that fails on every PR teaches everyone to merge past a red check (2026-09-17: a PR was merged before its lint log had been read). The script runs `black --line-ranges` over exactly the line ranges a change adds, keeps only the hunks that rewrite one of those lines (black expands a range to the whole statement, so one new key in a long dict literal would otherwise surface drift at its far end), and uses `--diff`, never `--check` — black caches a file as clean after a passing `--check --line-ranges` run and then reports it clean on a whole-file check. **`lint` is now expected to be green; a red `lint` means this change added drift — fix only the lines it prints.** `ruff` still checks the whole tree. Locally: `python scripts/fork/black_changed_lines.py origin/main`.
+
 ### When a patch lands upstream
 
 If upstream merges an equivalent fix, drop the corresponding commit:
