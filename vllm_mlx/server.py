@@ -169,6 +169,7 @@ from .endpoint_model_policies import (
 )
 from .engine.base import (
     EngineBusy,
+    GenerationAborted,
     MediaNotSupported,
     PromptTooLong,
     suspend_cancellation,
@@ -1208,17 +1209,34 @@ _STREAM_ERROR_MESSAGE = (
 )
 
 
-def _stream_error_chunk(response_id: str | None = None) -> str:
+def _stream_error_chunk(
+    response_id: str | None = None, exc: BaseException | None = None
+) -> str:
     """Terminal SSE payload for an OpenAI-shaped stream that died mid-flight.
 
     Matches the ``{"error": {...}}`` object OpenAI and vLLM both emit, which
     LiteLLM already understands.
+
+    A :class:`GenerationAborted` (#104) gets the 503 shape instead of the
+    generic one: headers are long gone, so the frame itself has to say
+    "retryable" — agent clients decide on the status number / "service
+    unavailable" wording (opencode's retry regex matches both), and a generic
+    internal error reads as fatal.
     """
-    error: dict[str, str] = {
+    error: dict[str, object] = {
         "message": _STREAM_ERROR_MESSAGE,
         "type": "internal_error",
         "code": "stream_failed",
     }
+    if isinstance(exc, GenerationAborted):
+        error = {
+            "message": str(exc),
+            "type": "service_unavailable",
+            "code": 503,
+            "error": exc.code,
+            "kind": exc.kind,
+            "retry_after": exc.retry_after_s,
+        }
     if response_id:
         # Already sent to the client on every prior chunk, so it leaks
         # nothing — and it is what ties a client-side report to the log line.
@@ -1226,12 +1244,15 @@ def _stream_error_chunk(response_id: str | None = None) -> str:
     return f"data: {json.dumps({'error': error})}\n\n"
 
 
-def _anthropic_stream_error_event() -> str:
-    """Same idea as :func:`_stream_error_chunk` in the Anthropic SSE dialect."""
+def _anthropic_stream_error_event(exc: BaseException | None = None) -> str:
+    """Same idea as :func:`_stream_error_chunk` in the Anthropic SSE dialect
+    (``overloaded_error`` is that dialect's retryable 5xx)."""
     payload = {
         "type": "error",
         "error": {"type": "api_error", "message": _STREAM_ERROR_MESSAGE},
     }
+    if isinstance(exc, GenerationAborted):
+        payload["error"] = {"type": "overloaded_error", "message": str(exc)}
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
 
 
@@ -1240,6 +1261,18 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     raise HTTPException(
         status_code=503,
         detail={"error": exc.code, "message": str(exc)},
+    ) from exc
+
+
+def _raise_generation_aborted(exc: GenerationAborted) -> None:
+    """Translate an engine-side abort (#104 — generation_error_recovery after
+    a Metal OOM or other fatal batch-step error) into a retryable HTTP 503.
+    Before this the abort was an HTTP 200 with ``content: null`` and a
+    ``finish_reason`` no client checks."""
+    raise HTTPException(
+        status_code=503,
+        detail={"error": exc.code, "kind": exc.kind, "message": str(exc)},
+        headers={"Retry-After": str(exc.retry_after_s)},
     ) from exc
 
 
@@ -4455,6 +4488,9 @@ async def status():
         # branches (0 when a rail is unarmed or N/A).
         "queue_cap": stats.get("queue_cap", 0),
         "queue_rejections": stats.get("queue_rejections", 0),
+        # (#104) fatal batch-step errors survived, and the rows they aborted
+        "generation_recoveries": stats.get("generation_recoveries", 0),
+        "recovery_aborted_requests": stats.get("recovery_aborted_requests", 0),
         "max_prompt_tokens": stats.get("max_prompt_tokens", 0),
         "prompt_rejections": stats.get("prompt_rejections", 0),
         "max_completion_tokens": stats.get("max_completion_tokens", 0),
@@ -5865,6 +5901,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except EngineBusy as exc:
                 tracker.finish(result="busy")
                 _raise_engine_busy(exc)
+            except GenerationAborted as exc:
+                tracker.finish(result="error")
+                _raise_generation_aborted(exc)
             except (MediaNotSupported, PromptTooLong) as exc:
                 tracker.finish(result="error")
                 _raise_prompt_too_long(exc)
@@ -6113,6 +6152,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
+        except GenerationAborted as exc:
+            tracker.finish(result="error")
+            _raise_generation_aborted(exc)
         except (MediaNotSupported, PromptTooLong) as exc:
             tracker.finish(result="error")
             _raise_prompt_too_long(exc)
@@ -6571,6 +6613,9 @@ async def create_anthropic_message(
         except EngineBusy as exc:
             tracker.finish(result="busy")
             _raise_engine_busy(exc)
+        except GenerationAborted as exc:
+            tracker.finish(result="error")
+            _raise_generation_aborted(exc)
         except (MediaNotSupported, PromptTooLong) as exc:
             tracker.finish(result="error")
             _raise_prompt_too_long(exc)
@@ -7152,6 +7197,16 @@ async def _stream_anthropic_messages(
         # Never yield here — see the note in stream_chat_completion.
         result_label = "cancelled"
         raise
+    except GenerationAborted as exc:
+        # (#104) expected, already logged with its traceback by the scheduler
+        result_label = "error"
+        logger.warning(
+            "Anthropic messages stream aborted by the engine after %d token(s): %s",
+            completion_tokens,
+            exc.kind,
+        )
+        yield _anthropic_stream_error_event(exc)
+        return
     except Exception:
         # PATCHES.md #91 — same silent-stream problem as the OpenAI path.
         result_label = "error"
@@ -7259,6 +7314,15 @@ async def stream_completion(
         result = "cancelled"
         closed = True
         raise
+    except GenerationAborted as exc:
+        # (#104) expected, already logged with its traceback by the scheduler
+        result = "error"
+        logger.warning(
+            "Streaming completion aborted by the engine after %d token(s): %s",
+            completion_tokens,
+            exc.kind,
+        )
+        yield _stream_error_chunk(exc=exc)
     except Exception:
         # PATCHES.md #91 — same silent-stream problem as the chat path.
         result = "error"
@@ -7812,6 +7876,20 @@ async def stream_chat_completion(
         # GeneratorExit raises "async generator ignored GeneratorExit".
         result_label = "cancelled"
         raise
+    except GenerationAborted as exc:
+        # (#104) generation_error_recovery took this row down. The scheduler
+        # already logged the traceback; what was missing is the client being
+        # told — this used to end as a well-formed EMPTY completion.
+        result_label = "error"
+        logger.warning(
+            "Streaming chat completion aborted by the engine after %d "
+            "token(s) (id=%s): %s",
+            completion_tokens,
+            response_id,
+            exc.kind,
+        )
+        yield _stream_error_chunk(response_id, exc)
+        yield "data: [DONE]\n\n"
     except Exception:
         # PATCHES.md #91 — log the traceback (previously this path was silent,
         # so a mid-stream failure left no record anywhere) and tell the client

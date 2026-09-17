@@ -355,3 +355,305 @@ def test_103_metrics_export_the_unaccounted_memory():
     }
     assert values["vllm_mlx_cache_pending_ladder_bytes"] == _mb(2)
     assert values["vllm_mlx_cache_ssd_queued_bytes"] == 12345
+
+
+# ----------------------- #104 an engine-side abort must not read as an answer
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+
+import pytest  # noqa: E402
+
+# opencode's retry policy (session/retry.ts): status >= 500, or a message
+# matching one of these. A frame that matches neither is treated as fatal.
+_AGENT_RETRY_RE = re.compile(
+    r"429|500|502|503|504|524|overloaded|service unavailable|internal error",
+    re.IGNORECASE,
+)
+
+
+def _aborted_output(**overrides):
+    base = dict(
+        output_text="",
+        new_text="",
+        output_token_ids=[],
+        prompt_tokens=7,
+        completion_tokens=0,
+        finished=True,
+        finish_reason="error",
+        error_kind="oom",
+        mtp_drafts=0,
+        mtp_accepted=0,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_104_only_engine_aborts_become_generation_aborted():
+    from vllm_mlx.engine.base import GenerationAborted, raise_if_generation_aborted
+
+    with pytest.raises(GenerationAborted) as caught:
+        raise_if_generation_aborted(_aborted_output())
+    assert caught.value.kind == "oom" and caught.value.code == "generation_aborted"
+    assert _AGENT_RETRY_RE.search(str(caught.value))
+
+    with pytest.raises(GenerationAborted) as caught:
+        raise_if_generation_aborted(_aborted_output(error_kind=None))
+    assert caught.value.kind == "generation_error"
+
+    # prompt_too_long keeps its non-retryable 400 path; normal finishes pass
+    raise_if_generation_aborted(_aborted_output(error_kind="prompt_too_long"))
+    raise_if_generation_aborted(_aborted_output(finish_reason="stop"))
+    raise_if_generation_aborted(_aborted_output(finish_reason="length"))
+
+
+def test_104_recovery_names_the_cause_and_counts_itself(monkeypatch):
+    scheduler = _make_scheduler(monkeypatch)
+    _running_request(scheduler, "oom-kind", 41, 1000)
+    generator = MagicMock()
+    generator.next.side_effect = RuntimeError(
+        "[METAL] Command buffer execution failed: Insufficient Memory "
+        "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)."
+    )
+    generator.prompt_cache_nbytes = 0
+    scheduler.batch_generator = generator
+
+    output = scheduler.step()
+
+    assert [(o.finish_reason, o.error_kind) for o in output.outputs] == [
+        ("error", "oom")
+    ]
+    stats = scheduler.get_stats()
+    assert stats["generation_recoveries"] == 1
+    assert stats["recovery_aborted_requests"] == 1
+
+    # anything that is not a Metal OOM is still an abort, just named honestly
+    _running_request(scheduler, "other-kind", 42, 5000)
+    generator = MagicMock()
+    generator.next.side_effect = RuntimeError("deque mutated during iteration")
+    generator.prompt_cache_nbytes = 0
+    scheduler.batch_generator = generator
+    output = scheduler.step()
+    assert [o.error_kind for o in output.outputs] == ["generation_error"]
+    assert scheduler.get_stats()["generation_recoveries"] == 2
+
+
+class _AbortingCore:
+    """An engine core whose request is taken down by recovery after ``emit``
+    good chunks — what BatchedEngine sees from engine_core today."""
+
+    def __init__(self, emit=0):
+        self.emit = emit
+
+    async def add_request(self, prompt, sampling_params, prefix_boundary=0):
+        return "req-abort"
+
+    async def stream_outputs(self, request_id):
+        for i in range(self.emit):
+            yield _aborted_output(
+                output_text="tok" * (i + 1),
+                new_text="tok",
+                output_token_ids=[i],
+                completion_tokens=i + 1,
+                finished=False,
+                finish_reason=None,
+                error_kind=None,
+            )
+        yield _aborted_output()
+
+    async def generate(self, prompt, sampling_params):
+        return _aborted_output()
+
+    async def abort_request(self, request_id):
+        return True
+
+
+def _batched_engine(emit=0):
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._loaded = True
+    engine._is_mllm = False
+    engine._mllm_scheduler = None
+    engine._engine = _AbortingCore(emit)
+    engine._tokenizer = SimpleNamespace(encode=lambda s, **k: [1])
+    return engine
+
+
+def test_104_batched_engine_raises_instead_of_returning_an_empty_turn():
+    from vllm_mlx.engine.base import GenerationAborted
+
+    with pytest.raises(GenerationAborted):
+        asyncio.run(_batched_engine().generate(prompt="x"))
+
+    seen = []
+
+    async def consume():
+        async for out in _batched_engine(emit=2).stream_generate(prompt="x"):
+            seen.append(out)
+
+    with pytest.raises(GenerationAborted):
+        asyncio.run(consume())
+    # the good chunks still reached the caller; the abort never did as text
+    assert [o.new_text for o in seen] == ["tok", "tok"]
+    assert all(o.finish_reason != "error" for o in seen)
+
+
+def test_104_non_stream_abort_is_a_retryable_503():
+    import vllm_mlx.server as srv
+    from fastapi import HTTPException
+    from vllm_mlx.engine.base import GenerationAborted
+
+    with pytest.raises(HTTPException) as caught:
+        srv._raise_generation_aborted(GenerationAborted("oom"))
+    assert caught.value.status_code == 503
+    assert caught.value.headers["Retry-After"] == "15"
+    assert caught.value.detail["error"] == "generation_aborted"
+    assert caught.value.detail["kind"] == "oom"
+
+    # every non-stream endpoint that maps EngineBusy must map this too
+    source = open(srv.__file__).read()
+    assert source.count("except GenerationAborted as exc:\n") >= 6
+    assert (
+        source.count("_raise_generation_aborted(exc)")
+        == source.count("_raise_engine_busy(exc)") - 1
+    )  # the pre-stream probe has no generation to abort
+
+
+class _AbortingChatEngine:
+    model_name = "test-model"
+
+    def __init__(self, emit=0):
+        self.emit = emit
+
+    async def _stream(self):
+        from vllm_mlx.engine.base import GenerationAborted, GenerationOutput
+
+        for i in range(self.emit):
+            yield GenerationOutput(
+                text=f"tok{i}",
+                new_text=f"tok{i}",
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+            )
+        raise GenerationAborted("oom")
+
+    def stream_chat(self, messages, **kwargs):
+        return self._stream()
+
+    def stream_generate(self, **kwargs):
+        return self._stream()
+
+
+def _sse(chunks):
+    out = []
+    for line in "".join(chunks).splitlines():
+        if line.startswith("data: ") and line[6:].strip() != "[DONE]":
+            out.append(json.loads(line[6:]))
+    return out
+
+
+class _Tracker:
+    def __init__(self):
+        self.calls = []
+
+    def observe_ttft(self):
+        pass
+
+    def finish(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+@pytest.mark.parametrize("emit", [0, 2])
+def test_104_chat_stream_abort_is_a_503_shaped_frame(monkeypatch, emit, caplog):
+    """Headers are long gone, so the frame has to say "retryable": the 09-16
+    recoveries all ended as 200 + an empty delta + finish_reason="error"."""
+    import vllm_mlx.server as srv
+
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    monkeypatch.setattr(srv, "_reasoning_parser_name", None)
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+    monkeypatch.setattr(srv, "_tool_call_parser", None)
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        stream=True,
+    )
+    tracker = _Tracker()
+    chunks = []
+
+    async def consume():
+        async for chunk in srv.stream_chat_completion(
+            _AbortingChatEngine(emit),
+            request.messages,
+            request,
+            metrics_tracker=tracker,
+        ):
+            chunks.append(chunk)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(consume())  # expected condition: must NOT raise
+
+    payloads = _sse(chunks)
+    errors = [p["error"] for p in payloads if "error" in p]
+    assert len(errors) == 1
+    assert errors[0]["code"] == 503 and errors[0]["kind"] == "oom"
+    assert errors[0]["error"] == "generation_aborted"
+    assert _AGENT_RETRY_RE.search(errors[0]["message"])
+    assert "".join(chunks).rstrip().endswith("data: [DONE]")
+    # never a clean finish: no chunk may carry a finish_reason
+    finishes = [
+        c.get("finish_reason")
+        for p in payloads
+        for c in p.get("choices", [])
+        if c.get("finish_reason")
+    ]
+    assert finishes == []
+    # counted as an error (feeds stream_aborts_total), phase from the tokens
+    assert tracker.calls[0]["result"] == "error"
+    assert tracker.calls[0]["completion_tokens"] == emit
+    assert "aborted by the engine" in caplog.text and "Traceback" not in caplog.text
+
+
+def test_104_completion_stream_abort_is_a_503_shaped_frame():
+    import vllm_mlx.server as srv
+
+    request = srv.CompletionRequest(model="test-model", prompt="hi", stream=True)
+    tracker = _Tracker()
+    chunks = []
+
+    async def consume():
+        async for chunk in srv.stream_completion(
+            _AbortingChatEngine(),
+            "hi",
+            request,
+            max_tokens=16,
+            metrics_tracker=tracker,
+        ):
+            chunks.append(chunk)
+
+    asyncio.run(consume())
+    errors = [p["error"] for p in _sse(chunks) if "error" in p]
+    assert len(errors) == 1 and errors[0]["code"] == 503
+    assert "[DONE]" in "".join(chunks)
+    assert tracker.calls[0]["result"] == "error"
+
+
+def test_104_anthropic_dialect_uses_its_retryable_error_type():
+    import vllm_mlx.server as srv
+    from vllm_mlx.engine.base import GenerationAborted
+
+    event = srv._anthropic_stream_error_event(GenerationAborted("oom"))
+    payload = json.loads(event.split("data: ", 1)[1])
+    assert payload["error"]["type"] == "overloaded_error"
+    assert _AGENT_RETRY_RE.search(payload["error"]["message"])
+    # the generic (#91) shapes are untouched
+    assert (
+        json.loads(srv._stream_error_chunk().split("data: ", 1)[1])["error"]["code"]
+        == "stream_failed"
+    )
+    assert "api_error" in srv._anthropic_stream_error_event()
