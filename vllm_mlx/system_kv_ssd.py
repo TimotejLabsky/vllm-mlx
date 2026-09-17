@@ -491,8 +491,13 @@ class SystemKVSSDStore:
             try:
                 if not dropped:
                     self._write_entry(
-                        tokens, tensors, layer_meta, ckpt_meta,
-                        snap_meta, kinds, nbytes,
+                        tokens,
+                        tensors,
+                        layer_meta,
+                        ckpt_meta,
+                        snap_meta,
+                        kinds,
+                        nbytes,
                     )
             except Exception:
                 logger.exception(
