@@ -78,6 +78,7 @@ class PressureManager:
         *,
         log_label: str,
         on_cache_clear: Optional[Callable[[], None]] = None,
+        before_evict: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, int]:
         """Run one relief pass; returns ``(cache_cleared, evicted_count)``.
 
@@ -125,6 +126,18 @@ class PressureManager:
             mx.clear_cache()
             if on_cache_clear is not None:
                 on_cache_clear()
+
+            # ``before_evict`` releases memory that serves no request (the
+            # SSD spill backlog) — tried first so a breach it can absorb
+            # costs no cache entry. True = it freed something.
+            if before_evict is not None:
+                try:
+                    if before_evict():
+                        mx.clear_cache()
+                        if mx.get_active_memory() <= threshold:
+                            return True, 0
+                except Exception:
+                    logger.debug("[%s] before_evict failed", log_label, exc_info=True)
 
             evicted = 0
             while drop_lru():
