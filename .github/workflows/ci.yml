@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fork: black_changed_lines.py diffs against the base
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,8 +27,12 @@ jobs:
       - name: Run ruff
         run: ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
-      - name: Run black
-        run: black --check vllm_mlx/ tests/
+      # Fork: check only the LINES this change adds. ~44 files carry
+      # formatting drift from upstream rebases (reformatting them wholesale
+      # would be pure rebase-conflict surface), so the whole-tree check failed
+      # on every PR and told nobody anything. See the script's docstring.
+      - name: Run black (changed lines)
+        run: python scripts/fork/black_changed_lines.py "${{ github.event.pull_request.base.sha || github.event.before }}"
 
   type-check:
     runs-on: ubuntu-latest
