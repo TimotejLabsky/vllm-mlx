@@ -3323,6 +3323,16 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is not None:
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
+                # Release cache references so Metal buffers can be freed
+                request.prompt_cache = None
+                request._extracted_cache = None
+            if self.hybrid_kv is not None:
+                # (#103) Drop the in-flight checkpoint ladder, as
+                # _do_abort_request does. This path skips _cleanup_finished,
+                # so without it every OOM-aborted row kept up to 8 recurrent
+                # state copies alive (and, after a HIT, its evicted donor's)
+                # — active memory ratcheted ~1 GB per recovery (2026-09-16).
+                self.hybrid_kv.discard_pending(request_id)
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
@@ -3542,7 +3552,7 @@ class Scheduler:
         result = []
 
         # Waiting requests
-        for req in self.waiting:
+        for req in list(self.waiting):  # executor pops while the loop reads
             result.append(
                 {
                     "request_id": req.request_id,
@@ -3824,7 +3834,7 @@ class Scheduler:
         Called from _schedule_waiting() before requests are moved to running.
         Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
         """
-        for request in self.waiting:
+        for request in list(self.waiting):  # add_request appends cross-thread
             if getattr(request, "cache_hit_type", None) != "ssd_pending":
                 continue
 
