@@ -333,6 +333,20 @@ class MetricsCollector:
                 "(#53 — fires even when the cache had nothing to evict).",
                 registry=registry,
             ),
+            # (#103) memory the snapshot bag does NOT account for — both were
+            # invisible while they pinned the 27B route at its watermark.
+            "cache_pending_ladder_bytes": Gauge(
+                "vllm_mlx_cache_pending_ladder_bytes",
+                "Bytes of in-flight checkpoint ladders (requests not yet "
+                "stored or discarded). Must return to 0 when nothing runs.",
+                registry=registry,
+            ),
+            "cache_ssd_queued_bytes": Gauge(
+                "vllm_mlx_cache_ssd_queued_bytes",
+                "Bytes of snapshots queued for SSD write-through and still "
+                "resident in unified memory.",
+                registry=registry,
+            ),
             # ---- counter mirrors of the cumulative cache stats (vLLM v1
             # metric shapes): the gauges above snapshot cumulative values,
             # which PromQL cannot window or reset-align; these are true
@@ -711,6 +725,15 @@ class MetricsCollector:
             )
             self._prom["cache_pressure_clears"].set(
                 _coerce_float(cache_stats.get("pressure_cache_clears", 0))
+            )
+            self._prom["cache_pending_ladder_bytes"].set(
+                _coerce_float(cache_stats.get("pending_ladder_mb", 0.0)) * 1024 * 1024
+            )
+            ssd_stats = cache_stats.get("ssd")
+            self._prom["cache_ssd_queued_bytes"].set(
+                _coerce_float(ssd_stats.get("queued_bytes", 0))
+                if isinstance(ssd_stats, dict)
+                else 0
             )
             self._prom["cache_memory_bytes"].set(
                 _coerce_float(cache_stats.get("current_memory_mb", 0.0)) * 1024 * 1024
