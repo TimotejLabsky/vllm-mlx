@@ -1431,6 +1431,11 @@ class Scheduler:
         except ValueError:
             self.queue_cap = 0
         self.queue_rejections = 0
+        # (#104) fatal batch-step errors survived via generation_error_recovery
+        # and the rows they took down — the ground truth behind every
+        # GenerationAborted the server reports.
+        self.generation_recoveries = 0
+        self.recovery_aborted_requests = 0
 
         # Prompt-token ceiling (fork #50): reject prompts past the route's
         # measured envelope with a non-retryable 400 instead of letting an
@@ -3470,12 +3475,21 @@ class Scheduler:
                 # Recover from fatal errors (OOM, Metal crash) instead of
                 # re-raising, which would cause infinite loop in engine_core.
                 aborted_ids = self._recover_from_generation_error()
+                # (#104) name the cause: the engine turns this output into a
+                # typed GenerationAborted (503 / error frame), and "oom" vs
+                # anything else is the first thing the client log needs.
+                error_kind = (
+                    "oom" if "Insufficient Memory" in str(e) else "generation_error"
+                )
+                self.generation_recoveries += 1
+                self.recovery_aborted_requests += len(aborted_ids)
                 for rid in aborted_ids:
                     output.outputs.append(
                         RequestOutput(
                             request_id=rid,
                             finished=True,
                             finish_reason="error",
+                            error_kind=error_kind,
                         )
                     )
                 output.finished_request_ids = aborted_ids
@@ -3633,6 +3647,8 @@ class Scheduler:
 
         stats["queue_cap"] = self.queue_cap
         stats["queue_rejections"] = self.queue_rejections
+        stats["generation_recoveries"] = self.generation_recoveries
+        stats["recovery_aborted_requests"] = self.recovery_aborted_requests
         stats["max_prompt_tokens"] = self.max_prompt_tokens
         stats["prompt_rejections"] = self.prompt_rejections
         stats["max_completion_tokens"] = self.max_completion_tokens

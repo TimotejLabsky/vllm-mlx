@@ -60,6 +60,44 @@ class EngineBusy(RuntimeError):
     code = "text_generation_busy"
 
 
+class GenerationAborted(RuntimeError):
+    """Raised when the engine aborted a request it had already accepted
+    (fork patch #104) — today that is ``generation_error_recovery`` after a
+    Metal OOM or any other fatal batch-step error.
+
+    The schedulers report the abort as a normal finished output with
+    ``finish_reason="error"``. Served as-is that is HTTP 200 with an empty
+    body, which every layer downstream reads as a legitimate empty turn:
+    LiteLLM rewrites it to ``stop`` and an agent client simply ends its
+    session (2026-09-16: 2,266 responses, 100% status 200, including 105
+    OOM aborts). The server translates this into a retryable 503 +
+    ``Retry-After`` before headers, or a 503-shaped terminal error frame once
+    a stream is open — the request was fine, the engine was not.
+    """
+
+    code = "generation_aborted"
+    retry_after_s = 15
+
+    def __init__(self, kind: str | None = None):
+        self.kind = kind or "generation_error"
+        super().__init__(
+            f"Service Unavailable (503): the engine aborted this request "
+            f"({self.kind}); it is safe to retry"
+        )
+
+
+def raise_if_generation_aborted(output: Any) -> None:
+    """Turn a scheduler ``finish_reason="error"`` output into
+    :class:`GenerationAborted`. ``prompt_too_long`` keeps its own typed 400
+    path (the request can never succeed, so it must not look retryable)."""
+    if getattr(output, "finish_reason", None) != "error":
+        return
+    kind = getattr(output, "error_kind", None)
+    if kind == "prompt_too_long":
+        return
+    raise GenerationAborted(kind)
+
+
 class EngineStopped(RuntimeError):
     """Raised when generation work is submitted after the engine has stopped.
 
