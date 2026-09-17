@@ -657,3 +657,118 @@ def test_104_anthropic_dialect_uses_its_retryable_error_type():
         == "stream_failed"
     )
     assert "api_error" in srv._anthropic_stream_error_event()
+
+
+# ------------------------------ #100 the hybrid bag's finish store vs upstream #683
+
+
+def _finish_one(scheduler, rid="fin-a", uid=51, base=1000):
+    """Drive one finished hybrid row through the REAL response path."""
+    request = _running_request(scheduler, rid, uid, base)
+    request.first_token_time = 0.0
+    request.append_output_token(base + 900)
+    scheduler._decode_tokens = lambda ids: ""
+    response = SimpleNamespace(
+        uid=uid,
+        token=base + 901,
+        finish_reason="stop",
+        prompt_cache=_donor_at(len(request.prompt_token_ids) + 2),
+    )
+    scheduler._process_batch_responses([response])
+    return request
+
+
+def test_100_hybrid_bag_keeps_the_extraction_upstream_calls_useless(monkeypatch):
+    """The condition itself, not its downstream effect: upstream #683 drops
+    the finish-time cache whenever it cannot be trimmed, and ArraysCache never
+    can — so on every hybrid model the bag's only concurrent store path went
+    dark for a month. The bag restores by slicing + checkpoints and never
+    trims; with it active the verdict of ``_prompt_output_entry_is_useless``
+    must not matter."""
+    from vllm_mlx.scheduler import Scheduler
+
+    monkeypatch.setattr(
+        Scheduler, "_prompt_output_entry_is_useless", staticmethod(lambda cache: True)
+    )
+    scheduler = _make_scheduler(monkeypatch)
+    assert scheduler.hybrid_kv is not None
+
+    request = _finish_one(scheduler)
+
+    assert getattr(request, "_extracted_cache", None) is not None
+
+
+def test_100_upstream_gate_still_governs_every_other_cache(monkeypatch):
+    """The carve-out is for the hybrid bag only. Without it, #683's protection
+    (45 dead full-length entries -> Metal resource limit 499000) must hold."""
+    from vllm_mlx.scheduler import Scheduler
+
+    scheduler = _make_scheduler(monkeypatch)
+    scheduler.hybrid_kv = None
+
+    monkeypatch.setattr(
+        Scheduler, "_prompt_output_entry_is_useless", staticmethod(lambda cache: True)
+    )
+    dropped = _finish_one(scheduler, "fin-useless", 52, 1000)
+    assert getattr(dropped, "_extracted_cache", None) is None
+
+    monkeypatch.setattr(
+        Scheduler, "_prompt_output_entry_is_useless", staticmethod(lambda cache: False)
+    )
+    kept = _finish_one(scheduler, "fin-useful", 53, 5000)
+    assert getattr(kept, "_extracted_cache", None) is not None
+
+
+def test_100_a_real_hybrid_cache_is_what_upstream_calls_useless():
+    """Pins the premise: if mlx-lm ever makes ArraysCache trimmable, the
+    carve-out stops mattering and this goes red to say so."""
+    from vllm_mlx.scheduler import Scheduler
+
+    assert Scheduler._prompt_output_entry_is_useless(_donor_at(64)) is True
+
+
+# ------------------------------------- #34/#37 the bag's LRU and donor linkage
+
+
+def test_034_a_hit_protects_its_entry_from_the_next_eviction(monkeypatch):
+    """Eviction is LRU with hit-touch, not FIFO: the chain an agent just
+    extended must outlive an idle one. (The baseline any smarter policy —
+    plan P1-1 — has to keep.)"""
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_SLOTS", "2")
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+
+    assert kv.fetch(TOKENS + [1, 2, 3]) is not None  # touches r1's entry
+
+    third = list(range(20000, 20800))
+    kv.store("r3", third, _donor_at(len(third)))
+
+    kept = sorted(e["tokens"][0] for e in kv._entries.values())
+    assert kept == [TOKENS[0], third[0]]  # the untouched DISJOINT entry went
+
+
+def test_037_a_store_whose_donor_was_evicted_still_lands_as_a_full_copy(monkeypatch):
+    """fetch links the request to its donor entry for the O(delta) grow path.
+    If that donor is evicted before the request finishes — routine with more
+    live chains than slots — the store must fall back to a full copy, not
+    fail or alias a dropped entry."""
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_SLOTS", "1")
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("donor", TOKENS, _donor_at(len(TOKENS)))
+
+    grown = TOKENS + list(range(30000, 30400))
+    assert kv.fetch(grown, request_id="grower") is not None
+    assert "grower" in kv._restore_source
+
+    kv.store("other", DISJOINT, _donor_at(len(DISJOINT)))  # evicts the donor
+    assert [e["tokens"][0] for e in kv._entries.values()] == [DISJOINT[0]]
+
+    assert kv.store("grower", grown, _donor_at(len(grown))) is True
+
+    entries = list(kv._entries.values())
+    assert len(entries) == 1 and entries[0]["tokens"] == grown
+    assert kv.grown_stores == 0  # a full copy, not a grow from a dead donor
+    assert "grower" not in kv._restore_source and "grower" not in kv._pending
+    # and it is a usable entry: an extension restores from it
+    assert kv.fetch(grown + [7, 8, 9]) is not None

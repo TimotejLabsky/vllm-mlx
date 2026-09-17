@@ -1562,6 +1562,8 @@ git push --force-with-lease       # update our fork
 
 Conflicts that come up are usually in the same files (especially `vllm_mlx/engine/simple.py` which sees a lot of upstream churn around the cache code). Resolve in favor of preserving our patch intent; rerun smoke tests after.
 
+**A rebase is not done until `tests/test_fork_invariants.py` is green AND its assertions were re-read against upstream's diff of the functions they touch.** A clean auto-merge proves nothing: upstream #683 merged without a conflict (2026-08-18 rebase) and silently disabled the hybrid bag's only concurrent store path for a month (#100), while every feature-level suite stayed green. That module pins the *conditions* fork semantics rest on — each test is named for its PATCHES.md number, and the #100 one is mutation-checked (it goes red when the carve-out is reverted to upstream's form). When a patch adds a guarantee upstream cannot see — a carve-out inside upstream's control flow, a cleanup upstream's error paths skip, a cross-thread assumption — add its test there in the same commit.
+
 ### When a patch lands upstream
 
 If upstream merges an equivalent fix, drop the corresponding commit:
