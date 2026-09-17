@@ -260,6 +260,20 @@ class BatchedSystemKV:
         # allocated, which prices not-yet-prefilled rows near zero. Set it to
         # the model's KV bytes/token (Qwen3.8-27B: 64 KiB).
         self.bpt_floor_kb = _env_int("VLLM_MLX_BATCHED_BPT_FLOOR_KB", 0)
+        # (#105) Solo-prefill guard. Every admission gate above prices
+        # CO-batching; a request that finds nothing running is admitted
+        # unexamined ("progress guarantee"), and #48 relief only acts between
+        # steps, so a solo prefill whose KV + per-chunk transient does not
+        # fit below the OOM wall dies mid-step. TRANSIENT_MB is the measured
+        # active->peak jump of one prefill chunk (0 = guard off; 27B-4bit:
+        # +6.7 GB measured 2026-09-16). CEILING_PCT is the share of the
+        # recommended working set the projection must stay under — the OOM
+        # wall, deliberately NOT the relief watermark (crossing that is
+        # normal for a deep solo prefill, and relief handles it).
+        self.solo_transient_mb = _env_int("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", 0)
+        self.solo_ceiling_pct = _env_int("VLLM_MLX_BATCHED_SOLO_CEILING_PCT", 95)
+        self.solo_relief_passes = 0
+        self.solo_rejections = 0
         # Ground-truth backstop: defer co-batching while MLX active memory
         # exceeds this percentage of the device's recommended working set.
         self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
@@ -1086,6 +1100,61 @@ class BatchedSystemKV:
         )
         return evicted
 
+    def solo_prefill_verdict(self, tokens_to_prefill: int) -> Optional[str]:
+        """(#105) Examine a request about to run ALONE. None = admit;
+        otherwise the ``error_kind`` to reject it with.
+
+        Projects ``active + tokens x bytes/token + one chunk's transient``
+        against the OOM wall. Over it, everything that is pure cache is given
+        back first (spill backlog, then the bag LRU-first, then the MLX
+        buffer cache) and the projection re-checked; only a request that
+        still cannot fit is rejected — before it costs a prefill and takes
+        the process's state down with it. Inert without TRANSIENT_MB, a
+        bytes/token estimate, or Metal."""
+        if self.solo_transient_mb <= 0 or tokens_to_prefill <= 0:
+            return None
+        ceiling = self._pressure.ceiling_bytes()
+        bpt = max(self.bytes_per_token(), float(self.bpt_floor_kb * 1024))
+        if not ceiling or bpt <= 0:
+            return None
+        limit = ceiling * self.solo_ceiling_pct / 100
+        need = tokens_to_prefill * bpt + self.solo_transient_mb * 1024 * 1024
+        try:
+            import mlx.core as mx
+
+            if mx.get_active_memory() + need <= limit:
+                return None
+            relieved = False
+            if self._ssd is not None and self._ssd.drop_backlog():
+                self.pressure_backlog_drops += 1
+                relieved = True
+            mx.clear_cache()
+            while mx.get_active_memory() + need > limit and self._drop_lru_entry():
+                relieved = True
+                mx.clear_cache()
+            active = mx.get_active_memory()
+        except Exception:
+            logger.debug("[batched_system_kv] solo guard failed open", exc_info=True)
+            return None
+        if relieved:
+            self.solo_relief_passes += 1
+        if active + need <= limit:
+            return None
+        self.solo_rejections += 1
+        logger.warning(
+            "[batched_system_kv] solo prefill rejected: %d tokens need ≈ %.1f GB "
+            "(%.1f KB/tok + %d MB chunk transient) on top of %.1f GB active "
+            "> %d%% of %.1f GB working set, with the cache already emptied",
+            tokens_to_prefill,
+            need / 1e9,
+            bpt / 1024,
+            self.solo_transient_mb,
+            active / 1e9,
+            self.solo_ceiling_pct,
+            ceiling / 1e9,
+        )
+        return "insufficient_memory"
+
     def _may_grow(self, request_id: str, tokens_list: list) -> bool:
         """Cheap pre-check of #37's grow path: is the request's donor entry
         still resident with a usable common prefix? (kinds are confirmed
@@ -1128,6 +1197,8 @@ class BatchedSystemKV:
                 "pressure_skipped_stores": self.pressure_skipped_stores,
                 "pressure_cache_clears": self.pressure_cache_clears,
                 "pressure_backlog_drops": self.pressure_backlog_drops,
+                "solo_relief_passes": self.solo_relief_passes,
+                "solo_rejections": self.solo_rejections,
                 # (#103) memory held OUTSIDE the entries: in-flight checkpoint
                 # ladders. Must read 0 whenever nothing is running or waiting
                 # — a non-zero idle value is a leaked ladder.
@@ -1207,6 +1278,21 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
         if candidate is not None:
             request.cache_hit_type = "ssd_pending"
             request._ssd_candidate = candidate
+
+
+def solo_prefill_verdict(scheduler, request) -> Optional[str]:
+    """_schedule_waiting hook (#105): the one admission check for a request
+    that finds nothing running. None = admit, else an ``error_kind``."""
+    hybrid_kv = scheduler.hybrid_kv
+    if hybrid_kv is None or scheduler.running:
+        return None
+    remaining = getattr(request, "remaining_tokens", None)
+    tokens = (
+        len(remaining)
+        if remaining is not None
+        else int(getattr(request, "num_prompt_tokens", 0) or 0)
+    )
+    return hybrid_kv.solo_prefill_verdict(tokens)
 
 
 def promote_ssd_pending(scheduler) -> None:
