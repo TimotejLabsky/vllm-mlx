@@ -31,6 +31,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     cleanup_startup_cancellation,
+    raise_if_generation_aborted,
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
@@ -1114,6 +1115,9 @@ class BatchedEngine(BaseEngine):
                 specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
+            # (#104) an engine-side abort is an error, not an empty turn
+            raise_if_generation_aborted(output)
+
             # Stop STRINGS are token-id-blind in the batched schedulers;
             # enforce them here (fork patch #32). Truncate BEFORE
             # clean_output_text — stop strings are often special tokens
@@ -1162,6 +1166,8 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
         )
+        # (#104) an engine-side abort is an error, not an empty turn
+        raise_if_generation_aborted(output)
 
         # Truncate BEFORE clean_output_text — stop strings are often special
         # tokens (<|im_end|>) that cleaning would strip from the scan.
@@ -1251,6 +1257,7 @@ class BatchedEngine(BaseEngine):
             # enforce them here (fork patch #32).
             gate = _GrammarStopGate(stop, logits_processors)
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                raise_if_generation_aborted(output)  # (#104)
                 new_text, stop_hit = gate.scan(output)
                 yield GenerationOutput(
                     text=clean_output_text(output.output_text),
@@ -1303,6 +1310,7 @@ class BatchedEngine(BaseEngine):
 
         gate = _GrammarStopGate(stop, logits_processors)
         async for output in self._engine.stream_outputs(request_id):
+            raise_if_generation_aborted(output)  # (#104)
             text = clean_output_text(output.output_text)
             new_text, stop_hit = gate.scan(output)
 
