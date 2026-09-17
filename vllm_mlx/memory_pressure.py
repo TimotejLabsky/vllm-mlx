@@ -52,6 +52,21 @@ class PressureManager:
         except Exception:
             return None
 
+    def ceiling_bytes(self) -> Optional[int]:
+        """The device's recommended working set, independent of whether the
+        watermark is armed (the solo-prefill guard, #105, prices against the
+        OOM wall rather than the relief threshold). None off-Metal."""
+        try:
+            import mlx.core as mx
+
+            if self._ws_ceiling is None:
+                self._ws_ceiling = mx.device_info()["max_recommended_working_set_size"]
+            if self._ws_ceiling and self._ws_ceiling > 0:
+                return self._ws_ceiling
+            return None
+        except Exception:
+            return None
+
     def watermark_status(self) -> tuple:
         """``(over, active_bytes, ceiling_bytes)`` against the watermark.
         ``(False, 0, 0)`` when the watermark env is unset or Metal is

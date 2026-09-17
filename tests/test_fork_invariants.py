@@ -772,3 +772,148 @@ def test_037_a_store_whose_donor_was_evicted_still_lands_as_a_full_copy(monkeypa
     assert "grower" not in kv._restore_source and "grower" not in kv._pending
     # and it is a usable entry: an extension restores from it
     assert kv.fetch(grown + [7, 8, 9]) is not None
+
+
+# ---------------------------------- #105 a request that runs alone is examined too
+
+_ENTRY_MB = 20  # what each resident entry "costs" in the mocked allocator
+
+
+def _solo_kv(monkeypatch, base_mb, ceiling_mb=100, transient_mb=10, floor_kb=64):
+    """Guard armed; mocked allocator where active = base + 20 MB per entry,
+    so evicting the bag visibly makes room. Limit = 95% of the ceiling."""
+    import mlx.core as mx
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", str(transient_mb))
+    monkeypatch.setenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB", str(floor_kb))
+    kv = BatchedSystemKV(_FakeModel())
+    monkeypatch.setattr(
+        mx, "get_active_memory", lambda: _mb(base_mb + _ENTRY_MB * len(kv._entries))
+    )
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": _mb(ceiling_mb)}
+    )
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    return kv
+
+
+def test_105_guard_is_inert_unless_armed(monkeypatch):
+    import mlx.core as mx
+
+    monkeypatch.delenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    monkeypatch.setattr(mx, "get_active_memory", lambda: _mb(10_000))
+    assert kv.solo_prefill_verdict(1_000_000) is None
+    assert kv.stats()["solo_rejections"] == 0
+
+
+def test_105_a_request_that_fits_is_admitted_untouched(monkeypatch):
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    # active 40 (20 + one entry) + 400 tok x 64 KB (25) + 10 transient = 75 <= 95
+    assert kv.solo_prefill_verdict(400) is None
+    assert kv.stats()["entry_count"] == 1
+    assert kv.solo_relief_passes == 0 and kv.solo_rejections == 0
+
+
+def test_105_makes_room_before_it_rejects(monkeypatch):
+    """The bag and the spill backlog are pure cache: give them back, then
+    re-check. Rejecting while holding droppable memory would be a false 503."""
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    ssd = MagicMock()
+    ssd.drop_backlog.return_value = _mb(5)
+    kv._ssd = ssd
+    # active 60 (20 + 2 entries); need 60 -> 120 > 95. One eviction -> 100,
+    # still over; two -> 80 <= 95.
+    assert kv.solo_prefill_verdict(800) is None
+    ssd.drop_backlog.assert_called_once()  # backlog first
+    assert kv.stats()["entry_count"] == 0
+    assert kv.solo_relief_passes == 1 and kv.solo_rejections == 0
+    assert kv.pressure_backlog_drops == 1
+
+
+def test_105_rejects_only_what_cannot_fit_with_the_cache_emptied(monkeypatch):
+    kv = _solo_kv(monkeypatch, base_mb=50)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    # need 60 on a 50 MB floor of weights -> 110 > 95 even with an empty bag
+    assert kv.solo_prefill_verdict(800) == "insufficient_memory"
+    assert kv.stats()["entry_count"] == 0  # it did try
+    assert kv.stats()["solo_rejections"] == 1
+
+
+def test_105_prices_only_the_tokens_still_to_prefill(monkeypatch):
+    """A restored prefix is already resident (it is inside ``active``)."""
+    kv = _solo_kv(monkeypatch, base_mb=50)
+    scheduler = SimpleNamespace(hybrid_kv=kv, running={})
+    deep_but_cached = SimpleNamespace(
+        remaining_tokens=[0] * 100, num_prompt_tokens=50_000
+    )
+    assert bkv.solo_prefill_verdict(scheduler, deep_but_cached) is None
+    cold = SimpleNamespace(remaining_tokens=None, num_prompt_tokens=50_000)
+    assert bkv.solo_prefill_verdict(scheduler, cold) == "insufficient_memory"
+
+
+def test_105_is_not_consulted_when_something_is_running(monkeypatch):
+    """Co-batching is the #39/#40/#102 gates' job; this one is for the hole
+    they leave (``if not scheduler.running: return False``)."""
+    kv = _solo_kv(monkeypatch, base_mb=50)
+    scheduler = SimpleNamespace(hybrid_kv=kv, running={"busy": object()})
+    cold = SimpleNamespace(remaining_tokens=None, num_prompt_tokens=50_000)
+    assert bkv.solo_prefill_verdict(scheduler, cold) is None
+    assert kv.solo_rejections == 0
+
+
+def test_105_a_rejection_reaches_the_client_and_does_not_block_the_queue(monkeypatch):
+    import mlx.core as mx
+    from vllm_mlx.request import Request, SamplingParams
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", "10")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB", "64")
+    scheduler = _make_scheduler(monkeypatch)
+    kv = scheduler.hybrid_kv
+    monkeypatch.setattr(mx, "get_active_memory", lambda: _mb(50))
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": _mb(100)}
+    )
+    # never reach the real generator: the request that passes the guard is
+    # put back by the "no batch generator yet" branch
+    monkeypatch.setattr(scheduler, "_ensure_batch_generator", lambda params: None)
+
+    def _waiting(rid, n):
+        request = Request(
+            request_id=rid,
+            prompt="x",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=list(range(n)),
+            num_prompt_tokens=n,
+        )
+        scheduler.requests[rid] = request
+        scheduler.waiting.append(request)
+        return request
+
+    too_big = _waiting("too-big", 800)  # 50 + 50 + 10 = 110 > 95
+    fits = _waiting("fits", 100)  # 50 + 6.25 + 10 <= 95
+    kv.note_scheduled("too-big", 0)
+    kv.capture_segment("too-big", 64, _donor_at(64))
+    assert "too-big" in kv._pending
+
+    output = scheduler.step()
+
+    assert [(o.request_id, o.finish_reason, o.error_kind) for o in output.outputs] == [
+        ("too-big", "error", "insufficient_memory")
+    ]
+    assert output.finished_request_ids == {"too-big"}
+    assert too_big.prompt_cache is None and "too-big" not in kv._pending
+    assert "too-big" not in scheduler.running
+    # the queue behind it was still examined — and passed the guard
+    assert list(scheduler.waiting) == [fits]
+    assert kv.stats()["solo_rejections"] == 1
+
+    # ...and #104 turns that output into a retryable, named error
+    from vllm_mlx.engine.base import GenerationAborted, raise_if_generation_aborted
+
+    with pytest.raises(GenerationAborted) as caught:
+        raise_if_generation_aborted(output.outputs[0])
+    assert caught.value.kind == "insufficient_memory"
