@@ -1471,6 +1471,9 @@ class Scheduler:
         # GenerationAborted the server reports.
         self.generation_recoveries = 0
         self.recovery_aborted_requests = 0
+        # (#105) outputs for requests rejected at schedule time — merged into
+        # the step's outputs so the client hears about it.
+        self._rejected_outputs: List[RequestOutput] = []
 
         # Prompt-token ceiling (fork #50): reject prompts past the route's
         # measured envelope with a non-retryable 400 instead of letting an
@@ -2441,6 +2444,15 @@ class Scheduler:
                 self.waiting.appendleft(request)
                 break
 
+            # Solo-prefill guard (fork #105): the gates above price
+            # co-batching only; a request that would run alone is otherwise
+            # admitted unexamined, and an OOM mid-prefill cannot be relieved.
+            if self.hybrid_kv is not None and not self.running:
+                reject_kind = _batched_kv.solo_prefill_verdict(self, request)
+                if reject_kind is not None:
+                    self._reject_at_schedule(request, reject_kind)
+                    continue
+
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
 
@@ -3363,6 +3375,25 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
+    def _reject_at_schedule(self, request: Request, error_kind: str) -> None:
+        """(#105) Finish a request that was never inserted into the batch.
+        The output reaches the client as a typed GenerationAborted (#104)."""
+        request_id = request.request_id
+        request.set_finished(RequestStatus.FINISHED_ABORTED)
+        request.prompt_cache = None
+        request._extracted_cache = None
+        if self.hybrid_kv is not None:
+            self.hybrid_kv.discard_pending(request_id)
+        self.finished_req_ids.add(request_id)
+        self._rejected_outputs.append(
+            RequestOutput(
+                request_id=request_id,
+                finished=True,
+                finish_reason="error",
+                error_kind=error_kind,
+            )
+        )
+
     def _recover_from_generation_error(self) -> Set[str]:
         """Recover from fatal generation error (OOM, Metal crash).
 
@@ -3549,6 +3580,14 @@ class Scheduler:
                     )
                 output.finished_request_ids = aborted_ids
                 break
+
+        # (#105) schedule-time rejections ride this step's outputs
+        if self._rejected_outputs:
+            rejected, self._rejected_outputs = self._rejected_outputs, []
+            output.outputs = list(output.outputs) + rejected
+            output.finished_request_ids = set(output.finished_request_ids) | {
+                o.request_id for o in rejected
+            }
 
         # Clear finished tracking for next step
         old_finished = self.finished_req_ids
