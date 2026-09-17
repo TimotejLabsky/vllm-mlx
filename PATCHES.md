@@ -3293,3 +3293,32 @@ No OpenAI client checks `finish_reason == "error"`. LiteLLM (`num_retries: 0` in
 - **Red then green.** 8 tests in `tests/test_fork_invariants.py`, all red with `vllm_mlx/` at `9b44443`: the helper's three cases; recovery through the real `step()` naming `oom` vs `generation_error` and counting itself; `BatchedEngine.generate` / `stream_generate` raising with the good chunks preserved; 503 + `Retry-After` and a source-level assertion that every `EngineBusy` handler has a sibling; chat stream before-first-token **and** mid-stream — exactly one frame, `code == 503`, message matching opencode's retry regex, `[DONE]` terminated, **no chunk carrying any `finish_reason`**, no raise, tracker `result="error"`, no traceback logged; completions stream; Anthropic dialect, with the #91 generic shapes pinned unchanged.
 - **Full suite:** 3701 passed / 31 skipped / 30 deselected (#103 baseline 3693 + 8). `ruff` clean (CI invocation); no new `black` findings.
 - **Live gate after deploy:** a recovery is rare after #103, so the gate is passive — the next `[generation_error_recovery]` line must coincide with `generation_recoveries` incrementing in `/v1/status`, a 503 (non-stream) or an `aborted by the engine` WARNING (stream) in the route log, and the opencode session recording an error / retry rather than an empty assistant message. No probe is needed; do not manufacture an OOM on the live route.
+
+## 105. `patch: solo-prefill-guard` — a request that runs alone is examined too
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`solo_prefill_verdict` + seam, envs, stats), `vllm_mlx/scheduler.py` (one hook in `_schedule_waiting`, `_reject_at_schedule`, output merge in `step`), `vllm_mlx/memory_pressure.py` (`ceiling_bytes`), `tests/test_fork_invariants.py` (+7).
+
+**The hole.** Every admission gate (#39 pad waste, #40 KV budget, #102 bpt floor, the watermark) prices **co-batching**: `should_defer_cobatch` opens with `if not scheduler.running: return False`, and the scheduler only calls it `and self.running`. A request that finds nothing running is admitted unexamined — the "progress guarantee". #48 relief acts *between* steps, and one prefill chunk realises the whole 64-layer graph in a single `mx.eval` (measured active→peak **+6.7 GB** on the 27B-4bit, 2026-09-16), so a solo prefill whose KV + chunk transient does not fit below the OOM wall dies mid-step, where nothing can help — and `generation_error_recovery` takes the process's in-flight state with it. **No clean-process incident yet**: the "solo OOMs" of 2026-09-16 were #103's unaccounted memory. This is defence, built now because #104 finally gives a schedule-time rejection an honest client-visible shape.
+
+**Design (inert by default; armed by `VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB`).** When a waiting request would run alone:
+
+    need  = tokens_to_prefill × max(learned bpt, BPT_FLOOR_KB) + SOLO_TRANSIENT_MB
+    limit = recommended_working_set × SOLO_CEILING_PCT/100        (default 95)
+    admit if  mx.get_active_memory() + need ≤ limit
+
+- **`tokens_to_prefill`, not the prompt length**: a restored prefix is already resident (inside `active`).
+- **Against the OOM wall, not the relief watermark** — crossing the watermark is normal for a deep solo prefill and relief handles it.
+- **Make room before rejecting.** Over the limit, everything that is pure cache goes first — the SSD spill backlog (#103 `drop_backlog`), then the bag LRU-first, `mx.clear_cache()` after each — and the projection is re-checked. Rejecting while holding droppable memory would be a false 503. (#37's evicted-donor store falls back to a full copy; pinned by a test.)
+- **Only what still cannot fit is rejected**: finished at schedule time with `error_kind="insufficient_memory"` → #104's `GenerationAborted` → 503 + `Retry-After` / the 503-shaped stream frame. It fails *before* costing a prefill, so a client's bounded retries are cheap; the WARNING carries the full arithmetic. `continue`, not `break`: the queue behind it is still examined.
+- Fails open on any error, off-Metal, or without a bytes/token estimate (set `BPT_FLOOR_KB`, as the #102 routes already do).
+
+Stats: `solo_relief_passes`, `solo_rejections` (→ `/v1/status` cache block).
+
+**Calibration (arming is a config change — not done in this patch).** Qwen3.8-27B-4bit: limit = 95% × 64.4 GB = 61.2 GB; weights ≈ 15 GB; `TRANSIENT_MB=8192` (measured 6.7 GB + margin); 64 KiB/token. With the bag emptied the largest admissible cold solo prefill is (61.2 − 15 − 8) GB / 64 KiB ≈ **560K tokens** — far above the route's 170K prompt ceiling, so on this route the guard never rejects; its effect is the *pre-emptive* make-room pass (e.g. 45 GB active + a 66K cold prefill = 57.6 GB: admitted untouched; 50 GB active → the bag is shed before the prefill starts instead of mid-ramp). The routes it would actually bound are the 45 GB-weight class (Coder-Next / Next-80B: 61.2 − 45 − transient leaves single-digit GB for KV — the same region as the measured 137K-safe / 148K-crash repeat-prefill wall, #53). **Measure that class's chunk transient and bytes/token before arming it there.**
+
+**Upstream:** fork-owned (rides the #34-series branch).
+
+**Verification:**
+- **Red then green.** 7 tests, all red with `vllm_mlx/` at `3bb72fe`: inert unless armed; a fitting request is admitted untouched; **makes room first** (backlog dropped once, then two evictions, then admit — 0 rejections); rejects only what cannot fit with the bag emptied; prices `remaining_tokens`, not the prompt; not consulted while anything is running; scheduler wiring through the real `step()` — the rejected row never enters the batch, its output carries `error`/`insufficient_memory`, its pending ladder is discarded, the request queued behind it passes the guard, and #104's helper turns the output into `GenerationAborted(kind="insufficient_memory")`.
+- **Full suite:** 3713 passed / 31 skipped / 30 deselected (#104 baseline 3701 + 5 invariants + 7). `ruff` clean; no new `black` findings.
+- **Live gate after arming:** `solo_rejections` stays 0 on the 27B routes (by the arithmetic above); `solo_relief_passes` > 0 should coincide with *fewer* mid-prefill `memory pressure: evicted` lines, not more.
