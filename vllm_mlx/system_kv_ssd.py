@@ -79,6 +79,11 @@ class SystemKVSSDStats:
     promote_misses: int = 0
     read_failures: int = 0
     evictions: int = 0
+    # Queued spills dropped by memory-pressure relief (drop_backlog) — kept
+    # apart from spill_drops (the enqueue-time cap) so the two causes read
+    # separately in /v1/status.
+    backlog_drops: int = 0
+    busy_writes: int = 0  # spills written while the engine was busy
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -96,6 +101,8 @@ class SystemKVSSDStats:
             "promote_misses": self.promote_misses,
             "read_failures": self.read_failures,
             "evictions": self.evictions,
+            "backlog_drops": self.backlog_drops,
+            "busy_writes": self.busy_writes,
         }
 
 
@@ -115,6 +122,13 @@ class SystemKVSSDConfig:
     # oversized spill is always admitted when the queue is empty so huge
     # prefixes can still persist.
     max_queued_gb: float = 12.0
+    # Defer-until-idle assumes idle windows exist. A batched route under
+    # sustained agent load never goes idle, so the backlog sat at the cap for
+    # hours (2026-09-17: 4 writes vs 30 drops in 3 h, ~12 GB pinned). After a
+    # queued spill has waited this long the writer may go ahead while busy,
+    # provided ``can_write_busy`` agrees (the caller's "not under memory
+    # pressure" check). 0 = never write while busy (the SimpleEngine default).
+    busy_write_after_s: float = 0.0
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
@@ -281,6 +295,7 @@ class SystemKVSSDStore:
         self,
         config: SystemKVSSDConfig,
         idle_check=None,
+        can_write_busy=None,
     ) -> None:
         self._config = config
         self._cache_dir = config.cache_dir
@@ -305,6 +320,15 @@ class SystemKVSSDStore:
         # work until the engine is idle; queued spills drain in the gaps
         # between turns and on close().
         self._idle_check = idle_check
+        # ``busy_write_after_s`` escape hatch (see the config field).
+        self._can_write_busy = can_write_busy
+        # Bumped by drop_backlog(): the item the writer already dequeued and
+        # is holding in its idle-wait carries the generation it was taken
+        # under, so relief can drop that one too (it is pinned bytes like
+        # the rest of the queue).
+        self._backlog_gen = 0
+        self._held_bytes = 0  # nbytes of the spill the writer is holding
+        self._wake = threading.Event()
 
     # ---- writer lifecycle -------------------------------------------------
 
@@ -418,16 +442,32 @@ class SystemKVSSDStore:
                 continue
             if item is None:  # poison pill
                 break
+            with self._lock:
+                gen = self._backlog_gen
+                self._held_bytes = item[-1]
+            dropped = False
+            wrote_busy = False
             # Wait for an idle window before the heavy serialization —
             # unless we're draining at shutdown (idle never comes then).
             if self._idle_check is not None and not draining:
+                waiting_since = time.monotonic()
                 while not self._writer_stop.is_set():
+                    with self._lock:
+                        dropped = self._backlog_gen != gen
+                    if dropped:
+                        break
                     try:
                         if self._idle_check():
                             break
                     except Exception:
                         break
-                    time.sleep(1.0)
+                    if self._may_write_busy(waiting_since):
+                        wrote_busy = True
+                        break
+                    # drop_backlog() sets the event so a relieved backlog
+                    # leaves memory now, not at the next poll.
+                    self._wake.wait(1.0)
+                    self._wake.clear()
                     # If close() queued the pill behind this item, switch to
                     # drain mode so shutdown isn't blocked by a busy engine.
                     if not self._spill_queue.empty():
@@ -443,15 +483,76 @@ class SystemKVSSDStore:
             # dropped) — release its share of the pinned-byte budget.
             with self._lock:
                 self._queued_bytes = max(0, self._queued_bytes - nbytes)
+                self._held_bytes = 0
+                if dropped:
+                    self._stats.backlog_drops += 1
+                elif wrote_busy:
+                    self._stats.busy_writes += 1
             try:
-                self._write_entry(
-                    tokens, tensors, layer_meta, ckpt_meta,
-                    snap_meta, kinds, nbytes,
-                )
+                if not dropped:
+                    self._write_entry(
+                        tokens, tensors, layer_meta, ckpt_meta,
+                        snap_meta, kinds, nbytes,
+                    )
             except Exception:
                 logger.exception(
                     "[system_kv_ssd] failed to write entry (%d tokens)", len(tokens)
                 )
+            finally:
+                # Loop locals outlive the iteration: without this the writer
+                # kept the last snapshot's arrays referenced until the NEXT
+                # spill arrived — on an empty queue, indefinitely.
+                item = tensors = None
+
+    def _may_write_busy(self, waiting_since: float) -> bool:
+        after = self._config.busy_write_after_s
+        if after <= 0 or time.monotonic() - waiting_since < after:
+            return False
+        if self._can_write_busy is None:
+            return True
+        try:
+            return bool(self._can_write_busy())
+        except Exception:
+            return False
+
+    def drop_backlog(self) -> int:
+        """Drop every queued-but-unwritten spill; returns the bytes released.
+
+        Memory-pressure relief calls this BEFORE evicting resident entries:
+        the backlog is pinned unified memory that serves no request (the
+        entry it mirrors is still in the bag, or already gone), so it is the
+        cheapest thing to give back. The spill the writer is holding in its
+        idle-wait is dropped too, via the generation bump."""
+        released = 0
+        pill = False
+        with self._lock:
+            self._backlog_gen += 1
+            released += self._held_bytes
+            while True:
+                try:
+                    queued = self._spill_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if queued is None:
+                    pill = True
+                    continue
+                nbytes = queued[-1]
+                released += nbytes
+                self._queued_bytes = max(0, self._queued_bytes - nbytes)
+                self._stats.backlog_drops += 1
+        if pill:
+            try:
+                self._spill_queue.put_nowait(None)
+            except queue.Full:
+                self._writer_stop.set()
+        self._wake.set()
+        if released:
+            logger.warning(
+                "[system_kv_ssd] dropped %.1f GB of queued spills under "
+                "memory pressure",
+                released / _BYTES_PER_GB,
+            )
+        return released
 
     def close(self) -> None:
         """Drain pending spills, stop the writer, close the index. Idempotent.
@@ -752,6 +853,10 @@ class SystemKVSSDStore:
 
     def get_stats(self) -> dict:
         d = self._stats.to_dict()
+        # The backlog is resident unified memory nothing else accounts for.
+        with self._lock:
+            d["queued_bytes"] = self._queued_bytes
+        d["queue_depth"] = self._spill_queue.qsize()
         try:
             d["entry_count"] = self._index.get_entry_count()
             d["total_bytes"] = self._index.get_total_bytes()

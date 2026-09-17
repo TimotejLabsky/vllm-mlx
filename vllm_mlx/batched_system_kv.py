@@ -276,6 +276,7 @@ class BatchedSystemKV:
         self.pressure_evictions = 0
         self.pressure_skipped_stores = 0
         self.pressure_cache_clears = 0  # watermark breaches relieved (#53)
+        self.pressure_backlog_drops = 0  # SSD spill backlogs relieved (#103)
 
         self.hits = 0
         self.misses = 0
@@ -305,9 +306,27 @@ class BatchedSystemKV:
                 cache_dir = os.path.join(
                     ssd_base, "batched-" + _model_slug(tokenizer)
                 )
+                # (#103) The store's defaults (12 GB backlog, write only when
+                # idle) were sized for SimpleEngine's turn gaps. A batched
+                # route under agent load has none: the backlog sat at the cap
+                # for hours, ~12 GB the bag never accounted for and relief
+                # never touched. Smaller cap, and a bounded wait after which
+                # a spill may be written while busy if memory allows.
+                queued_gb = float(
+                    os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_MAX_QUEUED_GB", "4") or 4
+                )
+                busy_after = float(
+                    os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_BUSY_WRITE_S", "30") or 0
+                )
                 self._ssd = SystemKVSSDStore(
-                    SystemKVSSDConfig(cache_dir=cache_dir, max_size_gb=max_gb),
+                    SystemKVSSDConfig(
+                        cache_dir=cache_dir,
+                        max_size_gb=max_gb,
+                        max_queued_gb=queued_gb,
+                        busy_write_after_s=busy_after,
+                    ),
                     idle_check=idle_check,
+                    can_write_busy=lambda: not self.under_pressure(),
                 )
                 self._ssd.start_writer()
                 logger.info(
@@ -593,9 +612,12 @@ class BatchedSystemKV:
             # short request (warmups, titles) would otherwise land here.
             self.discard_pending(request_id)
             return False
-        if (
-            self.under_pressure() or self._store_would_overshoot(tokens_list)
-        ) and not self._may_grow(request_id, tokens_list):
+        refusal = None
+        if self.under_pressure():
+            refusal = "over_watermark"
+        elif self._store_would_overshoot(tokens_list):
+            refusal = "copy_would_overshoot"
+        if refusal and not self._may_grow(request_id, tokens_list):
             # A non-grown store materializes a full-chain snapshot copy
             # (multi-GB at deep context) — the copy itself is the spike, so
             # the gate prices it in (#48 crash math). Skip it; the SSD tier
@@ -605,9 +627,10 @@ class BatchedSystemKV:
             self.discard_pending(request_id)
             logger.info(
                 "[batched_system_kv] skipping store under memory pressure "
-                "request=%s tokens=%d",
+                "request=%s tokens=%d reason=%s",
                 request_id[:12],
                 len(tokens_list),
+                refusal,
             )
             return False
         try:
@@ -1047,10 +1070,19 @@ class BatchedSystemKV:
         def _count_clear() -> None:
             self.pressure_cache_clears += 1
 
+        def _drop_spill_backlog() -> bool:
+            # (#103) Queued spills are resident copies no request can use —
+            # give them back before any entry a chain is about to extend.
+            if self._ssd is None or not self._ssd.drop_backlog():
+                return False
+            self.pressure_backlog_drops += 1
+            return True
+
         _, evicted = self._pressure.relieve(
             self._drop_lru_entry,
             log_label="batched_system_kv",
             on_cache_clear=_count_clear,
+            before_evict=_drop_spill_backlog,
         )
         return evicted
 
@@ -1095,6 +1127,15 @@ class BatchedSystemKV:
                 "pressure_evictions": self.pressure_evictions,
                 "pressure_skipped_stores": self.pressure_skipped_stores,
                 "pressure_cache_clears": self.pressure_cache_clears,
+                "pressure_backlog_drops": self.pressure_backlog_drops,
+                # (#103) memory held OUTSIDE the entries: in-flight checkpoint
+                # ladders. Must read 0 whenever nothing is running or waiting
+                # — a non-zero idle value is a leaked ladder.
+                "pending_ladders": len(self._pending),
+                "pending_ladder_mb": sum(
+                    ckpt_bytes(ladder) for ladder in self._pending.values()
+                )
+                / (1024 * 1024),
                 "timing_verdict": self._timing.verdict_totals(),
                 "entry_count": len(self._entries),
                 "capacity": self.slots,
@@ -1173,7 +1214,11 @@ def promote_ssd_pending(scheduler) -> None:
     ssd_pending requests. Runs on the executor thread — the blob read +
     array realize happen here, never on the event loop."""
     hybrid_kv = scheduler.hybrid_kv
-    for request in scheduler.waiting:
+    # (#103) Snapshot: add_request appends to ``waiting`` on the event loop
+    # while this runs on the executor — iterating the live deque raised
+    # "deque mutated during iteration" (15x on 2026-09-16), and that raise
+    # took the whole batch down through generation_error_recovery.
+    for request in list(scheduler.waiting):
         if getattr(request, "cache_hit_type", None) != "ssd_pending":
             continue
         candidate = getattr(request, "_ssd_candidate", None)
