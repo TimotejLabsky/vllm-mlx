@@ -1161,3 +1161,133 @@ def test_106_a_deferred_request_is_not_materialised_an_admitted_one_is(monkeypat
     scheduler._schedule_waiting()  # fits now: past the gates -> materialised
     assert request.cache_hit_type == "system_kv"
     assert request.prompt_cache is not None and kv.lazy_restores == 1
+
+
+# ------------------- #107 a queued request keeps its entry, or gets it from SSD
+
+
+def test_107_a_lazy_miss_falls_back_to_the_ssd_tier(monkeypatch, tmp_path):
+    """2026-09-21 stress test: a deep follow-up matched its chain at enqueue,
+    waited ~10 min behind the KV budget, lost the RAM entry - and re-prefilled
+    60K tokens cold (18 min) although the entry sat on SSD, 0.5 s away. The
+    eager miss path probes SSD; the lazy one did not."""
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    writer.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    writer.close()  # drain the spill to disk
+
+    kv = _make_ssd_cache(monkeypatch, tmp_path)
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))  # resident copy
+    request = _queued("waited", GROWN)
+    bkv.fetch_for_request(kv, request)
+    assert request.cache_hit_type == "system_kv_pending"
+    peeked = request.cached_tokens
+
+    with kv._lock:  # the wait: RAM loses the entry (relief takes pins too)
+        kv._entries.clear()
+    assert kv.peek(GROWN) == 0
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.cached_tokens == peeked and request.prompt_cache is not None
+    assert kv.lazy_ssd_fallbacks == 1 and kv.lazy_restore_misses == 0
+    assert kv.stats()["ssd_promotes"] == 1
+    kv.close()
+
+
+def test_107_no_ssd_probe_when_the_entry_is_still_resident(monkeypatch, tmp_path):
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    kv = _make_ssd_cache(monkeypatch, tmp_path)
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    request = _queued("prompt", GROWN)
+    bkv.fetch_for_request(kv, request)
+    kv.check_ssd = MagicMock(side_effect=AssertionError("disk probe on a RAM hit"))
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+
+    assert request.cache_hit_type == "system_kv" and kv.lazy_ssd_fallbacks == 0
+    kv.close()
+
+
+def test_107_a_queued_requests_entry_is_pinned_until_it_is_admitted(monkeypatch):
+    kv = _lazy_kv(monkeypatch)
+    request = _queued("waiting", GROWN)
+    bkv.fetch_for_request(kv, request)
+    assert kv.stats()["pinned_entries"] == 1
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+    assert kv.stats()["pinned_entries"] == 0  # released at admission
+
+    aborted = _queued("aborted", GROWN)
+    bkv.fetch_for_request(kv, aborted)
+    assert kv.stats()["pinned_entries"] == 1
+    kv.discard_pending("aborted")  # every abort path goes through this
+    assert kv.stats()["pinned_entries"] == 0 and kv._peeked == {}
+
+
+def test_107_budget_eviction_prefers_entries_nobody_is_waiting_for(monkeypatch):
+    """The 09-21 mechanism: an SSD promote for one chain pushed out the LRU
+    entry - which a queued request had matched minutes earlier."""
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_SLOTS", "2")
+    kv = _lazy_kv(monkeypatch)  # holds TOKENS
+    kv.store("other", DISJOINT, _donor_at(len(DISJOINT)))
+    bkv.fetch_for_request(kv, _queued("waiting", GROWN))  # pins TOKENS...
+    assert kv.fetch(DISJOINT + [1, 2, 3]) is not None  # ...then DISJOINT is MRU
+
+    third = list(range(50000, 50800))
+    kv.store("third", third, _donor_at(len(third)))
+
+    kept = sorted(e["tokens"][0] for e in kv._entries.values())
+    assert kept == [TOKENS[0], third[0]]  # the pinned LRU entry survived
+
+    # with every older entry pinned the budget still holds - and the entry
+    # just inserted is never its own victim
+    bkv.fetch_for_request(kv, _queued("waiting-2", third + [9, 9, 9]))
+    fourth = list(range(60000, 60800))
+    kv.store("fourth", fourth, _donor_at(len(fourth)))
+    assert kv.stats()["entry_count"] == 2
+    assert fourth[0] in [e["tokens"][0] for e in kv._entries.values()]
+
+
+def test_107_making_room_spares_pinned_entries_but_relief_does_not(monkeypatch):
+    kv = _projected_kv(monkeypatch, base_mb=20)
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    kv.lazy_restore = True
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    _charge_entries(kv)
+    bkv.fetch_for_request(kv, _queued("queued", GROWN))  # pins r1 (the LRU)
+    assert kv.fetch(DISJOINT + [1]) is not None  # r2 becomes MRU, r1 LRU
+    scheduler, candidate = _replay_0917(kv)
+
+    # 60 active + 41 > 95: one entry must go. LRU is r1 - but it is pinned.
+    assert bkv.should_defer_cobatch(scheduler, candidate) is False
+    assert [e["tokens"][0] for e in kv._entries.values()] == [TOKENS[0]]
+
+    # only a pinned entry left, still over -> wait, do not take it
+    kv2 = _projected_kv(monkeypatch, base_mb=45)
+    kv2.lazy_restore = True
+    kv2.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    _charge_entries(kv2)
+    bkv.fetch_for_request(kv2, _queued("queued", GROWN))
+    scheduler2, candidate2 = _replay_0917(kv2)
+    assert bkv.should_defer_cobatch(scheduler2, candidate2) is True  # 65+41 > 95
+    assert kv2.stats()["entry_count"] == 1 and kv2.projected_relief_passes == 0
+
+    # ...but against a real OOM everything is fair game
+    assert kv2._drop_lru_entry() is True and kv2.stats()["entry_count"] == 0
+
+
+def test_107_solo_guard_takes_pinned_entries_rather_than_reject(monkeypatch):
+    """A false 503 is worse than a queued request's cold prefill."""
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.peek(GROWN, request_id="queued")  # pinned
+    # active 40; need 60 -> 100 > 95. Sparing the pin would reject; it must not.
+    assert kv.solo_prefill_verdict(800) is None
+    assert kv.stats()["entry_count"] == 0 and kv.solo_rejections == 0
