@@ -129,6 +129,40 @@ its native SDPA ext was not even built on this box. What oMLX leaves on
 the table for us to consider is its **prefill** kernel drawer — see the
 watch list (GDN blocked_seq).
 
+### 2026-09-17/21 — agent-turn THROUGHPUT under concurrent deep chains: it is queueing and cache reach, not kernels
+
+Not a decode/prefill kernel lever, but it is where a multi-agent workload's
+wall time actually went, so it belongs next to lever 2 ("continuous batching
+as a speed lever: ~1.2× aggregate"). That verdict stands for *decode
+tokens/s*. For **turns per minute** on Qwen3.8-27B-4bit under idealplace-style
+review load (turns of 18–70K prompt tokens, ~1K generated), measured on the
+clean process (PATCHES.md #103+):
+
+- **The engine sat at one seat with a queue behind it.** `running=1` in 175 of
+  191 samples, 133 with requests waiting; the cache already covered 76 % of
+  prompt tokens and the median turn prefilled 5.1K tokens (~15 s) — yet TTFT
+  was median 137 s / p90 479 s, 34 % of turns past opencode's 300 s timeout.
+  **72 % of all turn time was TTFT, and almost all of that was queue wait.**
+- **`KV_BUDGET_MB` 4096 → 8192**: mean running 1.1 → 3.1 rows, **0.49 → 0.89
+  turns/min (~1.8×)**, TTFT > 300 s 34 % → 11 % (22 % over the rest of that
+  afternoon). Median TTFT did *not* improve (a prefill now interleaves with
+  2–3 decoding rows) — the win is the tail and the throughput. It also caused
+  three OOMs until #106 made admission see real memory; do not raise a budget
+  on arithmetic that assumes relief can act inside a step.
+- **Cache reach for DEEP chains is decided by the SSD tier, not the RAM bag.**
+  Under this load the bag turns over completely (12 evictions in two minutes).
+  Stress test, 5 × 60K-token chains, deep follow-ups: **1,150 s → 463 s →
+  123 s** as #107 / the 9 GB spill-queue cap / #108 landed — every hit in the
+  final run arrived through an SSD promote (0.5–0.9 s for a 60K entry) against
+  a 60K cold prefill of ~12 min (two concurrent rows ≈ 83 tok/s each).
+  Reproduce with `scripts/fork/stress_deep_chains.py`.
+- **Closed by the same data:** value-/session-aware eviction (the #85 verdict
+  delta on the clean process is 2.9 % evict-to-reuse; the earlier 25 % measured
+  relief thrash). What would move the needle next is *spill reliability and
+  size* (SSD checkpoint dedup: every entry under one system prompt
+  re-serialises the same ladder; a short entry is 3/4 fp32 GDN state), not a
+  smarter RAM policy.
+
 ## Watch list / open items
 
 - **GDN blocked_seq prefill kernel (from oMLX): REFUTED at the kill gate
