@@ -72,6 +72,29 @@ def _conversation(client):
     return outputs
 
 
+def _interleaved(client):
+    """Two conversations taking turns on a route with ONE cache slot: each
+    turn evicts the other chain from RAM, so every second turn has to come
+    back from the SSD tier (#36 promote, and #107's lazy fallback path)."""
+    chats = {
+        # diverge from the FIRST token: a shared system prompt would give a
+        # shallow RAM hit on the other chain and nothing would touch the disk
+        name: [{"role": "system", "content": f"Project {name} ({name * 3}). " + SYSTEM}]
+        for name in ("alpha", "beta")
+    }
+    outputs = []
+    for turn in TURNS[:2]:
+        for name in chats:
+            chats[name].append({"role": "user", "content": turn})
+            r = client.post(f"{BASE}/v1/chat/completions", json=_body(chats[name]))
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"] or ""
+            outputs.append(text)
+            chats[name].append({"role": "assistant", "content": text})
+            time.sleep(2.0)  # let the write-through spill land
+    return outputs
+
+
 def _burst(client, n=4):
     def one(i):
         messages = [
@@ -88,6 +111,7 @@ def _burst(client, n=4):
 
 def _run_server(env_extra, log_path):
     env = dict(os.environ, VLLM_MLX_BATCHED_SYSTEM_KV="1", **env_extra)
+    env.setdefault("VLLM_MLX_SSD_SYSTEM_KV_GB", "4")
     env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
     log = open(log_path, "w")
     proc = subprocess.Popen(
@@ -122,12 +146,14 @@ def _session(env_extra, label, workdir):
             warm = _conversation(client)  # same prompts again: pure restores
             burst = _burst(client)
             burst_again = _burst(client)
+            interleaved = _interleaved(client) if env_extra.get("_SSD") else []
             status = client.get(f"{BASE}/v1/status").json()
         return {
             "cold": cold,
             "warm": warm,
             "burst": burst,
             "burst_again": burst_again,
+            "interleaved": interleaved,
             "status": status,
             "log": open(log_path).read(),
         }
@@ -180,6 +206,24 @@ def main() -> int:
         ]
         print(f"INFO  {label} restores: {restores[:4]}")
 
+    ssd_env = {"_SSD": "1", "VLLM_MLX_SYSTEM_KV_SLOTS": "1"}
+    eager_ssd = _session(
+        {**ssd_env, "VLLM_MLX_SSD_SYSTEM_KV_DIR": os.path.join(workdir, "ssd-eager")},
+        "eager-ssd", workdir,
+    )  # fmt: skip
+    lazy_ssd = _session(
+        {
+            **ssd_env,
+            "VLLM_MLX_SSD_SYSTEM_KV_DIR": os.path.join(workdir, "ssd-lazy"),
+            "VLLM_MLX_BATCHED_LAZY_RESTORE": "1",
+            "VLLM_MLX_BATCHED_PROJECTED_ADMISSION": "1",
+            "VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB": "512",
+            "VLLM_MLX_BATCHED_BPT_FLOOR_KB": "64",
+        },
+        "lazy-ssd", workdir,
+    )  # fmt: skip
+    ssd_cache = lazy_ssd["status"].get("cache", {})
+
     cache = lazy["status"].get("cache", {})
     # Informational, NOT a gate for #106: a warm turn restores at a different
     # position than the first pass did, so the tail is prefilled in different
@@ -213,6 +257,20 @@ def main() -> int:
         f"projected_defers={cache.get('projected_defers')} "
         f"projected_relief_passes={cache.get('projected_relief_passes')}",
     )
+    check(
+        "one-slot route: turns served from the SSD tier, lazy == eager",
+        lazy_ssd["interleaved"] == eager_ssd["interleaved"]
+        and ssd_cache.get("ssd_promotes", 0) > 0,
+        f"ssd_promotes={ssd_cache.get('ssd_promotes')} "
+        f"lazy_restores={ssd_cache.get('lazy_restores')} "
+        f"lazy_ssd_fallbacks={ssd_cache.get('lazy_ssd_fallbacks')} "
+        f"pinned_entries={ssd_cache.get('pinned_entries')}",
+    )
+    check(
+        "no pin is left behind once the route is idle",
+        cache.get("pinned_entries", 0) == 0 and ssd_cache.get("pinned_entries", 0) == 0,
+    )
+    lazy["log"] += lazy_ssd["log"]
     bad = [
         line
         for line in lazy["log"].splitlines()
