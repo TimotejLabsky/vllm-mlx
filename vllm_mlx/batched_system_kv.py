@@ -274,6 +274,29 @@ class BatchedSystemKV:
         self.solo_ceiling_pct = _env_int("VLLM_MLX_BATCHED_SOLO_CEILING_PCT", 95)
         self.solo_relief_passes = 0
         self.solo_rejections = 0
+        # (#106) Two holes the 2026-09-17 OOMs (63.0-63.6 GB, three times in
+        # 2.5 h) went through with KV_BUDGET_MB=8192, all with one signature:
+        # a ~65-70K row decoding, a second deep row co-batched, and a 67-72K
+        # token cache RESTORE realised for a request that was still WAITING.
+        #
+        # LAZY_RESTORE: add_request only MATCHES (and LRU-touches the entry);
+        # the multi-GB restored copy is built on the executor at the moment
+        # the request is admitted. Before, every queued request pinned its
+        # restored cache (4-5 GB at 70K) for its whole wait, in no budget.
+        #
+        # PROJECTED_ADMISSION: the co-batch gates price padded KV against a
+        # budget but never look at what the process already holds. Project
+        # active + merged padded copy + the new row's growth + its restore +
+        # one chunk's transient against the OOM wall (the #105 knobs), make
+        # room first, and DEFER - never reject - what still does not fit.
+        self.lazy_restore = _env_int("VLLM_MLX_BATCHED_LAZY_RESTORE", 0) > 0
+        self.projected_admission = (
+            _env_int("VLLM_MLX_BATCHED_PROJECTED_ADMISSION", 0) > 0
+        )
+        self.lazy_restores = 0
+        self.lazy_restore_misses = 0
+        self.projected_defers = 0
+        self.projected_relief_passes = 0
         # Ground-truth backstop: defer co-batching while MLX active memory
         # exceeds this percentage of the device's recommended working set.
         self.mem_watermark_pct = _env_int("VLLM_MLX_BATCHED_MEM_WATERMARK_PCT", 0)
@@ -989,6 +1012,47 @@ class BatchedSystemKV:
         )
         return fresh, remaining, pos
 
+    def peek(self, tokens: list) -> int:
+        """(#106) The restore position ``fetch`` WOULD use, without building
+        anything: no state slices, no copy, no counters. 0 = no usable match.
+
+        LRU-touches the matched entry, so the chain a queued request is about
+        to extend outlives an idle one while it waits."""
+        tokens = list(tokens)
+        with self._lock:
+            best_key, best_lcp = None, 0
+            for key, entry in self._entries.items():
+                lcp = common_prefix_len(tokens, entry["tokens"])
+                if lcp > best_lcp:
+                    best_lcp, best_key = lcp, key
+            if best_key is None or best_lcp < self.partial_min:
+                return 0
+            entry = self._entries[best_key]
+            plan = {
+                "d": best_lcp,
+                "donor_len": len(entry["tokens"]),
+                "snapshot": entry["snapshot"],
+                "metas": entry["metas"],
+                "kinds": entry["kinds"],
+                "checkpoints": entry["checkpoints"],
+            }
+            pos, _states, _metas = select_restore_pos(
+                plan, min(best_lcp, len(tokens) - 1)
+            )
+            if pos < self.partial_min:
+                return 0
+            self._entries.move_to_end(best_key)
+            return pos
+
+    def restore_bytes(self, cached_tokens: int) -> float:
+        """What materialising a restore of ``cached_tokens`` will add to
+        active memory: sliced attention KV + one copy of the fixed
+        checkpoint-class state."""
+        if cached_tokens <= 0:
+            return 0.0
+        bpt = max(self.bytes_per_token(), float(self.bpt_floor_kb * 1024))
+        return cached_tokens * bpt + self._fixed_hint
+
     def bytes_per_token(self) -> float:
         """Per-token KV footprint learned from the newest resident entry
         (≈200 KB/token on a 27B-4bit). 0.0 until an entry has EVER been
@@ -1155,6 +1219,81 @@ class BatchedSystemKV:
         )
         return "insufficient_memory"
 
+    def projected_cobatch_verdict(
+        self, need_bytes: float, describe: str
+    ) -> Optional[str]:
+        """(#106) Would admitting this row beside the running ones cross the
+        OOM wall? None = admit; otherwise the defer reason.
+
+        ``need_bytes`` is everything the admission adds on top of current
+        active memory. Over the limit, pure cache is given back first - the
+        SSD spill backlog, then bag entries LRU-first but only down to the
+        RAM floor (a second seat is not worth an empty cache; relief will
+        take the rest if real pressure arrives) - and the projection is
+        re-checked. What still does not fit WAITS: rows finish and free their
+        KV, so deferral always makes progress. Inert unless armed; shares
+        #105's TRANSIENT_MB / CEILING_PCT."""
+        if not self.projected_admission or self.solo_transient_mb <= 0:
+            return None
+        ceiling = self._pressure.ceiling_bytes()
+        if not ceiling:
+            return None
+        limit = ceiling * self.solo_ceiling_pct / 100
+        need = need_bytes + self.solo_transient_mb * 1024 * 1024
+        try:
+            import mlx.core as mx
+
+            active = mx.get_active_memory()
+            if active + need <= limit:
+                return None
+            relieved = False
+            floor = self.ram_mb * 1024 * 1024
+            with self._lock:
+                bag = sum(e["bytes"] for e in self._entries.values())
+            backlog = 0
+            if self._ssd is not None:
+                backlog = int(self._ssd.get_stats().get("queued_bytes", 0) or 0)
+            sheddable = max(0, bag - floor) + backlog
+            if active + need - sheddable > limit:
+                # Shedding cannot close the gap: keep the cache (it holds the
+                # entry this very request will restore from) and just wait.
+                self.projected_defers += 1
+                return (
+                    f"projected peak {(active + need) / 1e9:.1f} GB > "
+                    f"{self.solo_ceiling_pct}% of {ceiling / 1e9:.1f} GB working "
+                    f"set ({active / 1e9:.1f} GB active + {describe} + "
+                    f"{self.solo_transient_mb} MB chunk transient; only "
+                    f"{sheddable / 1e9:.1f} GB of cache could be shed)"
+                )
+            if backlog and self._ssd.drop_backlog():
+                self.pressure_backlog_drops += 1
+                relieved = True
+            mx.clear_cache()
+            while mx.get_active_memory() + need > limit:
+                with self._lock:
+                    bag = sum(e["bytes"] for e in self._entries.values())
+                if bag <= floor or not self._drop_lru_entry():
+                    break
+                relieved = True
+                mx.clear_cache()
+            active = mx.get_active_memory()
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] projected admission failed open", exc_info=True
+            )
+            return None
+        if relieved:
+            self.projected_relief_passes += 1
+        if active + need <= limit:
+            return None
+        self.projected_defers += 1
+        return (
+            f"projected peak {(active + need) / 1e9:.1f} GB > "
+            f"{self.solo_ceiling_pct}% of {ceiling / 1e9:.1f} GB working set "
+            f"({active / 1e9:.1f} GB active + {describe} + "
+            f"{self.solo_transient_mb} MB chunk transient)"
+        )
+
     def _may_grow(self, request_id: str, tokens_list: list) -> bool:
         """Cheap pre-check of #37's grow path: is the request's donor entry
         still resident with a usable common prefix? (kinds are confirmed
@@ -1199,6 +1338,10 @@ class BatchedSystemKV:
                 "pressure_backlog_drops": self.pressure_backlog_drops,
                 "solo_relief_passes": self.solo_relief_passes,
                 "solo_rejections": self.solo_rejections,
+                "lazy_restores": self.lazy_restores,
+                "lazy_restore_misses": self.lazy_restore_misses,
+                "projected_defers": self.projected_defers,
+                "projected_relief_passes": self.projected_relief_passes,
                 # (#103) memory held OUTSIDE the entries: in-flight checkpoint
                 # ladders. Must read 0 whenever nothing is running or waiting
                 # — a non-zero idle value is a leaked ladder.
@@ -1261,7 +1404,18 @@ def maybe_create(model: Any, tokenizer: Any, idle_check=None):
 def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     """add_request hook: hybrid-safe checkpoint restore (#34) with the
     index-only SSD cold-tier probe on miss (#36 — the blob read happens on
-    the executor via promote_ssd_pending)."""
+    the executor via promote_ssd_pending).
+
+    With LAZY_RESTORE (#106) a hit is only MATCHED here; the copy is built by
+    ``materialize_pending_restore`` when the request is admitted."""
+    if getattr(hybrid_kv, "lazy_restore", False) is True:
+        pos = hybrid_kv.peek(request.prompt_token_ids)
+        if pos > 0:
+            request.cache_hit_type = "system_kv_pending"
+            request.prompt_cache = None
+            request.cached_tokens = pos
+            request.remaining_tokens = request.prompt_token_ids[pos:]
+            return
     result = hybrid_kv.fetch(
         request.prompt_token_ids, request_id=request.request_id
     )
@@ -1293,6 +1447,45 @@ def solo_prefill_verdict(scheduler, request) -> Optional[str]:
         else int(getattr(request, "num_prompt_tokens", 0) or 0)
     )
     return hybrid_kv.solo_prefill_verdict(tokens)
+
+
+def materialize_pending_restore(scheduler, request) -> None:
+    """_schedule_waiting hook (#106): build the restore a LAZY add_request
+    only matched. Runs on the executor thread at admission, so the slices are
+    recorded and evaluated on the thread that steps the batch.
+
+    The entry may have been evicted while the request waited (it was
+    LRU-touched at enqueue, so this is rare): ``fetch`` then returns a
+    shallower hit or nothing, and the request simply prefills more."""
+    if getattr(request, "cache_hit_type", None) != "system_kv_pending":
+        return
+    hybrid_kv = scheduler.hybrid_kv
+    result = None
+    if hybrid_kv is not None:
+        try:
+            result = hybrid_kv.fetch(
+                request.prompt_token_ids, request_id=request.request_id
+            )
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] lazy restore failed request=%s",
+                request.request_id[:12],
+                exc_info=True,
+            )
+    if result is not None:
+        cache, remaining, pos = result
+        request.cache_hit_type = "system_kv"
+        request.prompt_cache = cache
+        request.cached_tokens = pos
+        request.remaining_tokens = remaining
+        hybrid_kv.lazy_restores += 1
+    else:
+        request.cache_hit_type = "miss"
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        if hybrid_kv is not None:
+            hybrid_kv.lazy_restore_misses += 1
 
 
 def promote_ssd_pending(scheduler) -> None:
@@ -1626,6 +1819,35 @@ def should_defer_cobatch(scheduler, request) -> bool:
                 )
         if reason is not None:
             reason += f" [bpt {bpt / 1024:.1f} KB/tok, {bpt_source}]"
+
+    # 4. (#106) Projected peak vs the OOM wall. Gates 1-2 price padded KV
+    # against a budget and gate 3 looks at the present; none asks what THIS
+    # admission will add to what the process already holds.
+    if (
+        reason is None
+        and bpt > 0
+        and getattr(hybrid_kv, "projected_admission", False) is True
+    ):
+        lengths = [
+            r.num_prompt_tokens + len(r.output_token_ids)
+            for r in scheduler.running.values()
+        ]
+        lengths.append(request.num_prompt_tokens)
+        merged = len(lengths) * max(lengths) * bpt
+        remaining = getattr(request, "remaining_tokens", None)
+        growth = (
+            len(remaining) if remaining is not None else request.num_prompt_tokens
+        ) * bpt
+        restore = (
+            hybrid_kv.restore_bytes(getattr(request, "cached_tokens", 0) or 0)
+            if getattr(request, "cache_hit_type", None) == "system_kv_pending"
+            else 0.0
+        )
+        reason = hybrid_kv.projected_cobatch_verdict(
+            merged + growth + restore,
+            f"{merged / 1e9:.1f} GB merged KV at {len(lengths)} seats + "
+            f"{growth / 1e9:.1f} GB new-row growth + {restore / 1e9:.1f} GB restore",
+        )
 
     if reason is None and hybrid_kv.mem_watermark_pct > 0:
         over, active, ceiling = hybrid_kv.watermark_status()
