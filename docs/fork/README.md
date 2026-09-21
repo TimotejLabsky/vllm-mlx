@@ -13,3 +13,9 @@ rebase history — lives in [`PATCHES.md`](../../PATCHES.md) at the repo root.
 | [`prefix-caching-landscape-2026-08.md`](prefix-caching-landscape-2026-08.md) | How vLLM/SGLang/LMCache/Marconi do prefix caching, which of their axes are structurally N/A here, and the one real gap in ours |
 | [`improvement-roadmap-2026-08.md`](improvement-roadmap-2026-08.md) | 2026-08 ecosystem survey and ranked improvement levers |
 | [`vision-caching.md`](vision-caching.md) | Which caches apply on vision routes, why, and the per-arch sweep verdicts |
+| [`improvement-plan-2026-09-16.md`](improvement-plan-2026-09-16.md) | Memory safety and caching under concurrent agentic load: the 2026-09-16/17 incident analysis, the prioritised plan, and its **status block** (what shipped as #103–#108, what the data closed, what is still open) |
+| [`speed-lever-ledger-2026-09.md`](speed-lever-ledger-2026-09.md) | Every speed lever measured on the Studio — refuted and shipped. Read before proposing performance work |
+| [`engine-benchmarks-2026-09.md`](engine-benchmarks-2026-09.md) | Cross-engine benchmark round (fork vs upstream vs oMLX vs llama.cpp) and how to re-run it |
+| [`engine-field-survey-2026-08-18.md`](engine-field-survey-2026-08-18.md) | Survey of the MLX/Apple-Silicon serving field |
+| [`improvement-research-2026-08-30.md`](improvement-research-2026-08-30.md) | 2026-08-30 research round and same-day builds (#81–#83) |
+| [`mlxlm-issue-499000-draft.md`](mlxlm-issue-499000-draft.md) | Draft upstream issue for the mlx-lm Metal resource-limit (499000) leak |
