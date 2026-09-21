@@ -13,6 +13,8 @@
 > | **P2-2** cross-process guard | **Not built — downgraded by evidence.** The 09-16 storm was not cross-process (§0.1), and on 09-17/21 the HA 35B and the 27B never co-resided: llama-swap ping-pongs them (heavy is exclusive; the 27B idles out at `ttl 600`). Revisit only if a co-resident OOM is ever observed. |
 > | **P3** preemption / chunk budget | Still do not build. |
 >
+> **How to reproduce the evidence:** `scripts/fork/stress_deep_chains.py` (the 09-17 signature on a live, idle route — read its docstring first), `scripts/fork/e2e_lazy_restore.py` and `scripts/fork/e2e_recovery_signalling.py` (real server, small model, off the live routes). Open follow-ups are listed in PATCHES.md → *Future work*; the throughput verdict is in the speed-lever ledger.
+>
 > **Corrections to the body:** §0.4's "disk copies are ~2.4× RAM" was a bad comparison (fixed in place). The 09-17 afternoon load attributed to "CI" was 13 idealplace review runs stacked concurrently; reviews became opt-in by label at 12:07Z that day, so that load has not recurred — the stress tests (README rows 2026-09-21) are the evidence for #106–#108, not live CI.
 > **Open, none urgent:** verify "warm == cold byte-identical" on the 27B for multi-turn chains (a 4-bit 4B hybrid showed an argmax-tie flip ~20 tokens in, identically on unpatched code — different restore position ⇒ different prefill chunking); durable per-client attribution (LiteLLM has no DB, < 1 day of logs); carry the route config to the 8-bit sibling and the 45 GB-weight class; the three deferred #104 items above.
 
