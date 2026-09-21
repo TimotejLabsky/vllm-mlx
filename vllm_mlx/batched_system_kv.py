@@ -772,13 +772,27 @@ class BatchedSystemKV:
                 layer[0] if _is_segments(layer) and len(layer) == 1 else layer
                 for layer in entry["snapshot"]
             ]
-            self._ssd.enqueue_spill(
+            # (#108) While the spill sits in the write queue the queue holds
+            # the SAME arrays as this entry, so evicting the entry frees no
+            # memory - it only makes the chain unreachable (not in RAM, not
+            # yet in the SSD index) until the write lands. 2026-09-21: a
+            # follow-up arriving 10 s after its chain finished re-prefilled
+            # 60K tokens cold because of exactly that. The flag clears when
+            # the spill is written, fails, or is dropped by relief.
+            entry["spill_pending"] = True
+
+            def _landed(entry=entry):
+                entry["spill_pending"] = False
+
+            if not self._ssd.enqueue_spill(
                 tuple(tokens_list),
                 spill_snapshot,
                 checkpoints=entry["checkpoints"],
                 meta=entry["metas"],
                 kinds=entry["kinds"],
-            )
+                on_done=_landed,
+            ):
+                entry["spill_pending"] = False
         except Exception:
             logger.debug("[batched_system_kv] spill enqueue failed", exc_info=True)
 
@@ -877,11 +891,21 @@ class BatchedSystemKV:
         keys = list(self._entries)
         if keep_newest:
             keys = keys[:-1]
+
+        def queued(key) -> bool:  # (#108) its spill still sits in the queue
+            return bool(self._entries[key].get("spill_pending"))
+
         for key in keys:
-            if key not in pinned:
+            if key not in pinned and not queued(key):
                 return self._entries.pop(key)
         if spare_pinned or not keys:
             return None
+        # Everything is spoken for and a budget still has to hold. A pinned
+        # entry at least FREES memory; a spill-pending one frees nothing until
+        # its write lands, so it goes last.
+        for key in keys:
+            if not queued(key):
+                return self._entries.pop(key)
         return self._entries.pop(keys[0])
 
     def _enforce_budgets_locked(self) -> None:
@@ -1293,7 +1317,9 @@ class BatchedSystemKV:
                 bag = sum(e["bytes"] for e in self._entries.values())
                 pinned = set(self._peeked.values())
                 unpinned = sum(
-                    e["bytes"] for k, e in self._entries.items() if k not in pinned
+                    e["bytes"]
+                    for k, e in self._entries.items()
+                    if k not in pinned and not e.get("spill_pending")
                 )
             backlog = 0
             if self._ssd is not None:
@@ -1389,6 +1415,9 @@ class BatchedSystemKV:
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
+                "spill_pending_entries": sum(
+                    1 for e in self._entries.values() if e.get("spill_pending")
+                ),
                 "projected_defers": self.projected_defers,
                 "projected_relief_passes": self.projected_relief_passes,
                 # (#103) memory held OUTSIDE the entries: in-flight checkpoint
