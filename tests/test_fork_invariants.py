@@ -1291,3 +1291,124 @@ def test_107_solo_guard_takes_pinned_entries_rather_than_reject(monkeypatch):
     # active 40; need 60 -> 100 > 95. Sparing the pin would reject; it must not.
     assert kv.solo_prefill_verdict(800) is None
     assert kv.stats()["entry_count"] == 0 and kv.solo_rejections == 0
+
+
+# ---------- #108 an entry whose spill is still queued is not worth evicting
+
+
+def _busy_ssd_kv(monkeypatch, tmp_path, **env):
+    """A bag whose SSD writer never gets an idle window and may not write
+    while busy: every spill stays queued until the test says otherwise."""
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_BUSY_WRITE_S", "0")
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    busy = {"flag": True}
+    kv = BatchedSystemKV(
+        _FakeModel(),
+        tokenizer=SimpleNamespace(name_or_path="unit/test-model"),
+        idle_check=lambda: not busy["flag"],
+    )
+    return kv, busy
+
+
+def _entry_for(kv, first_token):
+    return next(e for e in kv._entries.values() if e["tokens"][0] == first_token)
+
+
+def test_108_spill_pending_tracks_the_queue_written_or_dropped(monkeypatch, tmp_path):
+    kv, busy = _busy_ssd_kv(monkeypatch, tmp_path)
+    try:
+        kv.store("a", TOKENS, _donor_at(len(TOKENS)))
+        entry = _entry_for(kv, TOKENS[0])
+        assert entry["spill_pending"] is True
+        assert kv.stats()["spill_pending_entries"] == 1
+
+        busy["flag"] = False  # an idle window: the write lands
+        assert _wait_for(lambda: entry["spill_pending"] is False, 10.0)
+        assert kv._ssd.lookup_prefix(tuple(TOKENS)) is not None
+
+        busy["flag"] = True
+        kv.store("b", DISJOINT, _donor_at(len(DISJOINT)))
+        other = _entry_for(kv, DISJOINT[0])
+        assert other["spill_pending"] is True
+        assert kv._ssd.drop_backlog() > 0  # relief takes the backlog
+        assert _wait_for(lambda: other["spill_pending"] is False, 5.0)
+        assert kv.stats()["spill_pending_entries"] == 0
+    finally:
+        kv.close()
+
+
+def test_108_a_spill_the_queue_refused_is_not_marked_pending(monkeypatch, tmp_path):
+    kv, _busy = _busy_ssd_kv(
+        monkeypatch, tmp_path, VLLM_MLX_SSD_SYSTEM_KV_MAX_QUEUED_GB="0.0000001"
+    )
+    try:
+        kv.store("a", TOKENS, _donor_at(len(TOKENS)))  # empty queue admits one
+        kv.store("b", DISJOINT, _donor_at(len(DISJOINT)))  # over the cap: dropped
+        assert _entry_for(kv, TOKENS[0])["spill_pending"] is True
+        assert _entry_for(kv, DISJOINT[0])["spill_pending"] is False
+        assert kv.stats()["ssd"]["spill_drops"] == 1
+    finally:
+        kv.close()
+
+
+def test_108_eviction_spares_the_entry_whose_spill_is_still_queued(
+    monkeypatch, tmp_path
+):
+    """2026-09-21 stress re-run: the last chain's follow-up arrived ~10 s after
+    its turn finished. The dynamic budget had just evicted that chain's RAM
+    entry while its spill was still queued - so it was in neither RAM nor the
+    SSD index, and 60K tokens were re-prefilled cold. The eviction had freed
+    nothing: the write queue holds the same arrays."""
+    kv, _busy = _busy_ssd_kv(monkeypatch, tmp_path, VLLM_MLX_SYSTEM_KV_SLOTS="2")
+    try:
+        kv.store("a", TOKENS, _donor_at(len(TOKENS)))  # LRU, spill queued
+        kv.store("b", DISJOINT, _donor_at(len(DISJOINT)))
+        _entry_for(kv, DISJOINT[0])["spill_pending"] = False  # b's write landed
+
+        third = list(range(50000, 50800))
+        kv.store("c", third, _donor_at(len(third)))
+
+        kept = sorted(e["tokens"][0] for e in kv._entries.values())
+        assert kept == [TOKENS[0], third[0]]  # b went, the queued LRU survived
+        assert kv.peek(GROWN) > 0  # ...so its follow-up restores instead of 18 min
+    finally:
+        kv.close()
+
+
+def test_108_a_pinned_entry_goes_before_a_spill_pending_one(monkeypatch, tmp_path):
+    """With everything spoken for the budget still has to hold: a pinned entry
+    at least frees memory, a spill-pending one frees nothing."""
+    kv, _busy = _busy_ssd_kv(monkeypatch, tmp_path, VLLM_MLX_SYSTEM_KV_SLOTS="2")
+    try:
+        kv.store("a", TOKENS, _donor_at(len(TOKENS)))  # LRU, spill queued
+        kv.store("b", DISJOINT, _donor_at(len(DISJOINT)))
+        _entry_for(kv, DISJOINT[0])["spill_pending"] = False
+        kv.peek(DISJOINT + [1, 2, 3], request_id="queued")  # b is pinned (and MRU)
+        assert kv.fetch(GROWN) is not None  # a becomes MRU, b LRU
+
+        third = list(range(50000, 50800))
+        kv.store("c", third, _donor_at(len(third)))
+
+        kept = sorted(e["tokens"][0] for e in kv._entries.values())
+        assert kept == [TOKENS[0], third[0]]  # the pinned one went, not the queued
+    finally:
+        kv.close()
+
+
+def test_108_make_room_does_not_count_spill_pending_bytes_as_sheddable(monkeypatch):
+    kv = _projected_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    _charge_entries(kv)
+    for entry in kv._entries.values():
+        entry["spill_pending"] = True  # evicting them would free nothing
+    scheduler, candidate = _replay_0917(kv)
+
+    # 60 active + 41 > 95 and nothing sheddable -> wait, cache untouched
+    assert bkv.should_defer_cobatch(scheduler, candidate) is True
+    assert kv.stats()["entry_count"] == 2 and kv.projected_relief_passes == 0
+
+    # relief is a different matter: against a real OOM it still takes them
+    assert kv._drop_lru_entry() is True
