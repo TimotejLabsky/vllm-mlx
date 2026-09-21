@@ -110,6 +110,33 @@ admission.
 
 ## Recent changes
 
+> **2026-09-21 — deep concurrent agent chains, stress-tested on the live 27B**
+> (PATCHES.md #106–#108): admission now projects the real memory peak before
+> co-batching (and makes what doesn't fit *wait*, never rejects); a queued
+> request's cache restore is built when it is admitted instead of pinning
+> 4–5 GB while it waits; its entry is pinned until then, comes back from the
+> SSD tier if RAM lost it, and an entry whose spill is still queued is no
+> longer evicted (that frees nothing). The pattern that OOMed three times on
+> 09-17 at 63 GB now peaks at 51 GB with **5 of 5 deep follow-ups served from
+> cache — 123 s instead of 1,150 s**. Reusable harnesses:
+> `scripts/fork/e2e_lazy_restore.py`, `scripts/fork/e2e_recovery_signalling.py`.
+>
+> **2026-09-17 — memory the cache doesn't count, and honest failures**
+> (PATCHES.md #103–#105): a never-idle SSD writer pinned ~12 GB outside every
+> guard and OOM recovery leaked checkpoint ladders — the 27B route sat at its
+> watermark with an *empty* cache for a day. Fixed, and made visible
+> (`pending_ladders`, `ssd.queued_bytes`). An engine-side abort is now a
+> retryable **503 / 503-shaped stream frame** instead of HTTP 200 with an
+> empty turn. Solo prefills get an admission check too. CI `lint` now checks
+> only the lines a change adds and is expected green
+> (`scripts/fork/black_changed_lines.py`); `tests/test_fork_invariants.py`
+> pins the conditions a rebase can silently undo.
+>
+> **2026-09-16 — hybrid chains cache again under concurrency** (PATCHES.md
+> #100–#102): an upstream gate had silently disabled the batched hybrid
+> cache's only concurrent store path since the v0.4.1 rebase; plus a dynamic
+> cache budget and an admission-pricing floor that survives engine recovery.
+>
 > **2026-09-06 (2) — the MLLM path gets the repetition rail** (PATCHES.md #98):
 > REPDETECT was silently ignored on the multimodal scheduler — found when the
 > new 180B route looped forever on an unknown entity at T=0. Consumer-side

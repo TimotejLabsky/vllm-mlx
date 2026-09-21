@@ -1,8 +1,25 @@
 # Improvement plan — memory safety and caching under concurrent agentic load (2026-09-16)
 
-*Research + plan only. Nothing here has been built, deployed or probed. Fork
-base for every citation: `origin/main` = `5edda49` (Studio runs `a2901ae`,
-same code). Companion to
+> ## Status — 2026-09-21 (read this first; the body below is the ORIGINAL plan)
+>
+> | Item | Outcome |
+> |---|---|
+> | **P0-1** recovery leak + deque crash | **Shipped #103**, widened: the bigger holder was a ~12 GB SSD spill backlog pinned by a never-idle writer (§0.1b). Deployed 09-17. |
+> | **P0-2** honest failure signalling | **Shipped #104** (503 + `Retry-After` / one 503-shaped stream frame). Verified live on 09-17: 6 aborts reached clients as errors. Deferred on purpose: streaming `PromptTooLong` pre-probe; terminal chunk on out-of-band `/cancel`. |
+> | **P2-1** solo-prefill guard | **Shipped #105**, armed on Qwen3.8-27B-4bit 09-17. By its arithmetic it never rejects there; it sheds cache before a deep solo prefill. Calibrate the 45 GB-weight class before arming it there. |
+> | **P2-3** fork-invariant tests | **Shipped** — `tests/test_fork_invariants.py` (51 tests; #100's carve-out mutation-checked) + the PATCHES.md rebase rule. Also: CI `lint` scoped to changed lines, now expected green. |
+> | **P1-2** retune concurrency | `KV_BUDGET_MB` 4096 → 8192 on 09-17 lifted the single-seat queue (1.1 → 3.1 rows) — **and caused three OOMs in 2.5 h** under 13 stacked review runs (63.0–63.6 GB). The "≈30 GB worst case" reasoning behind it was wrong: relief acts only *between* steps. Root cause fixed by **#106** (restores built at admission, not at enqueue; admission projects the real peak; what doesn't fit waits). 8192 stays. Slots 4 → 8, SSD tier 20 → 60 GB, spill-queue cap 4 → 9 GB also deployed. |
+> | **P1-1** cache retention | Stage 1's goal met differently: **#107** (queued requests pin their entry; lazy miss falls back to SSD) + **#108** (entries whose spill is still queued are not evicted) + the cap change. Stress test with the 09-17 signature: 5/5 deep follow-ups from cache, 123 s vs 1,150 s, peak 51 GB. **Stages 2–3 (session-affine / utility eviction) are CLOSED by data:** #85 verdict delta on the clean process = evictions +104, evict-to-reuse +3 (**2.9 %, was 25 %** — the old number measured relief thrash, not LRU). Under deep load the RAM bag turns over completely; the **SSD tier is what carries deep chains**. Still open from this item: SSD checkpoint dedup (all entries under one system prompt re-serialise the same ladder), and exempting the first post-system message boundary from `boundary_min_step` thinning (requests sharing only a ~1K system prompt miss entirely). |
+> | **P2-2** cross-process guard | **Not built — downgraded by evidence.** The 09-16 storm was not cross-process (§0.1), and on 09-17/21 the HA 35B and the 27B never co-resided: llama-swap ping-pongs them (heavy is exclusive; the 27B idles out at `ttl 600`). Revisit only if a co-resident OOM is ever observed. |
+> | **P3** preemption / chunk budget | Still do not build. |
+>
+> **Corrections to the body:** §0.4's "disk copies are ~2.4× RAM" was a bad comparison (fixed in place). The 09-17 afternoon load attributed to "CI" was 13 idealplace review runs stacked concurrently; reviews became opt-in by label at 12:07Z that day, so that load has not recurred — the stress tests (README rows 2026-09-21) are the evidence for #106–#108, not live CI.
+> **Open, none urgent:** verify "warm == cold byte-identical" on the 27B for multi-turn chains (a 4-bit 4B hybrid showed an argmax-tie flip ~20 tokens in, identically on unpatched code — different restore position ⇒ different prefill chunking); durable per-client attribution (LiteLLM has no DB, < 1 day of logs); carry the route config to the 8-bit sibling and the 45 GB-weight class; the three deferred #104 items above.
+
+*Research + plan only. Nothing here had been built, deployed or probed when
+this was written (2026-09-16); see the status block above for what happened
+next. Fork base for every citation: `origin/main` = `5edda49` (Studio ran
+`a2901ae`, same code). Companion to
 [`speed-lever-ledger-2026-09.md`](speed-lever-ledger-2026-09.md) (what NOT to
 re-propose) and
 [`prefix-caching-landscape-2026-08.md`](prefix-caching-landscape-2026-08.md)
