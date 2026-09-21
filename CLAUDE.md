@@ -30,6 +30,11 @@ feature branch — read this before changing anything.
     measured on this box (10 refuted, 5 shipped), the methodology lessons,
     and the watch list (mlx #4020 gated-delta kernels = the pending big win,
     taken via mlx release, never vendored). Update it with every new verdict.
+  - [`improvement-plan-2026-09-16.md`](docs/fork/improvement-plan-2026-09-16.md)
+    — memory safety + caching under concurrent agent load: the 2026-09-16/17
+    incident, the plan, and a **status block** kept current (shipped as
+    #103–#108; what the data closed; what is open). Read before touching
+    admission, relief, the SSD tier or the batched cache's eviction.
   - `DESIGN-system-kv-lru.md`, `DESIGN-system-kv-ssd.md` — design docs for
     patches #13 and #16.
   - [`vision-caching.md`](docs/fork/vision-caching.md) — which caches apply on
@@ -57,6 +62,20 @@ feature branch — read this before changing anything.
 - Tests assert **fork semantics**, not upstream's (e.g. default admission is
   `wait`, denylist probe instead of allowlist). The full suite must stay green:
   `.venv/bin/python -m pytest tests/`.
+- **`tests/test_fork_invariants.py` pins the conditions a rebase can silently
+  undo** (each test named for its PATCHES.md number). A rebase is not done
+  until it is green AND re-read against upstream's diff of the functions it
+  touches; a patch that adds a guarantee upstream cannot see adds its test
+  there in the same commit.
+- **CI `lint` is expected GREEN.** It black-checks only the lines a change
+  adds (`scripts/fork/black_changed_lines.py`; ~44 files of rebase drift are
+  left alone on purpose). Red means this change added drift — fix only the
+  lines it prints (`python scripts/fork/black_changed_lines.py origin/main`
+  locally). Never reformat a whole drifted file.
+- Server-path patches get a **real-server check off the live routes**
+  (`scripts/fork/e2e_*.py`: real `cli serve`, small model, spare port; run on
+  the Studio from rsync'd source via `PYTHONPATH` for the prod stack + a
+  hybrid model). Never manufacture a failure on a live route.
 - Upstream accepts external fork PRs again (verified 2026-07-07 — recent PRs
   are all cross-repo; the earlier collaborator restriction has lifted). Keep
   upstreaming branches ready and rebased (e.g. `fix/batched-stop-strings`,
