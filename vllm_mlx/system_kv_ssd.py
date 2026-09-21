@@ -288,6 +288,15 @@ def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
     return checkpoints
 
 
+def _spill_done(on_done) -> None:
+    if on_done is None:
+        return
+    try:
+        on_done()
+    except Exception:
+        logger.debug("[system_kv_ssd] spill on_done callback failed", exc_info=True)
+
+
 class SystemKVSSDStore:
     """NVMe-backed persistence for SimpleEngine system-KV snapshots."""
 
@@ -444,7 +453,7 @@ class SystemKVSSDStore:
                 break
             with self._lock:
                 gen = self._backlog_gen
-                self._held_bytes = item[-1]
+                self._held_bytes = item[6]
             dropped = False
             wrote_busy = False
             # Wait for an idle window before the heavy serialization —
@@ -477,8 +486,16 @@ class SystemKVSSDStore:
                                 break
                         except Exception:
                             pass
-            (tokens, tensors, layer_meta, ckpt_meta,
-             snap_meta, kinds, nbytes) = item
+            (
+                tokens,
+                tensors,
+                layer_meta,
+                ckpt_meta,
+                snap_meta,
+                kinds,
+                nbytes,
+                on_done,
+            ) = item
             # The snapshot is leaving the queue (about to be written and then
             # dropped) — release its share of the pinned-byte budget.
             with self._lock:
@@ -504,6 +521,7 @@ class SystemKVSSDStore:
                     "[system_kv_ssd] failed to write entry (%d tokens)", len(tokens)
                 )
             finally:
+                _spill_done(on_done)
                 # Loop locals outlive the iteration: without this the writer
                 # kept the last snapshot's arrays referenced until the NEXT
                 # spill arrived — on an empty queue, indefinitely.
@@ -541,8 +559,9 @@ class SystemKVSSDStore:
                 if queued is None:
                     pill = True
                     continue
-                nbytes = queued[-1]
+                nbytes = queued[6]
                 released += nbytes
+                _spill_done(queued[7])
                 self._queued_bytes = max(0, self._queued_bytes - nbytes)
                 self._stats.backlog_drops += 1
         if pill:
@@ -595,8 +614,14 @@ class SystemKVSSDStore:
         checkpoints: list | None = None,
         meta: list | None = None,
         kinds: list | None = None,
+        on_done=None,
     ) -> bool:
-        """Queue a snapshot (+ partial-restore checkpoints + per-layer
+        """``on_done`` (#108) is called exactly once when the queued spill
+        leaves the queue for good - written, failed, or dropped by
+        ``drop_backlog`` - from whichever thread that happens on. It is NOT
+        called when this method returns False (nothing was queued).
+
+        Queue a snapshot (+ partial-restore checkpoints + per-layer
         meta_state/kinds) for async write-through. False if dropped.
 
         Flattening (cheap, no copy — mx arrays are reference-held) happens on
@@ -640,8 +665,16 @@ class SystemKVSSDStore:
             return False
         try:
             self._spill_queue.put_nowait(
-                (tokens, tensors, layer_meta, ckpt_meta,
-                 snap_meta_json, kinds, nbytes)
+                (
+                    tokens,
+                    tensors,
+                    layer_meta,
+                    ckpt_meta,
+                    snap_meta_json,
+                    kinds,
+                    nbytes,
+                    on_done,
+                )
             )
             return True
         except queue.Full:
