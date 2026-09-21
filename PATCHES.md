@@ -3372,3 +3372,25 @@ Stats: `lazy_restores`, `lazy_restore_misses`, `projected_defers`, `projected_re
 - **Full suite:** 3728 passed / 31 skipped / 30 deselected (#106 baseline 3722 + 6). `ruff` + the changed-lines black gate clean.
 - **Real server, real models** (`scripts/fork/e2e_lazy_restore.py`, now with a one-slot SSD phase: two conversations diverging from the first token take turns, so every second turn must come back from disk): 7/7 on `Qwen3-0.6B-8bit` locally and on **hybrid `Qwen3.5-4B-4bit` on the Studio** — lazy ≡ eager byte-for-byte incl. the SSD-served turns (`ssd_promotes 2`), no pin left behind at idle, no recovery, no stream/thread error. (First cut of the SSD phase proved nothing: both chats shared the system prompt, so the lone RAM entry always gave a shallow hit and the disk was never touched.)
 - **Live gate after deploy + `MAX_QUEUED_GB=9`:** under deep concurrent chains `ssd.spill_drops` stays ~0, `lazy_restore_misses` ~0 with `lazy_ssd_fallbacks` absorbing evictions, `pinned_entries` returns to 0 at idle, and follow-ups show `cached_tokens` ≈ prompt length instead of `None`.
+
+## 108. `patch: spare-spill-pending` — an entry whose spill is still queued is not worth evicting
+
+**Files:** `vllm_mlx/system_kv_ssd.py` (`enqueue_spill(on_done=…)`, completion callback on write / failure / `drop_backlog`), `vllm_mlx/batched_system_kv.py` (`spill_pending` flag, victim ordering, gate-4 sheddable, stats), `tests/test_fork_invariants.py` (+5).
+
+**Found by the 2026-09-21 stress re-run of #107** (live Qwen3.8-27B-4bit, the 09-17 OOM signature, fresh 60K-token chains). After #107 + `MAX_QUEUED_GB=9`, 4 of 5 deep follow-ups came back from cache (46 / 49 / 84 / 428 s; phase 2 took 463 s instead of 1,150 s, 0 spill drops, 0 OOM). **The fifth re-prefilled 60K tokens cold (452 s):** its chain had finished ~10 s earlier; while two deep rows ramped, the #101 dynamic budget shrank and evicted that chain's RAM entry — **with its spill still in the write queue** (the #103 busy-write waits 30 s). For ~30 s the chain was in neither RAM nor the SSD index. And the eviction had freed **nothing**: the write queue holds the very same arrays as the entry, so dropping the entry only dropped the *index* to them. An agent's next turn arriving seconds after the previous one is the common case, not an edge.
+
+**Fix.** `_spill` marks the entry `spill_pending` and passes `enqueue_spill` an `on_done` callback that clears it; the SSD store calls it exactly once when the spill leaves the queue for good — written, failed, or dropped by `drop_backlog` (queued items *and* the one the writer holds) — and never when `enqueue_spill` returns False. `_pop_victim_locked` now orders victims:
+
+1. the LRU entry that is neither pinned by a queued request (#107) nor spill-pending;
+2. *(budget only)* a pinned entry — it at least frees memory;
+3. *(budget only)* a spill-pending entry, last — it frees nothing until its write lands.
+
+Gate 4 (#106) stops counting spill-pending bytes as sheddable, so it waits instead of shedding entries that would give nothing back. **Watermark relief is unchanged in effect:** it drops the backlog first (#103), which clears the flags, and then takes whatever it needs. The queue item grew an eighth field, so the two `item[-1]` byte lookups from #103 became `item[6]`. `spill_pending_entries` in stats. SimpleEngine's and upstream's callers pass no callback and behave as before.
+
+**Upstream:** fork-owned.
+
+**Verification:**
+- **Red then green.** 5 tests, all red with `vllm_mlx/` at `c9b5044`: the flag follows the queue through a landed write *and* a `drop_backlog`; a spill the cap refuses is not marked; **the 09-21 race** — slot-capped bag, the queued LRU entry survives, the landed one goes, and the follow-up's `peek` still hits; with everything spoken for a pinned entry goes before a spill-pending one; gate 4 waits rather than shed spill-pending entries while `_drop_lru_entry` (relief) still takes them.
+- **Full suite:** 3733 passed / 31 skipped / 30 deselected (#107 baseline 3728 + 5). `ruff` + the changed-lines black gate clean.
+- **Real server, real models** (`scripts/fork/e2e_lazy_restore.py`, incl. the one-slot SSD phase that drives the writer + promote path): 7/7 on `Qwen3-0.6B-8bit` locally and on hybrid `Qwen3.5-4B-4bit` on the Studio; lazy ≡ eager byte-for-byte, `ssd_promotes 2`, no pin left at idle, no traceback.
+- **Live gate after deploy:** re-run the stress test — all 5 deep follow-ups should report `cached_tokens` ≈ prompt length; `spill_pending_entries` returns to 0 within ~30 s of the last store.
