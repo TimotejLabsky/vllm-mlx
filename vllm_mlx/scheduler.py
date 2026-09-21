@@ -2418,6 +2418,11 @@ class Scheduler:
                     self._reject_at_schedule(request, reject_kind)
                     continue
 
+            # Lazy restore (fork #106): past every gate - build the cache
+            # copy that add_request only matched.
+            if self.hybrid_kv is not None:
+                _batched_kv.materialize_pending_restore(self, request)
+
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
 
