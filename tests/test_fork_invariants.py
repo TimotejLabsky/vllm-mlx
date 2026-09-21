@@ -917,3 +917,247 @@ def test_105_a_rejection_reaches_the_client_and_does_not_block_the_queue(monkeyp
     with pytest.raises(GenerationAborted) as caught:
         raise_if_generation_aborted(output.outputs[0])
     assert caught.value.kind == "insufficient_memory"
+
+
+# ------------------- #106 queued restores and co-batch admission see real memory
+
+GROWN = TOKENS + list(range(40000, 40300))  # a follow-up turn on TOKENS
+
+
+def _lazy_kv(monkeypatch, **env):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    return kv
+
+
+def _queued(rid, tokens):
+    return SimpleNamespace(
+        request_id=rid,
+        prompt_token_ids=list(tokens),
+        num_prompt_tokens=len(tokens),
+        output_token_ids=[],
+        prompt_cache=None,
+        cached_tokens=0,
+        remaining_tokens=None,
+        cache_hit_type=None,
+    )
+
+
+def test_106_peek_matches_fetch_but_builds_and_counts_nothing(monkeypatch):
+    kv = _lazy_kv(monkeypatch)
+    kv.store("other", DISJOINT, _donor_at(len(DISJOINT)))  # now the MRU entry
+    before = (kv.hits, kv.misses, kv.tokens_saved, dict(kv._pending))
+
+    pos = kv.peek(GROWN)
+
+    assert pos > 0
+    assert (kv.hits, kv.misses, kv.tokens_saved, dict(kv._pending)) == before
+    # ...but it LRU-touched the matched chain, so it outlives the idle one
+    assert list(kv._entries.values())[-1]["tokens"] == TOKENS
+    eager = kv.fetch(GROWN, request_id="eager")
+    assert eager is not None and eager[2] == pos  # same position fetch uses
+    assert kv.peek(list(range(70000, 70400))) == 0
+
+
+def test_106_lazy_add_request_pins_no_memory_until_admission(monkeypatch):
+    kv = _lazy_kv(monkeypatch)
+    request = _queued("lazy", GROWN)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "system_kv_pending"
+    assert request.prompt_cache is None  # the multi-GB copy does not exist yet
+    assert request.cached_tokens > 0
+    assert request.remaining_tokens == GROWN[request.cached_tokens :]
+    assert kv.hits == 0 and "lazy" not in kv._pending
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.prompt_cache is not None
+    assert kv.hits == 1 and kv.lazy_restores == 1
+    assert "lazy" in kv._restore_source  # grow-on-HIT linkage intact
+
+
+def test_106_a_lazy_restore_is_byte_identical_to_an_eager_one(monkeypatch):
+    import mlx.core as mx
+
+    lazy_kv = _lazy_kv(monkeypatch)
+    lazy = _queued("lazy", GROWN)
+    bkv.fetch_for_request(lazy_kv, lazy)
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=lazy_kv), lazy)
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "0")
+    eager_kv = BatchedSystemKV(_FakeModel())
+    eager_kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    eager = _queued("eager", GROWN)
+    bkv.fetch_for_request(eager_kv, eager)
+
+    assert eager.cache_hit_type == "system_kv"  # inert by default = old path
+    assert lazy.cached_tokens == eager.cached_tokens
+    assert lazy.remaining_tokens == eager.remaining_tokens
+    for lazy_layer, eager_layer in zip(lazy.prompt_cache, eager.prompt_cache):
+        lazy_state, eager_state = lazy_layer.state, eager_layer.state
+        assert len(lazy_state) == len(eager_state)
+        for a, b in zip(lazy_state, eager_state):
+            if a is None or b is None:
+                assert a is b
+            else:
+                assert a.shape == b.shape and bool(mx.array_equal(a, b))
+
+
+def test_106_an_entry_evicted_during_the_wait_degrades_to_a_miss(monkeypatch):
+    kv = _lazy_kv(monkeypatch, VLLM_MLX_SYSTEM_KV_SLOTS=1)
+    request = _queued("waited", GROWN)
+    bkv.fetch_for_request(kv, request)
+    assert request.cache_hit_type == "system_kv_pending"
+
+    kv.store("other", DISJOINT, _donor_at(len(DISJOINT)))  # evicts the match
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+
+    assert request.cache_hit_type == "miss" and request.prompt_cache is None
+    assert request.cached_tokens == 0 and request.remaining_tokens == GROWN
+    assert kv.lazy_restore_misses == 1
+
+
+def _projected_kv(monkeypatch, base_mb, ram_floor_mb=0, armed=True):
+    """Mocked allocator: active = base + 20 MB per resident entry; limit is
+    95% of a 100 MB ceiling; bytes/token floor 16 KB; chunk transient 8 MB."""
+    import mlx.core as mx
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", "8")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB", "16")
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_RAM_MB", str(ram_floor_mb))
+    if armed:
+        monkeypatch.setenv("VLLM_MLX_BATCHED_PROJECTED_ADMISSION", "1")
+    kv = BatchedSystemKV(_FakeModel())
+    monkeypatch.setattr(
+        mx, "get_active_memory", lambda: _mb(base_mb + _ENTRY_MB * len(kv._entries))
+    )
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": _mb(100)}
+    )
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    return kv
+
+
+def _charge_entries(kv):
+    """Tell the bag its entries cost what the mocked allocator charges."""
+    for entry in kv._entries.values():
+        entry["bytes"] = _mb(_ENTRY_MB)
+
+
+def _replay_0917(kv):
+    """One deep row decoding + a deep candidate whose restore is still only
+    matched: 2 x 700 tok merged (21.9 MB) + 50 tok growth + 650 tok restore
+    (10.2 MB) + 8 MB transient ~= 41 MB on top of active."""
+    running = {"deep": _queued("deep", range(700))}
+    candidate = _queued("second", range(700))
+    candidate.cache_hit_type = "system_kv_pending"
+    candidate.cached_tokens = 650
+    candidate.remaining_tokens = list(range(50))
+    return SimpleNamespace(hybrid_kv=kv, running=running), candidate
+
+
+def test_106_projection_is_inert_unless_armed(monkeypatch):
+    kv = _projected_kv(monkeypatch, base_mb=90, armed=False)
+    scheduler, candidate = _replay_0917(kv)
+    assert bkv.should_defer_cobatch(scheduler, candidate) is False
+    assert kv.projected_defers == 0
+
+
+def test_106_the_0917_signature_makes_room_instead_of_running_out(monkeypatch):
+    """Three OOMs at 63.0-63.6 GB: a ~65-70K row decoding, the bag grown into
+    idle headroom, a second deep row co-batched, a 67-72K restore realised for
+    a request still waiting. Every gate passed - none looks at what the
+    process already holds. Projected: 60 active + 41 = 101 > 95; shedding one
+    cache entry (-20) fits, so the row is admitted WITH room made."""
+    kv = _projected_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    _charge_entries(kv)
+    scheduler, candidate = _replay_0917(kv)
+
+    assert bkv.should_defer_cobatch(scheduler, candidate) is False
+
+    assert kv.stats()["entry_count"] == 1  # one shed, not the whole bag
+    assert kv.projected_relief_passes == 1 and kv.projected_defers == 0
+
+
+def test_106_what_cannot_fit_waits_and_is_never_rejected(monkeypatch, caplog):
+    kv = _projected_kv(monkeypatch, base_mb=60)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    scheduler, candidate = _replay_0917(kv)
+
+    with caplog.at_level("INFO"):
+        assert bkv.should_defer_cobatch(scheduler, candidate) is True
+
+    assert kv.projected_defers == 1 and kv.admission_deferrals == 1
+    assert kv.solo_rejections == 0
+    # shedding could not have closed the gap, so NOTHING was shed: the cache
+    # (incl. the entry this request will restore from) is intact
+    assert kv.stats()["entry_count"] == 1 and kv.projected_relief_passes == 0
+    assert "projected peak" in caplog.text and "restore" in caplog.text
+
+
+def test_106_room_is_made_only_down_to_the_ram_floor(monkeypatch):
+    """A second seat is not worth an empty cache: shedding stops at the RAM
+    floor, and the row waits instead."""
+    kv = _projected_kv(monkeypatch, base_mb=20, ram_floor_mb=25)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    third = list(range(50000, 50800))
+    kv.store("r3", third, _donor_at(len(third)))
+    _charge_entries(kv)
+    scheduler, candidate = _replay_0917(kv)
+
+    # 80 active + 41 = 121 > 95. Bag 60 -> 40 -> 20 MB; 20 <= the 25 MB floor
+    # stops it with one entry left: 40 + 41 = 81 fits.
+    assert bkv.should_defer_cobatch(scheduler, candidate) is False
+    assert kv.stats()["entry_count"] == 1
+
+
+def test_106_a_deferred_request_is_not_materialised_an_admitted_one_is(monkeypatch):
+    """The scheduler hook sits past every gate: deferral must not build the
+    copy (that was the unbudgeted memory), admission must."""
+    import mlx.core as mx
+    from vllm_mlx.request import Request, SamplingParams
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_PROJECTED_ADMISSION", "1")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", "8")
+    monkeypatch.setenv("VLLM_MLX_BATCHED_BPT_FLOOR_KB", "16")
+    scheduler = _make_scheduler(monkeypatch)
+    kv = scheduler.hybrid_kv
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    active = {"mb": 90}
+    monkeypatch.setattr(mx, "get_active_memory", lambda: _mb(active["mb"]))
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": _mb(100)}
+    )
+    monkeypatch.setattr(scheduler, "_ensure_batch_generator", lambda params: None)
+
+    request = Request(
+        request_id="queued",
+        prompt="x",
+        sampling_params=SamplingParams(max_tokens=8),
+        prompt_token_ids=list(GROWN),
+        num_prompt_tokens=len(GROWN),
+    )
+    bkv.fetch_for_request(kv, request)
+    scheduler.requests["queued"] = request
+    scheduler.waiting.append(request)
+    _running_request(scheduler, "busy", 61, 1000)
+
+    scheduler._schedule_waiting()  # 90 MB active: the projection defers it
+    assert request.cache_hit_type == "system_kv_pending"
+    assert request.prompt_cache is None and kv.lazy_restores == 0
+
+    active["mb"] = 10
+    scheduler._schedule_waiting()  # fits now: past the gates -> materialised
+    assert request.cache_hit_type == "system_kv"
+    assert request.prompt_cache is not None and kv.lazy_restores == 1
