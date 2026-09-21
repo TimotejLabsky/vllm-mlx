@@ -295,6 +295,13 @@ class BatchedSystemKV:
         )
         self.lazy_restores = 0
         self.lazy_restore_misses = 0
+        # (#107) request_id -> key of the entry a QUEUED request matched at
+        # enqueue. Make-room and budget eviction spare these while anything
+        # else can go: on 2026-09-21 a deep follow-up waited ~10 min behind
+        # the KV budget, lost its entry to make-room, and re-prefilled 60K
+        # tokens cold (18 min). Watermark relief can still take everything.
+        self._peeked: dict[str, int] = {}
+        self.lazy_ssd_fallbacks = 0
         self.projected_defers = 0
         self.projected_relief_passes = 0
         # Ground-truth backstop: defer co-batching while MLX active memory
@@ -515,6 +522,7 @@ class BatchedSystemKV:
             self._base_pos.pop(request_id, None)
             self._boundary_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
+            self._peeked.pop(request_id, None)
 
     # ---------------------------------------------------------------- store
 
@@ -860,10 +868,28 @@ class BatchedSystemKV:
             budget = min(budget, float(self.ram_max_mb) * 1024 * 1024)
         return max(budget, static)
 
+    def _pop_victim_locked(self, spare_pinned: bool, keep_newest: bool = False):
+        """(#107) Pop the LRU entry no queued request has matched. With every
+        candidate pinned: None when ``spare_pinned``, else plain LRU (a budget
+        still has to hold). ``keep_newest`` never offers the entry that was
+        just inserted - a promote must not evict itself."""
+        pinned = set(self._peeked.values())
+        keys = list(self._entries)
+        if keep_newest:
+            keys = keys[:-1]
+        for key in keys:
+            if key not in pinned:
+                return self._entries.pop(key)
+        if spare_pinned or not keys:
+            return None
+        return self._entries.pop(keys[0])
+
     def _enforce_budgets_locked(self) -> None:
         evicted = False
         while len(self._entries) > self.slots:
-            _, ev = self._entries.popitem(last=False)
+            ev = self._pop_victim_locked(spare_pinned=False, keep_newest=True)
+            if ev is None:
+                break
             self._timing.note_evict(timing_key(ev["tokens"]))
             self.evictions += 1
             evicted = True
@@ -875,7 +901,9 @@ class BatchedSystemKV:
                 len(self._entries) > 1
                 and sum(e["bytes"] for e in self._entries.values()) > budget
             ):
-                _, ev = self._entries.popitem(last=False)
+                ev = self._pop_victim_locked(spare_pinned=False, keep_newest=True)
+                if ev is None:
+                    break
                 self._timing.note_evict(timing_key(ev["tokens"]))
                 self.evictions += 1
                 evicted = True
@@ -1012,7 +1040,7 @@ class BatchedSystemKV:
         )
         return fresh, remaining, pos
 
-    def peek(self, tokens: list) -> int:
+    def peek(self, tokens: list, request_id: Optional[str] = None) -> int:
         """(#106) The restore position ``fetch`` WOULD use, without building
         anything: no state slices, no copy, no counters. 0 = no usable match.
 
@@ -1042,7 +1070,13 @@ class BatchedSystemKV:
             if pos < self.partial_min:
                 return 0
             self._entries.move_to_end(best_key)
+            if request_id is not None:
+                self._peeked[request_id] = best_key  # (#107) spared while it waits
             return pos
+
+    def release_peek(self, request_id: str) -> None:
+        with self._lock:
+            self._peeked.pop(request_id, None)
 
     def restore_bytes(self, cached_tokens: int) -> float:
         """What materialising a restore of ``cached_tokens`` will add to
@@ -1119,8 +1153,11 @@ class BatchedSystemKV:
         except Exception:
             return False
 
-    def _drop_lru_entry(self) -> bool:
+    def _drop_lru_entry(self, spare_pinned: bool = False) -> bool:
         """Drop the least-recently-used snapshot entry; False when empty.
+        ``spare_pinned`` (#107): skip entries a queued request has matched -
+        for make-room passes. Watermark relief calls it without: against a
+        real OOM everything is fair game.
 
         The bag is pure cache: non-grown entries reached SSD via
         write-through and grown entries re-grow from their spilled prefix,
@@ -1131,7 +1168,9 @@ class BatchedSystemKV:
         with self._lock:
             if not self._entries:
                 return False
-            _, ev = self._entries.popitem(last=False)
+            ev = self._pop_victim_locked(spare_pinned=spare_pinned)
+            if ev is None:
+                return False
             self._timing.note_evict(timing_key(ev["tokens"]))
             self.evictions += 1
             self.pressure_evictions += 1
@@ -1193,7 +1232,9 @@ class BatchedSystemKV:
                 self.pressure_backlog_drops += 1
                 relieved = True
             mx.clear_cache()
-            while mx.get_active_memory() + need > limit and self._drop_lru_entry():
+            while mx.get_active_memory() + need > limit and (
+                self._drop_lru_entry(spare_pinned=True) or self._drop_lru_entry()
+            ):
                 relieved = True
                 mx.clear_cache()
             active = mx.get_active_memory()
@@ -1250,10 +1291,16 @@ class BatchedSystemKV:
             floor = self.ram_mb * 1024 * 1024
             with self._lock:
                 bag = sum(e["bytes"] for e in self._entries.values())
+                pinned = set(self._peeked.values())
+                unpinned = sum(
+                    e["bytes"] for k, e in self._entries.items() if k not in pinned
+                )
             backlog = 0
             if self._ssd is not None:
                 backlog = int(self._ssd.get_stats().get("queued_bytes", 0) or 0)
-            sheddable = max(0, bag - floor) + backlog
+            # (#107) entries a queued request matched are not on offer: a
+            # second seat now is not worth an 18-minute cold prefill later
+            sheddable = max(0, min(unpinned, bag - floor)) + backlog
             if active + need - sheddable > limit:
                 # Shedding cannot close the gap: keep the cache (it holds the
                 # entry this very request will restore from) and just wait.
@@ -1272,7 +1319,7 @@ class BatchedSystemKV:
             while mx.get_active_memory() + need > limit:
                 with self._lock:
                     bag = sum(e["bytes"] for e in self._entries.values())
-                if bag <= floor or not self._drop_lru_entry():
+                if bag <= floor or not self._drop_lru_entry(spare_pinned=True):
                     break
                 relieved = True
                 mx.clear_cache()
@@ -1340,6 +1387,8 @@ class BatchedSystemKV:
                 "solo_rejections": self.solo_rejections,
                 "lazy_restores": self.lazy_restores,
                 "lazy_restore_misses": self.lazy_restore_misses,
+                "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
+                "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "projected_defers": self.projected_defers,
                 "projected_relief_passes": self.projected_relief_passes,
                 # (#103) memory held OUTSIDE the entries: in-flight checkpoint
@@ -1409,7 +1458,7 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     With LAZY_RESTORE (#106) a hit is only MATCHED here; the copy is built by
     ``materialize_pending_restore`` when the request is admitted."""
     if getattr(hybrid_kv, "lazy_restore", False) is True:
-        pos = hybrid_kv.peek(request.prompt_token_ids)
+        pos = hybrid_kv.peek(request.prompt_token_ids, request_id=request.request_id)
         if pos > 0:
             request.cache_hit_type = "system_kv_pending"
             request.prompt_cache = None
@@ -1463,9 +1512,21 @@ def materialize_pending_restore(scheduler, request) -> None:
     result = None
     if hybrid_kv is not None:
         try:
+            # (#107) The entry matched at enqueue may be gone from RAM by now
+            # (the request can wait minutes behind the KV budget). The eager
+            # miss path probes SSD; the lazy one went straight to a cold
+            # prefill - 18 minutes for a 60K chain whose entry was 0.5 s away
+            # on disk (2026-09-21). Promote first, then fetch once.
+            if getattr(hybrid_kv, "has_ssd", False) is True and hybrid_kv.peek(
+                request.prompt_token_ids
+            ) < (getattr(request, "cached_tokens", 0) or 0):
+                candidate = hybrid_kv.check_ssd(request.prompt_token_ids)
+                if candidate is not None and hybrid_kv.promote_ssd(candidate):
+                    hybrid_kv.lazy_ssd_fallbacks += 1
             result = hybrid_kv.fetch(
                 request.prompt_token_ids, request_id=request.request_id
             )
+            hybrid_kv.release_peek(request.request_id)
         except Exception:
             logger.debug(
                 "[batched_system_kv] lazy restore failed request=%s",
