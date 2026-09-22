@@ -13,6 +13,7 @@ Covers:
   UID's delta at most once per call.
 """
 
+import asyncio
 from collections import namedtuple
 
 import pytest
@@ -251,3 +252,69 @@ class TestProcessBatchResponsesAttributesMtpDeltas:
 
         assert outputs[0].mtp_drafts == 0
         assert outputs[0].mtp_accepted == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("drafts", "accepted"), [(2, 1), (2, 0), (0, 0)])
+def test_llm_mtp_counters_reach_api_metadata_after_aggregation(
+    stream, drafts, accepted
+):
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.output_collector import RequestOutputCollector
+    from vllm_mlx.request import RequestOutput
+    from vllm_mlx.server import _generation_metadata
+
+    # EngineCore puts a primary and its deferred draft into one collector
+    # before yielding. Both outputs carry the same cumulative MTP totals.
+    collector = RequestOutputCollector(aggregate=True)
+    for index, text in enumerate(["Hello", " world"]):
+        collector.put(
+            RequestOutput(
+                request_id="test-1",
+                new_token_ids=[10 + index],
+                new_text=text,
+                output_token_ids=[10, 11][: index + 1],
+                output_text="Hello" if index == 0 else "Hello world",
+                prompt_tokens=3,
+                completion_tokens=index + 1,
+                finished=index == 1,
+                finish_reason="length" if index == 1 else None,
+                mtp_drafts=drafts,
+                mtp_accepted=accepted,
+            )
+        )
+
+    class FakeEngineCore:
+        async def generate(self, *, prompt, sampling_params):
+            return collector.get_nowait()
+
+        async def add_request(self, *, prompt, sampling_params, prefix_boundary):
+            return "test-1"
+
+        async def stream_outputs(self, request_id):
+            yield collector.get_nowait()
+
+    # Exercise the real adapters without model loading or generation.
+    engine = object.__new__(BatchedEngine)
+    engine._loaded = True
+    engine._is_mllm = False
+    engine._engine = FakeEngineCore()
+
+    async def generate():
+        if stream:
+            outputs = [output async for output in engine.stream_generate("hello")]
+            assert len(outputs) == 1
+            return outputs[0]
+        return await engine.generate("hello")
+
+    output = asyncio.run(generate())
+
+    assert output.text == "Hello world"
+    assert output.completion_tokens == 2
+    assert (output.mtp_drafts, output.mtp_accepted) == (drafts, accepted)
+    metadata = _generation_metadata(None, output)
+    if drafts:
+        assert metadata is not None
+        assert (metadata.mtp_drafts, metadata.mtp_accepted) == (drafts, accepted)
+    else:
+        assert metadata is None

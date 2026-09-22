@@ -896,6 +896,8 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            mtp_drafts=output.mtp_drafts,
+            mtp_accepted=output.mtp_accepted,
         )
 
     async def stream_generate(
@@ -993,6 +995,8 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                mtp_drafts=output.mtp_drafts,
+                mtp_accepted=output.mtp_accepted,
             )
 
     async def chat(
