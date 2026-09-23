@@ -170,6 +170,38 @@ class ToolParser(ABC):
         self.current_tool_id = -1
         self.prev_tool_call_arr = []
 
+    def _stream_new_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Streaming delta for the calls this request has not emitted yet.
+
+        Parsers re-parse the whole accumulated text whenever a block closes, so
+        ``tool_calls`` holds every call so far. Re-sending the earlier ones —
+        at index 0 with a fresh id — makes OpenAI clients append their
+        arguments onto the first call (fork #110; upstream #774 fixed the same
+        in qwen_tool_parser). Counting by position, not by (name, arguments),
+        keeps two identical calls as two invocations. None when nothing is new.
+        """
+        first_new = self.current_tool_id + 1
+        new_calls = tool_calls[first_new:]
+        if not new_calls:
+            return None
+        self.current_tool_id = len(tool_calls) - 1
+        return {
+            "tool_calls": [
+                {
+                    "index": first_new + i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for i, tc in enumerate(new_calls)
+            ]
+        }
+
 
 class ToolParserManager:
     """

@@ -337,13 +337,25 @@ class Gemma4ToolParser(ToolParser):
 
         content_before = cleaned[:start_idx].strip() or None
 
-        block_start = start_idx + len(TOOL_CALL_START)
-        end_idx = cleaned.find(TOOL_CALL_END, block_start)
-        if end_idx == -1:
-            block = cleaned[block_start:]
-        else:
-            block = cleaned[block_start:end_idx]
+        # The Gemma 4 template renders each call as its own
+        # <|tool_call>…<tool_call|> block, so parallel calls arrive as several
+        # blocks — reading only the first dropped every call after it (#110).
+        tool_calls: list[dict[str, Any]] = []
+        while start_idx != -1:
+            block_start = start_idx + len(TOOL_CALL_START)
+            end_idx = cleaned.find(TOOL_CALL_END, block_start)
+            if end_idx == -1:
+                block = cleaned[block_start:]
+                start_idx = -1
+            else:
+                block = cleaned[block_start:end_idx]
+                start_idx = cleaned.find(TOOL_CALL_START, end_idx + len(TOOL_CALL_END))
+            tool_calls.extend(self._parse_canonical_block(block))
 
+        return tool_calls, content_before
+
+    def _parse_canonical_block(self, block: str) -> list[dict[str, Any]]:
+        """Parse the call:fn{...} entries inside one canonical block."""
         tool_calls: list[dict[str, Any]] = []
 
         pos = 0
@@ -379,7 +391,7 @@ class Gemma4ToolParser(ToolParser):
 
             pos = brace_end + 1
 
-        return tool_calls, content_before
+        return tool_calls
 
     def _extract_fallback(self, cleaned: str) -> ExtractedToolCallInformation | None:
         """Parse the Python-style fallback forms (issue #80).
@@ -462,22 +474,11 @@ class Gemma4ToolParser(ToolParser):
             tools_called=True, tool_calls=tool_calls, content=content
         )
 
-    def _format_streaming(self, result: ExtractedToolCallInformation) -> dict[str, Any]:
-        """Render extracted tool calls into the streaming delta shape."""
-        return {
-            "tool_calls": [
-                {
-                    "index": i,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": tc["arguments"],
-                    },
-                }
-                for i, tc in enumerate(result.tool_calls)
-            ]
-        }
+    def _format_streaming(
+        self, result: ExtractedToolCallInformation
+    ) -> dict[str, Any] | None:
+        """Render the not-yet-emitted tool calls into the streaming delta shape."""
+        return self._stream_new_tool_calls(result.tool_calls)
 
     def extract_tool_calls_streaming(
         self,
