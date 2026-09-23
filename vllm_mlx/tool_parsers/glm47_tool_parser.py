@@ -158,7 +158,7 @@ class Glm47ToolParser(ToolParser):
         # the non-streaming path sets content=None (reasoning before the
         # tag should not leak as regular content).
         if "<tool_call>" in current_text:
-            if "</tool_call>" in delta_text:
+            if self._marker_completed(previous_text, current_text, ("</tool_call>",)):
                 result = self.extract_tool_calls(current_text, request)
                 if result.tools_called:
                     return self._stream_new_tool_calls(result.tool_calls)

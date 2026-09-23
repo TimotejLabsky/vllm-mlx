@@ -1456,3 +1456,17 @@ def test_110_routed_parsers_emit_each_streamed_call_once():
     first, _ = FORMATS["harmony"]
     calls, _ = _stream("harmony", [first, "<|start|>assistant" + first])
     assert [c["index"] for c in calls] == [0, 1]
+
+
+# ------------------- #111 a closing marker split across deltas still fires
+def test_111_routed_parsers_see_split_closing_markers():
+    """Upstream's parsers trigger on `END in delta_text`; a rebase that takes
+    an upstream rewrite of a routed parser's trigger goes red here."""
+    from tests.test_tool_parser_stream_call_identity import A, B, FORMATS, _stream
+
+    for name in ("glm47", "gemma4", "nemotron", "harmony", "auto"):
+        first, second = FORMATS[name]
+        text = first + "\n" + second
+        calls, _ = _stream(name, [text[i : i + 1] for i in range(len(text))])
+        assert [c["index"] for c in calls] == [0, 1], name
+        assert [json.loads(c["function"]["arguments"]) for c in calls] == [A, B]

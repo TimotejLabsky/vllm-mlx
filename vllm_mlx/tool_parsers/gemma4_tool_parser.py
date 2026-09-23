@@ -497,8 +497,10 @@ class Gemma4ToolParser(ToolParser):
         if not has_canonical and not has_fallback:
             return {"content": delta_text}
 
-        # Canonical brace form: emit when the end delimiter arrives in this delta.
-        if has_canonical and TOOL_CALL_END in delta_text:
+        # Canonical brace form: emit when this delta completes an end delimiter.
+        if has_canonical and self._marker_completed(
+            previous_text, current_text, (TOOL_CALL_END,)
+        ):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._format_streaming(result)

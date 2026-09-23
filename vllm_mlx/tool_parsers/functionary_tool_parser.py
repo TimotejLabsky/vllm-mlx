@@ -172,7 +172,7 @@ class FunctionaryToolParser(ToolParser):
             return {"content": delta_text}
 
         end_markers = ["<|content|>", "</function>", "]"]
-        if any(m in delta_text for m in end_markers):
+        if self._marker_completed(previous_text, current_text, end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._stream_new_tool_calls(result.tool_calls)
