@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import vllm_mlx.server as srv
 from vllm_mlx.engine.base import GenerationOutput
+from vllm_mlx.utils.reasoning_effort import EFFORT_FALLBACK_KEY
 
 
 @pytest.fixture
@@ -147,10 +148,12 @@ def test_chat_completion_preparation_resolves_reasoning_effort_precedence(
 
     prepared = srv._prepare_chat_completion_invocation(engine, request, 8)
 
+    # Fork #76 also hands the engine the route default as its fallback level.
     assert prepared.chat_kwargs["chat_template_kwargs"] == {
         "reasoning_effort": expected_effort,
         "server_only": True,
         **({} if request_kwargs is None else request_kwargs),
+        EFFORT_FALLBACK_KEY: "low",
     }
 
 
