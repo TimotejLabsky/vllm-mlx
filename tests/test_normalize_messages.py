@@ -279,3 +279,57 @@ class TestNormalizeMessagesStructuralMerge:
              "function": {"name": "b", "arguments": "{}"}}]}
         _normalize_messages([first, second])
         assert first["tool_calls"] == tc  # concat produced a new list
+
+
+class TestNormalizeMessagesToolResults:
+    """#109: tool results are never merged.
+
+    Each ``role=tool`` message answers its own ``tool_call_id``; the #83
+    structural merge applied to them kept only the first id, so parallel
+    tool calls collapsed into one result (``"AAA\\n\\nBBB"`` under ``c1``).
+    The two-results case itself is upstream #774's
+    ``test_consecutive_tool_results_preserve_call_ids_and_contents`` above.
+    """
+
+    def _parallel_history(self):
+        calls = [
+            {
+                "id": cid,
+                "type": "function",
+                "function": {"name": "read", "arguments": f'{{"path": "{p}"}}'},
+            }
+            for cid, p in (("c1", "a"), ("c2", "b"))
+        ]
+        return [
+            {"role": "user", "content": "read a and b"},
+            {"role": "assistant", "content": "", "tool_calls": calls},
+            {"role": "tool", "tool_call_id": "c1", "content": "AAA"},
+            {"role": "tool", "tool_call_id": "c2", "content": "BBB"},
+        ]
+
+    def test_unknown_roles_not_merged(self):
+        from vllm_mlx.server import _normalize_messages
+
+        messages = [
+            {"role": "function", "name": "a", "content": "1"},
+            {"role": "function", "name": "b", "content": "2"},
+        ]
+        assert _normalize_messages(messages) == messages
+
+    def test_assistant_pair_still_merges_around_tool_results(self):
+        # #83 is kept on purpose (upstream #774 refuses merges when either
+        # side has tool_calls): text turn + two-call turn -> one combined
+        # assistant message with every call, results untouched.
+        from vllm_mlx.server import _normalize_messages
+
+        history = self._parallel_history()
+        messages = [
+            history[0],
+            {"role": "assistant", "content": "Reading both."},
+            *history[1:],
+        ]
+        result = _normalize_messages(messages)
+        assert len(result) == 4
+        assert result[1]["content"] == "Reading both."
+        assert [c["id"] for c in result[1]["tool_calls"]] == ["c1", "c2"]
+        assert [m["tool_call_id"] for m in result[2:]] == ["c1", "c2"]
