@@ -3431,3 +3431,31 @@ reached the template as one result for two calls — the Qwen template rendered 
 **What this patch adds on the rebased base:** a comment at the condition naming the partial adoption; tests for unknown roles and for a text turn + two-call turn merging with both calls while the two results stay separate; and `test_83_109_normalize_merges_assistant_pairs_never_tool_results` in `tests/test_fork_invariants.py`, which goes red if a rebase takes #774's condition wholesale (the #83 half) or loses the allowlist (the #109 half). Pre-rebase, the same change was written as a one-line fork fix (branch `patch/tool-results-stay-separate`, `96d9cb2`) and mutation-checked: all 4 new tests red with the allowlist removed.
 
 **Upstream:** allowlist = upstream #774; the #83 carve-out is fork-owned.
+
+## 110. `patch: tool-call-stream-once` — every streaming parser emits each tool call exactly once
+
+**Files:** `vllm_mlx/tool_parsers/abstract_tool_parser.py` (`ToolParser._stream_new_tool_calls`), the streaming emit block of `glm47`, `gemma4`, `nemotron`, `harmony`, `auto`, `kimi`, `minimax`, `deepseek`, `deepseek_v4`, `functionary`, `granite`, `xlam`; `gemma4._extract_canonical` (every block); `minimax._has_tool_end` (counts closings); `tests/test_tool_parser_stream_call_identity.py` (new, 32), `tests/test_fork_invariants.py` (+1).
+
+**Found by the 2026-09-23 AI stack audit** while reviewing upstream #774, whose `qwen_tool_parser` fix ("emit only newly completed calls on the final delta") was the only one of its kind. Every other streaming parser re-parses the whole accumulated text whenever a call block closes and returns **all** `result.tool_calls` as `index: i` with freshly generated ids. When a second call closes, the first is sent again at index 0. OpenAI-style clients (opencode, the SDKs) accumulate `tool_calls` deltas **by index**, so the second copy's `arguments` get appended to the first call's: `{"path": "a"}{"path": "a"}` → invalid JSON, or one call too many. Measured per parser, feeding two calls in their native shape plus trailing deltas (the #774 test shape):
+
+| Parser | Routed on | Before | Cause |
+|---|---|---|---|
+| glm47, nemotron, auto, kimi, deepseek, functionary | GLM-4.7-Flash / GLM-4.6V; Nemotron-Cascade-2 / Super; EuroLLM, Phi-4 ×2 | indexes `[0, 0, 1]` | re-emit all on each close |
+| gemma4 | both gemma-4 routes | `[0, 0]`, **call b lost** | `_extract_canonical` read only the first `<\|tool_call>` block — the Gemma 4 template renders every parallel call as its own block, so the **non-streaming** path dropped all parallel calls after the first too |
+| minimax | — | `[0]`, **call b lost** | `</minimax:tool_call> in current and not in previous` only fires for the first block, and the server's end-of-stream fallback skips once any call was streamed |
+| deepseek_v4 | — | `[0, 1, 0, 1]` | `finalize_streaming` re-parsed when any text followed the closed block |
+| harmony | gpt-oss-20b | ok, but **drops a repeated identical call** | dedupe by `(name, arguments)` — reading the same file twice is two invocations |
+| granite, xlam | — | ok (single array) | made consistent anyway: a later `]` in the text re-triggered them |
+
+**Fix.** One base-class helper, `_stream_new_tool_calls(tool_calls)`: emits `tool_calls[current_tool_id + 1:]` at `index = position`, advances `current_tool_id`, returns None when nothing is new — upstream #774's qwen logic, lifted so every parser shares it (qwen itself is left as upstream wrote it). Counting by position also retires harmony's signature dedupe. Streaming parsers are built per request (#644), and `reset()` already zeroes `current_tool_id`.
+
+**Server paths checked:** only the OpenAI chat stream emits tool calls from the streaming parser; it passes each delta's calls through and #92/#94 coerce each call independently — nothing relied on re-seeing earlier calls. The Anthropic and Responses paths build tool calls from one full parse at the end and use the streaming parser only to hold back text (the #690 `drop_post_call_text` flag latches on the first call, unchanged). #89's grammar-stop handling works on text, not tool deltas.
+
+**Known limit (unchanged, documented):** these parsers fire on the end marker appearing in *one* delta. The markers are single special tokens on the routed models, and when none fires, the server's end-of-stream fallback parses the whole text. A split marker on the *second* call only, after the first streamed, would still be missed; that needs inconsistent tokenization and was not addressed.
+
+**Upstream:** the qwen half is upstream #774; the helper and the other twelve parsers are fork-owned — a candidate PR.
+
+**Verification:**
+- **Red then green.** 14 of the 32 new tests fail against `c122916`'s parsers (the 9 re-emitting/losing parsers, gemma4 reset, harmony identical calls, gemma4 non-streaming blocks, minimax second block, deepseek_v4 finalize); all pass with the fix. The server-level SSE test (real `stream_chat_completion`, glm47/gemma4/nemotron/auto) goes red with glm47 reverted.
+- Full suite 3984 passed; on the Studio (prod venv, rsync'd source) 3977 passed + the 6 known environmental failures (5× `test_mcp_security` no `npx`, `test_106_a` mlx-lm pin fixture — identical on `c122916`).
+- **Real server, real model, before/after** (Studio, spare port 8768, `Qwen3-0.6B-8bit` with `--tool-call-parser auto` — its `<tool_call>{json}</tool_call>` output is the `auto` routes' format; T=0 prompt asking for two parallel `read` calls, streamed, accumulated by index as an OpenAI client does): **deployed `c122916`** → deltas `(0, a) (0, a) (1, b)` → call 0 accumulates to name `readread`, arguments `{"path": "a.txt"}{"path": "a.txt"}` (**invalid JSON**); **with #110** → `(0, a) (1, b)` → two valid calls, no traceback.
