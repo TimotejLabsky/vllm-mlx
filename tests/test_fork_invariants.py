@@ -1438,3 +1438,21 @@ def test_83_109_normalize_merges_assistant_pairs_never_tool_results():
         {"role": "tool", "tool_call_id": "c2", "content": "BBB"},
     ]
     assert _normalize_messages(results) == results
+
+
+# ---------------------- #110 streaming tool calls are emitted once, by position
+def test_110_routed_parsers_emit_each_streamed_call_once():
+    """Upstream owns these parsers and fixed the re-emit only in qwen (#774).
+    A rebase that takes an upstream rewrite of any routed parser's streaming
+    block — or reverts gemma4 to first-block-only parsing, or harmony to its
+    (name, arguments) dedupe — goes red here."""
+    from tests.test_tool_parser_stream_call_identity import FORMATS, _stream
+
+    for name in ("glm47", "gemma4", "nemotron", "harmony", "auto"):
+        first, second = FORMATS[name]
+        calls, _ = _stream(name, [first, "\n", second, "\n", ""])
+        assert [c["index"] for c in calls] == [0, 1], name
+    # Two identical calls are two invocations, not one.
+    first, _ = FORMATS["harmony"]
+    calls, _ = _stream("harmony", [first, "<|start|>assistant" + first])
+    assert [c["index"] for c in calls] == [0, 1]
