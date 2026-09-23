@@ -716,6 +716,37 @@ class ArraysCache(_BaseCache):
     def __getitem__(self, idx):
         return self.cache[idx]
 
+    # Fork #113: this vendored model builds its caches here but runs the
+    # INSTALLED mlx-vlm's qwen3_5 GatedDeltaNet layers. From mlx-vlm 0.7.0
+    # those layers store their state through these two cache methods instead
+    # of writing cache[0] / cache[1] themselves — without them every REAP-288
+    # batch failed (AttributeError -> 503). Semantics match mlx-vlm 0.7.2's
+    # ArraysCache with no speculative history (the fork never records one);
+    # on 0.6.x nothing calls them.
+    def update_window(self, index, source, width, *, lengths=None):
+        """Store the trailing causal window of ``source`` (the conv state)."""
+        width = int(width)
+        length = source.shape[1] - width
+        if width < 0 or length < 0:
+            raise ValueError("Invalid causal cache window width.")
+        if lengths is None:
+            state = mx.contiguous(source[:, length : length + width])
+        else:
+            positions = mx.clip(lengths, 0, length)[:, None] + mx.arange(width)
+            positions = positions.reshape(*positions.shape, *([1] * (source.ndim - 2)))
+            state = mx.take_along_axis(source, positions, axis=1)
+        self.cache[index] = state
+        return state
+
+    def update_recurrent(self, index, length, update):
+        """Run ``update(state, state_steps)`` and keep its final state."""
+        if length < 1:
+            raise ValueError("Recurrent updates must contain at least one token.")
+        result = update(self.cache[index], None)
+        output, state = result[:2]
+        self.cache[index] = state
+        return output, state
+
     @property
     def state(self):
         return self.cache
