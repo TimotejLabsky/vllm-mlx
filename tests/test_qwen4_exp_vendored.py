@@ -213,3 +213,87 @@ def test_fp8_checkpoint_is_rejected_with_clear_error():
     # FP8 guard unless PLE mode is "mmap", which module state is not here.
     with pytest.raises(NotImplementedError, match="FP8"):
         Model.sanitize(object(), dict(weights))
+
+
+# ---- #113: the vendored cache speaks the installed mlx-vlm >= 0.7 cache API
+def _vendored_cache_module():
+    # Resolved through mlx_vlm like the running model does (the module
+    # fixture registered the vendor tree first on mlx_vlm's __path__).
+    import mlx_vlm.models.qwen4_exp.cache as cache
+
+    assert "vllm_mlx/vendored/qwen4_exp" in cache.__file__.replace("\\", "/")
+    return cache
+
+
+def test_update_window_matches_the_pre_07_inline_conv_state():
+    """mlx-vlm 0.6.x's GatedDeltaNet stored the conv window inline; 0.7.x calls
+    cache.update_window. The vendored cache must store the same thing."""
+    import mlx.core as mx
+
+    vc = _vendored_cache_module()
+    S, keep = 7, 3
+    conv_input = mx.random.normal((2, S + keep, 16), key=mx.random.key(0))
+
+    cache = vc.ArraysCache(size=2)
+    cache.update_window(0, conv_input, keep)
+    assert mx.array_equal(cache[0], mx.contiguous(conv_input[:, -keep:, :]))
+
+    lengths = mx.array([4, 7])
+    cache.update_window(0, conv_input, keep, lengths=lengths)
+    ends = mx.clip(lengths, 0, S)
+    positions = (ends[:, None] + mx.arange(keep))[..., None]
+    assert mx.array_equal(cache[0], mx.take_along_axis(conv_input, positions, axis=1))
+
+
+def test_update_recurrent_runs_the_update_on_the_stored_state():
+    import mlx.core as mx
+
+    vc = _vendored_cache_module()
+    cache = vc.ArraysCache(size=2)
+    cache[1] = mx.ones((1, 2))
+    seen = []
+
+    def update(state, steps):
+        seen.append((state, steps))
+        return "out", state + 1
+
+    out, state = cache.update_recurrent(1, 3, update)
+    assert out == "out" and seen[0][1] is None
+    assert mx.array_equal(cache[1], mx.full((1, 2), 2.0)) and cache[1] is state
+
+
+def test_installed_qwen3_5_gdn_runs_on_the_vendored_cache():
+    """The REAP-288 failure shape: the vendored model's cache driven through
+    the INSTALLED mlx-vlm qwen3_5 GatedDeltaNet (whatever version is here).
+    On mlx-vlm 0.7.2 without #113 this raised AttributeError: update_window."""
+    import mlx.core as mx
+    from mlx_vlm.models.qwen3_5 import language as L
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+
+    vc = _vendored_cache_module()
+    cfg = TextConfig(
+        model_type="qwen3_5",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=100,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        max_position_embeddings=4096,
+    )
+    mx.random.seed(0)
+    layer = L.Qwen3_5GatedDeltaNet(cfg)
+    layer.eval()
+    cache = vc.ArraysCache(size=2)
+    out = layer(mx.random.normal((2, 7, 64), key=mx.random.key(1)), cache=cache)
+    out = layer(mx.random.normal((2, 1, 64), key=mx.random.key(2)), cache=cache)
+    mx.eval(out, cache[0], cache[1])
+    assert out.shape == (2, 1, 64)
+    assert cache[0].shape == (2, 3, 256)  # kernel-1 conv window
+    assert cache[1].shape == (2, 4, 32, 32)  # recurrent state
