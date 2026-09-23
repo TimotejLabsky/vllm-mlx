@@ -156,7 +156,7 @@ class xLAMToolParser(ToolParser):
             return {"content": delta_text}
 
         # Try to parse when we see completion markers
-        if "]" in delta_text or "```" in delta_text:
+        if self._marker_completed(previous_text, current_text, ("]", "```")):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._stream_new_tool_calls(result.tool_calls)
