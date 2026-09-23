@@ -6316,6 +6316,10 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         role = _ROLE_MAP.get(msg["role"], msg["role"])
         if (
             role == prev["role"]
+            # Upstream #774's allowlist: tool results are never merged (#109
+            # — the merge kept only the first tool_call_id). Its companion
+            # guard (no merge when either side has tool_calls) is NOT taken:
+            # it would undo #83's assistant text-turn + tool-call-turn merge.
             and role in ("system", "user", "assistant")
             and isinstance(prev.get("content"), str)
             and isinstance(msg.get("content"), str)
