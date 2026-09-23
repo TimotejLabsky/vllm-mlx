@@ -999,14 +999,21 @@ def test_106_a_lazy_restore_is_byte_identical_to_an_eager_one(monkeypatch):
     assert eager.cache_hit_type == "system_kv"  # inert by default = old path
     assert lazy.cached_tokens == eager.cached_tokens
     assert lazy.remaining_tokens == eager.remaining_tokens
+    def same(a, b):
+        # mlx-lm f4f3b57+ ArraysCache.state is (cache_list, left_padding,
+        # lengths) — a nested list — where 9acef5f returned the list itself.
+        if a is None or b is None:
+            return a is b
+        if isinstance(a, (list, tuple)):
+            return (
+                isinstance(b, (list, tuple))
+                and len(a) == len(b)
+                and all(same(x, y) for x, y in zip(a, b))
+            )
+        return a.shape == b.shape and bool(mx.array_equal(a, b))
+
     for lazy_layer, eager_layer in zip(lazy.prompt_cache, eager.prompt_cache):
-        lazy_state, eager_state = lazy_layer.state, eager_layer.state
-        assert len(lazy_state) == len(eager_state)
-        for a, b in zip(lazy_state, eager_state):
-            if a is None or b is None:
-                assert a is b
-            else:
-                assert a.shape == b.shape and bool(mx.array_equal(a, b))
+        assert same(lazy_layer.state, eager_layer.state)
 
 
 def test_106_an_entry_evicted_during_the_wait_degrades_to_a_miss(monkeypatch):
