@@ -449,7 +449,7 @@ class AutoToolParser(ToolParser):
         if any(m in delta_text for m in end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return self._new_streaming_tool_calls(result.tool_calls)
+                return self._stream_new_tool_calls(result.tool_calls)
 
         return None
 
