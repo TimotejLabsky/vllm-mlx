@@ -1477,3 +1477,24 @@ def test_111_routed_parsers_see_split_closing_markers():
         calls, _ = _stream(name, [text[i : i + 1] for i in range(len(text))])
         assert [c["index"] for c in calls] == [0, 1], name
         assert [json.loads(c["function"]["arguments"]) for c in calls] == [A, B]
+
+
+# ------------------------ #112 harmony streams read the raw control tokens
+def test_112_harmony_parsers_consume_the_raw_stream():
+    """Upstream owns both harmony parsers and the three streaming loops. The
+    flags route the raw delta to them (the Anthropic loop strips special
+    tokens first); the replay pins the split-channel-name handling. Either
+    lost in a rebase and gpt-oss streamed answers go empty again."""
+    from tests.test_harmony_stream_tool_calls import (
+        ANALYSIS,
+        FINAL_ANSWER_DELTAS,
+        TOOL_CALL_DELTAS,
+        _parse,
+    )
+    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+    from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
+
+    assert HarmonyReasoningParser.CONSUMES_RAW_STREAM is True
+    assert HarmonyToolParser.CONSUMES_RAW_STREAM is True
+    assert _parse(TOOL_CALL_DELTAS) == (ANALYSIS, "")
+    assert _parse(FINAL_ANSWER_DELTAS) == ("User wants a fact.", "The sky is blue.")
