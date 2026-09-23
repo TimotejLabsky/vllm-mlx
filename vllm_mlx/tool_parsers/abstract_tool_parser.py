@@ -170,6 +170,25 @@ class ToolParser(ABC):
         self.current_tool_id = -1
         self.prev_tool_call_arr = []
 
+    @staticmethod
+    def _marker_completed(
+        previous_text: str, current_text: str, markers: Sequence[str]
+    ) -> bool:
+        """Whether this delta completed one of ``markers`` (fork #111).
+
+        ``marker in delta_text`` misses a closing marker split across deltas —
+        and the server's end-of-stream fallback only runs when no call was
+        streamed at all, so a split close on a later call lost that call.
+        A marker completed by this delta ends inside it, so it lies within the
+        delta plus ``len(marker) - 1`` characters before it; one wholly inside
+        ``previous_text`` cannot fit there. O(delta), not a rescan.
+        """
+        start = len(previous_text)
+        return any(
+            marker in current_text[max(0, start - len(marker) + 1) :]
+            for marker in markers
+        )
+
     def _stream_new_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> dict[str, Any] | None:

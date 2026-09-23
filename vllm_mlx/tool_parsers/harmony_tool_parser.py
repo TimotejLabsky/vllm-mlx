@@ -162,11 +162,12 @@ class HarmonyToolParser(ToolParser):
         if "<|channel|>" not in current_text:
             return {"content": delta_text}
 
-        # A commentary block completed: an explicit terminator arrived in this
-        # delta, or the model moved on to the final channel.
-        block_completed = any(
-            tok in delta_text
-            for tok in ("<|call|>", "<|end|>", "<|return|>", "<|start|>")
+        # A commentary block completed: this delta completed an explicit
+        # terminator, or the model moved on to the final channel.
+        block_completed = self._marker_completed(
+            previous_text,
+            current_text,
+            ("<|call|>", "<|end|>", "<|return|>", "<|start|>"),
         ) or (
             "<|channel|>final" in current_text
             and "<|channel|>final" not in previous_text

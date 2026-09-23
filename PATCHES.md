@@ -3451,7 +3451,7 @@ reached the template as one result for two calls — the Qwen template rendered 
 
 **Server paths checked:** only the OpenAI chat stream emits tool calls from the streaming parser; it passes each delta's calls through and #92/#94 coerce each call independently — nothing relied on re-seeing earlier calls. The Anthropic and Responses paths build tool calls from one full parse at the end and use the streaming parser only to hold back text (the #690 `drop_post_call_text` flag latches on the first call, unchanged). #89's grammar-stop handling works on text, not tool deltas.
 
-**Known limit (unchanged, documented):** these parsers fire on the end marker appearing in *one* delta. The markers are single special tokens on the routed models, and when none fires, the server's end-of-stream fallback parses the whole text. A split marker on the *second* call only, after the first streamed, would still be missed; that needs inconsistent tokenization and was not addressed.
+**Known limit at #110 — closed by #111:** these parsers fired on the end marker appearing in *one* delta; a close split across deltas on a call after the first was lost.
 
 **Upstream:** the qwen half is upstream #774; the helper and the other twelve parsers are fork-owned — a candidate PR.
 
@@ -3459,3 +3459,18 @@ reached the template as one result for two calls — the Qwen template rendered 
 - **Red then green.** 14 of the 32 new tests fail against `c122916`'s parsers (the 9 re-emitting/losing parsers, gemma4 reset, harmony identical calls, gemma4 non-streaming blocks, minimax second block, deepseek_v4 finalize); all pass with the fix. The server-level SSE test (real `stream_chat_completion`, glm47/gemma4/nemotron/auto) goes red with glm47 reverted.
 - Full suite 3984 passed; on the Studio (prod venv, rsync'd source) 3977 passed + the 6 known environmental failures (5× `test_mcp_security` no `npx`, `test_106_a` mlx-lm pin fixture — identical on `c122916`).
 - **Real server, real model, before/after** (Studio, spare port 8768, `Qwen3-0.6B-8bit` with `--tool-call-parser auto` — its `<tool_call>{json}</tool_call>` output is the `auto` routes' format; T=0 prompt asking for two parallel `read` calls, streamed, accumulated by index as an OpenAI client does): **deployed `c122916`** → deltas `(0, a) (0, a) (1, b)` → call 0 accumulates to name `readread`, arguments `{"path": "a.txt"}{"path": "a.txt"}` (**invalid JSON**); **with #110** → `(0, a) (1, b)` → two valid calls, no traceback.
+
+## 111. `patch: split-close-marker` — a closing marker split across deltas still completes the call
+
+**Files:** `vllm_mlx/tool_parsers/abstract_tool_parser.py` (`ToolParser._marker_completed`), the completion trigger of `glm47`, `gemma4`, `nemotron`, `harmony`, `auto`, `kimi`, `deepseek`, `functionary`, `granite`, `xlam`; `tests/test_tool_parser_stream_call_identity.py` (+81), `tests/test_fork_invariants.py` (+1).
+
+**The gap #110 left open.** Ten streaming parsers decided "a call block just closed" with `END in delta_text`. A marker the tokenizer splits over two deltas (`</tool_` + `call>`) never appears in any single delta, so the parser never fires. When that happens on the *only* call, the server's end-of-stream fallback (`not tool_calls_detected` → parse the whole text) rescues it; when it happens on a *later* call, the first call has already streamed, the fallback is skipped, and **that call is silently lost**. Same shape as #110's minimax bug.
+
+**Fix.** `_marker_completed(previous_text, current_text, markers)`: a marker completed by this delta ends inside it, so it lies within the delta plus `len(marker) - 1` characters before it, and one wholly inside `previous_text` cannot fit there — the same tail-window argument as SimpleEngine's stop-string scan. O(delta) per call, no rescan of the accumulated text. All ten triggers use it (harmony's four terminators included). **Not changed:** `qwen` and `hermes` already count closings in the accumulated text (verified at 1-, 5-char and split-second-close chunking — the Qwen routes were never exposed); `deepseek_v4` and `minimax` (after #110) already compare accumulated text; `mistral`'s `[TOOL_CALLS]` check is a *start* marker in an incremental parser, a single special token on Mistral models.
+
+**Exposure on the routed models:** low — the routed parsers' closing markers are single special tokens there, so they arrive whole. This closes the class rather than a measured incident; it matters for any model or tokenizer that spells a marker in ordinary tokens.
+
+**Verification:**
+- **Red then green.** 51 of the new tests fail against `1267e27`'s parsers: every chunk size (1/2/3/5/7) for all ten, the split-second-close case for the six where it applies (auto, functionary, gemma4, glm47, harmony, nemotron), and the window unit tests; all pass with the fix. The server-level SSE test gained a split-second-close variant through the real `stream_chat_completion` (glm47/gemma4/nemotron/auto).
+- Full suite 4065 passed; on the Studio (prod venv, rsync'd source) 4059 passed + the 6 known environmental failures.
+- **Real server, no regression on whole markers** (Studio, spare port, `Qwen3-0.6B-8bit`, `--tool-call-parser auto`, two parallel `read` calls): streamed deltas `(0, a) (1, b)`, non-streaming the same two calls, no traceback. A live split-marker repro is not possible on these models — their closing markers are single special tokens — so the split cases are covered by the unit and server-loop tests.
