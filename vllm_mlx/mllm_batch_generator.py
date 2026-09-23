@@ -3425,6 +3425,7 @@ def install_chunked_prefill_mllm(
                                         token=0,
                                         logprobs=mx.zeros(1),
                                         finish_reason="error",
+                                        error_kind=_error_kind_for(e),
                                     )
                                 )
                                 continue
