@@ -124,16 +124,15 @@ class MiniMaxToolParser(ToolParser):
 
     def _has_tool_end(self, current: str, previous: str) -> bool:
         """Check if a tool call block just completed."""
+        # Count closings, not presence: a second block's close must fire too
+        # (#110 — "not in previous" only ever fired for the first block).
         # If wrapped format is used, only trigger on the wrapper closing tag
         if "<minimax:tool_call>" in current:
-            return (
-                "</minimax:tool_call>" in current
-                and "</minimax:tool_call>" not in previous
-            )
-        # Bare invoke: </invoke> just appeared
-        if "</invoke>" in current and "</invoke>" not in previous:
-            return True
-        return False
+            end = "</minimax:tool_call>"
+        else:
+            # Bare invoke: another </invoke> just appeared
+            end = "</invoke>"
+        return current.count(end) > previous.count(end)
 
     def extract_tool_calls_streaming(
         self,
@@ -153,20 +152,7 @@ class MiniMaxToolParser(ToolParser):
         if self._has_tool_end(current_text, previous_text):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+                return self._stream_new_tool_calls(result.tool_calls)
 
         # Inside tool call block but not yet complete — suppress output
         return None
