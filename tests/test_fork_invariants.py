@@ -1498,3 +1498,18 @@ def test_112_harmony_parsers_consume_the_raw_stream():
     assert HarmonyToolParser.CONSUMES_RAW_STREAM is True
     assert _parse(TOOL_CALL_DELTAS) == (ANALYSIS, "")
     assert _parse(FINAL_ANSWER_DELTAS) == ("User wants a fact.", "The sky is blue.")
+
+
+# --------- #113 the vendored qwen4_exp cache speaks mlx-vlm >= 0.7's cache API
+def test_113_vendored_qwen4_exp_cache_has_the_07_state_methods():
+    """The vendored qwen4_exp builds its own caches but runs the INSTALLED
+    mlx-vlm's qwen3_5 GatedDeltaNet, which from 0.7.0 stores state through
+    update_window / update_recurrent. A re-vendor from an older mlx-vlm build
+    (or a rebase that takes one) drops them and REAP-288 503s on every batch."""
+    from vllm_mlx.vendored.qwen4_exp import apply_qwen4_exp_compat_patch
+
+    apply_qwen4_exp_compat_patch()
+    import mlx_vlm.models.qwen4_exp.cache as cache
+
+    assert callable(getattr(cache.ArraysCache, "update_window", None))
+    assert callable(getattr(cache.ArraysCache, "update_recurrent", None))

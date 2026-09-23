@@ -3504,3 +3504,17 @@ reached the template as one result for two calls — the Qwen template rendered 
 - **Red then green.** 10 new tests replaying the captured deltas through the real `stream_chat_completion`, `_stream_anthropic_messages` and `_stream_responses_request` with the real harmony parsers: all 10 fail on `ce13c35`, all pass with the fix. Fork invariant pins both flags and the split-channel replay.
 - Full suite 4079 passed.
 - **Real server, real gpt-oss-20b** (Studio, spare port, rsync'd source, unpatched vs patched): the table above; non-streaming responses byte-identical before/after; 0 tracebacks.
+
+## 113. `patch: qwen4-exp-mlx-vlm-07-cache` — REAP-288 runs on mlx-vlm 0.7.x
+
+**Files:** `vllm_mlx/vendored/qwen4_exp/vendor/mlx_vlm/models/qwen4_exp/cache.py` (`ArraysCache.update_window`, `ArraysCache.update_recurrent`), `tests/test_qwen4_exp_vendored.py` (+3), `tests/test_fork_invariants.py` (+1).
+
+**Found by the 2026-09-23 package bump**, which had to roll mlx-vlm 0.7.2 back to 0.6.17: on 0.7.2 every REAP-288 (`qwen4_exp`, #97) batch failed with `AttributeError: 'ArraysCache' object has no attribute 'update_window'` → 503, while every other route (5 vision families 10/10, Qwen3.8 text T=0 byte-identical) was clean.
+
+**Cause.** The vendored `qwen4_exp` builds its caches from its **own** `cache.py` (vendored from an older mlx-vlm build) but runs the **installed** mlx-vlm's `qwen3_5` GatedDeltaNet layers. From mlx-vlm 0.7.0 those layers no longer write `cache[0]` (conv window) / `cache[1]` (recurrent state) themselves: the conv window goes through `cache.update_window(0, conv_input, k-1, lengths=cache.lengths)` and the state through `gated_delta_update(..., cache=cache)` → `cache.update_recurrent(1, S, fn)`. mlx-vlm's own `ArraysCache` grew those methods (plus speculative-history recording); the vendored one had neither. Other routes were unaffected because they use the installed mlx-vlm's own cache.
+
+**Fix.** The two methods on the vendored `ArraysCache`, with mlx-vlm 0.7.2's semantics for the non-speculative case (the fork never records speculative history): `update_window` stores the trailing `width` rows of the source, or the per-row `lengths` gather; `update_recurrent` runs `fn(cache[i], None)` and stores the returned state. On 0.6.x nothing calls them. Everything else the 0.7.x layers touch (`lengths`, `left_padding`, `advance`, `make_mask`, private `_qwen3_5_*` metadata attributes) the vendored class already supports.
+
+**Verification:**
+- **Cross-version bit-identity.** A tiny installed-mlx-vlm `Qwen3_5GatedDeltaNet` driven with the vendored cache (prefill B=2, two decode steps, and the per-row `lengths` window path) gives bit-identical outputs, conv window and recurrent state on mlx-vlm 0.6.17 and 0.7.2 (max diff 0). The unfixed cache on 0.7.2 reproduces the production error exactly.
+- **Red then green.** 3 new tests (window equivalence to the 0.6.x inline code incl. the `lengths` gather, recurrent update, and the installed GDN running on the vendored cache): pass on 0.6.17 and 0.7.2, all 3 fail on 0.7.2 with the unfixed cache. Full suite: 4084 passed on both mlx-vlm 0.6.17 and 0.7.2.
