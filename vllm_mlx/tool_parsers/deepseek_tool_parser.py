@@ -149,7 +149,9 @@ class DeepSeekToolParser(ToolParser):
             return {"content": delta_text}
 
         # If we see the end marker, parse the complete output
-        if self.TOOL_CALL_END in delta_text or self.TOOL_CALLS_END in delta_text:
+        if self._marker_completed(
+            previous_text, current_text, (self.TOOL_CALL_END, self.TOOL_CALLS_END)
+        ):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._stream_new_tool_calls(result.tool_calls)
