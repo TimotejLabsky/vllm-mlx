@@ -86,6 +86,23 @@ async def test_parallel_tool_execution_keeps_ordinary_error_result(monkeypatch):
     assert result.error_message == "tool failed"
 
 
+@pytest.fixture(autouse=True)
+def _whitelisted_commands_resolve(monkeypatch):
+    """These tests exercise the validation rules, not the host's PATH.
+    MCPServerConfig checks that its command resolves; on a box without Node
+    (the fork's Mac Studio has no npx/node), valid configs failed with
+    "not found in PATH". Resolve the whitelisted commands only when absent."""
+    real_which = mcp_security.shutil.which
+
+    def which(cmd, *args, **kwargs):
+        found = real_which(cmd, *args, **kwargs)
+        if found is None and cmd in ALLOWED_COMMANDS:
+            return f"/usr/local/bin/{cmd}"
+        return found
+
+    monkeypatch.setattr(mcp_security.shutil, "which", which)
+
+
 class TestMCPCommandValidator:
     """Tests for MCPCommandValidator class."""
 
