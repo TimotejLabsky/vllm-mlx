@@ -217,22 +217,11 @@ class DeepSeekV4ToolParser(ToolParser):
 
         return arguments
 
-    def _format_streaming(self, result: ExtractedToolCallInformation) -> dict[str, Any]:
-        """Render extracted tool calls into the streaming delta shape."""
-        return {
-            "tool_calls": [
-                {
-                    "index": i,
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": tc["arguments"],
-                    },
-                }
-                for i, tc in enumerate(result.tool_calls)
-            ]
-        }
+    def _format_streaming(
+        self, result: ExtractedToolCallInformation
+    ) -> dict[str, Any] | None:
+        """Render the not-yet-emitted tool calls into the streaming delta shape."""
+        return self._stream_new_tool_calls(result.tool_calls)
 
     def reset(self) -> None:
         """Reset parser state for a new request."""
@@ -287,10 +276,10 @@ class DeepSeekV4ToolParser(ToolParser):
                 if result.tools_called:
                     self._pending = ""
                     self._emitted_len = len(current_text)
-                    formatted = self._format_streaming(result)
+                    formatted = self._format_streaming(result) or {}
                     if head:
                         formatted = {**formatted, "content": head}
-                    return formatted
+                    return formatted or None
             return None
 
         text = self._pending + delta_text

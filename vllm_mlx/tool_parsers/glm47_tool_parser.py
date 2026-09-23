@@ -161,7 +161,7 @@ class Glm47ToolParser(ToolParser):
             if "</tool_call>" in delta_text:
                 result = self.extract_tool_calls(current_text, request)
                 if result.tools_called:
-                    return self._new_streaming_tool_calls(result.tool_calls)
+                    return self._stream_new_tool_calls(result.tool_calls)
             return None
 
         # No tool call detected yet; strip think tags and emit content

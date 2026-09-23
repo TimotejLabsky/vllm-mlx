@@ -152,6 +152,6 @@ class DeepSeekToolParser(ToolParser):
         if self.TOOL_CALL_END in delta_text or self.TOOL_CALLS_END in delta_text:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return self._new_streaming_tool_calls(result.tool_calls)
+                return self._stream_new_tool_calls(result.tool_calls)
 
         return None
