@@ -158,9 +158,6 @@ class HarmonyToolParser(ToolParser):
         (deduplicated by name + arguments). Final-channel content is emitted
         as regular content deltas and plain text passes through unchanged.
         """
-        if not hasattr(self, "_emitted_streaming_signatures"):
-            self._emitted_streaming_signatures = set()
-
         # No harmony channel at all: plain text passes through
         if "<|channel|>" not in current_text:
             return {"content": delta_text}
@@ -178,24 +175,11 @@ class HarmonyToolParser(ToolParser):
         if block_completed:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                emitted = []
-                for i, tc in enumerate(result.tool_calls):
-                    signature = (tc["name"], tc["arguments"])
-                    if signature not in self._emitted_streaming_signatures:
-                        self._emitted_streaming_signatures.add(signature)
-                        emitted.append(
-                            {
-                                "index": i,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"],
-                                },
-                            }
-                        )
+                # Positional, not (name, arguments): two identical calls are
+                # two invocations (#110).
+                emitted = self._stream_new_tool_calls(result.tool_calls)
                 if emitted:
-                    return {"tool_calls": emitted}
+                    return emitted
 
         # In the final channel, emit content
         if "<|channel|>final" in current_text and "<|call|>" not in current_text:
@@ -212,11 +196,6 @@ class HarmonyToolParser(ToolParser):
 
         # Building tool call or in analysis channel, suppress output
         return None
-
-    def reset(self) -> None:
-        """Reset parser state for a new request."""
-        super().reset()
-        self._emitted_streaming_signatures = set()
 
 
 def _strip_control_tokens(text: str) -> str:
