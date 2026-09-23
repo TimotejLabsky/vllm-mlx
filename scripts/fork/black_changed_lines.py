@@ -50,10 +50,27 @@ def _resolve_base(base: str) -> str | None:
     return None
 
 
-def changed_ranges(base: str, path: str) -> list[tuple[int, int]]:
-    """(start, end) line ranges ``path`` gained relative to ``base``."""
+def diff_spec(base: str) -> str:
+    """``base...HEAD`` (from the merge-base) for an ordinary PR or push.
+
+    After a force-push (a rebase onto upstream) ``github.event.before`` is not
+    an ancestor of HEAD, and the merge-base is the OLD upstream base — so
+    ``...`` counted every line of every fork patch as "changed" and the job
+    went red on each rebase with drift nobody added. Compare the two trees
+    instead (``base..HEAD``): exactly what the push changed in content —
+    upstream's window plus the conflict resolutions.
+    """
+    try:
+        _git("merge-base", "--is-ancestor", base, "HEAD")
+        return f"{base}...HEAD"
+    except subprocess.CalledProcessError:
+        return f"{base}..HEAD"
+
+
+def changed_ranges(spec: str, path: str) -> list[tuple[int, int]]:
+    """(start, end) line ranges ``path`` gained in the diff ``spec``."""
     ranges = []
-    for line in _git("diff", "-U0", f"{base}...HEAD", "--", path).splitlines():
+    for line in _git("diff", "-U0", spec, "--", path).splitlines():
         match = _HUNK.match(line)
         if not match:
             continue
@@ -104,21 +121,27 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
+    spec = diff_spec(base)
     files = [
         f
         for f in _git(
-            "diff", "--name-only", "--diff-filter=AM", f"{base}...HEAD", "--", *paths
+            "diff", "--name-only", "--diff-filter=AM", spec, "--", *paths
         ).splitlines()
         if f.endswith(".py")
     ]
     if not files:
         print(f"black_changed_lines: no Python changes under {paths} vs {base[:12]}")
         return 0
+    if not spec.endswith("...HEAD"):
+        print(
+            f"black_changed_lines: {base[:12]} is not an ancestor of HEAD "
+            "(history rewritten) — checking the tree diff, not the merge-base"
+        )
 
     env = dict(os.environ, BLACK_CACHE_DIR=tempfile.mkdtemp(prefix="black-cache-"))
     failed = []
     for path in files:
-        ranges = changed_ranges(base, path)
+        ranges = changed_ranges(spec, path)
         if not ranges:
             continue
         cmd = [sys.executable, "-m", "black", "--quiet", "--diff"]
