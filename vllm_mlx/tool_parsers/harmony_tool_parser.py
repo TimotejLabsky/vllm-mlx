@@ -66,6 +66,11 @@ class HarmonyToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser harmony are set.
     """
 
+    # The OpenAI streaming loop hands this parser the raw delta (control
+    # tokens intact) instead of the reasoning parser's stripped content; it
+    # splits the channels itself (fork #112).
+    CONSUMES_RAW_STREAM = True
+
     SUPPORTS_NATIVE_TOOL_FORMAT = False
 
     def extract_tool_calls(

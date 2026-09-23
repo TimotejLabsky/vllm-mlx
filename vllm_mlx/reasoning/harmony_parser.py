@@ -32,6 +32,32 @@ _FINAL_PATTERN = re.compile(
 )
 
 
+_MESSAGE_END_TOKENS = ("<|end|>", "<|return|>", "<|call|>", "<|start|>")
+
+
+def _channel_state(text: str) -> tuple[str | None, bool]:
+    """(channel, inside its message) at the end of the accumulated text.
+
+    The channel is whatever follows the last ``<|channel|>`` — "analysis",
+    "final" or "commentary" (possibly followed by `` to=functions.x``); a name
+    still being streamed is None. The message is open once ``<|message|>``
+    follows that header and no end token has closed it since.
+    """
+    header = text.rfind("<|channel|>")
+    if header == -1:
+        return None, False
+    rest = text[header + len("<|channel|>") :]
+    channel = next(
+        (name for name in ("analysis", "final", "commentary") if rest.startswith(name)),
+        None,
+    )
+    start = rest.find("<|message|>")
+    if start == -1:
+        return channel, False
+    body = rest[start + len("<|message|>") :]
+    return channel, not any(token in body for token in _MESSAGE_END_TOKENS)
+
+
 class HarmonyReasoningParser(ReasoningParser):
     """
     Reasoning parser for GPT-OSS models using Harmony format.
@@ -45,6 +71,11 @@ class HarmonyReasoningParser(ReasoningParser):
                 <|channel|>final<|message|>Result.<|return|>"
         Output: reasoning="Thinking...", content="Result."
     """
+
+    # Streaming loops must hand this parser the raw delta: the channel
+    # structure lives in control tokens a special-token filter would delete
+    # (fork #112 — the Anthropic path did exactly that).
+    CONSUMES_RAW_STREAM = True
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -97,58 +128,30 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             DeltaMessage with reasoning and/or content, or None.
         """
-        # Detect channel switches in the delta
-        if "<|channel|>" in delta_text:
-            if "analysis" in delta_text:
-                self._current_channel = "analysis"
-                self._in_message = False
-                return None
-            elif "final" in delta_text:
-                self._current_channel = "final"
-                self._in_message = False
-                return None
-            elif "commentary" in delta_text:
-                self._current_channel = "commentary"
-                self._in_message = False
-                return None
-
-        # Detect channel from full context if not yet determined
-        if self._current_channel is None and "<|channel|>" in current_text:
-            last_channel = current_text.rfind("<|channel|>")
-            after = current_text[last_channel + len("<|channel|>") :]
-            if after.startswith("analysis"):
-                self._current_channel = "analysis"
-            elif after.startswith("final"):
-                self._current_channel = "final"
-            elif after.startswith("commentary"):
-                self._current_channel = "commentary"
-
-        # Handle message start
-        if "<|message|>" in delta_text:
-            self._in_message = True
-            # Don't emit the token itself
+        # Control tokens arrive as their own deltas and the channel name is
+        # split across tokens ("comment" + "ary" on gpt-oss-20b), so the old
+        # per-delta checks ("<|channel|>" and the name in ONE delta) never
+        # saw a switch: the parser stayed on "analysis" and streamed the
+        # final answer and the tool-call arguments as reasoning (fork #112).
+        # The state is derived from the accumulated text instead — only on a
+        # control-token delta, the only thing that can change it (the channel
+        # name is complete by the time <|message|> arrives), so plain text
+        # deltas stay O(1) instead of re-slicing the message every token.
+        if "<|" in delta_text:
+            # Control-token delta (or a merged delta containing one): never
+            # user-visible. Text riding along after the token is dropped, as
+            # before; token-level streaming does not produce that shape.
+            self._current_channel, self._in_message = _channel_state(current_text)
             return None
 
-        # Handle channel/message end tokens
-        if any(
-            token in delta_text
-            for token in ("<|end|>", "<|return|>", "<|call|>", "<|start|>")
-        ):
-            self._in_message = False
+        if not self._in_message:
             return None
-
-        # Skip control tokens
-        if delta_text.strip().startswith("<|") and delta_text.strip().endswith("|>"):
-            return None
-
-        # Emit content based on current channel
-        if self._in_message and self._current_channel == "analysis":
+        if self._current_channel == "analysis":
             return DeltaMessage(reasoning=delta_text)
-
-        if self._in_message and self._current_channel == "final":
+        if self._current_channel == "final":
             return DeltaMessage(content=delta_text)
-
-        # In commentary or unknown channel, suppress
+        # Commentary (tool calls) belongs to the tool parser, which reads the
+        # raw stream; an unknown/partial channel name is withheld.
         return None
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
