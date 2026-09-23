@@ -162,8 +162,11 @@ def test_deepseek_v4_finalize_does_not_resend_streamed_calls():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("split_second_close", [False, True])
 @pytest.mark.parametrize("name", ["glm47", "gemma4", "nemotron", "auto"])
-async def test_openai_stream_carries_each_call_once(name, monkeypatch):
+async def test_openai_stream_carries_each_call_once(
+    name, split_second_close, monkeypatch
+):
     """Through the real server loop: the SSE stream an OpenAI client
     accumulates by index gets call 0 and call 1, once each."""
     from types import SimpleNamespace
@@ -177,7 +180,12 @@ async def test_openai_stream_carries_each_call_once(name, monkeypatch):
     monkeypatch.setattr(srv, "_reasoning_parser", None, raising=False)
 
     first, second = FORMATS[name]
-    deltas = [first, "\n", second, "\n", ""]
+    if split_second_close:
+        # #111: the first call streamed, so the server's end-of-stream
+        # fallback is skipped — the parser itself has to see the split close.
+        deltas = [first, "\n", second[:-3], second[-3:], ""]
+    else:
+        deltas = [first, "\n", second, "\n", ""]
 
     def _out(i, text):
         last = i == len(deltas) - 1
@@ -231,3 +239,49 @@ async def test_openai_stream_carries_each_call_once(name, monkeypatch):
 
     assert [c["index"] for c in calls] == [0, 1]
     assert [json.loads(c["function"]["arguments"]) for c in calls] == [A, B]
+
+
+# ------------------------------------------- #111 split end markers are seen
+def _chunked(text, size):
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 5, 7])
+@pytest.mark.parametrize("name", sorted(FORMATS))
+def test_calls_survive_any_chunking(name, size):
+    """A closing marker split across deltas never appears in one delta_text;
+    triggering on it lost the call (fork #111)."""
+    first, second = FORMATS[name]
+    calls, _ = _stream(name, _chunked(first + "\n" + second, size) + ["\n", ""])
+
+    assert [c["index"] for c in calls] == [0, 1]
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [A, B]
+
+
+@pytest.mark.parametrize("name", sorted(FORMATS))
+def test_split_close_on_the_second_call_only(name):
+    """The case the server's end-of-stream fallback cannot rescue: the first
+    call already streamed, so the fallback is skipped."""
+    first, second = FORMATS[name]
+    calls, _ = _stream(name, [first, "\n", second[:-3], second[-3:], ""])
+
+    assert [c["index"] for c in calls] == [0, 1]
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [A, B]
+
+
+@pytest.mark.parametrize(
+    "previous, current, expected",
+    [
+        ("ab</tool", "ab</tool_call>", True),  # completed across the boundary
+        ("ab</tool_call>", "ab</tool_call>\n", False),  # already complete before
+        ("", "</tool_call>", True),  # whole marker in one delta
+        ("<tool_call>x", "<tool_call>xy", False),  # no marker
+        ("a</tool_call>b</tool_", "a</tool_call>b</tool_call>", True),  # 2nd
+    ],
+)
+def test_marker_completed_window(previous, current, expected):
+    from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+    assert (
+        ToolParser._marker_completed(previous, current, ("</tool_call>",)) is expected
+    )

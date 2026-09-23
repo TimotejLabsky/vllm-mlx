@@ -418,7 +418,7 @@ class AutoToolParser(ToolParser):
 
         # Check for completion markers
         end_markers = ["<tool_call|>", "</tool_call>", "</function>", ")]"]
-        if any(m in delta_text for m in end_markers):
+        if self._marker_completed(previous_text, current_text, end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._stream_new_tool_calls(result.tool_calls)
