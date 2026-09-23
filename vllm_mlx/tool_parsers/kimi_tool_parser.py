@@ -139,7 +139,7 @@ class KimiToolParser(ToolParser):
         if not self._has_tool_section(current_text):
             return {"content": delta_text}
 
-        if self.TOOL_CALL_END in delta_text:
+        if self._marker_completed(previous_text, current_text, (self.TOOL_CALL_END,)):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._stream_new_tool_calls(result.tool_calls)
