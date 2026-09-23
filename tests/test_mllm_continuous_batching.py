@@ -2273,9 +2273,13 @@ class TestChunkedPrefillCacheHandling:
         assert abort_responses[0].request_id == "req-abort"
 
     @pytest.mark.parametrize("active_decode", [False, True])
-    def test_inline_audio_failure_is_reported_once_during_prefill(
+    def test_inline_preprocess_failure_is_reported_once_during_prefill(
         self, monkeypatch, active_decode
     ):
+        # Upstream #694 drove this with audio requests; the fork never
+        # inlines media (be3f08f — media gets its own prefill, where
+        # _process_prompts already fails each request atomically), so the
+        # inline failure is driven by text requests whose preprocess raises.
         from mlx_vlm import utils
 
         from vllm_mlx.mllm_batch_generator import (
@@ -2283,7 +2287,6 @@ class TestChunkedPrefillCacheHandling:
             MLLMBatchRequest,
             install_chunked_prefill_mllm,
         )
-        from vllm_mlx.models import mllm
 
         gen = self._make_fake_batch_gen()
         gen.language_model = MagicMock()
@@ -2292,22 +2295,28 @@ class TestChunkedPrefillCacheHandling:
         gen.vision_cache = MagicMock()
         gen.vision_cache.get_pixel_cache.return_value = None
         gen._process_prompts = MagicMock()
+        gen.max_prompt_tokens = 0
 
         # These prompts exceed the inline budget, reproducing the path where
         # a failed resolver used to leave input_ids unset and retry each chunk.
         prepare_inputs = MagicMock(return_value={"input_ids": mx.array([[1] * 8])})
         monkeypatch.setattr(utils, "prepare_inputs", prepare_inputs)
-        resolve_audio = MagicMock(side_effect=TimeoutError("audio download timed out"))
-        monkeypatch.setattr(mllm, "process_audio_input", resolve_audio)
         failed = [
             MLLMBatchRequest(
-                uid=uid,
-                request_id=f"bad-audio-{uid}",
-                prompt="long audio prompt",
-                audio=[f"https://example.com/audio-{uid}.wav"],
+                uid=uid, request_id=f"bad-text-{uid}", prompt="long bad prompt"
             )
             for uid in (1, 2)
         ]
+        real_preprocess = gen._preprocess_request
+        bad_calls = []
+
+        def preprocess(request):
+            if request.request_id.startswith("bad-"):
+                bad_calls.append(request.request_id)
+                raise TimeoutError("tokenizer timed out")
+            real_preprocess(request)
+
+        gen._preprocess_request = preprocess
         healthy = MLLMBatchRequest(uid=3, request_id="healthy", prompt="long text")
         gen.unprocessed_requests = [*failed, healthy]
 
@@ -2350,7 +2359,8 @@ class TestChunkedPrefillCacheHandling:
 
         following = [*gen._next(), *gen._next()]
         assert all(response.finish_reason != "error" for response in following)
-        assert resolve_audio.call_count == 2
+        assert bad_calls == ["bad-text-1", "bad-text-2"]
+        assert all(e.error_kind is None for e in errors)
         prepare_inputs.assert_called_once()
         gen._process_prompts.assert_not_called()
         assert gen._partial["processed"] == 12

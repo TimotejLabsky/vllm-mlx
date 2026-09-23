@@ -894,9 +894,11 @@ def _prepare_chat_completion_invocation(
     specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
     if specprefill_backbone_pct is not None:
         chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+    # Upstream #772 forwards reasoning_effort through this helper's
+    # request_reasoning_effort; the fork's #76 block below is its superset
+    # ("none" -> enable_thinking=False, normalization, route fallback).
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
-        request.chat_template_kwargs,
-        request_reasoning_effort=getattr(request, "reasoning_effort", None),
+        request.chat_template_kwargs
     )
 
     # Forward OpenAI reasoning_effort into the chat template (patch #76).
