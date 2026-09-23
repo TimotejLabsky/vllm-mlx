@@ -1412,3 +1412,29 @@ def test_108_make_room_does_not_count_spill_pending_bytes_as_sheddable(monkeypat
 
     # relief is a different matter: against a real OOM it still takes them
     assert kv._drop_lru_entry() is True
+
+
+# ------------------------- #83/#109 _normalize_messages vs upstream #774 guard
+def test_83_109_normalize_merges_assistant_pairs_never_tool_results():
+    """Upstream #774 refuses any merge where either side has tool_calls; the
+    fork keeps #83's assistant text-turn + tool-call-turn merge (templates
+    need alternating roles) and shares only the role allowlist (#109). A
+    rebase that takes #774's condition wholesale goes red on the first half."""
+    from vllm_mlx.server import _normalize_messages
+
+    tc = [
+        {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}}
+    ]
+    merged = _normalize_messages(
+        [
+            {"role": "assistant", "content": "Let me check."},
+            {"role": "assistant", "content": "", "tool_calls": tc},
+        ]
+    )
+    assert len(merged) == 1 and merged[0]["tool_calls"] == tc
+
+    results = [
+        {"role": "tool", "tool_call_id": "c1", "content": "AAA"},
+        {"role": "tool", "tool_call_id": "c2", "content": "BBB"},
+    ]
+    assert _normalize_messages(results) == results
