@@ -3478,3 +3478,29 @@ reached the template as one result for two calls — the Qwen template rendered 
 - **Red then green.** 51 of the new tests fail against `1267e27`'s parsers: every chunk size (1/2/3/5/7) for all ten, the split-second-close case for the six where it applies (auto, functionary, gemma4, glm47, harmony, nemotron), and the window unit tests; all pass with the fix. The server-level SSE test gained a split-second-close variant through the real `stream_chat_completion` (glm47/gemma4/nemotron/auto).
 - Full suite 4065 passed; on the Studio (prod venv, rsync'd source) 4059 passed + the 6 known environmental failures.
 - **Real server, no regression on whole markers** (Studio, spare port, `Qwen3-0.6B-8bit`, `--tool-call-parser auto`, two parallel `read` calls): streamed deltas `(0, a) (1, b)`, non-streaming the same two calls, no traceback. A live split-marker repro is not possible on these models — their closing markers are single special tokens — so the split cases are covered by the unit and server-loop tests.
+
+## 112. `patch: harmony-stream-channels` — streamed gpt-oss answers and tool calls reach the client
+
+**Files:** `vllm_mlx/reasoning/harmony_parser.py` (`_channel_state`, streaming rewritten, `CONSUMES_RAW_STREAM`), `vllm_mlx/tool_parsers/harmony_tool_parser.py` (`CONSUMES_RAW_STREAM`), `vllm_mlx/server.py` (OpenAI and Anthropic streaming loops: raw-stream routing), `tests/test_harmony_stream_tool_calls.py` (new, 10), `tests/test_fork_invariants.py` (+1).
+
+**Found by the 2026-09-23 package-bump A/B** (identical on every build back to `d7989bd`, so long-standing). On the live `gpt-oss-20b-MXFP4-Q4` route (`--reasoning-parser harmony --tool-call-parser harmony`), **every streamed response lost its answer**; non-streaming was fine. Measured on the real model, spare port, unpatched vs patched:
+
+| Endpoint (streaming) | Plain question — content | Tool request |
+|---|---|---|
+| OpenAI `/v1/chat/completions` | `""` → `"Paris"` | no `tool_calls`, args leaked into `reasoning`, `finish: stop` → `read({"path": "a.txt"})`, `finish: tool_calls` |
+| Anthropic `/v1/messages` | nothing at all → text + thinking | nothing at all → thinking + `tool_use: read` |
+| Responses `/v1/responses` | `""` → `"Paris"` | already worked (end-of-stream parse) |
+
+**Three causes, one root.** Captured raw deltas from gpt-oss-20b (BatchedEngine, T=0): `'<|channel|>' 'analysis' '<|message|>' 'We' … '<|end|>' '<|start|>' 'assistant' '<|channel|>' 'comment' 'ary' ' to' '=' 'functions' '.read' ' ' '<|constrain|>' 'json' '<|message|>' '{"' 'path' … ''` — control tokens are their own deltas, the channel name is split across tokens, and `<|call|>` (the stop token) never appears.
+1. The harmony **reasoning parser** switched channel only when `<|channel|>` and the name shared a delta — never true — so it stayed on `analysis` and routed the final answer and the tool-call arguments to `reasoning`.
+2. The **OpenAI loop** fed the tool parser the reasoning parser's content — final-channel text with the markers stripped — while `HarmonyToolParser` needs the raw `<|channel|>commentary to=functions.x … <|message|>{args}`. It also dropped control-token deltas before the tool parser (the reasoning parser returns None for them).
+3. The **Anthropic loop** ran `SPECIAL_TOKENS_PATTERN` over the delta *before* the reasoning parser, deleting every harmony control token: the parser never saw a channel, so nothing streamed.
+
+**Fix.** The reasoning parser derives `(channel, inside message)` from the accumulated text via `_channel_state`, recomputed only on control-token deltas (the only thing that can change it; plain deltas stay O(1)). Both harmony parsers declare `CONSUMES_RAW_STREAM`: the OpenAI and Anthropic loops then hand them the raw delta (control-token deltas included) and let the tool parser produce the content — it already splits channels itself (final → content, commentary → tool calls, analysis → nothing, the reasoning parser having returned it as reasoning). The completed call is emitted by the existing end-of-stream fallback, which parses the raw accumulation. Scoped to parsers that declare the flag; every other route's loop is unchanged.
+
+**Upstream:** the harmony parsers and all three loops are upstream-owned; the bug exists there too — a candidate PR.
+
+**Verification:**
+- **Red then green.** 10 new tests replaying the captured deltas through the real `stream_chat_completion`, `_stream_anthropic_messages` and `_stream_responses_request` with the real harmony parsers: all 10 fail on `ce13c35`, all pass with the fix. Fork invariant pins both flags and the split-channel replay.
+- Full suite 4079 passed.
+- **Real server, real gpt-oss-20b** (Studio, spare port, rsync'd source, unpatched vs patched): the table above; non-streaming responses byte-identical before/after; 0 tracebacks.
