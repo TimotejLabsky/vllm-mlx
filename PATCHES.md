@@ -3403,3 +3403,22 @@ Gate 4 (#106) stops counting spill-pending bytes as sheddable, so it waits inste
 - **Full suite:** 3733 passed / 31 skipped / 30 deselected (#107 baseline 3728 + 5). `ruff` + the changed-lines black gate clean.
 - **Real server, real models** (`scripts/fork/e2e_lazy_restore.py`, incl. the one-slot SSD phase that drives the writer + promote path): 7/7 on `Qwen3-0.6B-8bit` locally and on hybrid `Qwen3.5-4B-4bit` on the Studio; lazy ≡ eager byte-for-byte, `ssd_promotes 2`, no pin left at idle, no traceback.
 - **Live gate after deploy:** re-run the stress test — all 5 deep follow-ups should report `cached_tokens` ≈ prompt length; `spill_pending_entries` returns to 0 within ~30 s of the last store.
+
+## 109. `patch: tool-results-stay-separate` — parallel tool results must not collapse into one
+
+**Files:** `vllm_mlx/server.py` (`_normalize_messages` — comment only on the rebased base), `tests/test_normalize_messages.py` (+2), `tests/test_fork_invariants.py` (+1).
+
+**Found by the 2026-09-23 AI stack audit** (verified offline by exec'ing the fork's own function at `3b801c1`, deployed `d7989bd`). `_normalize_messages` merged consecutive same-role string-content messages with no role restriction, and #83's structural carry made the merged dict keep the first message's `tool_call_id` (first-writer-wins). A parallel tool-call turn followed by its two results
+
+```
+[user, assistant(tool_calls=[c1, c2]), tool(c1, "AAA"), tool(c2, "BBB")]
+  -> tool(c1, "AAA\n\nBBB")   # c2 gone
+```
+
+reached the template as one result for two calls — the Qwen template rendered a single `<tool_response>`. opencode issues parallel calls constantly (default route Qwen3.8-27B-8bit), so every such history re-sent was corrupted.
+
+**Fix = upstream #774's role allowlist** (`93b0b71`, taken in the 2026-09-23 rebase): `role in ("system", "user", "assistant")`, so tool results (and any unknown role) never merge. Chat templates render consecutive tool messages natively (Qwen groups them into one user turn, one `<tool_response>` each). **#774's companion guard — `not prev.get("tool_calls") and not msg.get("tool_calls")` — is NOT taken** (dropped while replaying #83): it would undo #83's assistant text-turn + tool-call-turn merge into the OpenAI combined shape, leaving two consecutive assistant turns that alternating-role templates reject. Upstream's `test_assistant_tool_calls_are_not_merged_into_text` asserts the opposite of #83 and was dropped with it; its `test_consecutive_tool_results_preserve_call_ids_and_contents` is kept.
+
+**What this patch adds on the rebased base:** a comment at the condition naming the partial adoption; tests for unknown roles and for a text turn + two-call turn merging with both calls while the two results stay separate; and `test_83_109_normalize_merges_assistant_pairs_never_tool_results` in `tests/test_fork_invariants.py`, which goes red if a rebase takes #774's condition wholesale (the #83 half) or loses the allowlist (the #109 half). Pre-rebase, the same change was written as a one-line fork fix (branch `patch/tool-results-stay-separate`, `96d9cb2`) and mutation-checked: all 4 new tests red with the allowlist removed.
+
+**Upstream:** allowlist = upstream #774; the #83 carve-out is fork-owned.
