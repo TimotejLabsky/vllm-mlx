@@ -44,11 +44,12 @@ dependencies = [
     # April, so `>=0.32.0` is unsatisfiable from PyPI and makes this package
     # uninstallable (CI caught exactly that). Raising it was also justified by a
     # premise we later disproved: 0.31.3 does NOT corrupt our checkpoints (see
-    # PATCHES.md #78). Production separately pins a git commit, mlx-lm@9acef5f,
-    # and must NOT go past it — 11a6ce7 turns ArraysCache.state into a 3-tuple
-    # and silently disables partial restore on every hybrid model. That ceiling
-    # is unexpressible as a version bound (both report 0.32.0), which is what
-    # the one-shot classify_layers guard exists for.
+    # PATCHES.md #78). Production separately pins a git commit, mlx-lm@f4f3b57
+    # (docs/llm/llm-stack.md in personal-infratructure). The old 9acef5f ceiling
+    # is gone: 11a6ce7 turned ArraysCache.state into a 3-tuple, and fork #81
+    # made both shapes native. The next pin lift crosses mlx-lm#1778 (cache
+    # `state` returns the full state), which #81's tripwires guard. Git pins
+    # all report 0.32.0, so no version bound can express this; test the pin.
     "mlx-lm>=0.31.3",
     "mlx-vlm>=0.6.5",  # 0.6.5+ fixes the Qwen3.5 sanitize double-run that made 0.6.4 corrupt (upstream #674; our old pin was >=0.6.2,!=0.6.4 — superseded)
 
