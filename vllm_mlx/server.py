@@ -942,7 +942,10 @@ def _prepare_chat_completion_invocation(
     # Map OpenAI reasoning_effort="none" → chat_template_kwargs.enable_thinking=False
     # (HA Extended OpenAI Conversation sends reasoning_effort; top-level
     # enable_thinking does not actually suppress <think> in 0.2.9.)
-    if request.reasoning_effort == "none":
+    if (
+        isinstance(request.reasoning_effort, str)
+        and request.reasoning_effort.strip().lower() == "none"
+    ):
         ctk = chat_kwargs.get("chat_template_kwargs") or {}
         ctk.setdefault("enable_thinking", False)
         chat_kwargs["chat_template_kwargs"] = ctk
@@ -975,7 +978,14 @@ def _prepare_chat_completion_invocation(
     # Only build when thinking is actually enabled for this request -- a CLI
     # default budget should not alter non-thinking requests.
     thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
-    enable_thinking = chat_kwargs.get("enable_thinking", True)
+    # Thinking can be switched off in the template kwargs alone (reasoning_effort
+    # "none", explicit chat_template_kwargs, a server default), leaving no
+    # top-level enable_thinking: a budget processor built then would start in
+    # THINKING for a prompt that has no <think> and force </think> into content.
+    if _thinking_disabled(request, chat_kwargs):
+        enable_thinking = False
+    else:
+        enable_thinking = chat_kwargs.get("enable_thinking", True)
     thinking_proc = None
     if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
