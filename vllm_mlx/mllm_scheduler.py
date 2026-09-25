@@ -746,6 +746,14 @@ class MLLMScheduler:
 
             if response.specprefill_outcome is not None:
                 request.specprefill_outcome = response.specprefill_outcome
+            # add_request counted the text-only prompt; the generator reports
+            # the processor-expanded length (vision tokens included) (#115).
+            expanded = getattr(response, "prompt_tokens", None)
+            if expanded and response.finish_reason != "error":
+                diff = expanded - request.num_prompt_tokens
+                if diff:
+                    self.total_prompt_tokens += diff
+                    request.num_prompt_tokens = expanded
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
@@ -769,13 +777,6 @@ class MLLMScheduler:
                 logger.warning(f"Request {request_id} failed during preprocessing")
                 outputs.append(output)
                 continue
-
-            # Update authoritative prompt token count from batch generator prefill
-            if response.prompt_tokens is not None and response.prompt_tokens > 0:
-                diff = response.prompt_tokens - request.num_prompt_tokens
-                if diff != 0:
-                    self.total_prompt_tokens += diff
-                    request.num_prompt_tokens = response.prompt_tokens
 
             # Append token to request
             request.output_tokens.append(response.token)
