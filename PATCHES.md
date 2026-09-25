@@ -3558,3 +3558,19 @@ reached the template as one result for two calls — the Qwen template rendered 
 - **Red then green:** the correction test fails on the unfixed scheduler. The stamping test covers rows that join and leave, and unknown uids.
 
 **Upstreaming:** if upstream merges #796, take theirs at the rebase and drop this patch's stamping hook.
+
+---
+
+## 116. `patch: anthropic-image-blocks` — `/v1/messages` converts image blocks instead of dropping them (upstream #776)
+
+**Files:** `vllm_mlx/api/anthropic_adapter.py` (`_convert_message`), `vllm_mlx/server.py` (`create_anthropic_message`: adapter `ValueError` → 400), `tests/test_anthropic_adapter_images.py` (new, from the PR), `tests/test_server.py` (+`TestAnthropicImageClientErrors`, from the PR), `tests/test_media_not_supported.py` (+2), `tests/test_fork_invariants.py` (+1).
+
+**Cause.** `_convert_message` handled `text`, `tool_use` and `tool_result` with no `image` branch, so an Anthropic image block parsed cleanly and was then thrown away. `/v1/messages` (what Claude Code uses, via the LiteLLM passthrough) returned 200 with a confident answer about an image the model never saw. On vision routes the image never arrived. On text routes the fork's vision-series 400 guard (`MediaNotSupported`) never fired, because by the time it ran there was no media left to see.
+
+**Fix.** Cherry-pick of open upstream PR #776 (Azam Mirza, head `e2992eb`, both commits). Image blocks become OpenAI `image_url` parts: `base64` as a data URI with its declared `media_type`, `url` passed through, text/image order kept. Empty or unknown sources raise, and the route turns that into a 400 before acquiring an engine. The text-only path still produces a plain string. **Conflict resolution:** the PR predates upstream #646's skip of empty text blocks; #646's skip is kept on both the text list and the new ordered parts list.
+
+**Fork semantics.** On a **text route** an image on `/v1/messages` now gets the same `400 media_not_supported` as chat completions instead of a silent 200. That is a deliberate product call (Tim, 2026-09-25): an honest error beats an answer about an unseen image, even though it ends a Claude Code turn. On a **vision route** the image reaches the model.
+
+**Not covered:** images nested inside `tool_result.content` (e.g. Claude Code reading an image file) still go through text-only extraction and are dropped, as before. The PR leaves this as an explicit follow-up.
+
+**Upstreaming:** it is upstream's PR. When #776 merges, take upstream's version at the rebase and keep the #646 resolution if it is still needed.

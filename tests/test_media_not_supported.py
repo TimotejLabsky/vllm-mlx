@@ -123,3 +123,49 @@ class TestEngineDefenseInDepth:
 
         with pytest.raises(MediaNotSupported):
             asyncio.run(_consume())
+
+
+class TestAnthropicImageBlocksReachTheGuard:
+    """#116 (upstream #776): Anthropic image blocks used to be dropped by the
+    adapter, so /v1/messages never reached the guard above and a text route
+    answered about an image it never saw. They now convert to image_url parts
+    and hit the same 400 as chat completions; vision routes receive them.
+    """
+
+    def _converted(self):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+        return anthropic_to_openai(
+            AnthropicRequest(
+                model="m",
+                max_tokens=16,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgo=",
+                                },
+                            },
+                            {"type": "text", "text": "What is this?"},
+                        ],
+                    }
+                ],
+            )
+        )
+
+    def test_text_route_rejects_anthropic_image(self):
+        with pytest.raises(MediaNotSupported):
+            _prepare_anthropic_invocation(
+                _TextOnlyEngine(), self._converted(), effective_max_tokens=16
+            )
+
+    def test_vision_route_accepts_anthropic_image(self):
+        _prepare_anthropic_invocation(
+            _MllmEngine(), self._converted(), effective_max_tokens=16
+        )
