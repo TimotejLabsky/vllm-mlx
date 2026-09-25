@@ -1573,3 +1573,13 @@ def test_115_mllm_usage_counts_expanded_prompt():
 
     test_expanded_prompt_length_replaces_text_estimate_once()
     test_next_stamps_rows_from_before_and_after_the_step()
+
+
+def test_116_anthropic_image_on_text_route_is_rejected_not_dropped():
+    """#116: /v1/messages image blocks must reach the media guard. A rebase
+    that loses the adapter's image branch brings back the silent 200 on text
+    routes (the image vanishes before the guard can see it).
+    """
+    from tests.test_media_not_supported import TestAnthropicImageBlocksReachTheGuard
+
+    TestAnthropicImageBlocksReachTheGuard().test_text_route_rejects_anthropic_image()
