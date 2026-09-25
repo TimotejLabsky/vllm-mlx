@@ -3522,3 +3522,23 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Verification:**
 - **Cross-version bit-identity.** A tiny installed-mlx-vlm `Qwen3_5GatedDeltaNet` driven with the vendored cache (prefill B=2, two decode steps, and the per-row `lengths` window path) gives bit-identical outputs, conv window and recurrent state on mlx-vlm 0.6.17 and 0.7.2 (max diff 0). The unfixed cache on 0.7.2 reproduces the production error exactly.
 - **Red then green.** 3 new tests (window equivalence to the 0.6.x inline code incl. the `lengths` gather, recurrent update, and the installed GDN running on the vendored cache): pass on 0.6.17 and 0.7.2, all 3 fail on 0.7.2 with the unfixed cache. Full suite: 4084 passed on both mlx-vlm 0.6.17 and 0.7.2.
+
+---
+
+## 114. `patch: thinking-off-budget` — a thinking budget no longer arms on thinking-off requests
+
+**Files:** `vllm_mlx/server.py` (`_prepare_chat_completion_invocation`), `tests/test_thinking_off_budget.py` (new, 5), `tests/test_fork_invariants.py` (+1).
+
+**Found by the 2026-09-25 upstream PR triage** (upstream #810 maps `reasoning_effort="none"` onto `enable_thinking=False`; we already did that in #76, but the triage showed where it stopped short).
+
+**Cause.** Thinking can be switched off in the chat-template kwargs alone: `reasoning_effort="none"` (#76), an explicit `chat_template_kwargs:{enable_thinking:false}`, or a `--default-chat-template-kwargs` server default. The budget gate read only the top-level `chat_kwargs["enable_thinking"]` (default True), so on a route with `--default-thinking-token-budget` (the Qwen3.8-27B routes: 6144) it built `ThinkingAwareLogitsProcessor(prompt_has_think_tag=True)`. That processor starts in THINKING for a prompt the template rendered with no `<think>`, and once the budget runs out it forces `</think>` into the answer. Also, the #76 `"none"` check was case-sensitive, so `"None"` neither disabled thinking nor forwarded an effort.
+
+**Fix.** The gate uses the existing `_thinking_disabled(request, chat_kwargs)` helper, which the streaming parsers already use, and `"none"` is matched case- and whitespace-insensitively.
+
+**Verification:**
+- **Real server A/B** on Qwen3-0.6B-8bit (`cli serve --continuous-batching --text-only --reasoning-parser qwen3 --default-thinking-token-budget 8`, spare port, T=0, `reasoning_effort:"none"`, "list the planets"). Without the fix the content derails into garbage once `</think>` is forced ("Human: What is the difference between a planet and a dwarf planet? A. …"). With the fix it is the correct 8-line list.
+- **Red then green:** 4 of the 5 new tests fail on the unfixed server. The thinking-on control passes on both.
+
+**Exposure.** Latent and narrow on prod. It needs a thinking-off request on a budgeted route, and an answer longer than the budget.
+
+**Upstreaming:** candidate. It is the missing half of #810.
