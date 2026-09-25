@@ -302,6 +302,24 @@ class BatchedSystemKV:
         # tokens cold (18 min). Watermark relief can still take everything.
         self._peeked: dict[str, int] = {}
         self.lazy_ssd_fallbacks = 0
+        # (#117) SSD-vs-RAM-partial arbitration. ``fetch`` used to take ANY
+        # RAM entry sharing >= PARTIAL_MIN tokens and only consulted the SSD on
+        # a total miss: with a hybrid model the partial snaps DOWN to a
+        # checkpoint (LCP 3719 -> restore at 2048), so an exact snapshot 34 ms
+        # away on disk lost to a 2K-token match (4.5% of HA voice requests
+        # re-prefilled ~3.7K tokens, 2026-09-25). The SSD candidate now wins
+        # when its usable length beats the RAM restore position by more than
+        # this many tokens (0 disables = old behaviour).
+        self.ssd_prefer_gain = max(
+            0, _env_int("VLLM_MLX_SYSTEM_KV_SSD_PREFER_GAIN", 512)
+        )
+        self.ssd_preferred = 0
+        # request_id -> LCP where a divergent restore stopped sharing the
+        # donor's chain; the new prefill checkpoints THERE (#117) so the next
+        # request of either kind restores at the shared boundary, not at the
+        # last uniform interval below it.
+        self._divergence: dict[str, int] = {}
+        self.divergence_cuts = 0
         self.projected_defers = 0
         self.projected_relief_passes = 0
         # Ground-truth backstop: defer co-batching while MLX active memory
@@ -454,6 +472,26 @@ class BatchedSystemKV:
         self._marker_ids[family] = tuple(seqs)
         return self._marker_ids[family]
 
+    def add_divergence_cut(
+        self, request_id: str, cached_tokens: int, n_tokens: int, boundaries=()
+    ) -> tuple:
+        """(#117) ``boundaries`` plus the position where this request's
+        restored donor diverged (relative to the tokens about to be
+        prefilled). HA voice prompts share tool schemas + Assist context and
+        then split by language INSIDE the one system message, where no
+        template marker exists: the cut is the only way that boundary becomes
+        a checkpoint, and the next request restores there instead of at the
+        uniform interval below it."""
+        with self._lock:
+            div = self._divergence.get(request_id)
+        if div is None:
+            return tuple(boundaries)
+        rel = div - cached_tokens
+        if rel < self.partial_min or rel >= n_tokens:
+            return tuple(boundaries)
+        self.divergence_cuts += 1
+        return tuple(sorted({int(b) for b in boundaries} | {rel}))
+
     def note_scheduled(
         self, request_id: str, cached_tokens: int, boundaries=()
     ) -> None:
@@ -523,6 +561,7 @@ class BatchedSystemKV:
             self._boundary_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
             self._peeked.pop(request_id, None)
+            self._divergence.pop(request_id, None)
 
     # ---------------------------------------------------------------- store
 
@@ -691,6 +730,7 @@ class BatchedSystemKV:
             checkpoints = self._pending.pop(request_id, [])
             self._base_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
+            self._divergence.pop(request_id, None)
             entry = self._insert_entry_locked(
                 tokens_list, kinds, snapshot, metas, checkpoints
             )
@@ -803,26 +843,84 @@ class BatchedSystemKV:
         full-prefix or shared-prefix SSD candidate, or None. The blob read
         happens on the executor via ``promote_ssd`` — the scheduler's
         ``ssd_pending`` pattern keeps disk reads out of ``add_request``.
-        """
+
+        The candidate carries ``usable`` (#117): the position a restore from
+        it would land on, for comparing against the RAM tier."""
         if self._ssd is None:
             return None
         toks = tuple(tokens)
         try:
             row = self._ssd.lookup_prefix(toks)
             if row is not None and row.get("num_tokens", 0) >= self.partial_min:
+                n = row["num_tokens"]
                 return {
-                    "tokens": toks[: row["num_tokens"]],
+                    "tokens": toks[:n],
                     "file_path": row["file_path"],
+                    "usable": self._ssd_usable(row["file_path"], n, n, len(toks) - 1),
                 }
             for row in self._ssd.lookup_shared(toks):
                 if row.get("common_len", 0) >= self.partial_min:
+                    stored = tuple(row["tokens"])
                     return {
-                        "tokens": tuple(row["tokens"]),
+                        "tokens": stored,
                         "file_path": row["file_path"],
+                        "usable": self._ssd_usable(
+                            row["file_path"],
+                            len(stored),
+                            row["common_len"],
+                            len(toks) - 1,
+                        ),
                     }
         except Exception:
             logger.debug("[batched_system_kv] check_ssd failed", exc_info=True)
         return None
+
+    def _ssd_usable(self, file_path: str, donor_len: int, lcp: int, cap: int) -> int:
+        """Where a restore from an SSD entry would land — the analog of
+        ``select_restore_pos`` without loading the blob (only the small
+        meta.json is read). The whole chain restores as itself; a divergent
+        one snaps down to its checkpoint ladder."""
+        d = min(lcp, cap)
+        if d >= donor_len:
+            return donor_len
+        meta = self._ssd.read_meta(file_path) or {}
+        kinds = meta.get("kinds")
+        if kinds is not None and not any(k == "ckpt" for k in kinds):
+            return d  # all-trimmable: any position is recoverable by slicing
+        return max(
+            (
+                cp["pos"]
+                for cp in meta.get("checkpoints", [])
+                if 0 < cp.get("pos", 0) <= d
+            ),
+            default=0,
+        )
+
+    def ssd_beats_ram(self, tokens: list, ram_pos: int) -> Optional[dict]:
+        """(#117) The SSD candidate for ``tokens`` when restoring from it
+        would land more than ``ssd_prefer_gain`` tokens past the RAM restore
+        position ``ram_pos``; else None (keep the RAM hit).
+
+        Index/meta reads only — safe on the event loop. Whichever tier
+        wins, ``fetch`` still sees every RAM entry (a promoted entry joins
+        the LRU first), so choosing the SSD can only add options."""
+        if self._ssd is None or self.ssd_prefer_gain <= 0 or ram_pos <= 0:
+            return None
+        if len(tokens) - 1 - ram_pos <= self.ssd_prefer_gain:
+            return None  # nothing left to gain
+        candidate = self.check_ssd(tokens)
+        if candidate is None:
+            return None
+        usable = candidate.get("usable", 0)
+        if usable - ram_pos <= self.ssd_prefer_gain:
+            return None
+        self.ssd_preferred += 1
+        logger.info(
+            "[batched_system_kv] ssd preferred: ram_pos=%d ssd_len=%d -> ssd",
+            ram_pos,
+            usable,
+        )
+        return candidate
 
     def promote_ssd(self, candidate: dict) -> bool:
         """Load an SSD candidate into the RAM LRU (EXECUTOR thread — the
@@ -959,8 +1057,36 @@ class BatchedSystemKV:
                 return None, None
         return out, metas
 
+    def _best_match_locked(self, tokens: list):
+        """The entry with the best RESTORABLE position for ``tokens`` (caller
+        holds the lock): ``(key, lcp, pos, ck_states, ck_metas)`` or None.
+
+        Ranked by restore position, then LCP — not raw LCP (#117): on a
+        hybrid model a long LCP can snap down to a checkpoint far below it,
+        while a shorter match on another entry restores deeper."""
+        cap = len(tokens) - 1
+        best = None
+        for key, entry in self._entries.items():
+            lcp = common_prefix_len(tokens, entry["tokens"])
+            if lcp < self.partial_min:
+                continue
+            plan = {
+                "d": lcp,
+                "donor_len": len(entry["tokens"]),
+                "snapshot": entry["snapshot"],
+                "metas": entry["metas"],
+                "kinds": entry["kinds"],
+                "checkpoints": entry["checkpoints"],
+            }
+            pos, ck_states, ck_metas = select_restore_pos(plan, min(lcp, cap))
+            if pos < self.partial_min:
+                continue
+            if best is None or (pos, lcp) > (best[2], best[1]):
+                best = (key, lcp, pos, ck_states, ck_metas)
+        return best
+
     def fetch(self, tokens: list, request_id: Optional[str] = None) -> Optional[tuple]:
-        """Longest-common-prefix match over entries → checkpoint restore.
+        """Best-restore-position match over entries → checkpoint restore.
 
         Returns ``(cache_list, remaining_tokens, restore_pos)`` or None.
         ``remaining_tokens`` is never empty — at minimum the last token is
@@ -975,34 +1101,13 @@ class BatchedSystemKV:
         """
         tokens = list(tokens)
         with self._lock:
-            best_key = None
-            best_lcp = 0
-            for key, entry in self._entries.items():
-                lcp = common_prefix_len(tokens, entry["tokens"])
-                if lcp > best_lcp:
-                    best_lcp = lcp
-                    best_key = key
-            if best_key is None or best_lcp < self.partial_min:
+            match = self._best_match_locked(tokens)
+            if match is None:
                 self.misses += 1
                 return None
-
+            best_key, best_lcp, pos, ck_states, ck_metas = match
             entry = self._entries[best_key]
-            cap = min(best_lcp, len(tokens) - 1)
-            plan = {
-                "d": best_lcp,
-                "donor_len": len(entry["tokens"]),
-                "snapshot": entry["snapshot"],
-                "metas": entry["metas"],
-                "kinds": entry["kinds"],
-                "checkpoints": entry["checkpoints"],
-            }
-            pos, ck_states, ck_metas = select_restore_pos(plan, cap)
-            if pos < self.partial_min:
-                self.misses += 1
-                return None
-            states, metas = self._build_restore_states(
-                entry, ck_states, pos, ck_metas
-            )
+            states, metas = self._build_restore_states(entry, ck_states, pos, ck_metas)
             if states is None:
                 self.misses += 1
                 return None
@@ -1016,14 +1121,14 @@ class BatchedSystemKV:
             if divergent:
                 self.partial_hits += 1
                 self.partial_tokens_saved += pos
+                if request_id is not None and best_lcp - pos >= self.partial_min:
+                    # (#117) the chains part ways at best_lcp, above the last
+                    # checkpoint: cut the prefill there so it gets one.
+                    self._divergence[request_id] = best_lcp
 
             if request_id is not None:
-                inherited = [
-                    cp for cp in entry["checkpoints"] if cp["pos"] <= pos
-                ]
-                if ck_states and (
-                    not inherited or inherited[-1]["pos"] < pos
-                ):
+                inherited = [cp for cp in entry["checkpoints"] if cp["pos"] <= pos]
+                if ck_states and (not inherited or inherited[-1]["pos"] < pos):
                     inherited.append(
                         {"pos": pos, "states": ck_states, "metas": ck_metas}
                     )
@@ -1064,36 +1169,26 @@ class BatchedSystemKV:
         )
         return fresh, remaining, pos
 
-    def peek(self, tokens: list, request_id: Optional[str] = None) -> int:
+    def peek(
+        self,
+        tokens: list,
+        request_id: Optional[str] = None,
+        touch: bool = True,
+    ) -> int:
         """(#106) The restore position ``fetch`` WOULD use, without building
         anything: no state slices, no copy, no counters. 0 = no usable match.
 
         LRU-touches the matched entry, so the chain a queued request is about
-        to extend outlives an idle one while it waits."""
+        to extend outlives an idle one while it waits (``touch=False`` for a
+        pure probe)."""
         tokens = list(tokens)
         with self._lock:
-            best_key, best_lcp = None, 0
-            for key, entry in self._entries.items():
-                lcp = common_prefix_len(tokens, entry["tokens"])
-                if lcp > best_lcp:
-                    best_lcp, best_key = lcp, key
-            if best_key is None or best_lcp < self.partial_min:
+            match = self._best_match_locked(tokens)
+            if match is None:
                 return 0
-            entry = self._entries[best_key]
-            plan = {
-                "d": best_lcp,
-                "donor_len": len(entry["tokens"]),
-                "snapshot": entry["snapshot"],
-                "metas": entry["metas"],
-                "kinds": entry["kinds"],
-                "checkpoints": entry["checkpoints"],
-            }
-            pos, _states, _metas = select_restore_pos(
-                plan, min(best_lcp, len(tokens) - 1)
-            )
-            if pos < self.partial_min:
-                return 0
-            self._entries.move_to_end(best_key)
+            best_key, _lcp, pos, _states, _metas = match
+            if touch:
+                self._entries.move_to_end(best_key)
             if request_id is not None:
                 self._peeked[request_id] = best_key  # (#107) spared while it waits
             return pos
@@ -1403,6 +1498,8 @@ class BatchedSystemKV:
                 "evictions": self.evictions,
                 "boundary_stores": self.boundary_stores,
                 "ssd_promotes": self.ssd_promotes,
+                "ssd_preferred": self.ssd_preferred,
+                "divergence_cuts": self.divergence_cuts,
                 "grown_stores": self.grown_stores,
                 "admission_deferrals": self.admission_deferrals,
                 "pressure_evictions": self.pressure_evictions,
@@ -1485,8 +1582,32 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     the executor via promote_ssd_pending).
 
     With LAZY_RESTORE (#106) a hit is only MATCHED here; the copy is built by
-    ``materialize_pending_restore`` when the request is admitted."""
-    if getattr(hybrid_kv, "lazy_restore", False) is True:
+    ``materialize_pending_restore`` when the request is admitted.
+
+    (#117) With an SSD tier, the RAM match is first weighed against the SSD
+    candidate: a weak checkpoint-snapped RAM partial no longer shadows an
+    exact snapshot on disk."""
+    lazy = getattr(hybrid_kv, "lazy_restore", False) is True
+    if getattr(hybrid_kv, "has_ssd", False) is True:
+        tokens = request.prompt_token_ids
+        candidate = hybrid_kv.ssd_beats_ram(tokens, hybrid_kv.peek(tokens, touch=False))
+        if candidate is not None:
+            request.prompt_cache = None
+            request._ssd_over_ram = True
+            if lazy:
+                # materialize_pending_restore's #107 fallback promotes at
+                # admission (behind every gate), so the copy stays unbudgeted-
+                # free; the usable length prices the wait correctly.
+                usable = candidate["usable"]
+                request.cache_hit_type = "system_kv_pending"
+                request.cached_tokens = usable
+                request.remaining_tokens = tokens[usable:]
+            else:
+                request.cache_hit_type = "ssd_pending"
+                request._ssd_candidate = candidate
+                request.remaining_tokens = tokens
+            return
+    if lazy:
         pos = hybrid_kv.peek(request.prompt_token_ids, request_id=request.request_id)
         if pos > 0:
             request.cache_hit_type = "system_kv_pending"
@@ -1494,9 +1615,7 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
             request.cached_tokens = pos
             request.remaining_tokens = request.prompt_token_ids[pos:]
             return
-    result = hybrid_kv.fetch(
-        request.prompt_token_ids, request_id=request.request_id
-    )
+    result = hybrid_kv.fetch(request.prompt_token_ids, request_id=request.request_id)
     if result is not None:
         cache, remaining, pos = result
         request.cache_hit_type = "system_kv"
@@ -1595,7 +1714,10 @@ def promote_ssd_pending(scheduler) -> None:
         result = None
         if candidate is not None:
             try:
-                if hybrid_kv.promote_ssd(candidate):
+                promoted = hybrid_kv.promote_ssd(candidate)
+                # (#117) An SSD-over-RAM pick that fails to load must still
+                # take the RAM partial it displaced, not a cold prefill.
+                if promoted or getattr(request, "_ssd_over_ram", False):
                     result = hybrid_kv.fetch(
                         request.prompt_token_ids,
                         request_id=request.request_id,
@@ -1758,6 +1880,9 @@ def insert_segmented(
         )
         boundaries = find_message_boundaries(
             tokens, marker_seqs, hybrid_kv.boundary_min_step
+        )
+        boundaries = hybrid_kv.add_divergence_cut(
+            request.request_id, request.cached_tokens, len(tokens), boundaries
         )
     except Exception:
         logger.debug("[batched_system_kv] boundary detection failed", exc_info=True)
