@@ -1546,3 +1546,16 @@ def test_64_no_duplicate_literal_keys_after_auto_merge():
             if repeated:
                 dupes.append(f"{path.relative_to(root)}:{node.lineno} {repeated}")
     assert not dupes, "duplicate literal keys (silent auto-merge?): " + "; ".join(dupes)
+
+
+def test_114_thinking_budget_skips_template_level_thinking_off():
+    """#114: thinking switched off only in chat_template_kwargs (#76's
+    reasoning_effort="none" mapping) must not arm the default thinking
+    budget. The processor would start in THINKING and force </think> into
+    content. A rebase of _prepare_chat_completion_invocation can silently
+    revert the gate to the top-level enable_thinking.
+    """
+    from tests.test_thinking_off_budget import _built
+
+    assert not _built(reasoning_effort="none").called
+    assert not _built(chat_template_kwargs={"enable_thinking": False}).called
