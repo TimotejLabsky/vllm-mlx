@@ -158,6 +158,7 @@ def test_scheduler_step_head_calls_relief():
     sched.finished_req_ids = set()
     sched._clear_cache_interval = 32
     sched._step_count = 0
+    sched._steps_executed = 0  # upstream #749 counter
 
     output = sched.step()
 
