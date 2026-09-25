@@ -1583,3 +1583,175 @@ def test_116_anthropic_image_on_text_route_is_rejected_not_dropped():
     from tests.test_media_not_supported import TestAnthropicImageBlocksReachTheGuard
 
     TestAnthropicImageBlocksReachTheGuard().test_text_route_rejects_anthropic_image()
+
+
+# ------------- #117 an exact SSD snapshot beats a weak, checkpoint-snapped RAM partial
+
+_SHARED = list(range(1000, 2500))  # tools + Assist context, common to both agents
+_TAIL_A = list(range(50000, 50800))  # language-A system prompt + history
+_TAIL_B = list(range(60000, 60800))  # language-B ...
+_A = _SHARED + _TAIL_A
+_B = _SHARED + _TAIL_B
+_B_NEXT = _B + list(range(70000, 70100))  # the next tool-loop request of B
+
+
+def _store_chain(kv, rid, tokens, ckpts=(448,)):
+    kv.note_scheduled(rid, 0)
+    for pos in ckpts:
+        kv.capture_segment(rid, pos, _donor_at(pos))
+    kv.store(rid, tokens, _donor_at(len(tokens)))
+
+
+def _ssd_split_kv(monkeypatch, tmp_path, **env):
+    """RAM holds only chain A (shares 1500 tokens with B, restores at its 448
+    checkpoint); chain B's exact snapshot sits on SSD only."""
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    _store_chain(writer, "b", _B)
+    writer.close()  # drain the spill to disk
+    kv = _make_ssd_cache(monkeypatch, tmp_path)
+    _store_chain(kv, "a", _A)
+    assert [e["tokens"] for e in kv._entries.values()] == [_A]
+    return kv
+
+
+def test_117_ssd_snapshot_beats_a_weak_ram_partial(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(monkeypatch, tmp_path)
+    request = _queued("b-next", _B_NEXT)
+    assert kv.peek(_B_NEXT, touch=False) == 448  # what the old path restored
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "ssd_pending"
+    assert request._ssd_candidate["usable"] == len(_B)
+    assert kv.ssd_preferred == 1
+
+    scheduler = SimpleNamespace(hybrid_kv=kv, waiting=[request])
+    bkv.promote_ssd_pending(scheduler)  # executor side
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.cached_tokens == len(_B)  # >= 95% of the prompt cached
+    assert request.cached_tokens / len(_B_NEXT) > 0.95
+    assert request.remaining_tokens == _B_NEXT[len(_B) :]
+    kv.close()
+
+
+def test_117_prefer_gain_zero_restores_the_old_behaviour(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(monkeypatch, tmp_path, VLLM_MLX_SYSTEM_KV_SSD_PREFER_GAIN=0)
+    request = _queued("b-next", _B_NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "system_kv" and request.cached_tokens == 448
+    assert kv.ssd_preferred == 0
+    kv.close()
+
+
+def test_117_a_gain_below_the_threshold_keeps_the_ram_hit(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(
+        monkeypatch, tmp_path, VLLM_MLX_SYSTEM_KV_SSD_PREFER_GAIN=len(_B)
+    )
+    request = _queued("b-next", _B_NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "system_kv" and request.cached_tokens == 448
+    kv.close()
+
+
+def test_117_a_resident_exact_entry_never_probes_the_disk(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(monkeypatch, tmp_path)
+    _store_chain(kv, "b", _B)  # B is in RAM too now
+    kv.check_ssd = MagicMock(side_effect=AssertionError("disk probe on an exact hit"))
+    request = _queued("b-next", _B_NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.cached_tokens == len(_B)
+    kv.close()
+
+
+def test_117_lazy_route_defers_the_promote_to_admission(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(monkeypatch, tmp_path, VLLM_MLX_BATCHED_LAZY_RESTORE=1)
+    request = _queued("b-next", _B_NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    # priced at the SSD length, but nothing loaded and no copy built yet
+    assert request.cache_hit_type == "system_kv_pending"
+    assert request.cached_tokens == len(_B) and request.prompt_cache is None
+    assert request.remaining_tokens == _B_NEXT[len(_B) :]
+    assert kv.stats()["ssd_promotes"] == 0 and kv._peeked == {}
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), request)
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.cached_tokens == len(_B) and request.prompt_cache is not None
+    assert kv.lazy_ssd_fallbacks == 1 and kv.stats()["ssd_promotes"] == 1
+    kv.close()
+
+
+def test_117_a_failed_promote_falls_back_to_the_ram_partial(monkeypatch, tmp_path):
+    kv = _ssd_split_kv(monkeypatch, tmp_path)
+    request = _queued("b-next", _B_NEXT)
+    bkv.fetch_for_request(kv, request)
+    assert request.cache_hit_type == "ssd_pending"
+    kv.promote_ssd = lambda candidate: False  # blob gone / corrupt
+
+    bkv.promote_ssd_pending(SimpleNamespace(hybrid_kv=kv, waiting=[request]))
+
+    assert request.cache_hit_type == "system_kv" and request.cached_tokens == 448
+    kv.close()
+
+
+def test_117_ram_entries_rank_by_restore_position_not_raw_lcp():
+    """X shares 1500 tokens with the request but only has a 448 checkpoint;
+    Y shares 1000 and has a 900 one. The old LCP-first pick restored at 448."""
+    kv = BatchedSystemKV(_FakeModel())
+    request = _SHARED + list(range(80000, 80700))
+    _store_chain(kv, "x", _SHARED + list(range(81000, 81500)), ckpts=(448,))
+    _store_chain(kv, "y", _SHARED[:1000] + list(range(82000, 82500)), ckpts=(448, 900))
+
+    assert kv.peek(request, touch=False) == 900
+    cache, _remaining, pos = kv.fetch(request)
+    assert pos == 900 and cache[0].offset == 900
+
+
+def test_117_a_divergent_restore_cuts_the_prefill_at_the_divergence():
+    """The tools -> system-prompt boundary is inside ONE system message: no
+    template marker sees it. Restoring across it must checkpoint it."""
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "a", _A)
+    request = _queued("b", _B_NEXT)
+
+    _cache, remaining, pos = kv.fetch(_B_NEXT, request_id="b")
+    assert pos == 448 and kv._divergence["b"] == len(_SHARED)
+
+    generator = MagicMock()
+    request.cached_tokens = pos
+    request.prompt = None  # no template family -> no message boundaries
+    bkv.insert_segmented(kv, generator, request, remaining, {})
+
+    ([segments],), _kw = generator.insert_segments.call_args
+    assert sum(len(seg) for seg in segments) == len(remaining)
+    ends = [pos + sum(len(s) for s in segments[: i + 1]) for i in range(len(segments))]
+    assert len(_SHARED) in ends  # a segment ends exactly at the divergence
+    assert kv.stats()["divergence_cuts"] == 1
+    assert len(_SHARED) in kv._boundary_pos["b"]  # survives ladder thinning
+
+    kv.discard_pending("b")
+    assert "b" not in kv._divergence
+
+
+def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "a", _A)
+    near = _A[:600] + [1, 2, 3, 4]  # lcp 600 -> restores at 448, 152 apart
+
+    kv.fetch(near, request_id="near")
+
+    assert "near" not in kv._divergence

@@ -3574,3 +3574,28 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Not covered:** images nested inside `tool_result.content` (e.g. Claude Code reading an image file) still go through text-only extraction and are dropped, as before. The PR leaves this as an explicit follow-up.
 
 **Upstreaming:** it is upstream's PR. When #776 merges, take upstream's version at the rebase and keep the #646 resolution if it is still needed.
+
+## 117. `patch: ssd-beats-weak-ram-partial` — an exact SSD snapshot no longer loses to a checkpoint-snapped RAM partial
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`_best_match_locked`, `check_ssd` `usable`, `_ssd_usable`, `ssd_beats_ram`, `add_divergence_cut`, `fetch`/`peek`, `fetch_for_request`, `promote_ssd_pending`, `insert_segmented`, stats), `tests/test_fork_invariants.py` (+9).
+
+**Found 2026-09-25** in the HA voice benchmark (`Qwen3.6-35B-A3B-4bit`): ~4.5% of requests logged `restore at 2048/5772 tokens (lcp=3719, divergent), prefilling 3724` — ~3.7K tokens re-prefilled (3–5 s, the slow p95 voice turns) while the exact snapshot sat on SSD, 34 ms away. The HA agents share tool schemas + Assist context (~3.7K) and then split by language *inside one system message*; with 4 slots the continuation entries push the other language's base out of RAM.
+
+**Cause (three parts).**
+1. `fetch_for_request` consulted the SSD only on a total RAM **miss**; any RAM entry sharing ≥ `PARTIAL_MIN` (256) tokens won, however little it restored. On a hybrid model that partial snaps *down* to a checkpoint (LCP 3719 → 2048).
+2. `fetch`/`peek` picked the donor by raw LCP, not by the position it would actually restore at, so a long LCP with a poor ladder beat a shorter one restoring deeper.
+3. The 3.7K shared-prefix boundary was never a checkpoint: #88 cuts at template *turn markers*, and tools → system prompt is inside one message.
+
+**Fix.**
+1. **Arbitrate before committing.** `check_ssd` now returns `usable` (where a restore from that entry lands: the whole chain, or the checkpoint ladder read from `meta.json` — no blob I/O, still event-loop safe). `ssd_beats_ram` compares it with the RAM restore position (`peek(touch=False)`); if the SSD is ahead by more than `VLLM_MLX_SYSTEM_KV_SSD_PREFER_GAIN` (default **512** tokens, `0` = old behaviour) the request goes the SSD route: eager → `ssd_pending`; lazy (#106) → `system_kv_pending` priced at the SSD length, with #107's admission-time promote doing the load (so the copy is still built behind every gate). Logged as `ssd preferred: ram_pos=… ssd_len=… -> ssd`; counter `ssd_preferred`. A promote that fails still takes the RAM partial it displaced (`_ssd_over_ram`) instead of prefilling cold. `fetch` still sees every RAM entry after a promote, so the SSD pick can only add options. A resident exact entry never probes the disk.
+2. **Rank donors by restore position, then LCP** (`_best_match_locked`, shared by `fetch` and `peek`).
+3. **Cut at the divergence.** A divergent restore records where the chains parted (`_divergence`, only when ≥ `PARTIAL_MIN` past the restore point); `insert_segmented` adds it as a boundary (and flags it preferred-survivor for ladder thinning), so the new entry has a checkpoint at the shared boundary and the next request of *either* kind restores there. Counter `divergence_cuts`. This helps with no SSD involved.
+
+**Not done (left as config levers).** Handoff item 3 (pin base prefixes / `SLOTS=6`): not built; try `VLLM_MLX_SYSTEM_KV_SLOTS=6` first (`RAM_MB` is shared across slots — check `_enforce_budgets_locked`). Rollback of this patch's behaviour without a redeploy: `VLLM_MLX_SYSTEM_KV_SSD_PREFER_GAIN=0` (arbitration off; the ranking and divergence cut stay).
+
+**Upstream:** fork-owned (batched system-KV is a fork module).
+
+**Verification.**
+- 9 new tests: SSD exact snapshot beats a 448-restore RAM partial (eager → promote → `cached_tokens == len(B)`, >95% of the prompt); `GAIN=0` and a too-high threshold keep the RAM hit; a resident exact entry never calls `check_ssd`; lazy route defers the promote to admission (nothing loaded at enqueue, `lazy_ssd_fallbacks 1`); failed promote falls back to the RAM partial; donor ranking by restore position (900 vs 448); divergence cut lands exactly on the shared boundary through `insert_segmented`; no cut next to the restore point.
+- Full suite: 4126 passed / 31 skipped / 30 deselected.
+- **Not yet measured live:** no Studio deploy, no `native_eval.py` / `speed_report.py` run, no production-log delta. Acceptance on the log (checkpoint-only restores 4.5% → <1%) and the HA turn p95 is the post-deploy check.
