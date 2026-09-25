@@ -109,6 +109,9 @@ class TestMLLMSchedulerStepsExecuted:
             def process_pending_removals(self):
                 pass
 
+            def maybe_relieve_pressure(self):  # fork: MLLM pressure relief hook
+                pass
+
             def next(self):
                 raise RuntimeError("simulated forward-pass failure")
 

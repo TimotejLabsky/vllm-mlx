@@ -1513,3 +1513,36 @@ def test_113_vendored_qwen4_exp_cache_has_the_07_state_methods():
 
     assert callable(getattr(cache.ArraysCache, "update_window", None))
     assert callable(getattr(cache.ArraysCache, "update_recurrent", None))
+
+
+def test_64_no_duplicate_literal_keys_after_auto_merge():
+    """A rebase auto-merged upstream #749's ``"steps_executed"`` next to the
+    fork's (#64) with no conflict marker: the MLLM ``get_stats()`` dict and the
+    engine promote tuple each carried the key twice, and the later entry
+    silently won. Pin the whole bug class: no dict literal (or string
+    tuple/list/set of >3 items) in the package repeats a constant key.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "vllm_mlx"
+    dupes = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Dict):
+                keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+            elif (
+                isinstance(node, (ast.Tuple, ast.List, ast.Set))
+                and len(node.elts) > 3
+                and all(
+                    isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    for e in node.elts
+                )
+            ):
+                keys = [e.value for e in node.elts]
+            else:
+                continue
+            repeated = sorted({k for k in keys if keys.count(k) > 1}, key=str)
+            if repeated:
+                dupes.append(f"{path.relative_to(root)}:{node.lineno} {repeated}")
+    assert not dupes, "duplicate literal keys (silent auto-merge?): " + "; ".join(dupes)
