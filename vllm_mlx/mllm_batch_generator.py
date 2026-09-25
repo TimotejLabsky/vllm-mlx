@@ -270,6 +270,9 @@ class MLLMBatchResponse:
     # Machine-readable cause when finish_reason == "error" (e.g.
     # "prompt_too_long") — lets the scheduler translate into typed errors.
     error_kind: Optional[str] = None
+    # Processor-expanded prompt length (text + vision tokens), stamped in
+    # next(); the scheduler's add-time count is a text-only estimate (#115).
+    prompt_tokens: Optional[int] = None
 
 
 def _error_kind_for(exc: BaseException) -> Optional[str]:
@@ -2374,7 +2377,31 @@ class MLLMBatchGenerator:
             List of MLLMBatchResponse, one per active request
         """
         with mx.stream(MLLMBatchGenerator._stream):
-            return self._next()
+            before = self.active_batch
+            responses = self._next()
+        self._stamp_prompt_tokens(responses, before)
+        return responses
+
+    def _stamp_prompt_tokens(
+        self, responses: List[MLLMBatchResponse], before: Optional["MLLMBatch"]
+    ) -> None:
+        """Fill ``prompt_tokens`` from each row's expanded ``input_ids``.
+
+        One choke point for every ``_next`` variant (MTP and chunked prefill
+        replace it). Rows can join (prefill) or leave the batch during the
+        step, so look in the batch from before and after it.
+        """
+        sizes = {}
+        for batch in (before, self.active_batch):
+            if batch is None:
+                continue
+            for uid, req in zip(batch.uids, batch.requests):
+                ids = getattr(req, "input_ids", None)
+                if ids is not None:
+                    sizes[uid] = int(ids.size)
+        for r in responses:
+            if r.prompt_tokens is None:
+                r.prompt_tokens = sizes.get(r.uid)
 
     def stats(self) -> MLLMBatchStats:
         """

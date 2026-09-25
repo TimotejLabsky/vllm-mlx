@@ -1559,3 +1559,17 @@ def test_114_thinking_budget_skips_template_level_thinking_off():
 
     assert not _built(reasoning_effort="none").called
     assert not _built(chat_template_kwargs={"enable_thinking": False}).called
+
+
+def test_115_mllm_usage_counts_expanded_prompt():
+    """#115: MLLM usage reports the processor-expanded prompt (vision tokens
+    included). The fork stamps it in MLLMBatchGenerator.next(); a rebase that
+    takes upstream #796's per-site stamping instead must keep this green.
+    """
+    from tests.test_mllm_prompt_tokens_usage import (
+        test_expanded_prompt_length_replaces_text_estimate_once,
+        test_next_stamps_rows_from_before_and_after_the_step,
+    )
+
+    test_expanded_prompt_length_replaces_text_estimate_once()
+    test_next_stamps_rows_from_before_and_after_the_step()
