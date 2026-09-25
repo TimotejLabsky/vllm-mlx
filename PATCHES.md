@@ -3542,3 +3542,19 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Exposure.** Latent and narrow on prod. It needs a thinking-off request on a budgeted route, and an answer longer than the budget.
 
 **Upstreaming:** candidate. It is the missing half of #810.
+
+---
+
+## 115. `patch: mllm-expanded-prompt-tokens` — MLLM usage counts the vision tokens (port of upstream #796)
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`MLLMBatchResponse.prompt_tokens`, `next()` → `_stamp_prompt_tokens`), `vllm_mlx/mllm_scheduler.py` (`_process_batch_responses`), `tests/test_mllm_prompt_tokens_usage.py` (new, 3), `tests/test_fork_invariants.py` (+1).
+
+**Cause.** `MLLMScheduler.add_request` sets `num_prompt_tokens` from `tokenizer.encode(prompt)`. That is the text-only template, with one placeholder per image. Nothing corrected it afterwards, so every image request on the vision routes (GLM-4.6V, Qwen3-VL-30B, REAP-288) under-reported `usage.prompt_tokens`/`total_tokens` and `/v1/status` totals by the image's vision-token count, often thousands. This is reporting only: generation and the prompt ceiling were unaffected.
+
+**Fix.** A hand-port of upstream #796 (open PR, riiji), reshaped for the fork. Upstream stamps `prompt_tokens` at each `MLLMBatchResponse(...)` site in `_next`/`_generation_step`/`_mtp_next`, and the fork has 11 such sites. Instead, the public `next()` stamps every response once from its row's processor-expanded `input_ids` (which are never trimmed; only local copies are sliced for chunked prefill), looking in the batch from before and after the step because rows join and leave during a step. So every `_next` replacement (MTP, chunked prefill) is covered by one hook. The scheduler corrects `num_prompt_tokens` and the schedule-time `total_prompt_tokens` accrual by the difference, once. Upstream's `add_request` debug-log hunk and MTP hunks were not taken.
+
+**Verification:**
+- **Real server A/B** with Qwen2-VL-2B-4bit (`cli serve --continuous-batching`, spare port, 448×448 image): image-request `prompt_tokens` went from 31 to 286 (256 vision tokens replacing one placeholder), the same streaming and non-streaming. The text-only request stayed at 29. The `/v1/status` total came to 630 = 2×286 + 2×29.
+- **Red then green:** the correction test fails on the unfixed scheduler. The stamping test covers rows that join and leave, and unknown uids.
+
+**Upstreaming:** if upstream merges #796, take theirs at the rebase and drop this patch's stamping hook.

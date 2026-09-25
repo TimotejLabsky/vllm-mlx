@@ -384,6 +384,11 @@ class TestMLLMBatchResponse:
         scheduler = MLLMScheduler.__new__(MLLMScheduler)
         scheduler.requests = {}
         scheduler.waiting = []
+        # Fork admission rails (queue cap, prompt ceiling), unarmed.
+        scheduler.queue_cap = 0
+        scheduler.queue_rejections = 0
+        scheduler.max_prompt_tokens = 0
+        scheduler.prompt_rejections = 0
 
         mock_tokenizer = MagicMock()
         mock_tokenizer.encode.side_effect = RuntimeError(
@@ -400,8 +405,10 @@ class TestMLLMBatchResponse:
             )
 
         assert scheduler.requests[req_id].num_prompt_tokens == 0
+        # Fork wording: a WARNING, since the failure disarms the prompt ceiling.
         assert any(
-            "Could not pre-estimate prompt tokens for request" in record.message
+            "Could not tokenize prompt for" in record.message
+            and record.levelno == logging.WARNING
             for record in caplog.records
         )
 
@@ -456,7 +463,11 @@ class TestMLLMBatchResponse:
             samplers=None,
         )
 
+        # The fork stamps prompt_tokens once, in the public next()'s
+        # _stamp_prompt_tokens (#115), not at each _next response site.
+        before = generator.active_batch
         responses = MLLMBatchGenerator._next(generator)
+        generator._stamp_prompt_tokens(responses, before)
         assert len(responses) == 2
         assert responses[0].prompt_tokens == 20
         assert responses[1].prompt_tokens == 615
