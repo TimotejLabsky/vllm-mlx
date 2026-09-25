@@ -241,6 +241,7 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     for block in msg.content:
         if block.type == "text" and block.text:
+            # Empty text blocks are skipped (upstream #646).
             text_parts.append(block.text)
             content_parts.append({"type": "text", "text": block.text})
 
