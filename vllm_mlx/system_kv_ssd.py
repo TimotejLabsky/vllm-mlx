@@ -32,6 +32,7 @@ which is already off the event loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .ssd_cache import SSDIndex, _blob_to_tokens, _tokens_hash
@@ -49,6 +50,12 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _SNAPSHOT_FILE = "snapshot.safetensors"
 _META_FILE = "meta.json"
+# (#119) Content-addressed checkpoint blobs, shared by every entry whose
+# chain passes through the same prefix. Lives beside ``data/`` (not in it),
+# so reconcile's entry-dir scan never sees it.
+_CKPT_DIR = "ckpt"
+_BLOB_SUFFIX = ".safetensors"
+_BLOB_TMP_SUFFIX = ".tmp.safetensors"
 
 
 class _SystemKVIndex(SSDIndex):
@@ -84,6 +91,9 @@ class SystemKVSSDStats:
     # separately in /v1/status.
     backlog_drops: int = 0
     busy_writes: int = 0  # spills written while the engine was busy
+    # (#119) checkpoint blobs found already on disk instead of re-written
+    ckpt_dedup_hits: int = 0
+    ckpt_dedup_bytes: int = 0
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -103,6 +113,8 @@ class SystemKVSSDStats:
             "evictions": self.evictions,
             "backlog_drops": self.backlog_drops,
             "busy_writes": self.busy_writes,
+            "ckpt_dedup_hits": self.ckpt_dedup_hits,
+            "ckpt_dedup_bytes": self.ckpt_dedup_bytes,
         }
 
 
@@ -134,6 +146,16 @@ class SystemKVSSDConfig:
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
     # the startup reconcile pass removes them.
     tmp_stale_seconds: float = 300.0
+    # (#119) Write each partial-restore checkpoint once, as a blob keyed by
+    # its token prefix, instead of into every entry's snapshot file. Reading
+    # handles both layouts regardless of this flag.
+    # ``VLLM_MLX_SSD_SYSTEM_KV_CKPT_DEDUP=0`` = pre-#119 writes.
+    dedup_checkpoints: bool = field(
+        default_factory=lambda: os.environ.get(
+            "VLLM_MLX_SSD_SYSTEM_KV_CKPT_DEDUP", "1"
+        ).strip()
+        != "0"
+    )
 
     @property
     def max_size_bytes(self) -> int:
@@ -288,6 +310,28 @@ def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
     return checkpoints
 
 
+def checkpoint_blob_key(tokens, cm: dict) -> str:
+    """(#119) Content address of one checkpoint: the token prefix it was
+    captured at plus its per-layer layout. Two entries whose chains share
+    ``tokens[:pos]`` hold interchangeable states there (the same property
+    ``_insert_entry_locked`` relies on when it merges absorbed ladders)."""
+    layout = json.dumps(
+        [
+            [lm["i"], lm["n"], bool(lm.get("tuple")), bool(lm.get("kind3"))]
+            for lm in cm["layers"]
+        ],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(
+        _tokens_hash(tuple(tokens[: cm["pos"]])).encode() + layout.encode()
+    ).hexdigest()
+    return digest[:40]
+
+
+def _entry_blob_keys(meta: dict | None) -> list[str]:
+    return [cm["blob"] for cm in (meta or {}).get("checkpoints", []) if cm.get("blob")]
+
+
 def _spill_done(on_done) -> None:
     if on_done is None:
         return
@@ -309,8 +353,10 @@ class SystemKVSSDStore:
         self._config = config
         self._cache_dir = config.cache_dir
         self._data_dir = os.path.join(self._cache_dir, "data")
+        self._ckpt_dir = os.path.join(self._cache_dir, _CKPT_DIR)
         os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
         os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+        os.makedirs(self._ckpt_dir, mode=config.dir_permissions, exist_ok=True)
         self._index = _SystemKVIndex(self._cache_dir)
         self._stats = SystemKVSSDStats()
         self._lock = threading.Lock()
@@ -338,6 +384,14 @@ class SystemKVSSDStore:
         self._backlog_gen = 0
         self._held_bytes = 0  # nbytes of the spill the writer is holding
         self._wake = threading.Event()
+        # (#119) blob key -> number of entries referencing it, and the bytes
+        # of the blob files themselves (the capacity cap counts them once).
+        # Guarded by ``_blob_lock``: the writer adds and evicts, a corrupt
+        # read quarantines from the caller's thread.
+        self._blob_lock = threading.Lock()
+        self._blob_refs: dict[str, int] = {}
+        self._blob_sizes: dict[str, int] = {}
+        self._rebuild_blob_refs()
 
     # ---- writer lifecycle -------------------------------------------------
 
@@ -370,6 +424,8 @@ class SystemKVSSDStore:
         single bad row never blocks startup.
         """
         now = time.time()
+        # (#119) Refcounts rebuilt before anything below deletes an entry.
+        entry_blobs = self._rebuild_blob_refs()
         # (a) stale tmp dirs
         try:
             for name in os.listdir(self._data_dir):
@@ -410,6 +466,20 @@ class SystemKVSSDStore:
         # data dirs with no index row -> orphan, remove
         for fp in on_disk - set(indexed):
             self._delete_entry(fp)
+        # (#119) entries whose checkpoint blob is gone cannot load -> drop
+        # them now rather than at the first promote; then GC the blob dir.
+        for fp, keys in entry_blobs.items():
+            if fp not in indexed or fp not in on_disk:
+                continue
+            if any(not os.path.exists(self._blob_path(k)) for k in keys):
+                logger.warning(
+                    "[system_kv_ssd] reconcile: entry %s lost a checkpoint "
+                    "blob; dropping it",
+                    fp,
+                )
+                self._quarantine(_blob_to_tokens(indexed[fp]["tokens_blob"]), fp)
+                on_disk.discard(fp)
+        self._gc_blobs(now)
         # backfill memory_bytes from the real snapshot file size
         fixed = 0
         for fp, e in indexed.items():
@@ -495,6 +565,7 @@ class SystemKVSSDStore:
                 kinds,
                 nbytes,
                 on_done,
+                ckpt_blobs,
             ) = item
             # The snapshot is leaving the queue (about to be written and then
             # dropped) — release its share of the pinned-byte budget.
@@ -515,6 +586,7 @@ class SystemKVSSDStore:
                         snap_meta,
                         kinds,
                         nbytes,
+                        ckpt_blobs=ckpt_blobs,
                     )
             except Exception:
                 logger.exception(
@@ -525,7 +597,7 @@ class SystemKVSSDStore:
                 # Loop locals outlive the iteration: without this the writer
                 # kept the last snapshot's arrays referenced until the NEXT
                 # spill arrived — on an empty queue, indefinitely.
-                item = tensors = None
+                item = tensors = ckpt_blobs = None
 
     def _may_write_busy(self, waiting_since: float) -> bool:
         after = self._config.busy_write_after_s
@@ -630,8 +702,14 @@ class SystemKVSSDStore:
         """
         try:
             tensors, layer_meta = flatten_snapshot(snapshot)
-            ckpt_tensors, ckpt_meta = flatten_checkpoints(checkpoints)
-            tensors.update(ckpt_tensors)
+            ckpt_blobs = None
+            if self._config.dedup_checkpoints and checkpoints:
+                ckpt_meta, ckpt_blobs = self._flatten_checkpoint_blobs(
+                    tokens, checkpoints
+                )
+            else:
+                ckpt_tensors, ckpt_meta = flatten_checkpoints(checkpoints)
+                tensors.update(ckpt_tensors)
         except Exception:
             logger.exception("[system_kv_ssd] flatten failed; skipping spill")
             return False
@@ -674,6 +752,7 @@ class SystemKVSSDStore:
                     kinds,
                     nbytes,
                     on_done,
+                    ckpt_blobs,
                 )
             )
             return True
@@ -695,6 +774,54 @@ class SystemKVSSDStore:
         snap_meta: list | None,
         kinds: list | None,
         nbytes: int,
+        ckpt_blobs: dict | None = None,
+    ) -> None:
+        """``ckpt_blobs`` (#119): blob key -> checkpoint tensors, or None for
+        a blob that was already on disk at enqueue. ``ckpt_meta`` rows that
+        carry a ``blob`` key are stored by reference; rows without one read
+        their tensors from ``tensors`` (the pre-#119 layout)."""
+        acquired: list[str] = []
+        if ckpt_blobs is not None:
+            kept = []
+            for cm in ckpt_meta:
+                key = cm.get("blob")
+                if key is None:
+                    kept.append(cm)
+                elif self._put_blob(key, ckpt_blobs.get(key)):
+                    acquired.append(key)
+                    kept.append(cm)
+                else:
+                    # Evicted between enqueue and now, and no tensors held.
+                    logger.info(
+                        "[system_kv_ssd] checkpoint blob %s vanished before "
+                        "the write; storing the entry without pos %d",
+                        key,
+                        cm["pos"],
+                    )
+            ckpt_meta = kept
+        try:
+            self._write_entry_files(
+                tokens,
+                tensors,
+                layer_meta,
+                ckpt_meta,
+                snap_meta,
+                kinds,
+                fmt=4 if ckpt_blobs is not None else 3,
+            )
+        except Exception:
+            self._release_blobs(acquired)
+            raise
+
+    def _write_entry_files(
+        self,
+        tokens: tuple[int, ...],
+        tensors: dict,
+        layer_meta: list[dict],
+        ckpt_meta: list[dict],
+        snap_meta: list | None,
+        kinds: list | None,
+        fmt: int,
     ) -> None:
         import mlx.core as mx
 
@@ -715,7 +842,7 @@ class SystemKVSSDStore:
         with open(meta_path, "w") as f:
             json.dump(
                 {
-                    "format": 3,
+                    "format": fmt,
                     "layers": layer_meta,
                     "num_tokens": len(tokens),
                     "checkpoints": ckpt_meta,
@@ -729,7 +856,9 @@ class SystemKVSSDStore:
         disk_bytes = os.path.getsize(snap_path)
 
         if os.path.exists(entry_dir):
-            shutil.rmtree(entry_dir)
+            # Re-spill of the same chain: the new entry's blobs are already
+            # acquired, so releasing the old ones frees only what it alone held.
+            self._delete_entry(entry_hash)
         os.rename(tmp_dir, entry_dir)
 
         # Index the ACTUAL on-disk size, not the snapshot's in-RAM nbytes:
@@ -757,7 +886,7 @@ class SystemKVSSDStore:
         cfg = self._config
         try:
             while (
-                self._index.get_total_bytes() > cfg.max_size_bytes
+                self._index.get_total_bytes() + self._blob_bytes() > cfg.max_size_bytes
                 or self._index.get_entry_count() > cfg.max_entries
             ):
                 victims = self._index.get_lru(limit=1)
@@ -774,7 +903,153 @@ class SystemKVSSDStore:
     def _delete_entry(self, file_path: str) -> None:
         entry_dir = os.path.join(self._data_dir, file_path)
         if os.path.isdir(entry_dir):
+            keys = _entry_blob_keys(self.read_meta(file_path))
             shutil.rmtree(entry_dir, ignore_errors=True)
+            self._release_blobs(keys)
+
+    # ---- checkpoint blobs (#119) -----------------------------------------
+
+    def _blob_path(self, key: str) -> str:
+        return os.path.join(self._ckpt_dir, key + _BLOB_SUFFIX)
+
+    def _flatten_checkpoint_blobs(self, tokens, checkpoints) -> tuple[list, dict]:
+        """One blob per checkpoint. A blob already on disk is not carried
+        (its tensors stay out of the spill queue, so they are not pinned)."""
+        ckpt_meta: list[dict] = []
+        blobs: dict = {}
+        for cp in checkpoints:
+            t, (cm,) = flatten_checkpoints([cp])
+            key = checkpoint_blob_key(tokens, cm)
+            cm["blob"] = key
+            ckpt_meta.append(cm)
+            blobs[key] = None if os.path.exists(self._blob_path(key)) else t
+        return ckpt_meta, blobs
+
+    def _put_blob(self, key: str, tensors: dict | None) -> bool:
+        """Take a reference on blob ``key``, writing it if it is not on disk.
+        False when it is neither on disk nor provided. Runs under
+        ``_blob_lock`` end to end, so a concurrent release cannot delete a
+        blob between the existence check and the reference."""
+        import mlx.core as mx
+
+        path = self._blob_path(key)
+        with self._blob_lock:
+            if os.path.exists(path):
+                size = self._blob_sizes.get(key)
+                if size is None:
+                    size = os.path.getsize(path)
+                    self._blob_sizes[key] = size
+                with self._lock:
+                    self._stats.ckpt_dedup_hits += 1
+                    self._stats.ckpt_dedup_bytes += size
+            elif tensors is None:
+                return False
+            else:
+                tmp = os.path.join(self._ckpt_dir, key + _BLOB_TMP_SUFFIX)
+                mx.eval(list(tensors.values()))
+                mx.save_safetensors(tmp, tensors)
+                os.chmod(tmp, self._config.file_permissions)
+                os.replace(tmp, path)
+                self._blob_sizes[key] = os.path.getsize(path)
+            self._blob_refs[key] = self._blob_refs.get(key, 0) + 1
+        return True
+
+    def _release_blobs(self, keys) -> None:
+        with self._blob_lock:
+            for key in keys:
+                n = self._blob_refs.get(key, 0) - 1
+                if n > 0:
+                    self._blob_refs[key] = n
+                    continue
+                self._blob_refs.pop(key, None)
+                self._blob_sizes.pop(key, None)
+                try:
+                    os.remove(self._blob_path(key))
+                except FileNotFoundError:
+                    pass
+
+    def _blob_bytes(self) -> int:
+        with self._blob_lock:
+            return sum(self._blob_sizes.values())
+
+    def _rebuild_blob_refs(self) -> dict[str, list[str]]:
+        """Recount blob references from the entries' meta.json (the only
+        record of them) and size the referenced blobs. Runs at construction
+        — a store that never starts its writer still releases correctly —
+        and again at reconcile. Returns entry dir -> its blob keys."""
+        out: dict[str, list[str]] = {}
+        try:
+            names = os.listdir(self._data_dir)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name.endswith(".tmp"):
+                continue
+            keys = _entry_blob_keys(self.read_meta(name))
+            if keys:
+                out[name] = keys
+        refs: dict[str, int] = {}
+        for keys in out.values():
+            for k in keys:
+                refs[k] = refs.get(k, 0) + 1
+        sizes: dict[str, int] = {}
+        for k in refs:
+            try:
+                sizes[k] = os.path.getsize(self._blob_path(k))
+            except OSError:
+                pass
+        with self._blob_lock:
+            self._blob_refs = refs
+            self._blob_sizes = sizes
+        return out
+
+    def _gc_blobs(self, now: float) -> None:
+        """Reconcile the blob dir against the rebuilt refcounts: remove
+        unreferenced blobs and stale interrupted writes, size the rest."""
+        try:
+            names = os.listdir(self._ckpt_dir)
+        except FileNotFoundError:
+            return
+        removed = 0
+        with self._blob_lock:
+            self._blob_sizes = {}
+            for name in names:
+                path = os.path.join(self._ckpt_dir, name)
+                if name.endswith(_BLOB_TMP_SUFFIX):
+                    try:
+                        stale = (
+                            now - os.path.getmtime(path)
+                            > self._config.tmp_stale_seconds
+                        )
+                    except OSError:
+                        stale = True
+                    if stale:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                    continue
+                if not name.endswith(_BLOB_SUFFIX):
+                    continue
+                key = name[: -len(_BLOB_SUFFIX)]
+                if self._blob_refs.get(key, 0) > 0:
+                    try:
+                        self._blob_sizes[key] = os.path.getsize(path)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            logger.info(
+                "[system_kv_ssd] reconcile: removed %d unreferenced checkpoint "
+                "blobs in %s",
+                removed,
+                self._cache_dir,
+            )
 
     # ---- promote ----------------------------------------------------------
 
@@ -835,9 +1110,16 @@ class SystemKVSSDStore:
                 meta = json.load(f)
             tensors = mx.load(snap_path)
             snapshot = unflatten_snapshot(tensors, meta["layers"])
-            checkpoints = unflatten_checkpoints(
-                tensors, meta.get("checkpoints", [])
-            )
+            ckpt_meta = meta.get("checkpoints", [])
+            if any(cm.get("blob") for cm in ckpt_meta):
+                # (#119) one blob per checkpoint; a missing blob raises and
+                # quarantines the entry like any other unreadable part.
+                checkpoints = []
+                for cm in ckpt_meta:
+                    blob = mx.load(self._blob_path(cm["blob"]))
+                    checkpoints.extend(unflatten_checkpoints(blob, [cm]))
+            else:
+                checkpoints = unflatten_checkpoints(tensors, ckpt_meta)
             snap_meta_raw = meta.get("meta")
             snap_meta = (
                 [tuple(m) if m else None for m in snap_meta_raw]
@@ -895,9 +1177,13 @@ class SystemKVSSDStore:
         with self._lock:
             d["queued_bytes"] = self._queued_bytes
         d["queue_depth"] = self._spill_queue.qsize()
+        with self._blob_lock:
+            d["ckpt_blob_count"] = len(self._blob_sizes)
+            d["ckpt_blob_bytes"] = sum(self._blob_sizes.values())
         try:
             d["entry_count"] = self._index.get_entry_count()
-            d["total_bytes"] = self._index.get_total_bytes()
+            # Disk footprint, blobs counted once (what the cap enforces).
+            d["total_bytes"] = self._index.get_total_bytes() + d["ckpt_blob_bytes"]
         except Exception:
             pass
         return d

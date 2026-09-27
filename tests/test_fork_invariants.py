@@ -1755,3 +1755,29 @@ def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
     kv.fetch(near, request_id="near")
 
     assert "near" not in kv._divergence
+
+
+# ------------- #119 a checkpoint shared by several SSD entries is written once
+
+
+def test_119_divergent_chains_share_their_common_checkpoint_on_disk(
+    monkeypatch, tmp_path
+):
+    """A and B share a 1500-token prefix; both ladders hold the 448
+    checkpoint inside it. Before #119 each entry's snapshot file carried its
+    own copy (on the 27B ~151 MB of fp32 GDN state per checkpoint per entry)."""
+    import glob
+
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    _store_chain(writer, "a", _A, ckpts=(448, 1600))
+    _store_chain(writer, "b", _B, ckpts=(448, 1600))
+    writer.close()
+
+    blobs = glob.glob(str(tmp_path / "**" / "ckpt" / "*.safetensors"), recursive=True)
+    assert len(blobs) == 3  # 448 once, 1600 (past the divergence) per chain
+    reader = _make_ssd_cache(monkeypatch, tmp_path)
+    stats = reader._ssd.get_stats()
+    assert stats["entry_count"] == 2 and stats["ckpt_blob_count"] == 3
+    reader.close()
