@@ -544,10 +544,17 @@ def thin_checkpoints(checkpoints, capacity):
     learned this the hard way — its final checkpoint destroyed the
     penultimate one). Replaces the old content-blind drop-every-other
     geometric thinning.
+
+    An ``anchor`` checkpoint (#118: the end of the system message, the one
+    prefix every session of an agent shares) is never evicted either while
+    another candidate exists — as the ladder's lowest boundary it has the
+    smallest gap, so the gap rule alone would drop it first.
     """
     cap = max(1, capacity)
     while len(checkpoints) > cap and len(checkpoints) > 2:
-        candidates = checkpoints[:-2]
+        candidates = [c for c in checkpoints[:-2] if not c.get("anchor")]
+        if not candidates:
+            candidates = checkpoints[:-2]
         pool = [c for c in candidates if not c.get("boundary")] or candidates
         victim = None
         victim_gap = None
@@ -561,19 +568,23 @@ def thin_checkpoints(checkpoints, capacity):
     return checkpoints
 
 
-def append_checkpoint(checkpoints, pos, states, metas, capacity, *, boundary=False):
-    """Append a {pos, states, metas, boundary} checkpoint, keeping the list
+def append_checkpoint(
+    checkpoints, pos, states, metas, capacity, *, boundary=False, anchor=False
+):
+    """Append a {pos, states, metas, boundary[, anchor]} checkpoint, keeping the list
     sorted and bounded (see ``thin_checkpoints`` for the eviction policy).
     ``boundary=True`` marks a message-boundary-aligned position (#88) —
     preferred survivor under thinning, because divergence points in agent
     traffic land at message starts (a re-rendered history diverges where
     the next turn begins), not at arbitrary 2048-multiples.
+    ``anchor=True`` (#118) pins it against thinning altogether.
     """
     if checkpoints and checkpoints[-1]["pos"] >= pos:
         return checkpoints
-    checkpoints.append(
-        {"pos": pos, "states": states, "metas": metas, "boundary": boundary}
-    )
+    cp = {"pos": pos, "states": states, "metas": metas, "boundary": boundary}
+    if anchor:
+        cp["anchor"] = True
+    checkpoints.append(cp)
     return thin_checkpoints(checkpoints, capacity)
 
 

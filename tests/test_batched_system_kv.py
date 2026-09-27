@@ -913,6 +913,21 @@ def test_find_message_boundaries_hits_and_min_step(monkeypatch):
     assert find_message_boundaries([0] * 50, [marker], 0) == ()
 
 
+def test_find_message_boundaries_anchors_the_first(monkeypatch):
+    """#118: ``first_min`` keeps the first boundary regardless of min_step
+    (when it is long enough to restore from), and later cuts step from it."""
+    from vllm_mlx.batched_system_kv import find_message_boundaries
+
+    marker = (7, 8, 9)
+    toks = (
+        [0] * 100 + [7, 8, 9] + [0] * 50 + [7, 8, 9] + [0] * 300 + [7, 8, 9] + [0] * 20
+    )
+    assert find_message_boundaries(toks, [marker], 10_000, first_min=50) == (100, 456)
+    assert find_message_boundaries(toks, [marker], 120, first_min=50) == (100, 456)
+    # too short to serve a restore -> no anchor, and no later hit posing as one
+    assert find_message_boundaries(toks, [marker], 120, first_min=101) == (153, 456)
+
+
 def test_split_segments_boundary_cuts_with_interval_bound(monkeypatch):
     kv = _boundary_kv(monkeypatch)
     kv.ckpt_interval = 256

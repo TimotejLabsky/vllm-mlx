@@ -988,3 +988,46 @@ def test_append_checkpoint_carries_boundary_flag():
     cps = append_checkpoint(cps, 300, {}, {}, capacity=8, boundary=True)
     assert cps[0].get("boundary") is False
     assert cps[1]["boundary"] is True
+
+
+def test_thin_checkpoints_never_evicts_the_anchor():
+    """#118: the anchor is the lowest boundary with the smallest gap — the
+    gap rule alone would pick it first."""
+    from vllm_mlx.system_kv import thin_checkpoints
+
+    cps = [
+        {"pos": 600, "states": {}, "metas": {}, "boundary": True, "anchor": True},
+        {"pos": 2700, "states": {}, "metas": {}, "boundary": True},
+        {"pos": 4800, "states": {}, "metas": {}, "boundary": True},
+        {"pos": 6900, "states": {}, "metas": {}, "boundary": True},
+        {"pos": 9000, "states": {}, "metas": {}, "boundary": True},
+    ]
+    out = thin_checkpoints(cps, 4)
+    assert [c["pos"] for c in out] == [600, 4800, 6900, 9000]
+
+
+def test_append_checkpoint_carries_anchor_flag():
+    cps = append_checkpoint([], 600, {}, {}, capacity=8, boundary=True, anchor=True)
+    cps = append_checkpoint(cps, 900, {}, {}, capacity=8)
+    assert cps[0]["anchor"] is True and "anchor" not in cps[1]
+
+
+def test_flatten_checkpoints_keeps_thinning_flags():
+    cps = [
+        {
+            "pos": 256,
+            "states": {1: _rec_states(1.0)},
+            "metas": {1: None},
+            "boundary": True,
+            "anchor": True,
+        },
+        {
+            "pos": 512,
+            "states": {1: _rec_states(2.0)},
+            "metas": {1: None},
+            "boundary": False,
+        },
+    ]
+    rebuilt = unflatten_checkpoints(*flatten_checkpoints(cps))
+    assert rebuilt[0].get("boundary") is True and rebuilt[0].get("anchor") is True
+    assert not rebuilt[1].get("boundary") and not rebuilt[1].get("anchor")

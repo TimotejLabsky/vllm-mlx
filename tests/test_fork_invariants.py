@@ -1755,3 +1755,79 @@ def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
     kv.fetch(near, request_id="near")
 
     assert "near" not in kv._divergence
+
+
+# ------------- #118 the end of the system message is always a checkpoint
+
+_MARK = (7, 8, 9)  # a template turn-start marker, as token ids
+_SYS = list(_MARK) + list(range(1000, 1597))  # 600-token system message
+
+
+def _deep_chain(turns=12, turn_len=2100):
+    toks = list(_SYS)
+    for t in range(turns):
+        toks += list(_MARK) + list(
+            range(10_000 * (t + 1), 10_000 * (t + 1) + turn_len - 3)
+        )
+    return toks
+
+
+def _prefill_cold(kv, rid, tokens):
+    """insert_segmented on a cold prompt, then capture at every segment end
+    and store — what the scheduler does across the request's prefill."""
+    kv.boundary_marker_ids = lambda prompt, tokenizer: (_MARK,)
+    request = _queued(rid, tokens)
+    request.prompt = "rendered"
+    generator = MagicMock()
+    bkv.insert_segmented(kv, generator, request, tokens, {})
+    ([segments],), _kw = generator.insert_segments.call_args
+    end = 0
+    for seg in segments[:-1]:
+        end += len(seg)
+        kv.capture_segment(rid, end, _donor_at(end))
+    kv.store(rid, tokens, _donor_at(len(tokens)))
+
+
+def test_118_a_short_system_prompt_is_a_restore_point_after_a_deep_chain(
+    monkeypatch,
+):
+    """A 600-token system prompt sits below the 2048 boundary min_step, and
+    as the ladder's lowest boundary it has the smallest gap, so thinning
+    dropped it first. A new session that shares only the system prompt then
+    restored nothing."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_KV_ANCHOR_FIRST_BOUNDARY", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    chain = _deep_chain()
+    _prefill_cold(kv, "deep", chain)
+
+    [entry] = kv._entries.values()
+    assert len(entry["checkpoints"]) == kv.ckpt_capacity  # the ladder was thinned
+    assert [cp["pos"] for cp in entry["checkpoints"] if cp.get("anchor")] == [600]
+    assert kv.stats()["anchor_cuts"] == 1
+
+    new_session = _SYS + list(_MARK) + list(range(90_000, 90_500))
+    assert kv.peek(new_session, touch=False) == 600
+
+
+def test_118_anchor_off_restores_the_old_miss(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_KV_ANCHOR_FIRST_BOUNDARY", "0")
+    kv = BatchedSystemKV(_FakeModel())
+    _prefill_cold(kv, "deep", _deep_chain())
+
+    new_session = _SYS + list(_MARK) + list(range(90_000, 90_500))
+    assert kv.peek(new_session, touch=False) == 0
+
+
+def test_118_the_anchor_survives_an_ssd_round_trip(monkeypatch, tmp_path):
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    monkeypatch.delenv("VLLM_MLX_BATCHED_KV_ANCHOR_FIRST_BOUNDARY", raising=False)
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    _prefill_cold(writer, "deep", _deep_chain())
+    writer.close()
+
+    store = _make_ssd_cache(monkeypatch, tmp_path)._ssd
+    [row] = store._index.all_entries()
+    loaded = store.read_entry(tuple(_deep_chain()), row["file_path"])
+    assert [cp["pos"] for cp in loaded["checkpoints"] if cp.get("anchor")] == [600]
+    store.close()
