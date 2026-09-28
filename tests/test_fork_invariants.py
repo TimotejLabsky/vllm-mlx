@@ -1769,3 +1769,39 @@ def test_118_images_hash_is_order_sensitive():
 
     for h in (simple_hash, batched_hash):
         assert h(["img-a", "img-b"]) != h(["img-b", "img-a"])
+
+
+
+def test_119_serve_command_opts_into_clean_exit():
+    """#119 (upstream #745): every llama-swap route starts via
+    ``cli.serve_command``, whose ``uvicorn.run`` call is fork-modified (#90),
+    so a rebase conflict there can silently drop the opt-in line. Without it
+    the TLS-destructor segfault returns on every model swap / idle unload.
+    Also pins that a cleanup failure still skips the early exit.
+    """
+    import ast
+    from pathlib import Path
+
+    from vllm_mlx.shutdown import should_exit_without_finalizing
+
+    src = Path(__file__).resolve().parents[1] / "vllm_mlx" / "cli.py"
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "serve_command"
+    )
+    opt_in = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "_exit_process_after_shutdown"
+            for t in n.targets
+        )
+        and isinstance(n.value, ast.Constant)
+        and n.value.value is True
+    ]
+    assert opt_in, "serve_command no longer sets server._exit_process_after_shutdown"
+
+    assert should_exit_without_finalizing(None, None, True, env={})
+    assert not should_exit_without_finalizing(None, RuntimeError(), True, env={})

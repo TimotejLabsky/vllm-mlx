@@ -3611,3 +3611,17 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fix.** The `mllm_cache.py` hunk of open upstream PR #726 (`"_".join(hashes)`) — **plus the same fix in `vision_embedding_cache.py`, which #726 misses.** That module has its *own* copy of `compute_images_hash`, and it is the one the batched MLLM path (both production vision routes) actually uses; `mllm_cache.py`'s copy only serves the SimpleEngine `MLLMPrefixCacheManager`. Caught by this patch's own pixel-cache test. Worth reporting on #726. The PR's batched-generator hunks are already covered by #56's `has_media` gate (audio included, #55), and the SSD namespace was already bumped to `mllm-v2`, so they are not taken.
 
 **Upstream:** when #726 (or #728, which carries the same hunk) merges, take upstream's file; the invariant test stays.
+
+## 119. `patch: clean-exit` — the serve process exits before MLX's thread-local teardown can segfault (upstream #745)
+
+**Files:** `vllm_mlx/shutdown.py` (new), `vllm_mlx/server.py` (`_exit_process_after_shutdown`, end of `lifespan`, `main`), `vllm_mlx/cli.py` (`serve_command` opt-in, `_exit_without_finalizing`), `docs/reference/configuration.md` (`VLLM_MLX_CLEAN_EXIT`), `.github/workflows/ci.yml`, `tests/test_shutdown_decision.py` + `tests/test_shutdown_exit.py` (from the PR), `tests/test_fork_invariants.py` (+1).
+
+**Cause.** After a clean lifespan shutdown, CPython finalization joins the threads that touched MLX; MLX's compile cache lives in thread-local storage whose destructor calls `_Py_Dealloc` without the GIL → `EXC_BAD_ACCESS` in `CompileCache::CacheEntry::~CacheEntry`. The fork still spins up a `to_thread` for shutdown cache I/O, so it has the same shape. Every llama-swap swap / TTL unload is a shutdown; a crashing multi-GB process that macOS is still writing a crash report for is a plausible cause of the 2026-08-17 "stale process squats the port" symptom (`improvement-research-2026-08-30.md` P2-c already marked this "adopt, tiny").
+
+**Fix.** Cherry-pick of open upstream PR #745 (sbayer2). At the end of `lifespan`, if neither the serving phase nor cleanup raised and a serve entry point opted in, run the MLLM temp-file sweep (the only `atexit` handler the fork owns), flush stdio and `os._exit(0)`. `VLLM_MLX_CLEAN_EXIT=0` restores normal finalization; library/embedded use never opts in. **Conflict resolution:** `serve_command`'s `uvicorn.run(...)` carries #90's `log_config=timestamped_log_config()`; the opt-in line is placed before it and #90 kept.
+
+**Fork check.** The fork's SSD writers (#36 system-KV spills, #49 drain) are closed by `close_ssd_tier()` inside the awaited `engine.stop()`, i.e. **before** the exit point, and `SystemKVSSDStore.close()` commits the index — nothing the fork persists on shutdown is skipped.
+
+**Not yet verified on the Studio** (no access from the pod): look for `Python-*.ips` reports with the `CompileCache` stack in `~/Library/Logs/DiagnosticReports` before deploy (confirms the diagnosis), and after deploy SIGTERM a spare-port server → exit code 0, no new `.ips`, system-KV SSD index committed.
+
+**Upstream:** when #745 merges, take upstream's files and re-apply the `cli.py` opt-in next to #90; the invariant test catches a lost opt-in.
