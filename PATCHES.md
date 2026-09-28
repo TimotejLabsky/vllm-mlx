@@ -3625,3 +3625,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Not yet verified on the Studio** (no access from the pod): look for `Python-*.ips` reports with the `CompileCache` stack in `~/Library/Logs/DiagnosticReports` before deploy (confirms the diagnosis), and after deploy SIGTERM a spare-port server → exit code 0, no new `.ips`, system-KV SSD index committed.
 
 **Upstream:** when #745 merges, take upstream's files and re-apply the `cli.py` opt-in next to #90; the invariant test catches a lost opt-in.
+
+## 120. `patch: hybrid-keep-strict-prefixes` — storing a longer hybrid entry no longer evicts the prefix the next request needs (upstream #770)
+
+**Files:** `vllm_mlx/memory_cache.py` (`MemoryAwarePrefixCache.store`), `tests/test_memory_cache.py` (from the PR).
+
+**Cause.** Store-time prefix-subset eviction deletes entries that are a strict prefix of the new one, assuming the longer entry subsumes them. That holds only if the cache can be trimmed back. Recurrent (SSM) layers cannot be rewound — `fetch()` refuses LCP/supersequence reuse for them — so on a hybrid model the strict-prefix entry is the *only* one a branching request can reuse, and each request's store destroyed the next one's hit.
+
+**Fix.** Cherry-pick of open upstream PR #770 (CBribiescas): skip store-time prefix eviction when any cache layer is non-trimmable. Memory-limit LRU eviction is unchanged (and is improved by #121).
+
+**Fleet scope.** `MemoryAwarePrefixCache` is not used by text routes (batched system-KV replaces it, `VLLM_MLX_BATCHED_SYSTEM_KV=1`); it serves the MLLM path. Taken early for the first **hybrid vision route** (`Qwen3.8-27B-4bit-vision`, personal-infratructure PR #629). Inert on the pure-attention vision routes.
+
+**Upstream:** take upstream's version when #770 merges.
