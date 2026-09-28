@@ -12,6 +12,7 @@ Phase A fix: media-bearing requests neither store nor fetch. Text-only
 requests are unaffected. (Composite media-hash keys — phase B — come later.)
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -33,7 +34,7 @@ class _RecordingPrefixCache:
         self.fetch_calls.append(list(tokens))
         return self.fetch_result
 
-    def store(self, tokens, cache):
+    def store(self, tokens, cache, evict_prefixes=True):
         self.store_calls.append((list(tokens), cache))
 
 
@@ -42,6 +43,9 @@ def _bare_generator(prefix_cache, model_config=None):
     gen.prefix_cache = prefix_cache
     gen.model = SimpleNamespace(config=model_config or SimpleNamespace())
     gen._think_suffix_len = 0
+    # #124 (upstream #744) checkpoint-ownership state, set by __init__.
+    gen._prefix_checkpoint_lock = threading.Lock()
+    gen._request_prefix_checkpoints = {}
     return gen
 
 

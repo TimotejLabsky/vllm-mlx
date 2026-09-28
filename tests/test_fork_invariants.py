@@ -1805,3 +1805,22 @@ def test_119_serve_command_opts_into_clean_exit():
 
     assert should_exit_without_finalizing(None, None, True, env={})
     assert not should_exit_without_finalizing(None, RuntimeError(), True, env={})
+
+
+def test_124_hybrid_exact_path_never_touches_media_requests():
+    """#124 (upstream #744): the exact-hit fetch (prompt-final logits) and the
+    full-prompt hybrid snapshot store in ``_process_prompts`` are new paths
+    into the token-keyed prefix cache. Upstream's versions have no media
+    check; #56's rule (media prompts never fetch or store — placeholder ids
+    don't encode pixels) must hold on both, or two images alias.
+    """
+    import inspect
+    import re
+
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+    src = inspect.getsource(MLLMBatchGenerator._process_prompts)
+    for anchor in ("fetch_exact_auxiliary", "prepare_store("):
+        idx = src.index(anchor)
+        cond = src[src.rindex("if (", 0, idx) : idx]
+        assert re.search(r"not req\.has_media", cond), anchor
