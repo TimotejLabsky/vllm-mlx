@@ -3614,7 +3614,7 @@ reached the template as one result for two calls — the Qwen template rendered 
 
 ## 119. `patch: clean-exit` — the serve process exits before MLX's thread-local teardown can segfault (upstream #745)
 
-**Files:** `vllm_mlx/shutdown.py` (new), `vllm_mlx/server.py` (`_exit_process_after_shutdown`, end of `lifespan`, `main`), `vllm_mlx/cli.py` (`serve_command` opt-in, `_exit_without_finalizing`), `docs/reference/configuration.md` (`VLLM_MLX_CLEAN_EXIT`), `.github/workflows/ci.yml`, `tests/test_shutdown_decision.py` + `tests/test_shutdown_exit.py` (from the PR), `tests/test_fork_invariants.py` (+1).
+**Files:** `vllm_mlx/shutdown.py` (new), `vllm_mlx/server.py` (`_exit_process_after_shutdown`, end of `lifespan`, `main`), `vllm_mlx/cli.py` (`serve_command` opt-in, `_exit_without_finalizing`), `docs/reference/configuration.md` (`VLLM_MLX_CLEAN_EXIT`), `tests/test_shutdown_decision.py` + `tests/test_shutdown_exit.py` (from the PR), `tests/test_fork_invariants.py` (+1).
 
 **Cause.** After a clean lifespan shutdown, CPython finalization joins the threads that touched MLX; MLX's compile cache lives in thread-local storage whose destructor calls `_Py_Dealloc` without the GIL → `EXC_BAD_ACCESS` in `CompileCache::CacheEntry::~CacheEntry`. The fork still spins up a `to_thread` for shutdown cache I/O, so it has the same shape. Every llama-swap swap / TTL unload is a shutdown; a crashing multi-GB process that macOS is still writing a crash report for is a plausible cause of the 2026-08-17 "stale process squats the port" symptom (`improvement-research-2026-08-30.md` P2-c already marked this "adopt, tiny").
 
@@ -3652,7 +3652,7 @@ reached the template as one result for two calls — the Qwen template rendered 
 
 ## 122. `patch: mllm-reshuffle-metadata-eval` — batch membership changes stop leaking Metal handles on vision routes (upstream #708)
 
-**Files:** `vllm_mlx/mllm_batch_generator.py` (`MLLMBatch._sync_reshuffle_metadata`, called at the end of `filter()`/`extend()`), `tests/test_batch_reshuffle_metadata.py` (from the PR), `.github/workflows/ci.yml`.
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`MLLMBatch._sync_reshuffle_metadata`, called at the end of `filter()`/`extend()`), `tests/test_batch_reshuffle_metadata.py` (from the PR). The PRs' `ci.yml` entries for the new test files (#119, #122) are not in the commits — the pod's token lacks `workflow` scope; see PR #39 for the lines to add.
 
 **Cause.** `filter()`/`extend()` rebuild per-layer `offset`/`left_padding`/`lengths` as lazy MLX ops; decode never evaluates `offset` (the mask uses the Python-int `_idx`), so each membership change extends an unevaluated chain retaining every buffer that fed it for the batch's lifetime. Under continuous traffic the batch never drains → Metal handle count climbs to the 499000 limit and the process aborts. Hybrid `ArraysCache` metadata has no decode-time reader at all.
 
