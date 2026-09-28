@@ -3637,3 +3637,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fleet scope.** `MemoryAwarePrefixCache` is not used by text routes (batched system-KV replaces it, `VLLM_MLX_BATCHED_SYSTEM_KV=1`); it serves the MLLM path. Taken early for the first **hybrid vision route** (`Qwen3.8-27B-4bit-vision`, personal-infratructure PR #629). Inert on the pure-attention vision routes.
 
 **Upstream:** take upstream's version when #770 merges.
+
+## 121. `patch: evict-superseded-first` — under memory pressure, drop a subsumed turn before another conversation's newest entry (upstream #766)
+
+**Files:** `vllm_mlx/memory_cache.py` (`_find_superseded_lru`, `_evict_lru`), `tests/test_memory_cache.py` (from the PR).
+
+**Cause.** `_evict_lru` was plain `popitem(last=False)`. Multi-turn traffic stores one entry per turn, each a strict prefix of the next; on a hybrid model #120 keeps those (they are reusable), so plain LRU sacrificed an older conversation's *newest* entry before a newer conversation's already-superseded turns.
+
+**Fix.** Cherry-pick of open upstream PR #766 (CBribiescas): the victim is the oldest entry that is a strict prefix of another resident entry, else LRU. Only chooses the victim once eviction is required — never deletes proactively. Log tag `[lru_evict:superseded|lru]`.
+
+**Fork interaction.** The MLLM memory-pressure relief (`MLLMBatchGenerator._pressure_drop_lru`, #48/#53 discipline) calls `_evict_lru`, so relief now also drops superseded entries first — the intended order. Paired with #120 for the hybrid vision route.
+
+**Upstream:** take upstream's version when #766 merges.
