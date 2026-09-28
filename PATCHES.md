@@ -3649,3 +3649,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fork interaction.** The MLLM memory-pressure relief (`MLLMBatchGenerator._pressure_drop_lru`, #48/#53 discipline) calls `_evict_lru`, so relief now also drops superseded entries first — the intended order. Paired with #120 for the hybrid vision route.
 
 **Upstream:** take upstream's version when #766 merges.
+
+## 122. `patch: mllm-reshuffle-metadata-eval` — batch membership changes stop leaking Metal handles on vision routes (upstream #708)
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`MLLMBatch._sync_reshuffle_metadata`, called at the end of `filter()`/`extend()`), `tests/test_batch_reshuffle_metadata.py` (from the PR), `.github/workflows/ci.yml`.
+
+**Cause.** `filter()`/`extend()` rebuild per-layer `offset`/`left_padding`/`lengths` as lazy MLX ops; decode never evaluates `offset` (the mask uses the Python-int `_idx`), so each membership change extends an unevaluated chain retaining every buffer that fed it for the batch's lifetime. Under continuous traffic the batch never drains → Metal handle count climbs to the 499000 limit and the process aborts. Hybrid `ArraysCache` metadata has no decode-time reader at all.
+
+**Fix.** Cherry-pick of open upstream PR #708 (rohnach29): `mx.eval` those small arrays after every filter/extend, recursing into `CacheList`. Evaluating an already-materialized array is free.
+
+**Relation to #84.** #84 found that evaluating metadata did **not** fix the *text-path per-step* leak; this is a different, per-membership-change leak on the MLLM batch. Low-volume vision routes restart often enough that it was never observed here; taken early as cheap insurance for the hybrid vision route, where `ArraysCache` makes it strictly worse.
+
+**Upstream:** take upstream's version when #708 merges.
