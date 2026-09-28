@@ -119,10 +119,14 @@ def compute_image_hash(image_path: str) -> str:
 
 
 def compute_images_hash(images: List[str]) -> str:
-    """Compute combined hash for multiple images."""
+    """Compute an order-sensitive combined hash for multiple images.
+
+    Image order is part of the model input: the same images in a different
+    order must not hit each other's pixel entries (PATCHES.md #118).
+    """
     if not images:
         return "no_images"
-    hashes = sorted(compute_image_hash(img) for img in images)
+    hashes = [compute_image_hash(img) for img in images]
     return hashlib.sha256("_".join(hashes).encode()).hexdigest()[:16]
 
 

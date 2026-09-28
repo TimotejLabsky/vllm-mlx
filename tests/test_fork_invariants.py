@@ -1755,3 +1755,17 @@ def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
     kv.fetch(near, request_id="near")
 
     assert "near" not in kv._divergence
+
+
+def test_118_images_hash_is_order_sensitive():
+    """#118: both image-set hashes are order-sensitive. The production pixel
+    cache (``VisionEmbeddingCache._make_key``, batched MLLM path) uses
+    ``vision_embedding_cache``'s own copy, which upstream #726 does NOT fix —
+    a rebase that takes upstream's file brings back ``sorted`` and reordered
+    images silently hit each other's preprocessed pixels.
+    """
+    from vllm_mlx.mllm_cache import compute_images_hash as simple_hash
+    from vllm_mlx.vision_embedding_cache import compute_images_hash as batched_hash
+
+    for h in (simple_hash, batched_hash):
+        assert h(["img-a", "img-b"]) != h(["img-b", "img-a"])

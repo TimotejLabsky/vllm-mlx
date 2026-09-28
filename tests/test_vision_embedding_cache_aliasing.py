@@ -48,3 +48,23 @@ class TestPixelCacheAliasing:
         entry = cache.get_pixel_cache(["fake-image-a"], "what color?")
         assert entry is not None
         assert entry.extra_kwargs == {}
+
+
+class TestPixelCacheImageOrder:
+    """#118: the pixel-cache key is order-sensitive. The same images in a
+    different order are a different model input; a hit would feed the cached
+    ``pixel_values`` in the first request's order (image 1 and 2 swapped).
+    """
+
+    def test_reordered_images_miss(self):
+        cache = VisionEmbeddingCache()
+        cache.set_pixel_cache(
+            images=["img-a", "img-b"],
+            prompt="compare",
+            pixel_values=mx.zeros((2, 3, 4, 4)),
+            input_ids=mx.array([[1, 2, 3]]),
+            extra_kwargs=None,
+            processing_time=0.1,
+        )
+        assert cache.get_pixel_cache(["img-a", "img-b"], "compare") is not None
+        assert cache.get_pixel_cache(["img-b", "img-a"], "compare") is None
