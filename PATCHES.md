@@ -3661,3 +3661,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Relation to #84.** #84 found that evaluating metadata did **not** fix the *text-path per-step* leak; this is a different, per-membership-change leak on the MLLM batch. Low-volume vision routes restart often enough that it was never observed here; taken early as cheap insurance for the hybrid vision route, where `ArraysCache` makes it strictly worse.
 
 **Upstream:** take upstream's version when #708 merges.
+
+## 123. `patch: mllm-prefix-key-message-boundary` — the MLLM prefix-cache key ends at the last complete message, not at a startup-measured think suffix (upstream #764)
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`_resolve_im_end_id`, `_prompt_boundary_len`; used by `_prefix_cache_lookup`, `_maybe_store_prefix_cache` and the chunked store/fetch sites), `tests/test_mllm_continuous_batching.py` (from the PR).
+
+**Cause.** `_think_suffix_len` is measured **once** at startup with `enable_thinking=True` (Qwen3.5/3.6/3.8: `<think>\n`, 2 tokens), but thinking is chosen per request. A thinking-off request renders `<think>\n\n</think>\n\n` (4 tokens), so the stored key kept 2 generation-prompt tokens and was never a strict prefix of the next turn. On a plain-KV model LCP-trim recovered it; on a **hybrid** model LCP reuse is refused (SSM state can't rewind) — every turn silently re-prefilled the whole conversation.
+
+**Fix.** Cherry-pick of open upstream PR #764 (CBribiescas): key on the last `<|im_end|>` (single-token ChatML only); fall back to the old think-suffix strip otherwise. **Conflict resolution:** the fork moved the fetch into `_prefix_cache_lookup` (#56's `has_media` gate); the boundary change is applied there, and the PR's inline version of the old block is dropped.
+
+**Fleet scope.** GLM-4.6V (non-ChatML) keeps the old path. Qwen3-VL-Instruct (ChatML, pure attention) now keys 3 tokens earlier (`\n<|im_start|>assistant\n` re-prefilled — negligible). The point is the hybrid vision route `Qwen3.8-27B-4bit-vision`, whose route default is thinking **on** but whose agent clients often send it off.
+
+**Upstream:** take upstream's version when #764 merges; re-apply into `_prefix_cache_lookup` if upstream still has the inline block.
