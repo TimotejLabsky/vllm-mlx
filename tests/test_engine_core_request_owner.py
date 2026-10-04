@@ -11,6 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+def _isolate_package_attr(monkeypatch, package_name, attr):
+    """Restore (or remove) ``package.attr`` at teardown — the import system
+    rebinds it to the fake-backed submodule."""
+    package = importlib.import_module(package_name)
+    monkeypatch.setattr(package, attr, getattr(package, attr, None), raising=False)
+
+
 @pytest.fixture
 def engine_core_module(monkeypatch):
     """Import engine_core with lightweight substitutes for MLX-only modules."""
@@ -38,6 +45,12 @@ def engine_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
     monkeypatch.setitem(sys.modules, "vllm_mlx.mlx_streams", fake_streams)
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core", raising=False)
+    # Fork: when engine_core was not imported yet, delitem records nothing to
+    # restore and the fake-backed module leaked into every later test
+    # (get_registry() -> None). Register the slot so teardown drops it.
+    monkeypatch.setitem(sys.modules, "vllm_mlx.engine_core", None)
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core")
+    _isolate_package_attr(monkeypatch, "vllm_mlx", "engine_core")
 
     return importlib.import_module("vllm_mlx.engine_core")
 
@@ -53,6 +66,9 @@ def batched_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched", raising=False)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.engine.batched", None)
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched")
+    _isolate_package_attr(monkeypatch, "vllm_mlx.engine", "batched")
 
     module = importlib.import_module("vllm_mlx.engine.batched")
     return module, fake_mx

@@ -1218,6 +1218,7 @@ class SimpleEngine(BaseEngine):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=template_tools,
                 **kwargs,
             )
@@ -1373,6 +1374,7 @@ class SimpleEngine(BaseEngine):
 
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
+            local_kwargs["top_p"] = top_p
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = strip_effort_fallback(chat_template_kwargs)
             if mllm_draft_requested:
@@ -2691,12 +2693,14 @@ class SimpleEngine(BaseEngine):
         else:
             use_specprefill = self._draft_model is not None
 
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
+        # Ensure token IDs exist so usage.prompt_tokens is always reported
+        # (upstream #610 era: previously only the system-KV branch or
+        # specprefill tokenized, and every other request reported
+        # prompt_tokens=0) — and specprefill needs them anyway.
+        if full_tokens_list is None:
             tokenizer = text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
-            )
+            bos = getattr(tokenizer, "bos_token", None)
+            add_special = not (isinstance(bos, str) and full_prompt.startswith(bos))
             full_tokens_list = tokenizer.encode(
                 full_prompt, add_special_tokens=add_special
             )

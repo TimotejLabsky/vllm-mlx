@@ -564,9 +564,7 @@ class BatchedEngine(BaseEngine):
         scheduler_kwargs = {
             # getattr: fork tests build engines via __new__ and set only what
             # they exercise.
-            "specprefill_draft_model": getattr(
-                self, "_specprefill_draft_model", None
-            ),
+            "specprefill_draft_model": getattr(self, "_specprefill_draft_model", None),
         }
         if getattr(self, "_mllm_draft_model", None) is not None:
             scheduler_kwargs.update(

@@ -809,69 +809,8 @@ async def test_stream_anthropic_flushes_truncated_deepseek_v4_dsml(
     assert text == truncated
     assert events[-1]["type"] == "message_stop"
 
-# Explicit-marker guard on the Anthropic/Responses STREAMING paths (patch #27
-# follow-up, logic from upstream #610): with thinking disabled the reasoning
-# parser stays off until the model emits an explicit reasoning marker (Gemma 4
-# opens <|channel>thought regardless of the template kwarg); from that point
-# deltas are parsed so raw markers don't leak, and parsed reasoning is
-# suppressed — only cleaned content is emitted.
-
-_GEMMA_DELTAS = (
-    "<|channel>thought\n",
-    "Let me think.",
-    "<channel|>",
-    "The answer is 42.",
-)
-
-
-def _gemma_parser():
-    from vllm_mlx.reasoning.gemma4_parser import Gemma4ReasoningParser
-
-    return Gemma4ReasoningParser()
-
-
-@pytest.mark.anyio
-async def test_stream_anthropic_strips_markers_when_thinking_disabled():
-    async def fake_stream_chat(messages, **kwargs):
-        for piece in _GEMMA_DELTAS:
-            yield SimpleNamespace(new_text=piece, prompt_tokens=4, completion_tokens=1)
-
-    engine = MagicMock(stream_chat=fake_stream_chat)
-    msgs = [{"role": "user", "content": "What is the answer?"}]
-    openai_request = srv.ChatCompletionRequest(
-        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
-    )
-    anthropic_request = srv.AnthropicRequest(
-        model="test-model", max_tokens=8, messages=msgs
-    )
-    prepared = srv.PreparedChatInvocation(
-        messages=msgs,
-        chat_kwargs={"chat_template_kwargs": {"enable_thinking": False}},
-        response_format=None,
-        json_logits_processor=None,
-    )
-
-    saved = (srv._reasoning_parser, srv._model_name)
-    srv._reasoning_parser, srv._model_name = _gemma_parser(), "test-model"
-    try:
-        body = "".join(
-            [
-                c
-                async for c in srv._stream_anthropic_messages(
-                    engine, openai_request, anthropic_request, prepared
-                )
-            ]
-        )
-    finally:
-        srv._reasoning_parser, srv._model_name = saved
-
-    # Raw markers and the thought text must not reach the text block.
-    assert "<|channel>" not in body and "<channel|>" not in body
-    assert "Let me think." not in body
-    # Thinking was disabled — no thinking block, only cleaned content.
-    assert "thinking_delta" not in body
-    assert "The answer is 42." in body
-    assert '"type": "text_delta"' in body
+# Fork #47: Responses-path counterpart of upstream #610's Anthropic test
+# above (same gemma deltas, thinking disabled).
 
 
 @pytest.mark.anyio
@@ -1010,16 +949,19 @@ async def test_stream_anthropic_routes_implicit_think_to_thinking_block(monkeypa
 
 
 @pytest.mark.anyio
-async def test_stream_anthropic_thinking_off_never_probes(monkeypatch):
-    """#27 latch semantics: thinking off must not flip untagged text to reasoning."""
-    engine, probe_calls = _implicit_think_engine()
+async def test_stream_anthropic_thinking_off_never_emits_thinking(monkeypatch):
+    """Latch semantics: thinking off must not flip untagged text to reasoning.
+
+    (Upstream #610's parser preparation may probe the template with the
+    request's enable_thinking=False; only the observable stream is pinned.)
+    """
+    engine, _probe_calls = _implicit_think_engine()
     _use_glm_parser(monkeypatch)
 
     body = await _run_anthropic(
         engine, {"chat_template_kwargs": {"enable_thinking": False}}
     )
 
-    assert probe_calls == []
     assert "thinking_delta" not in body
 
 

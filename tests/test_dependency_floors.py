@@ -53,8 +53,11 @@ def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
         ("0.31.2", False),
         ("0.31.3", True),
         ("0.31.4", True),
-        ("0.32.0", False),
-        ("0.32.1", False),
+        # Fork: upstream e2821ce caps mlx-lm <0.32 for its legacy cache/batch
+        # API; the fork runs 0.32.x in production (pinned commit) and patch
+        # #81 makes both cache-state shapes native, so the cap is rejected.
+        ("0.32.0", True),
+        ("0.32.1", True),
     ],
 )
 def test_mlx_lm_version_range_preserves_legacy_cache_api(

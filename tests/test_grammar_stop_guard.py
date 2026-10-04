@@ -510,6 +510,8 @@ def _bare_scheduler_with_request(cfg, logits_processors=None):
     sched.running = {"req-json-loop": request}
     sched._repstop = RepetitionStopTracker(cfg)
     sched.batch_generator = Mock()
+    # upstream #757: the scheduler drains per-UID MTP deltas as a pair.
+    sched.batch_generator.drain_mtp_uid_deltas.return_value = ({}, {})
     sched._store_prompt_only_cache = lambda *a, **k: None
     sched._get_detokenizer = lambda rid: detok
     sched._detokenizer_pool = {"req-json-loop": detok}

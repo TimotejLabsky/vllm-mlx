@@ -129,7 +129,12 @@ async def _run_jobs(model, processor, jobs, stagger_steps: int = 0):
                 sched.step()
             batch = sched.batch_generator.active_batch
             if batch is not None and batch.requests:
-                first_delta = batch.requests[0].rope_delta
+                # Upstream #744 request-local mRoPE state (#57 retired onto
+                # it): the per-row delta the decode step passes as kwargs.
+                head = batch.requests[0]
+                first_delta = getattr(head, "decode_rope_delta", None)
+                if first_delta is None:
+                    first_delta = getattr(head, "rope_deltas", None)
             for idx in range(1, len(jobs)):
                 _add(idx)
         else:

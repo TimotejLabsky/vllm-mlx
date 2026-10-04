@@ -3808,12 +3808,14 @@ def _extract_reasoning_and_tool_calls(
     reasoning_text = None
     text_for_tool_parse = output_text
 
-    # Always run the reasoning parser when one is configured — even when
-    # thinking is disabled — so reasoning-protocol markers are stripped from
-    # content (e.g. gemma-4's echoed `<|channel>thought\n<channel|>` prefill
-    # under enable_thinking=False). When thinking is off we discard the
-    # reasoning text but keep the cleaned content.
-    if _reasoning_parser:
+    suppress_reasoning = not allow_reasoning
+    if _reasoning_parser and suppress_reasoning:
+        # Thinking is disabled, but the model opened an explicit reasoning
+        # block anyway — parse iff markers are present (see
+        # _explicit_reasoning_markers_present).
+        allow_reasoning = _explicit_reasoning_markers_present(output_text)
+
+    if _reasoning_parser and allow_reasoning:
         reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
             output_text
         )
@@ -3830,9 +3832,12 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
-        if not allow_reasoning:
-            # Thinking off: don't surface reasoning, but fold reasoning-classified
-            # text back into content so markerless output (Qwen) isn't dropped.
+        if suppress_reasoning:
+            # Keep the cleaned answer, but do not expose thoughts emitted
+            # despite enable_thinking=False. Fork #27 safety net: if the
+            # parse left no answer at all (e.g. an unclosed reasoning block),
+            # fold the reasoning-classified text back rather than return an
+            # empty message.
             if reasoning_text and not (text_for_tool_parse or "").strip():
                 text_for_tool_parse = reasoning_text
             reasoning_text = None
@@ -7796,26 +7801,28 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            # Always run the reasoning parser when one is configured — even
-            # when thinking is disabled. With enable_thinking=False some
-            # templates still emit reasoning-protocol markers (e.g. gemma-4's
-            # echoed `<|channel>thought\n<channel|>` prefill); the parser must
-            # run to strip them from content. We simply suppress the reasoning
-            # output in that case (see `reasoning = None` below). Skipping the
-            # parser entirely leaked the raw markers into content and broke
-            # downstream consumers (HA: "model not returning a valid response").
-            # NOTE (rebase onto d96458c): upstream #644 made parsers
-            # request-local, so this tests the per-request `reasoning_parser`
-            # built above rather than the module-global `_reasoning_parser`
-            # this patch originally referenced — the loop body below already
-            # calls the request-local instance.
-            # NOTE (rebase onto 22efb47): upstream #677 added a
-            # `not _thinking_disabled(request, kwargs)` clause here — exactly
-            # the skip this patch exists to prevent — so it is deliberately
-            # dropped. Upstream's `or output_finished` IS kept: #677 withholds
-            # a trailing partial tag and flushes it via `finalize_stream()` on
-            # the final output, which carries no new text.
-            if reasoning_parser and (delta_text or output_finished):
+            if reasoning_parser and delta_text:
+                raw_stream_text += delta_text
+                if (
+                    thinking_off
+                    and not disabled_reasoning_latched
+                    and _explicit_reasoning_markers_present(
+                        raw_stream_text, reasoning_parser
+                    )
+                ):
+                    disabled_reasoning_latched = True
+
+            # Use reasoning parser if enabled (skip when enable_thinking=False
+            # is set either on the request or via the resolved chat template
+            # kwargs / server default — unless the disabled-thinking marker
+            # latch above has fired). Upstream #610/#815; supersedes fork #27's
+            # always-run + fold (which ate content around a lone gemma
+            # `<channel|>` and surfaced thoughts the request had disabled).
+            if (
+                reasoning_parser
+                and (delta_text or output_finished)
+                and (not thinking_off or disabled_reasoning_latched)
+            ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
                 delta_msg = _extract_streaming_reasoning_delta(
@@ -7840,17 +7847,6 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
-                if _thinking_disabled(request, kwargs):
-                    # Thinking off: the parser still runs (to strip prefill
-                    # markers, e.g. gemma's `<|channel>thought<channel|>`), but
-                    # we must not surface a reasoning stream. Markerless output
-                    # (Qwen emits no <think> when thinking is off) gets routed to
-                    # `reasoning` by the streaming parser — fold it back into
-                    # content so it isn't lost. gemma keeps its answer in
-                    # content with an empty thought; folding is a no-op there.
-                    if reasoning:
-                        content = (content or "") + reasoning
-                    reasoning = None
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
                 )

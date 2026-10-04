@@ -468,9 +468,10 @@ class TestSimpleEngineConcurrency:
 
         # No system → system-KV machinery never engages: the prompt render is
         # the only template call, the system prefix is never tokenized, and
-        # nothing is stored or counted.
+        # nothing is stored or counted. (The full prompt IS tokenized once, so
+        # usage.prompt_tokens is reported — the upstream simple.py delta.)
         assert tokenizer.apply_chat_template.call_count == 1
-        assert tokenizer.encode.call_count == 0
+        assert tokenizer.encode.call_count == 1
         assert engine._system_kv_snapshot is None
         assert len(engine._system_kv_lru) == 0
         assert engine._system_kv_misses == 0

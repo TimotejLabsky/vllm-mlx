@@ -244,6 +244,8 @@ def _bare_scheduler_with_request(cfg):
     sched.running = {"req-loop-1": request}
     sched._repstop = RepetitionStopTracker(cfg)
     sched.batch_generator = Mock()
+    # upstream #757: the scheduler drains per-UID MTP deltas as a pair.
+    sched.batch_generator.drain_mtp_uid_deltas.return_value = ({}, {})
     sched._store_prompt_only_cache = lambda *a, **k: None
     sched._get_detokenizer = lambda rid: detok
     sched._detokenizer_pool = {"req-loop-1": detok}
@@ -349,6 +351,7 @@ def _bare_mllm_scheduler_with_request(cfg):
         status=None,
         output_text=None,
         finish_reason=None,
+        specprefill_outcome=None,  # upstream #701 request field
     )
     detok = SimpleNamespace(
         add_token=lambda t: None,
@@ -361,6 +364,8 @@ def _bare_mllm_scheduler_with_request(cfg):
     sched.running = {"mllm-loop-1": request}
     sched._repstop = RepetitionStopTracker(cfg)
     sched.batch_generator = Mock()
+    # upstream #757: the scheduler drains per-UID MTP deltas as a pair.
+    sched.batch_generator.drain_mtp_uid_deltas.return_value = ({}, {})
     sched._detokenizer_pool = {"mllm-loop-1": detok}
     sched.total_completion_tokens = 0
     sched.num_requests_processed = 0
@@ -378,6 +383,7 @@ def _mllm_resp(token, finish_reason=None):
         mtp_attempted_count=0,
         from_draft=False,
         error_kind=None,
+        specprefill_outcome=None,  # upstream #701 response field
     )
 
 

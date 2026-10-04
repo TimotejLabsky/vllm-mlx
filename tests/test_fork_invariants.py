@@ -1548,6 +1548,81 @@ def test_64_no_duplicate_literal_keys_after_auto_merge():
     assert not dupes, "duplicate literal keys (silent auto-merge?): " + "; ".join(dupes)
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Plain answer", "Plain answer"),  # markerless: parser never engaged
+        ("<think>x</think>Answer", "Answer"),  # thoughts dropped, answer kept
+        ("<think>All of it, never closed", "All of it, never closed"),
+    ],
+)
+def test_27_thinking_off_never_returns_empty_or_thoughts(output, expected):
+    """#27 retired onto upstream #610/#815's marker latch (2026-10-04); what
+    survives of it is the guarantee: with thinking disabled a non-stream
+    reply never surfaces a reasoning field and never comes back empty.
+    """
+    import vllm_mlx.server as srv
+    from vllm_mlx.reasoning.qwen3_parser import Qwen3ReasoningParser
+
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = Qwen3ReasoningParser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            output, None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+    assert reasoning is None
+    assert expected in (content or "")
+
+
+def test_rebase_no_shadowed_definitions_after_auto_merge():
+    """2026-10-04 rebase: upstream merged PRs the fork had cherry-picked
+    (#610 -> #47, #776 -> #116) and both copies of their tests auto-merged
+    side by side. A second ``class``/``def`` with the same name in one scope
+    silently replaces the first, so upstream's (stricter) tests never ran.
+    Pin the bug class across the package and the test suite.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    # Pre-existing inside upstream itself (056c97d + cd61a35), not a merge
+    # artifact of ours; the later definition is the live one.
+    allowed = {("vllm_mlx/server.py", "", "_get_engine_tokenizer")}
+
+    def legit(node):
+        for dec in getattr(node, "decorator_list", []):
+            src = ast.unparse(dec)
+            if src.endswith((".setter", ".deleter", ".register")) or "overload" in src:
+                return True
+        return False
+
+    shadowed = []
+
+    def walk(rel, body, scope):
+        seen = {}
+        for node in body:
+            if not isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            if node.name in seen and not legit(node):
+                if (rel, scope, node.name) not in allowed:
+                    shadowed.append(f"{rel}:{node.lineno} {scope}{node.name}")
+            seen[node.name] = node.lineno
+            if isinstance(node, ast.ClassDef):
+                walk(rel, node.body, f"{scope}{node.name}.")
+
+    for top in ("vllm_mlx", "tests"):
+        for path in sorted((root / top).rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            walk(rel, ast.parse(path.read_text()).body, "")
+    assert not shadowed, "shadowed definitions (silent auto-merge?): " + "; ".join(
+        shadowed
+    )
+
+
 def test_114_thinking_budget_skips_template_level_thinking_off():
     """#114: thinking switched off only in chat_template_kwargs (#76's
     reasoning_effort="none" mapping) must not arm the default thinking

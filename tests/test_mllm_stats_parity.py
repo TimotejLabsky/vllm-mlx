@@ -29,6 +29,9 @@ class _FakeGenerator:
     def get_prefix_cache_stats(self):
         return {"hits": 7, "misses": 1}
 
+    def get_specprefill_stats(self):  # upstream #701
+        return {"enabled": False}
+
 
 def _bare_scheduler():
     sched = MLLMScheduler.__new__(MLLMScheduler)
