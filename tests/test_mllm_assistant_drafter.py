@@ -29,9 +29,18 @@ def _install_fake_mlx_vlm(monkeypatch, drafter_module):
     monkeypatch.setitem(
         sys.modules,
         "mlx_vlm.utils",
-        SimpleNamespace(load_config=lambda path: {"model_type": "qwen4_exp"}),
+        SimpleNamespace(
+            load_config=lambda path: {"model_type": "qwen4_exp"},
+            get_model_path=lambda path: path,
+        ),
     )
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", drafter_module)
+    # Fork #97: a qwen4_exp target registers the vendored arch before
+    # mlx_vlm.load(); the fake model needs no runtime configuration.
+    monkeypatch.setattr(
+        "vllm_mlx.vendored.qwen4_exp.configure_qwen4_exp_runtime",
+        lambda path: None,
+    )
     return target
 
 
