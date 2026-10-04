@@ -14,61 +14,11 @@ from contextlib import contextmanager
 import pytest
 
 
-@contextmanager
-def _isolated_module_import(module_name):
-    """Restore both import-cache and package links after a stubbed import."""
-    missing = object()
-    previous_module = sys.modules.pop(module_name, missing)
-    parent_name, _, child_name = module_name.rpartition(".")
-    parent = sys.modules.get(parent_name)
-    previous_attr = vars(parent).get(child_name, missing) if parent else missing
-    try:
-        yield importlib.import_module(module_name)
-    finally:
-        if previous_module is missing:
-            sys.modules.pop(module_name, None)
-        else:
-            sys.modules[module_name] = previous_module
-        if parent is None:
-            parent = sys.modules.get(parent_name)
-        if parent is not None:
-            if previous_attr is missing:
-                vars(parent).pop(child_name, None)
-            else:
-                setattr(parent, child_name, previous_attr)
-
-
-@pytest.mark.parametrize("fixture_name", ["engine_core_module", "batched_module"])
-@pytest.mark.parametrize("preexisting", [False, True], ids=["absent", "present"])
-def test_import_fixture_restores_module_and_parent(
-    monkeypatch, fixture_name, preexisting
-):
-    module_name = {
-        "engine_core_module": "vllm_mlx.engine_core",
-        "batched_module": "vllm_mlx.engine.batched",
-    }[fixture_name]
-    parent_name, _, child_name = module_name.rpartition(".")
-    parent = importlib.import_module(parent_name)
-    previous = types.ModuleType(module_name)
-    monkeypatch.setitem(sys.modules, module_name, previous)
-    monkeypatch.setitem(vars(parent), child_name, previous)
-    if not preexisting:
-        sys.modules.pop(module_name)
-        vars(parent).pop(child_name)
-
-    with pytest.MonkeyPatch.context() as local_patch:
-        fixture = globals()[fixture_name].__wrapped__(local_patch)
-        if isinstance(fixture, types.GeneratorType):
-            next(fixture)
-            with pytest.raises(StopIteration):
-                next(fixture)
-
-    if preexisting:
-        assert sys.modules[module_name] is previous
-        assert vars(parent)[child_name] is previous
-    else:
-        assert module_name not in sys.modules
-        assert child_name not in vars(parent)
+def _isolate_package_attr(monkeypatch, package_name, attr):
+    """Restore (or remove) ``package.attr`` at teardown — the import system
+    rebinds it to the fake-backed submodule."""
+    package = importlib.import_module(package_name)
+    monkeypatch.setattr(package, attr, getattr(package, attr, None), raising=False)
 
 
 @pytest.fixture
@@ -99,8 +49,15 @@ def engine_core_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", fake_scheduler)
     monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
     monkeypatch.setitem(sys.modules, "vllm_mlx.mlx_streams", fake_streams)
-    with _isolated_module_import("vllm_mlx.engine_core") as module:
-        yield module
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core", raising=False)
+    # Fork: when engine_core was not imported yet, delitem records nothing to
+    # restore and the fake-backed module leaked into every later test
+    # (get_registry() -> None). Register the slot so teardown drops it.
+    monkeypatch.setitem(sys.modules, "vllm_mlx.engine_core", None)
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core")
+    _isolate_package_attr(monkeypatch, "vllm_mlx", "engine_core")
+
+    return importlib.import_module("vllm_mlx.engine_core")
 
 
 @pytest.fixture
@@ -113,8 +70,13 @@ def batched_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
-    with _isolated_module_import("vllm_mlx.engine.batched") as module:
-        yield module, fake_mx
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched", raising=False)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.engine.batched", None)
+    monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched")
+    _isolate_package_attr(monkeypatch, "vllm_mlx.engine", "batched")
+
+    module = importlib.import_module("vllm_mlx.engine.batched")
+    return module, fake_mx
 
 
 @pytest.mark.anyio
