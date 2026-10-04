@@ -1,6 +1,13 @@
 # Local patches in this fork
 
-This fork carries its patches on top of [`waybarrios/vllm-mlx@37a16c7`](https://github.com/waybarrios/vllm-mlx/commit/37a16c7) (2026-09-24, past `v0.5.0`; previous pins: `93b0b71` (2026-09-19), `ec8e493` (2026-09-15), `22efb47` (2026-08-27), `4b654c0` (2026-08-23), `5021350` (2026-08-15, one commit past `v0.4.1`), `b998776`, `d96458c`, `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+This fork carries its patches on top of [`waybarrios/vllm-mlx@80e7fde`](https://github.com/waybarrios/vllm-mlx/commit/80e7fde) (2026-10-03; previous pins: `37a16c7` (2026-09-24), `93b0b71` (2026-09-19), `ec8e493` (2026-09-15), `22efb47` (2026-08-27), `4b654c0` (2026-08-23), `5021350` (2026-08-15, one commit past `v0.4.1`), `b998776`, `d96458c`, `0dd1157` (`v0.4.0`), `a48c86c`, `caa8838`, `015e080`, `395b13c`, `9c83c84`). Each patch is a separate commit on `main` with the prefix `patch:`. They are listed here in apply order (bottom of git log → top).
+
+> **2026-10-04 rebase note — rebased onto upstream `80e7fde` (50 commits past `37a16c7`: #744 hybrid prefix-cache ownership + exact replay, #701 VLM SpecPrefill, #610/#815 thinking-off reasoning latch, #742 schema-aware tool arguments, #776 Anthropic images, #757/#777 MTP counters, #707 owner-thread cleanup, #803 MLLM top_p, #782 metrics, #752/#724 MLLM drafters, e2821ce mlx-lm cap); suite green at 4402 passed / 31 skipped / 30 deselected, ruff + changed-lines black clean.** 203 fork commits replayed, 22 conflict stops — `git merge-tree` had named 15 files. Backup: `backup/pre-rebase-2026-10-04`. Net change vs the backup equals upstream's window diff in 43 of 69 touched files; the other 26 differ exactly by the resolutions below (audited line-by-line: every "upstream-only" line is either already in the fork via #47/#116 or a listed resolution).
+> - **Retired onto upstream (code taken, fork tests kept where they still pin something):** **#27** → #610/#815's explicit-marker latch on chat completions (stream + non-stream). Upstream's own tests proved #27's always-run ate content around a lone gemma `<channel|>` and its fold surfaced thoughts the request had disabled; the latch also covers #27's original Qwen case (markerless output never reaches the parser). One #27 guarantee survives as a fork delta: a non-stream thinking-off reply whose parse leaves no content folds the reasoning back instead of returning empty (pinned: `test_27_thinking_off_never_returns_empty_or_thoughts`). **#47** → its three hunks are #610 verbatim; its duplicate test copies were deleted (they *shadowed* upstream's), the Responses-path test is kept. **#57** → #744 derives per-request mRoPE `rope_deltas`/`position_ids` and passes them as kwargs on every prefill/decode forward (mlx-vlm 0.7.x applies the kwarg over the shared `_rope_deltas`), covering all three #57 vectors; `test_mllm_rope_deltas.py` dropped. **The #58 real-model suite is the proof and must run on the Studio before deploy.** **#92/#94** → #742's `_coerce_tool_arguments` (both directions, unions, scalars); all 42 fork tests pass on it (kept as `test_tool_argument_coercion_fork92.py` + `test_tool_scalar_coercion.py`) after porting one rule (`"4.0"` → `4` for an `integer` field). Note: the string direction now emits compact JSON (was `indent=2`). **#116** → collapsed into #776 (only its comment + tests remain).
+> - **Merged, fork semantics kept:** **#56** — `_prefix_cache_lookup` kept (fork tests call it) but now returns `(kv, remaining, last_logits)` with #744's `is_text_only` gate + exact-aux replay; the fork's `has_media`/placeholder/empty-rotating guards stay. **#67** — the HF-cache resolution of `generation_config.json` moved into upstream's new shared `collect_eos_token_ids`, so every caller gets it. **#60/#61/#62/#64/#66/#82/#89/#112/#115** (+ #32 batched stop strings vs #757) — additive collisions with #701's `specprefill_outcome`/config plumbing and #757's MTP counters; both sides kept.
+> - **Rejected:** e2821ce's `mlx-lm<0.32.0` cap (production runs 0.32.x at the pin; #81 handles both cache-state shapes) — upstream's range test adapted. `engine/simple.py` wholesale per policy, then restored: #803 `top_p` on both MLLM chat paths, and prompt tokenization whenever no other branch tokenized (`usage.prompt_tokens` was 0 off the system-KV path). Upstream's text-route EOS wrap is already the fork's `wrap_tokenizer_with_eos`; its drafter-deferred route does not exist in the fork's `simple.py`.
+> - **Silent-merge class, new:** both copies of cherry-picked-then-merged tests auto-merged side by side, and the later `def`/`class` silently shadowed upstream's (`TestAnthropicImageClientErrors`, #47's gemma tests). Pinned for the whole package + suite: `test_rebase_no_shadowed_definitions_after_auto_merge` (mutation-checked; allowlists one pre-existing upstream duplicate, `_get_engine_tokenizer`).
+> - **Test-fake drift fixed:** upstream's `test_engine_core_request_owner.py` leaked a fake-registry `engine_core` module into later tests when the real one was not yet imported (fixture now registers the slot with monkeypatch); fork fakes gained `drain_mtp_uid_deltas`, `specprefill_outcome`, `get_specprefill_stats`, `is_text_only`, the #60/#68 generator attributes, and the #97 qwen4_exp hook.
 
 > **2026-09-25 rebase note — rebased onto upstream `37a16c7` (5 commits past `93b0b71`: only #749, MLLM `steps_executed`); suite green at 4091 passed / 31 skipped / 30 deselected, ruff + changed-lines black clean.** 199 fork commits replayed, 0 conflict stops, **but one SILENT auto-merge:** #749's `"steps_executed"` landed next to #64's own in `MLLMScheduler.get_stats()` and in the engine promote tuple (duplicate dict key, the fork's silently won). #64 now defers to upstream's counter (squashed into the patch). Pinned by `test_64_no_duplicate_literal_keys_after_auto_merge` (AST scan, whole package). Upstream's new test fake gained the fork's `maybe_relieve_pressure()` hook. Backup: `backup/pre-rebase-2026-09-25`.
 
@@ -687,6 +694,8 @@ Cherry-picks upstream open PR [#597](https://github.com/waybarrios/vllm-mlx/pull
 
 ## 27. `f7499a9` — `patch: run-reasoning-parser-when-thinking-disabled`
 
+> **RETIRED on the 2026-10-04 rebase** onto upstream #610/#815's explicit-marker latch (see the rebase note at the top). Surviving fork delta: the non-stream empty-content fold. Section kept for history.
+
 **Files:** `vllm_mlx/server.py` (`stream_chat_completion` gate + `_extract_reasoning_and_tool_calls`)
 
 When `enable_thinking=False`, the server **skipped the reasoning parser entirely** on both chat-completion paths (`stream_chat_completion` gated on `... and not _thinking_disabled(...)`; non-stream via `allow_reasoning=not _thinking_disabled(...)` in `_extract_reasoning_and_tool_calls`). That assumes thinking-off output carries no reasoning-protocol markers — **false for gemma-4.**
@@ -1030,6 +1039,8 @@ Ports **only the `_is_empty_tool_wrapper` guard** from upstream open PR [#497](h
 
 ## 47. `fix(reasoning): strip markers on Anthropic/Responses streaming when thinking disabled` — patch #27 follow-up
 
+> **RETIRED on the 2026-10-04 rebase** — upstream #610 merged; the hunks were byte-equivalent and auto-collapsed. Only the Responses-path test remains fork-owned.
+
 **Files:** `vllm_mlx/server.py`, `tests/test_chat_template_kwargs.py`
 
 Closes the two streaming gaps patch #27 left open: `_stream_anthropic_messages` and `_stream_responses_request` still skipped the reasoning parser entirely when thinking was disabled, so gemma-4's echoed `<|channel>thought\n<channel|>` prefill (and gpt-oss channel markers) leaked raw into the text stream on those two APIs.
@@ -1169,6 +1180,8 @@ Vision-series #2 (plan 2026-07-28). Two holes in batched-MLLM media classificati
 
 ## 56. `patch: mllm-prefix-cache-media-guard` — image-safe prefix caching (phase A)
 
+> **2026-10-04 rebase:** merged with upstream #744 (text-only gate + owned exact replay); the fork helper and media guards are kept around it. See the rebase note.
+
 **Files:** `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_prefix_cache_media.py` (new), `tests/test_mllm_ssd_spill.py`
 
 Vision-series #3 (plan 2026-07-28). **Live correctness bug on the batched MLLM path:** the prefix cache (`MemoryAwarePrefixCache`) is keyed on raw token ids, but a media prompt's KV depends on pixel/audio content the placeholder tokens don't encode. The store site (`_maybe_store_prefix_cache`) had **no media check at all** (its "text-only" docstring lied), and the fetch guard only inspected the *remaining* (uncached) ids for `image_token_index` — on an **exact match** `remaining_ids == []` and the guard never ran, and `video_token_index` was never checked. Net: two different images whose prompts tokenize identically could serve each other's vision KV; the SSD tier persisted such entries across restarts.
@@ -1186,6 +1199,8 @@ Fix (phase A — correctness rail; composite media-hash keys are a later perf fo
 ---
 
 ## 57. `patch: mllm-per-row-rope-deltas` — MRoPE correctness for batched decode (glm4v/qwen3_vl families)
+
+> **RETIRED on the 2026-10-04 rebase** onto upstream #744's request-local mRoPE kwargs. Gate before deploy: #58's real-model suite on the Studio.
 
 **Files:** `vllm_mlx/mllm_batch_generator.py`, `tests/test_mllm_rope_deltas.py` (new)
 
@@ -1353,6 +1368,8 @@ Vision-series #13 (plan 2026-07-28). There was no images analog of `audio_limits
 ---
 
 ## 67. `patch: mllm-eos-from-generation-config` — EOS union works for HF repo ids
+
+> **2026-10-04 rebase:** the HF-cache resolution now lives in upstream's shared `utils/tokenizer.collect_eos_token_ids` (#610); the scheduler calls that.
 
 **Files:** `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_eos_from_generation_config.py` (new)
 
@@ -2664,6 +2681,8 @@ confirmed by re-running against a stash — and stay unfixed per fork policy).
 
 ## 92. `patch: tool-argument-type-coercion` — arguments must land on their declared type
 
+> **RETIRED on the 2026-10-04 rebase** onto upstream #742 (superset); fork tests kept as `tests/test_tool_argument_coercion_fork92.py`.
+
 **Problem.** `_coerce_tool_arguments` coerced in **one direction only**: schema
 says `string`, model produced a dict/list -> JSON-stringify it. There was no
 reverse case, and the reverse is the one the production coding route hits.
@@ -2797,6 +2816,8 @@ real fix; the breakers are the belt-and-braces layer for any path that reaches
 the engine without declared tools.
 
 ## 94. `patch: tool-scalar-type-coercion` — the same gap, for scalars
+
+> **RETIRED on the 2026-10-04 rebase** onto upstream #742, plus one ported rule (integral float → int for `integer`). Fork tests kept.
 
 **Problem.** #92 taught `_coerce_tool_arguments` to recover `array`/`object`
 parameters delivered as JSON text. It stopped there — but the XML-ish tool
@@ -3562,6 +3583,8 @@ reached the template as one result for two calls — the Qwen template rendered 
 ---
 
 ## 116. `patch: anthropic-image-blocks` — `/v1/messages` converts image blocks instead of dropping them (upstream #776)
+
+> **RETIRED on the 2026-10-04 rebase** — upstream #776 merged; the cherry-pick collapsed.
 
 **Files:** `vllm_mlx/api/anthropic_adapter.py` (`_convert_message`), `vllm_mlx/server.py` (`create_anthropic_message`: adapter `ValueError` → 400), `tests/test_anthropic_adapter_images.py` (new, from the PR), `tests/test_server.py` (+`TestAnthropicImageClientErrors`, from the PR), `tests/test_media_not_supported.py` (+2), `tests/test_fork_invariants.py` (+1).
 

@@ -2621,6 +2621,12 @@ class TestMLLMHybridPrefixCacheIsolation:
         # Supply already-tokenized inputs and a tiny model forward while keeping
         # checkpoint publication, storage, replay, and sampling real.
         gen._preprocess_request = lambda request: None
+        # Fork #60: the atomic vision encode runs a pressure-relief pass
+        # first; inert here (the generator is built via __new__).
+        gen.maybe_relieve_pressure = lambda: 0
+        # Fork #68: mistral3-style media calls take the attention mask; the
+        # fake media forward does not.
+        gen._model_call_takes_mask = False
         monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
         monkeypatch.setattr(
             "mlx_lm.models.cache.make_prompt_cache",
