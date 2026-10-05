@@ -204,6 +204,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,vision,harmony]"
 
+      # Fork: test against the production pins, not the newest PyPI releases.
+      - name: Install production pins (fork)
+        run: pip install -r scripts/fork/prod-pins.txt
+
       - name: Verify Apple Silicon
         run: |
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
