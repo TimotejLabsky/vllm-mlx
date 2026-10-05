@@ -2665,7 +2665,8 @@ def _interleave_sched(prefilling=True, rows=None):
 def test_135_off_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", raising=False)
     sched, gen, processed, _ = _interleave_sched()
-    assert bkv.interleave_decode_steps(sched, SimpleNamespace(outputs=[], finished_request_ids=set())) == 0
+    out = SimpleNamespace(outputs=[], finished_request_ids=set())
+    assert bkv.interleave_decode_steps(sched, out) == 0
     assert gen.calls == 0
 
 
