@@ -2131,6 +2131,112 @@ def test_128_off_by_default_and_never_scans(monkeypatch):
     assert kv.stats()["divergence_events"] == 0
 
 
+# ------------- #129 the thinking-budget processor syncs incrementally
+
+
+def _thinking_proc(cls=None, budget=5, inner=None):
+    from vllm_mlx.constrained.thinking_processor import ThinkingAwareLogitsProcessor
+
+    return (cls or ThinkingAwareLogitsProcessor)(
+        start_token_ids=[100],
+        end_token_ids=[101, 102],
+        thinking_token_budget=budget,
+        vocab_size=128,
+        inner=inner,
+    )
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_129_fast_sync_is_equivalent_to_the_full_walk(seed):
+    """Fork issue #54: the processor ran tokens.tolist() + a Python prefix
+    compare over prompt + generated every step (5.9 ms/step at 60K tokens).
+    The fast path must leave the phase machine and the logits it returns
+    exactly as the full walk would - through think spans, budget exhaustion,
+    the forced transition and random rollbacks (including CONTENT -> THINKING).
+    """
+    import random
+
+    import mlx.core as mx
+
+    from vllm_mlx.constrained.thinking_processor import (
+        ThinkingAwareLogitsProcessor,
+    )
+
+    class _FullWalk(ThinkingAwareLogitsProcessor):
+        def _try_fast_sync(self, tokens, target_len):
+            return False
+
+    rng = random.Random(seed)
+    alphabet = [1, 2, 3, 4, 100, 101, 102]
+    seq = [7, 8, 100, 9, 101, 102, 10, 11]  # prompt replaying an old span
+    fast = _thinking_proc(budget=rng.choice([0, 2, 5, 40]))
+    ref = _thinking_proc(_FullWalk, budget=fast._thinking_token_budget)
+    for _ in range(160):
+        if len(seq) > 12 and rng.random() < 0.12:
+            del seq[-rng.randint(1, min(6, len(seq) - 9)) :]  # rollback
+        seq.append(rng.choice(alphabet))
+        logits = mx.arange(128, dtype=mx.float32)
+        out_fast = fast(mx.array(seq), logits)
+        out_ref = ref(mx.array(seq), logits)
+        assert fast.state == ref.state
+        assert fast.thinking_tokens == ref.thinking_tokens
+        assert mx.array_equal(out_fast, out_ref).item()
+
+
+def test_129_content_phase_reads_no_token_values():
+    """Once the reasoning closed (and no inner constraint), nothing the
+    processor does depends on token values: no tolist(), so no GPU sync."""
+    import mlx.core as mx
+
+    from vllm_mlx.constrained.thinking_processor import Phase
+
+    class _NoRead:
+        def __init__(self, ids):
+            self._ids = ids
+            self.size = len(ids)
+
+        def tolist(self):
+            raise AssertionError("token values read in CONTENT")
+
+        def __getitem__(self, key):
+            raise AssertionError("token values read in CONTENT")
+
+    proc = _thinking_proc()
+    seq = [7, 8]
+    proc(mx.array(seq), mx.zeros((128,)))  # first call = the prompt
+    for tok in (100, 3, 101, 102):  # open, think, close
+        seq.append(tok)
+        proc(mx.array(seq), mx.zeros((128,)))
+    assert proc.state == Phase.CONTENT
+    for tok in range(20, 40):
+        seq.append(tok)
+        out = proc(_NoRead(list(seq)), mx.zeros((128,)))
+        assert out[100].item() == float("-inf")  # think tags still masked
+
+
+def test_129_rollback_inside_content_stays_in_content():
+    """Found while building #129: the token that closed the reasoning got no
+    snapshot, so a rollback to any CONTENT position restored the pre-close
+    state - and then forced the end sequence again into the answer."""
+    import mlx.core as mx
+
+    from vllm_mlx.constrained.thinking_processor import Phase
+
+    proc = _thinking_proc(budget=50)
+    seq = [7, 8]
+    proc(mx.array(seq), mx.zeros((128,)))
+    for tok in (100, 3, 4, 101, 102, 20, 21, 22):  # think, close, answer
+        seq.append(tok)
+        proc(mx.array(seq), mx.zeros((128,)))
+    assert proc.state == Phase.CONTENT
+
+    seq[-2:] = [30]  # rewind two answer tokens, continue differently
+    out = proc(mx.array(seq), mx.arange(128, dtype=mx.float32))
+
+    assert proc.state == Phase.CONTENT
+    assert out[30].item() == 30.0  # answer logits untouched, nothing forced
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
