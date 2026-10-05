@@ -131,9 +131,13 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
     if request.tool_choice:
         tool_choice = _convert_tool_choice(request.tool_choice)
 
+    enable_thinking, thinking_budget = _convert_thinking(request.thinking)
+
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
+        enable_thinking=enable_thinking,
+        thinking_token_budget=thinking_budget,
         max_tokens=request.max_tokens,
         temperature=request.temperature if request.temperature is not None else 0.7,
         top_p=request.top_p if request.top_p is not None else 0.9,
@@ -146,6 +150,28 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         response_format=request.response_format,
         chat_template_kwargs=request.chat_template_kwargs,
     )
+
+
+def _convert_thinking(thinking: dict | None) -> tuple[bool | None, int | None]:
+    """Map Anthropic ``thinking`` onto ``(enable_thinking, thinking_token_budget)``.
+
+    ``disabled`` turns thinking off and ``enabled`` on, with ``budget_tokens`` as
+    the request's budget (the server only lets it tighten a route default,
+    fork #120). ``adaptive``, unknown types and a missing field leave the route
+    default untouched. The field was previously dropped, so ``disabled`` did
+    nothing on thinking routes.
+    """
+    if not isinstance(thinking, dict):
+        return None, None
+    kind = thinking.get("type")
+    if kind == "disabled":
+        return False, None
+    if kind == "enabled":
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+            return True, budget
+        return True, None
+    return None, None
 
 
 def openai_to_anthropic(
