@@ -3729,3 +3729,15 @@ Folded in (fork issue #57): `BatchedSystemKV`'s thread-contract docstring and th
 **Upstream:** fork-owned.
 
 **Verification:** `test_125_lazy_ram_miss_ssd_hit_builds_nothing_until_admission` (enqueue builds nothing, the pre-admission promote hook leaves it alone, admission restores at the priced position via one SSD promote) and `test_125_eager_route_keeps_the_ssd_pending_promote`; both red with the fix reverted (mutation-checked).
+
+## 126. `patch: keep-system-boundary` — a short shared system prompt gets its checkpoint
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`find_message_boundaries` `first_min`, `insert_segmented`), `tests/test_fork_invariants.py` (+2).
+
+**Gap** (fork issue #49; the open follow-up from #108's stress runs): #88's `BOUNDARY_MIN_STEP` (2048) measures the first message boundary from token 0. On a cold prompt that boundary is the end of the system message, so any system prompt shorter than 2048 tokens lost it; only the newest turn start (llama.cpp #24176's always-kept rule) and the uniform 2048 interval survived — both past the shared prefix. A second conversation with the same ~1K system prompt (HA Assist, short agent personas) restored **nothing** on a hybrid model, whose restore must snap down to a checkpoint. The issue pointed at llama.cpp #28302 (thin only at capacity); our `thin_checkpoints` already works that way — the drop was in boundary *selection*, not ladder thinning.
+
+**Fix:** `find_message_boundaries(..., first_min=)` always keeps the first boundary at or past `first_min`, then applies `min_step` from there. `insert_segmented` passes `first_min=PARTIAL_MIN` only for a **cold** prompt (`cached_tokens == 0`), so past a restore a burst of short turns still cannot shred the ladder. Cost: at most one extra recurrent-state checkpoint per cold request, and it is a boundary-flagged preferred survivor under `thin_checkpoints`.
+
+**Upstream:** fork-owned.
+
+**Verification:** `test_126_short_system_prompt_is_checkpointed_and_shared` (cold ~1K system prompt → a segment ends at the system boundary, and a second conversation restores exactly there; without the fix the segment ends are `[1603, 1608]` and nothing is shared) and `test_126_restored_prompt_keeps_the_min_step_rule`; both red with the fix reverted (mutation-checked).

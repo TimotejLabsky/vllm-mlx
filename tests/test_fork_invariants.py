@@ -1931,6 +1931,70 @@ def test_125_eager_route_keeps_the_ssd_pending_promote(monkeypatch, tmp_path):
     kv.close()
 
 
+# ----------- #126 a short shared system prompt keeps its end-of-system checkpoint
+
+_MARK = (7, 8, 9)  # a turn-start marker (the template's <|im_start|>)
+_SYS = list(_MARK) + list(range(3000, 3997))  # ~1K system prompt, 1000 tokens
+
+
+def _conversation(user_tokens):
+    return _SYS + list(_MARK) + user_tokens + list(_MARK) + [1, 2]
+
+
+def _cold_insert(kv, rid, tokens):
+    """Insert a cold prompt the way _schedule_waiting does, then capture a
+    checkpoint at every segment end and store the finished chain."""
+    request = SimpleNamespace(request_id=rid, cached_tokens=0, prompt="<rendered>")
+    generator = MagicMock()
+    bkv.insert_segmented(kv, generator, request, tokens, {})
+    ([segments],), _kw = generator.insert_segments.call_args
+    end = 0
+    for seg in segments[:-1]:
+        end += len(seg)
+        kv.capture_segment(rid, end, _donor_at(end))
+    kv.store(rid, tokens, _donor_at(len(tokens)))
+    return segments
+
+
+def test_126_short_system_prompt_is_checkpointed_and_shared(monkeypatch):
+    """Fork issue #49: #88's min_step (2048) measured the first boundary from
+    token 0, so the end of a ~1K system prompt was thinned away; only the
+    newest turn start survived, and a second conversation with the same
+    system prompt restored NOTHING (the uniform interval sits past it too)."""
+    kv = BatchedSystemKV(_FakeModel())
+    assert kv.boundary_min_step == 2048 and kv.ckpt_interval == 2048
+    monkeypatch.setattr(kv, "boundary_marker_ids", lambda *_a: (_MARK,))
+
+    first = _conversation(list(range(5000, 5600)))
+    segments = _cold_insert(kv, "chat-1", first)
+
+    ends = [sum(len(s) for s in segments[: i + 1]) for i in range(len(segments))]
+    assert len(_SYS) in ends  # end-of-system is a segment boundary
+
+    second = _conversation(list(range(6000, 6400)))
+    _cache, remaining, pos = kv.fetch(second, request_id="chat-2")
+    assert pos == len(_SYS)
+    assert remaining == second[len(_SYS) :]
+
+
+def test_126_restored_prompt_keeps_the_min_step_rule():
+    """Only a COLD prompt keeps its first boundary: past a restore, the first
+    boundary is just another turn, and a burst of short turns must still not
+    shred the ladder."""
+    from vllm_mlx.batched_system_kv import find_message_boundaries
+
+    toks = [0] * 100 + list(_MARK) + [0] * 50 + list(_MARK) + [0] * 300
+    toks += list(_MARK) + [0] * 20
+    # hits at 100, 153, 456
+    assert find_message_boundaries(toks, [_MARK], 10_000) == (456,)
+    assert find_message_boundaries(toks, [_MARK], 10_000, first_min=0) == (100, 456)
+    # the first boundary must clear first_min (a restore below PARTIAL_MIN
+    # is unusable) - then the next one qualifies instead
+    assert find_message_boundaries(toks, [_MARK], 10_000, first_min=120) == (153, 456)
+    # min_step then measures from the kept first boundary
+    assert find_message_boundaries(toks, [_MARK], 120, first_min=0) == (100, 456)
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
