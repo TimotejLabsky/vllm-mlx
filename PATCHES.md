@@ -3760,3 +3760,21 @@ Folded in (fork issue #57): `BatchedSystemKV`'s thread-contract docstring and th
 - **Pure mlx-lm on the Studio** (prod pins, 512-token prompt, hook placed exactly as the scheduler places it): 27B base crashes at 10,561, patched runs **14,000 clean**, decode +0.1–1.1 % at every matched 2K window; 4B base 21,638 → **40,000 clean**, same speed throughout.
 - **Tests:** `test_127_only_recurrent_states_are_selected` (real mlx-lm caches: GDN + nested `CacheList` selected, `BatchKVCache`/`BatchRotatingKVCache`/`KVCache` not), `test_127_hook_reaches_the_pinned_generation_batch` (fails if a pin bump renames `_generation_batch`/`prompt_cache` — the hook would otherwise go silently inert), `test_127_step_evaluates_after_every_next` (+ the kill switch). Two of them red with the hook removed / the selector widened (mutation-checked). Suite 4477 passed.
 - **Real server** (`scripts/fork/e2e_recurrent_eval.py`, spare port, `Qwen3.8-27B-4bit`, `/v1/completions` counting continuation, `max_tokens` 12000): unpatched (`VLLM_MLX_EVAL_RECURRENT_STATES=0`) → **HTTP 503**, log `[metal::malloc] Resource limit (499000) exceeded` (served as #104's recovery 503); patched → **`finish_reason=length`, 12,000 tokens, 28.1 tok/s**, no error. T=0 chat output identical on/off. (A chat-turn counting prompt is not a valid endurance probe: the 27B ended its own turn at 3.9K.)
+
+## 128. `patch: divergence-log` — where a prompt parts ways with the cache, and how much it re-prefills
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`note_divergence`, `fetch_for_request` wrapper, stats), `tests/test_fork_invariants.py` (+3).
+
+**Why** (fork issue #43): Qwen-family templates keep `<think>` only on assistant turns after the last user message. On routes with `preserve_thinking:false` a new user message re-renders the previous tool loop *without* its reasoning, so the prompt diverges from the cached chain at that loop's first assistant turn and the whole loop (tool results included) is re-prefilled. How often and how deep this hits live traffic was unmeasured; it decides the `preserve_thinking` config call on the 27B routes, issue #47 (idle-time next-turn prefill) and whether suffix reuse (#58) is ever worth it.
+
+**What:** with `VLLM_MLX_DIVERGENCE_LOG=1`, every request's prompt is compared against every RAM entry after the restore match. A true divergence (not a prompt that simply extends a chain) is counted in `stats()`:
+- `divergence_events`;
+- `divergence_depth_hist`: prompt tokens after the split. A new user turn is shallow; a think-stripped re-render is deep;
+- `divergence_reprefill_hist`: tokens actually prefilled, i.e. depth plus checkpoint-snap loss;
+- `divergence_at_think`: the cached side continues with a `<think>` marker.
+
+It also logs one INFO line with the decoded ±24-token windows of both sides. Off by default: it scans every entry and decodes text. RAM entries only; an SSD-only chain is not seen.
+
+**Upstream:** fork-owned (llama.cpp #27600 logs the same point).
+
+**Verification:** `test_128_think_stripped_rerender_is_a_deep_divergence`, `test_128_next_turn_extending_the_chain_is_not_a_divergence`, `test_128_off_by_default_and_never_scans`; all three red with the patch reverted. Suite 4480 passed.

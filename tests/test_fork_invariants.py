@@ -2072,6 +2072,65 @@ def test_127_step_evaluates_after_every_next(monkeypatch):
     assert calls == [generator]  # the kill switch works
 
 
+# ------------- #128 divergence-point log (fork issue #43)
+
+_THINK = 7777  # stands in for the <think> token of a past assistant turn
+
+
+class _DecodeTok:
+    name_or_path = "unit/test-model"
+
+    def decode(self, ids):
+        return "".join("<think>" if i == _THINK else "." for i in ids)
+
+
+def _divergence_kv(monkeypatch, on=True):
+    if on:
+        monkeypatch.setenv("VLLM_MLX_DIVERGENCE_LOG", "1")
+    else:
+        monkeypatch.delenv("VLLM_MLX_DIVERGENCE_LOG", raising=False)
+    return BatchedSystemKV(_FakeModel(), tokenizer=_DecodeTok())
+
+
+def test_128_think_stripped_rerender_is_a_deep_divergence(monkeypatch):
+    """Qwen templates drop <think> from assistant turns before the last user
+    message: the next request re-renders the previous tool loop without it,
+    so the prompt parts ways with the cached chain deep in the history."""
+    kv = _divergence_kv(monkeypatch)
+    head = list(range(1000, 1600))  # system + first user turn
+    loop = list(range(20000, 25000))  # assistant tool loop (5K tokens)
+    kv.store("turn1", head + [_THINK] + loop, _donor_at(len(head) + 1 + len(loop)))
+
+    request = _queued("turn2", head + loop + list(range(30000, 30050)))
+    bkv.fetch_for_request(kv, request)
+
+    st = kv.stats()
+    assert st["divergence_events"] == 1 and st["divergence_at_think"] == 1
+    assert st["divergence_depth_hist"]["<16K"] == 1  # 5,050 tokens after the split
+    assert sum(st["divergence_reprefill_hist"].values()) == 1
+
+
+def test_128_next_turn_extending_the_chain_is_not_a_divergence(monkeypatch):
+    kv = _divergence_kv(monkeypatch)
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+
+    bkv.fetch_for_request(kv, _queued("next", GROWN))
+
+    assert kv.stats()["divergence_events"] == 0
+
+
+def test_128_off_by_default_and_never_scans(monkeypatch):
+    kv = _divergence_kv(monkeypatch, on=False)
+    kv.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    kv.note_divergence = MagicMock(side_effect=AssertionError("scanned while off"))
+
+    bkv.fetch_for_request(
+        kv, _queued("other", TOKENS[:500] + list(range(50000, 50400)))
+    )
+
+    assert kv.stats()["divergence_events"] == 0
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
