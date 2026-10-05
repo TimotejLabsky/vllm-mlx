@@ -2502,6 +2502,119 @@ def test_132_thinning_never_evicts_the_anchor():
     assert out[0]["anchor"] is True and "anchor" not in out[1]
 
 
+# ------------- #133 the thinking processor is fed host-side tokens (no per-step sync)
+
+
+def _counting_processor(**kw):
+    from vllm_mlx.constrained.thinking_processor import ThinkingAwareLogitsProcessor
+
+    class _Counting(ThinkingAwareLogitsProcessor):
+        syncs = 0
+
+        def _sync_to_tokens(self, tokens):
+            type(self).syncs += 1
+            return super()._sync_to_tokens(tokens)
+
+    return _Counting(
+        start_token_ids=[100], end_token_ids=[101, 102], vocab_size=128, **kw
+    )
+
+
+def _simulate_mlx_lm(proc, budget_seed, steps=150):
+    """Drive a processor the way mlx-lm's GenerationBatch does: each step it
+    sees the full sequence whose newest token is still lazy; the scheduler
+    feeds that token (note_generated) after the step. Returns the per-step
+    outputs and the reference processor's (synchronous, never fed)."""
+    import random
+
+    import mlx.core as mx
+
+    from vllm_mlx.constrained.thinking_processor import (
+        ThinkingAwareLogitsProcessor,
+    )
+
+    rng = random.Random(budget_seed)
+    ref = ThinkingAwareLogitsProcessor(
+        start_token_ids=[100],
+        end_token_ids=[101, 102],
+        thinking_token_budget=proc._thinking_token_budget,
+        vocab_size=128,
+    )
+    seq = [7, 8, 9]
+    pending = None
+    for _ in range(steps):
+        # separate objects: the processors mask logits IN PLACE, so a shared
+        # array would make the reference's mask show up in the fast output
+        base = [float(i % 7) for i in range(128)]
+        out_fast = proc(mx.array(seq), mx.array(base))
+        out_ref = ref(mx.array(seq), mx.array(base))
+        assert mx.array_equal(out_fast, out_ref).item(), (len(seq), ref.state)
+        assert proc.state == ref.state or pending is not None
+        if pending is not None:
+            proc.note_generated(pending)
+        allowed = [
+            i for i in (1, 2, 3, 100, 101, 102) if out_ref[i].item() > float("-inf")
+        ]
+        allowed = allowed or [int(mx.argmax(out_ref).item())]
+        nxt = rng.choice(allowed + [101, 102] if 101 in allowed else allowed)
+        seq.append(nxt)
+        pending = nxt
+    return proc, ref, type(proc).syncs
+
+
+@pytest.mark.parametrize(
+    "seed,budget", [(s, b) for s in range(4) for b in (0, 3, 8, 60)]
+)
+def test_133_fed_processor_is_identical_to_the_synchronous_one(seed, budget):
+    """Fork issue #54 remainder: reading ``tokens`` every step forced the CPU
+    to wait for the previous sample before queueing the next step (~3.4 %
+    decode). The fed processor must return byte-identical logits and reach
+    identical states - through think open/close, budget exhaustion and the
+    forced end sequence."""
+    proc = _counting_processor(thinking_token_budget=budget)
+    proc, ref, syncs = _simulate_mlx_lm(proc, seed)
+    assert proc.thinking_tokens == ref.thinking_tokens
+
+
+def test_133_a_long_think_reads_the_gpu_only_near_the_budget():
+    """With a budget far away the fed processor never reads ``tokens``."""
+    import mlx.core as mx
+
+    from vllm_mlx.constrained.thinking_processor import Phase
+
+    proc = _counting_processor(thinking_token_budget=10_000, prompt_has_think_tag=True)
+    seq = [7, 8, 9]
+    pending = None
+    for i in range(200):
+        proc(mx.array(seq), mx.zeros((128,)))
+        if pending is not None:
+            proc.note_generated(pending)
+        seq.append(3)
+        pending = 3
+    assert proc.state == Phase.THINKING and proc.thinking_tokens == 199
+    assert type(proc).syncs <= 2  # the prompt call and the first unfed step
+
+
+def test_133_a_rescheduled_request_gets_the_lagged_path_back():
+    """Cache-corruption recovery restarts a request from its prompt with the
+    SAME processor. The sync rollback must re-anchor the feed count, or every
+    later fed token lands at the wrong position and each step syncs."""
+    import mlx.core as mx
+
+    proc = _counting_processor(thinking_token_budget=10_000, prompt_has_think_tag=True)
+    for _run in range(2):  # first run, then the restart
+        seq, pending = [7, 8, 9], None
+        for _ in range(50):
+            proc(mx.array(seq), mx.zeros((128,)))
+            if pending is not None:
+                proc.note_generated(pending)
+            seq.append(3)
+            pending = 3
+        if _run == 0:
+            syncs_before_restart = type(proc).syncs
+    assert type(proc).syncs - syncs_before_restart <= 2
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
