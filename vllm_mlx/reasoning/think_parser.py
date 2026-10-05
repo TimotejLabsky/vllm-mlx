@@ -153,6 +153,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
             reasoning = reasoning.strip() or None
             return self._promote_tool_calls(reasoning, None)
 
+        if self._implicit_mode:
+            # The template opened <think> in the prompt and the output never
+            # closed it (cut off by max_tokens): all of it is reasoning, as on
+            # the streaming path (fork #121).
+            return self._promote_tool_calls(model_output.strip() or None, None)
+
         return None, model_output
 
     def extract_reasoning_streaming(
