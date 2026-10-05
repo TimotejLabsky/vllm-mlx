@@ -293,12 +293,29 @@ def detect_template_markers(full_prompt):
 
 
 def common_prefix_len(a, b):
-    """Length of the longest common prefix of two token-id sequences."""
+    """Length of the longest common prefix of two token-id sequences.
+
+    (#130) Bisects on C-speed slice comparisons instead of walking token by
+    token in Python: 95K tokens 3.0 -> 0.6-1.1 ms. It runs over every bag
+    entry for every request (match, peek, divergence log) on the generation
+    worker, between decode steps."""
+    if type(a) is not type(b) or not isinstance(a, (list, tuple)):
+        # list == tuple is always False, and arrays compare elementwise:
+        # slice equality is only meaningful between two same-type sequences.
+        a, b = list(a), list(b)
     n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n  # invariant: a[:lo] == b[:lo], and they differ before hi
+    while hi - lo > 32:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    while lo < hi and a[lo] == b[lo]:
+        lo += 1
+    return lo
 
 
 def entry_bytes(snap):
