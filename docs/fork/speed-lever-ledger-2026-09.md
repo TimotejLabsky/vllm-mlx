@@ -223,6 +223,45 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
   whose per-step eval is what costs the PR version 15–25 %.) Supersedes the
   unarmed #84 clamp. **Built as #127, DEPLOYED 2026-10-05** (`f41b6c4`).
 
+### 2026-10-05 (later) — #42, #54 probes and the mlx 0.32.3 bump (#50)
+
+- **#42 dequantize-then-matmul for prefill — BELOW THE KILL GATE on M1
+  Ultra.** mlx #4621's kernel probe at the real Qwen3.8-27B-4bit shapes
+  (group 64), M = our 2048-token prefill chunk: gate/up (5120→17408)
+  qmm 32.3 ms vs deq+mm 27.6 ms = **1.17×**; down (17408→5120) 32.6 vs 35.8
+  = **0.91× (slower)**; the issue's own shape 1.19×. Weighted over the MLP
+  that is ≈ +6 % of MLP time, ≈ +3–4 % of whole-model prefill — under the
+  1.15× gate, before any T=0 shift or transient-memory cost. Identical on
+  mlx 0.32.2 and 0.32.3. M ≤ 32 is 2–3× slower (decode must stay on qmm).
+  Do not build; revisit only if a later mlx makes the down projection win
+  too.
+- **#54 thinking-budget processor — REAL, ≈ 3.4 % decode at short context,
+  growing with context.** Qwen3.8-27B-4bit, exact live route on a spare
+  port, A/B/A/B, T=0 reasoning byte-identical: budget on 29.1–29.2 tok/s
+  single / 41.2–41.4 at 4 streams; flag removed 30.1–30.2 / 42.5–42.7
+  (−3.4 % / −3.1 %, 1.5K-token sequences). The cost is mostly the per-step
+  `tokens.tolist()` sync (host work at 1.5K is only 0.15 ms), and the
+  host part is O(sequence): `tolist()` + the Python prefix compare over
+  prompt + generated cost 1.5 ms at 16K, **5.9 ms at 60K, 9.6 ms at 100K**
+  per step per thinking row, against a 33 ms 27B decode step. Fix =
+  incremental sync (compare only the newly generated tail, fall back to
+  the full walk on a rollback). Not built yet.
+- **mlx 0.32.2 → 0.32.3 + mlx-vlm 0.7.2 → 0.7.4 (issue #50): neutral to
+  +1.5 %, no memory change, T=0 shifts.** Old vs bump venv, each route's
+  exact live cmd + env, spare port: 35B-A3B single 88.5 → 89.9 tok/s
+  (+1.5 %), 4-stream even, 34.6K prefill 1111–1116 → 1129–1134 (+1.5 %),
+  peak 24.6–24.85 GB both; Qwen3.8-27B-4bit 30.4 → 30.4, prefill 198 →
+  198, peak 25.03 → 25.03 GB — mlx #4505's head-dim-256 SDPA memory win
+  does not engage on the batched path at 34.6K. T=0 output shifts on both
+  (expected: tie cascade), diverging late between equivalent wordings.
+  transformers stays 5.17: 5.18 requires huggingface_hub ≥ 1.31 (from
+  1.10) + hf-xet, no gain for us. Gates on the bump venv: Studio suite 4476/0;
+  e2e lazy_restore 7/7, ssd_prefer 6/6, recovery_signalling 7/7 (default
+  text model — pointed at the VLM-capable Qwen3.5-4B without --text-only its
+  injector never fires), short_system_share, recurrent_eval, divergence_log;
+  vision sweep 10/10 on gemma4, glm4v, mistral3, qwen3_5 (identical to prod;
+  Qwen3-VL-30B-8bit skipped — too big beside the resident HA 35B).
+
 ## Watch list / open items
 
 - **GDN blocked_seq prefill kernel (from oMLX): REFUTED at the kill gate
