@@ -238,9 +238,16 @@ def main() -> int:
         lazy["cold"] == eager["cold"] and lazy["warm"] == eager["warm"],
         repr(lazy["cold"][0][:60]),
     )
+    # Repeat identity is informational for the same reason as warm == cold:
+    # since #126 the first burst restores at the end-of-system checkpoint and
+    # the repeat from its own deeper entry - different prefill chunks, late
+    # argmax-tie flips (verified 2026-10-05: boundary restore vs cold diverge
+    # at char 62-224 between synonyms, never from the first token).
+    repeat = lazy["burst_again"] == lazy["burst"]
+    print(f"{'INFO' if repeat else 'NOTE'}  burst repeat == first burst: {repeat}")
     check(
-        "concurrent burst identical across servers and across repeats",
-        lazy["burst"] == eager["burst"] and lazy["burst_again"] == lazy["burst"],
+        "concurrent burst identical across servers",
+        lazy["burst"] == eager["burst"] and lazy["burst_again"] == eager["burst_again"],
         f"{len(lazy['burst'])} concurrent rows",
     )
     check(
