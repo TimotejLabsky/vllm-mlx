@@ -24,6 +24,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from .cache_state_compat import from_legacy_state
 from .paged_cache import BlockTable, PagedCacheManager
 
 logger = logging.getLogger(__name__)
@@ -935,7 +936,7 @@ class BlockAwarePrefixCache:
                         cache.offset = keys.shape[self._cache_state_seq_axis(state)]
                     else:
                         try:
-                            cache = cache_cls.from_state(state, meta_state)
+                            cache = from_legacy_state(cache_cls, state, meta_state)
                         except (TypeError, ValueError):
                             # #81: a pre-1632 flat-list recurrent state fed
                             # to a 1632 mlx-lm class — wrap with the empty
@@ -943,7 +944,8 @@ class BlockAwarePrefixCache:
                             import mlx.core as mx
 
                             if isinstance(state, list):
-                                cache = cache_cls.from_state(
+                                cache = from_legacy_state(
+                                    cache_cls,
                                     (state, mx.array([]), mx.array([])),
                                     meta_state,
                                 )

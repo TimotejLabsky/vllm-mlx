@@ -26,6 +26,13 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from . import batched_system_kv as _batched_kv
 from . import recurrent_state_eval as _recurrent_eval
+from .cache_state_compat import (
+    from_legacy_state,
+    has_meta_state,
+    legacy_meta_state,
+    legacy_state,
+    set_legacy_state,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -1063,8 +1070,9 @@ def _install_mtp(
                 for _ci, _c in enumerate(prompt_cache):
                     if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
                         if hasattr(_c, "state"):
+                            # #137: post-mlx-lm#1778 states carry int scalars.
                             _rnn_snapshots[_ci] = [
-                                s.copy() if s is not None else None for s in _c.state
+                                s.copy() if hasattr(s, "copy") else s for s in _c.state
                             ]
 
             verify_input = mx.concatenate(
@@ -2065,9 +2073,9 @@ class Scheduler:
         extracted = []
         for layer_cache in raw_cache:
             try:
-                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
-                    state = layer_cache.state  # (keys, values) or more for Mamba
-                    meta = layer_cache.meta_state  # (offset,) as strings
+                if hasattr(layer_cache, "state") and has_meta_state(layer_cache):
+                    state = legacy_state(layer_cache)  # (keys, values) or more
+                    meta = legacy_meta_state(layer_cache)  # strings tuple
                     extracted.append(
                         {
                             "state": state,
@@ -2127,7 +2135,7 @@ class Scheduler:
                         cache.values = values
                         cache.offset = keys.shape[2]
                     else:
-                        cache = cache_cls.from_state(state, meta_state)
+                        cache = from_legacy_state(cache_cls, state, meta_state)
                 else:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache
@@ -4172,20 +4180,22 @@ class Scheduler:
                     n3 = ld.get("arity3_n")
                     if n3 is not None:
                         layer_obj = ArraysCache(n3)
-                        layer_obj.state = (
-                            state_arrays[:n3],
-                            state_arrays[n3],
-                            state_arrays[n3 + 1],
+                        set_legacy_state(
+                            layer_obj,
+                            (
+                                state_arrays[:n3],
+                                state_arrays[n3],
+                                state_arrays[n3 + 1],
+                            ),
                         )
                     else:
                         layer_obj = ArraysCache(len(state_arrays))
                         try:
-                            layer_obj.state = state_arrays
+                            set_legacy_state(layer_obj, state_arrays)
                         except (TypeError, ValueError):
-                            layer_obj.state = (
-                                state_arrays,
-                                mx.array([]),
-                                mx.array([]),
+                            set_legacy_state(
+                                layer_obj,
+                                (state_arrays, mx.array([]), mx.array([])),
                             )
                     result.append(layer_obj)
                 else:
