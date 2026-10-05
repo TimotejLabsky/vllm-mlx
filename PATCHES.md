@@ -3865,3 +3865,28 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 **Verification:** `test_132_short_system_prompt_survives_a_deep_chain_thinning` (12-turn deep chain thinned to 8: anchor at 600 kept, a new session peeks 600, bookkeeping released), `test_132_the_anchor_survives_an_ssd_round_trip`, `test_132_thinning_never_evicts_the_anchor`. Mutation-checked: dropping the thinning pin fails 3; dropping the SSD flags fails 1; restoring the store-path leak fails 1. Suite 4512 passed. Supersedes fork PR #37.
 - **Real server A/B** (`scripts/fork/e2e_short_system_share.py`, `Qwen3.5-4B-4bit` on the Studio, now `--text-only` by default): a 22,853-token, 12-turn chat on its own ~1K system prompt runs cold and fills the ladder; then a brand-new session with the same system prompt asks one question. `main`: **cached 0/1027**. #132: **cached 1003/1027** (`anchor_cuts=2`). The #126 cases still pass on both.
+
+## 138. `patch: mllm-prefix-eviction` — hybrid prefixes survive publish and pressure; superseded turns are evicted first (ports of upstream #770 + #766)
+
+**Files:** `vllm_mlx/memory_cache.py` (`_has_non_trimmable_layer`, `commit_prepared`, `_find_superseded_lru`, `_evict_lru`), `tests/test_fork_138_mllm_prefix_eviction.py` (new, 13), `tests/test_fork_invariants.py` (+2).
+
+**Upstream:** waybarrios/vllm-mlx #770 ("do not evict strict-prefix entries of hybrid caches on store", open) and #766 ("prefer superseded prefixes over LRU when evicting", open, changes requested). Supersedes the stale ports #120/#121 on fork PR #39 (`patch/upstream-early-hybrid-vision`), which predate the `prepare_store`/`commit_prepared` split and no longer apply.
+
+**Affected path:** only `MemoryAwarePrefixCache`. In production that cache is built on the **MLLM BatchedEngine path** alone (`mllm_scheduler` → `MLLMBatchGenerator.prefix_cache`, text-only requests; media requests never store or fetch, #56). The 19 text routes run `VLLM_MLX_BATCHED_SYSTEM_KV=1`, and `batched_system_kv.maybe_create` replaces the memory-aware cache there, so they are untouched. Deployed MLLM-path routes:
+- **GLM-4.6V-Flash-4bit** and **Qwen3-VL-30B-A3B-8bit**: full-attention, all `KVCache` layers (trimmable). The #770 guard cannot fire. #766 changes the victim only under cache pressure (LRU or #48 relief via `_pressure_drop_lru`), and only when a shorter entry is resident beside its extension. Completion stores use `evict_prefixes=True`, so that case is rare here (a shorter key stored after a longer one: retry, edit, branch).
+- **Qwen3.8-Flash-Next-REAP-288-4bit** (qwen4_exp, hybrid GDN, MLLM path, no `--text-only`): hybrid entries are published through `_publish_prefill_checkpoint`, which already passes `evict_prefixes=False`. So #770 is defense in depth here: the one remaining hybrid `evict_prefixes=True` store (the interleaved-prefill `_store_prefix_snapshot` with a zero think suffix) usually re-publishes an existing exact key and returns early. Because nothing proactively deletes hybrid prefixes, superseded turns pile up. That makes #766 the live change on this route under pressure. Its hit-side benefit is unmeasured.
+
+Verdict: **low priority**. Both changes are correct, but no deployed route has a measured loss that they fix.
+
+**Fix:**
+- **#770, in `commit_prepared`, not `store()`:** when the new entry has any non-trimmable layer, the proactive strict-prefix eviction is skipped. Upstream guards `store()`, but on the fork the MLLM path publishes via `prepare_store` + `commit_prepared`. Putting the guard there covers every publish path, including the default `evict_prefixes=True`. LRU eviction under the memory limit is unchanged.
+- **#766 with the review blocker fixed:** `_evict_lru` first evicts, in LRU order, an entry `K` that a resident strict extension `E` supersedes. Otherwise it pops the LRU entry, as before. Upstream treats every extension as a substitute. Thump604's review shows that is wrong for hybrids: `fetch()` refuses to rewind a non-trimmable `E`, so a sibling branch below `E` can only hit `K`. The fork's eligibility rule:
+  - if `E` is trimmable, `K` is superseded (LCP/supersequence trims `E` back);
+  - if `E` is hybrid, `K` is superseded only if `E` was used **more recently** than `K`. A dead conversation turn goes first. A shared system prefix refreshed after its extension falls back to plain LRU.
+  - The eviction log line now reads `[lru_evict:superseded|lru]`.
+
+**Verification:**
+- **Unit:** 13 tests in the new file: upstream #770's 4 tests and #766's test, ported; the reviewer's regression (`S`, `S+A`, refresh `S`, pressure, then `S+B` still fetches `S`); the hybrid dead turn goes first; a trimmable prefix is preferred even when fresher; the victim is spilled to SSD and logged as superseded; the pressure-relief hook uses the same order; the guard holds through `commit_prepared`. Plus 2 fork invariants (guard in `commit_prepared`; recency guard).
+- **Mutation-checked:** dropping the #770 guard fails 4; plain LRU fails 5; upstream's any-extension rule (no recency guard) fails 1 (+1 invariant); recency-only (no trimmable shortcut) fails 2.
+- **Suite:** full mocked suite 4527 passed, 31 skipped.
+- **Studio check pending.** Real-server run on the MLLM path: REAP-288 or a small hybrid VLM on a spare port, with a small `--cache-memory-mb` (it caps the MLLM prefix cache). Prewarm a shared prefix, run two branching turns, apply pressure, and confirm the second branch hits and the log shows `[lru_evict:superseded]` victims only for dead turns.
