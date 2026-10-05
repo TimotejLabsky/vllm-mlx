@@ -18,4 +18,5 @@ rebase history — lives in [`PATCHES.md`](../../PATCHES.md) at the repo root.
 | [`engine-benchmarks-2026-09.md`](engine-benchmarks-2026-09.md) | Cross-engine benchmark round (fork vs upstream vs oMLX vs llama.cpp) and how to re-run it |
 | [`engine-field-survey-2026-08-18.md`](engine-field-survey-2026-08-18.md) | Survey of the MLX/Apple-Silicon serving field |
 | [`improvement-research-2026-08-30.md`](improvement-research-2026-08-30.md) | 2026-08-30 research round and same-day builds (#81–#83) |
+| [`speedup-research-2026-10-05.md`](speedup-research-2026-10-05.md) | 2026-10-05 research round: speedup tricks from other engines (MLX ecosystem, llama.cpp, vLLM/SGLang/Dynamo) cross-checked against the fork's hot path — ranked candidates with kill gates, **none measured yet** |
 | [`mlxlm-issue-499000-draft.md`](mlxlm-issue-499000-draft.md) | Draft upstream issue for the mlx-lm Metal resource-limit (499000) leak |
