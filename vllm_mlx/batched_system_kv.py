@@ -309,6 +309,28 @@ class BatchedSystemKV:
         )
         self.lazy_restores = 0
         self.lazy_restore_misses = 0
+        # (#131) Admission order (fork issue #44). FCFS pops the head and, when
+        # a co-batch gate defers it, stops: one deep cold request blocked every
+        # short or cache-hit request behind it (2026-09-17: median prefill
+        # ~15 s but median TTFT 137 s). ADMISSION_ORDER=sjf ranks the first
+        # SJF_WINDOW waiting requests by tokens still to prefill minus an
+        # aging credit and admits the first one the gates accept. Once the
+        # oldest has waited SJF_MAX_WAIT_S it alone may be admitted (the
+        # running set drains and it gets in) - no starvation.
+        self.admission_sjf = (
+            os.environ.get("VLLM_MLX_BATCHED_ADMISSION_ORDER", "fcfs").lower() == "sjf"
+        )
+        self.sjf_window = max(1, _env_int("VLLM_MLX_BATCHED_SJF_WINDOW", 8))
+        self.sjf_aging_tok_per_s = max(
+            0, _env_int("VLLM_MLX_BATCHED_SJF_AGING_TOK_PER_S", 100)
+        )
+        self.sjf_max_wait_s = max(0, _env_int("VLLM_MLX_BATCHED_SJF_MAX_WAIT_S", 240))
+        self.sjf_reorders = 0
+        self.sjf_holds = 0
+        # (#131, fork issue #46a) a request that MISSED at enqueue is matched
+        # again at admission: a follower that waited behind the KV budget
+        # used to prefill cold although its leader's entry had landed since.
+        self.admission_rematches = 0
         # (#107) request_id -> key of the entry a QUEUED request matched at
         # enqueue. Make-room and budget eviction spare these while anything
         # else can go: on 2026-09-21 a deep follow-up waited ~10 min behind
@@ -1590,6 +1612,9 @@ class BatchedSystemKV:
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
                 "lazy_ssd_deferred": self.lazy_ssd_deferred,
+                "sjf_reorders": self.sjf_reorders,
+                "sjf_holds": self.sjf_holds,
+                "admission_rematches": self.admission_rematches,
                 "divergence_events": self.divergence_events,
                 "divergence_at_think": self.divergence_at_think,
                 "divergence_depth_hist": dict(self.divergence_depth_hist),
@@ -1766,6 +1791,9 @@ def materialize_pending_restore(scheduler, request) -> None:
     The entry may have been evicted while the request waited (it was
     LRU-touched at enqueue, so this is rare): ``fetch`` then returns a
     shallower hit or nothing, and the request simply prefills more."""
+    if getattr(request, "cache_hit_type", None) == "miss":
+        _rematch_at_admission(scheduler.hybrid_kv, request)
+        return
     if getattr(request, "cache_hit_type", None) != "system_kv_pending":
         return
     hybrid_kv = scheduler.hybrid_kv
@@ -1807,6 +1835,111 @@ def materialize_pending_restore(scheduler, request) -> None:
         request.remaining_tokens = request.prompt_token_ids
         if hybrid_kv is not None:
             hybrid_kv.lazy_restore_misses += 1
+
+
+def _rematch_at_admission(hybrid_kv, request) -> None:
+    """(#131 / issue #46a) Retry the RAM match for a request that missed at
+    enqueue. Cheap when there is still nothing (a peek, no copy, no
+    counters); a hit restores exactly as an enqueue-time hit would."""
+    if hybrid_kv is None:
+        return
+    try:
+        if hybrid_kv.peek(request.prompt_token_ids, touch=False) <= 0:
+            return
+        result = hybrid_kv.fetch(
+            request.prompt_token_ids, request_id=request.request_id
+        )
+    except Exception:
+        logger.debug("[batched_system_kv] admission re-match failed", exc_info=True)
+        return
+    if result is None:
+        return
+    cache, remaining, pos = result
+    request.cache_hit_type = "system_kv"
+    request.prompt_cache = cache
+    request.cached_tokens = pos
+    request.remaining_tokens = remaining
+    hybrid_kv.admission_rematches += 1
+    logger.info(
+        "[batched_system_kv] admission re-match request=%s restored=%d "
+        "remaining=%d (missed at enqueue)",
+        request.request_id[:12],
+        pos,
+        len(remaining),
+    )
+
+
+def _uncached_tokens(request) -> int:
+    remaining = getattr(request, "remaining_tokens", None)
+    if remaining is not None:
+        return len(remaining)
+    return int(getattr(request, "num_prompt_tokens", 0) or 0)
+
+
+def next_admission(scheduler):
+    """_schedule_waiting hook (#131): remove and return the next request to
+    admit, or None to stop admitting this pass.
+
+    FCFS (default): the head, unless a co-batch gate defers it - then it
+    stays at the head and admission stops (the pre-#131 behaviour).
+
+    SJF (``VLLM_MLX_BATCHED_ADMISSION_ORDER=sjf``): the first ``window``
+    waiting requests ranked by uncached tokens minus ``aging`` x seconds
+    waited; the first one the co-batch gates accept is admitted, a deferred
+    one no longer blocks those behind it. If the OLDEST has waited past
+    ``max_wait`` it is the only candidate (hold the line)."""
+    waiting = scheduler.waiting
+    if not waiting:
+        return None
+    hybrid_kv = scheduler.hybrid_kv
+    if hybrid_kv is None or not getattr(hybrid_kv, "admission_sjf", False):
+        request = waiting[0]
+        if (
+            hybrid_kv is not None
+            and scheduler.running
+            and should_defer_cobatch(scheduler, request)
+        ):
+            return None
+        return waiting.popleft()
+
+    import time
+
+    now = time.time()
+    head = waiting[0]
+    oldest = min(waiting, key=lambda r: getattr(r, "arrival_time", now))
+    if (
+        hybrid_kv.sjf_max_wait_s > 0
+        and now - getattr(oldest, "arrival_time", now) >= hybrid_kv.sjf_max_wait_s
+    ):
+        candidates = [oldest]
+    else:
+        window = list(waiting)[: hybrid_kv.sjf_window]
+        aging = hybrid_kv.sjf_aging_tok_per_s
+        candidates = sorted(
+            window,
+            key=lambda r: (
+                _uncached_tokens(r) - aging * (now - getattr(r, "arrival_time", now)),
+                getattr(r, "arrival_time", now),
+            ),
+        )
+    for request in candidates:
+        if scheduler.running and should_defer_cobatch(scheduler, request):
+            continue
+        waiting.remove(request)
+        if request is not head:
+            hybrid_kv.sjf_reorders += 1
+            logger.info(
+                "[batched_system_kv] admitting request=%s ahead of %s "
+                "(uncached %d vs %d)",
+                request.request_id[:12],
+                head.request_id[:12],
+                _uncached_tokens(request),
+                _uncached_tokens(head),
+            )
+        return request
+    if len(candidates) == 1 and len(waiting) > 1:
+        hybrid_kv.sjf_holds += 1
+    return None
 
 
 def promote_ssd_pending(scheduler) -> None:

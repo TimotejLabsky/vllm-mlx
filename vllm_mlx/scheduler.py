@@ -2440,17 +2440,12 @@ class Scheduler:
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
-            request = self.waiting.popleft()
-
-            # Length-aware co-batching guard (fork flip-enablement): defer
-            # rather than pay the padded-KV spike of mixing very different
-            # context lengths. FCFS order preserved (appendleft + break).
-            if (
-                self.hybrid_kv is not None
-                and self.running
-                and _batched_kv.should_defer_cobatch(self, request)
-            ):
-                self.waiting.appendleft(request)
+            # Length-aware co-batching guard (fork flip-enablement) + admission
+            # order (fork #131): the hook applies the co-batch gates and
+            # returns None to stop - FCFS by default, shortest-prefill-first
+            # with aging when VLLM_MLX_BATCHED_ADMISSION_ORDER=sjf.
+            request = _batched_kv.next_admission(self)
+            if request is None:
                 break
 
             # Solo-prefill guard (fork #105): the gates above price
