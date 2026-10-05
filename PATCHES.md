@@ -3665,3 +3665,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Second gap, found by the live probe of the first fix:** `_prepare_anthropic_invocation` forwarded neither `enable_thinking` nor built the thinking-budget processor — so even mapped, `disabled` still thought (276 tokens for "Hello", the reasoning merely hidden by the latch), and the routes' `--default-thinking-token-budget` caps (6144/8192 on the Qwen3.8 routes) were **never enforced on `/v1/messages`**. The OpenAI builder's budget block is now `_attach_thinking_budget()`, shared by both builders; the Anthropic stream's reasoning-parser gate (`allowed=not logits_processors`) became `_anthropic_stream_reasoning_allowed()`, which treats the thinking processor as the thinking case and still disables the parser for structured output — the non-stream rule.
 
 **Verified:** 16 tests (mapping table, `_thinking_disabled` resolution, clamp table, invocation: `disabled` reaches engine kwargs and skips the budget, route budget now built on `/v1/messages`, client budget tightens it, stream gate with/without structured output). Live (spare port, GLM-4.7-Flash + Qwen3.5-9B): see the #118–#122 live block below.
+
+---
+
+## 121. `patch: nonstream-implicit-thinking` — a truncated reply inside an implicit `<think>` is reasoning on non-stream paths too
+
+**Files:** `vllm_mlx/server.py` (`_extract_reasoning_and_tool_calls(chat_kwargs=…)`), `vllm_mlx/reasoning/think_parser.py`, `qwen3_parser.py`, `deepseek_r1_parser.py`, `tests/test_nonstream_implicit_thinking.py`
+
+**Found 2026-10-05** (live sweep, A/B-identical on the pre-rebase tree): GLM-4.7-Flash, `max_tokens=64`, non-stream chat and `/v1/messages` returned the chain-of-thought as `content` ("The user wants a one-word greeting…"); streaming put it in reasoning. Upstream's glm4 parser comment already named the gap: the non-stream path had no implicit-mode signal.
+
+**Fix:** both non-stream callers pass `prepared.chat_kwargs`; when thinking is on and `_detect_implicit_thinking` says the template opened `<think>`, the extractor parses with a **request-local** parser in implicit mode (the module parser is shared across concurrent requests). In implicit mode, untagged output is reasoning in the base think parser and in the `qwen3`/`deepseek_r1` overrides, which short-circuited to "pure content" without `</think>`. Explicit mode and closed blocks are unchanged; thinking-off requests never probe.
+
+**Verified:** 8 tests (3 parsers × implicit; explicit unchanged; server extractor with/without implicit template; shared parser untouched; thinking-off never probes). Suite 4442 passed.
