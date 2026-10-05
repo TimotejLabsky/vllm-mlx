@@ -3778,3 +3778,4 @@ It also logs one INFO line with the decoded ±24-token windows of both sides. Of
 **Upstream:** fork-owned (llama.cpp #27600 logs the same point).
 
 **Verification:** `test_128_think_stripped_rerender_is_a_deep_divergence`, `test_128_next_turn_extending_the_chain_is_not_a_divergence`, `test_128_off_by_default_and_never_scans`; all three red with the patch reverted. Suite 4480 passed.
+- **Real server** (`scripts/fork/e2e_divergence_log.py`, `Qwen3.5-4B-4bit` on the Studio, thinking on, turn 2 sends the history back without the reasoning): `divergence_events=1`, `divergence_at_think=1`, depth bucket `<256`; the logged window shows the cached side continuing `<think>\nThinking Process:` where the new prompt has the answer. 4/4, also under the mlx 0.32.3 bump venv.
