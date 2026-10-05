@@ -1553,13 +1553,14 @@ def test_64_no_duplicate_literal_keys_after_auto_merge():
     [
         ("Plain answer", "Plain answer"),  # markerless: parser never engaged
         ("<think>x</think>Answer", "Answer"),  # thoughts dropped, answer kept
-        ("<think>All of it, never closed", "All of it, never closed"),
+        ("<think>All of it, never closed", ""),  # cut off inside reasoning
     ],
 )
-def test_27_thinking_off_never_returns_empty_or_thoughts(output, expected):
-    """#27 retired onto upstream #610/#815's marker latch (2026-10-04); what
-    survives of it is the guarantee: with thinking disabled a non-stream
-    reply never surfaces a reasoning field and never comes back empty.
+def test_124_thinking_off_never_surfaces_thoughts(output, expected):
+    """#27 retired onto upstream #610/#815's marker latch (2026-10-04); #124
+    then removed its last fold (an empty parse returned the reasoning AS
+    content — the non-stream path disagreed with streaming, which drops it).
+    With thinking disabled, thoughts never reach the client in any field.
     """
     import vllm_mlx.server as srv
     from vllm_mlx.reasoning.qwen3_parser import Qwen3ReasoningParser
@@ -1573,7 +1574,47 @@ def test_27_thinking_off_never_returns_empty_or_thoughts(output, expected):
     finally:
         srv._reasoning_parser = saved
     assert reasoning is None
-    assert expected in (content or "")
+    assert (content or "") == expected
+
+
+def test_124_harmony_tool_call_survives_thinking_off(monkeypatch):
+    """The unclosed-marker drop must not treat harmony's <|channel|> (#118,
+    no closing token) as an unclosed think block: it cut the commentary
+    block and gpt-oss non-stream tool calls came back as content 'assistant'.
+    """
+    import vllm_mlx.server as srv
+    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+
+    monkeypatch.setattr(srv, "_reasoning_parser", HarmonyReasoningParser())
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True, raising=False)
+    monkeypatch.setattr(srv, "_tool_call_parser", "harmony", raising=False)
+    monkeypatch.setattr(srv, "_tool_parser_instance", None, raising=False)
+    request = srv.ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Read a.txt"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+    output = (
+        "<|channel|>analysis<|message|>Need to read.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.read "
+        '<|constrain|>json<|message|>{"path": "a.txt"}<|call|>'
+    )
+    reasoning, _, tool_calls = srv._extract_reasoning_and_tool_calls(
+        output, request, allow_reasoning=False
+    )
+    assert reasoning is None
+    assert [c.function.name for c in tool_calls or []] == ["read"]
 
 
 def test_rebase_no_shadowed_definitions_after_auto_merge():
