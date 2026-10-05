@@ -191,6 +191,18 @@ def _model_slug(tokenizer: Any) -> str:
     return name or "model"
 
 
+# (#128) histogram bucket upper bounds, in tokens
+_DIVERGENCE_BUCKETS = ("<256", "<1K", "<4K", "<16K", "<64K", ">=64K")
+_DIVERGENCE_BOUNDS = (256, 1024, 4096, 16384, 65536)
+
+
+def _divergence_bucket(n: int) -> str:
+    for label, bound in zip(_DIVERGENCE_BUCKETS, _DIVERGENCE_BOUNDS):
+        if n < bound:
+            return label
+    return _DIVERGENCE_BUCKETS[-1]
+
+
 class BatchedSystemKV:
     """LRU of hybrid-safe snapshot entries + per-request checkpoint ladders.
 
@@ -307,6 +319,16 @@ class BatchedSystemKV:
         # (#125) RAM-miss SSD hits deferred to admission instead of promoted
         # (and materialised) while the request waits.
         self.lazy_ssd_deferred = 0
+        # (#128) Divergence-point log (fork issue #43): where does a request's
+        # prompt part ways with the closest cached chain, and how much of it is
+        # re-prefilled? Answers whether think-stripping templates re-prefill
+        # whole tool loops. Env-gated: it scans every entry and decodes text.
+        self.divergence_log = os.environ.get("VLLM_MLX_DIVERGENCE_LOG") == "1"
+        self._tokenizer = tokenizer
+        self.divergence_events = 0
+        self.divergence_at_think = 0
+        self.divergence_depth_hist = dict.fromkeys(_DIVERGENCE_BUCKETS, 0)
+        self.divergence_reprefill_hist = dict.fromkeys(_DIVERGENCE_BUCKETS, 0)
         # (#117) SSD-vs-RAM-partial arbitration. ``fetch`` used to take ANY
         # RAM entry sharing >= PARTIAL_MIN tokens and only consulted the SSD on
         # a total miss: with a hybrid model the partial snaps DOWN to a
@@ -1152,8 +1174,8 @@ class BatchedSystemKV:
         # build_partial_restore_states slices trim-layer KV lazily and fetch
         # used to run on the event-loop thread (it runs on the generation
         # worker now, but an inline EngineCore still calls it from the loop),
-        # while the batch steps on the engine-core executor — evaluating the slices over there trips the
-        # MLX stream/thread mismatch (patch #28's crash class). Without this,
+        # while the batch steps on the engine-core executor — evaluating the
+        # slices over there trips the MLX stream/thread mismatch (patch #28's crash class). Without this,
         # engine_core catches the first step's crash, self-heals to
         # model-thread stepping, and silently re-prefills the request COLD —
         # found live in the Studio A/B (R2 re-send: 32s despite a logged
@@ -1175,6 +1197,55 @@ class BatchedSystemKV:
             ", divergent" if divergent else "", len(remaining),
         )
         return fresh, remaining, pos
+
+    def note_divergence(self, tokens: list, request_id: str, cached: int) -> None:
+        """(#128) Record where ``tokens`` diverge from the closest RAM chain.
+
+        ``depth`` = prompt tokens after the divergence (a new user turn is
+        short; a think-stripped re-render of a whole tool loop is deep);
+        ``reprefill`` = tokens this request will actually prefill (``depth``
+        plus what checkpoint snapping lost). Only true divergences count — a
+        prompt that extends a whole chain is the normal next turn."""
+        tokens = list(tokens)
+        with self._lock:
+            best_lcp, donor = 0, None
+            for entry in self._entries.values():
+                lcp = common_prefix_len(tokens, entry["tokens"])
+                if lcp > best_lcp:
+                    best_lcp, donor = lcp, entry["tokens"]
+        if donor is None or best_lcp >= min(len(tokens), len(donor)):
+            return
+        depth = len(tokens) - best_lcp
+        reprefill = len(tokens) - max(0, int(cached or 0))
+        self.divergence_events += 1
+        self.divergence_depth_hist[_divergence_bucket(depth)] += 1
+        self.divergence_reprefill_hist[_divergence_bucket(reprefill)] += 1
+        ours = theirs = ""
+        if self._tokenizer is not None:
+            try:
+                lo, hi = max(0, best_lcp - 24), best_lcp + 24
+                ours = self._tokenizer.decode(tokens[lo:hi])
+                theirs = self._tokenizer.decode(donor[lo:hi])
+                tail = self._tokenizer.decode(donor[best_lcp : best_lcp + 8])
+                if "<think" in tail or "think>" in tail:
+                    self.divergence_at_think += 1
+            except Exception:
+                logger.debug(
+                    "[batched_system_kv] divergence decode failed", exc_info=True
+                )
+        logger.info(
+            "[batched_system_kv] divergence request=%s prompt=%d lcp=%d "
+            "depth=%d restored=%d reprefill=%d snap_loss=%d ours=%r theirs=%r",
+            request_id[:12],
+            len(tokens),
+            best_lcp,
+            depth,
+            int(cached or 0),
+            reprefill,
+            max(0, best_lcp - int(cached or 0)),
+            ours,
+            theirs,
+        )
 
     def peek(
         self,
@@ -1519,6 +1590,10 @@ class BatchedSystemKV:
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
                 "lazy_ssd_deferred": self.lazy_ssd_deferred,
+                "divergence_events": self.divergence_events,
+                "divergence_at_think": self.divergence_at_think,
+                "divergence_depth_hist": dict(self.divergence_depth_hist),
+                "divergence_reprefill_hist": dict(self.divergence_reprefill_hist),
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")
@@ -1585,6 +1660,23 @@ def maybe_create(model: Any, tokenizer: Any, idle_check=None):
 
 
 def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
+    """add_request hook: the restore match (``_fetch_for_request``) plus, with
+    ``VLLM_MLX_DIVERGENCE_LOG=1``, the #128 divergence record."""
+    _fetch_for_request(hybrid_kv, request)
+    if getattr(hybrid_kv, "divergence_log", False) is True:
+        try:
+            cached = getattr(request, "cached_tokens", 0) or 0
+            candidate = getattr(request, "_ssd_candidate", None)
+            if not cached and candidate is not None:
+                cached = candidate.get("usable", 0)  # eager SSD promote pending
+            hybrid_kv.note_divergence(
+                request.prompt_token_ids, request.request_id, cached
+            )
+        except Exception:
+            logger.debug("[batched_system_kv] divergence log failed", exc_info=True)
+
+
+def _fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     """add_request hook: hybrid-safe checkpoint restore (#34) with the
     index-only SSD cold-tier probe on miss (#36 — the blob read happens on
     the executor via promote_ssd_pending).
