@@ -322,7 +322,14 @@ def flatten_checkpoints(checkpoints: list | None) -> tuple[dict, list[dict]]:
                 "tuple": not isinstance(st, list),
                 "meta": list(m) if m else None,
             })
-        ckpt_meta.append({"pos": cp["pos"], "layers": layers})
+        cm = {"pos": cp["pos"], "layers": layers}
+        # (#132) Thinning flags (#88 boundary, #132 anchor) survive a spill,
+        # so a promoted ladder is thinned by the same policy as a resident
+        # one. Additive keys: older readers ignore them, format unchanged.
+        for flag in ("boundary", "anchor"):
+            if cp.get(flag):
+                cm[flag] = True
+        ckpt_meta.append(cm)
     return tensors, ckpt_meta
 
 
@@ -346,7 +353,11 @@ def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
                 states[i] = tuple(seq) if lm.get("tuple") else seq
             m = lm.get("meta")
             metas[i] = tuple(m) if m else None
-        checkpoints.append({"pos": cm["pos"], "states": states, "metas": metas})
+        cp = {"pos": cm["pos"], "states": states, "metas": metas}
+        for flag in ("boundary", "anchor"):
+            if cm.get(flag):
+                cp[flag] = True
+        checkpoints.append(cp)
     return checkpoints
 
 

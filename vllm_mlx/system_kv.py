@@ -564,7 +564,13 @@ def thin_checkpoints(checkpoints, capacity):
     """
     cap = max(1, capacity)
     while len(checkpoints) > cap and len(checkpoints) > 2:
-        candidates = checkpoints[:-2]
+        # (#132) An ``anchor`` (the end of a cold prompt's system message,
+        # the prefix every session of an agent shares) is never evicted
+        # while another candidate exists: as the ladder's lowest boundary it
+        # has the smallest gap, so the gap rule alone would drop it FIRST.
+        candidates = [c for c in checkpoints[:-2] if not c.get("anchor")]
+        if not candidates:
+            candidates = checkpoints[:-2]
         pool = [c for c in candidates if not c.get("boundary")] or candidates
         victim = None
         victim_gap = None
@@ -578,7 +584,9 @@ def thin_checkpoints(checkpoints, capacity):
     return checkpoints
 
 
-def append_checkpoint(checkpoints, pos, states, metas, capacity, *, boundary=False):
+def append_checkpoint(
+    checkpoints, pos, states, metas, capacity, *, boundary=False, anchor=False
+):
     """Append a {pos, states, metas, boundary} checkpoint, keeping the list
     sorted and bounded (see ``thin_checkpoints`` for the eviction policy).
     ``boundary=True`` marks a message-boundary-aligned position (#88) —
@@ -588,9 +596,10 @@ def append_checkpoint(checkpoints, pos, states, metas, capacity, *, boundary=Fal
     """
     if checkpoints and checkpoints[-1]["pos"] >= pos:
         return checkpoints
-    checkpoints.append(
-        {"pos": pos, "states": states, "metas": metas, "boundary": boundary}
-    )
+    cp = {"pos": pos, "states": states, "metas": metas, "boundary": boundary}
+    if anchor:
+        cp["anchor"] = True  # (#132) pinned against thinning
+    checkpoints.append(cp)
     return thin_checkpoints(checkpoints, capacity)
 
 
