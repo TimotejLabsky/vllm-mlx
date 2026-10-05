@@ -3822,3 +3822,21 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 **Verification:** `test_130_common_prefix_len_matches_the_token_walk[0-5]` (every divergence point including the 32-token bisect edges, list/tuple/numpy mixes), `test_130_ssd_shared_lookup_matches_upstream` (fork index vs upstream `SSDIndex`, identical results), `test_130_prefix_boundary_only_for_the_legacy_chunked_path`. Mutation-checked: dropping the type normalization fails 6, breaking the numpy divergence point fails 1, removing the guard fails 1.
 - **Real server** (Studio, `Qwen3.5-4B-4bit`, a fully cached re-send of a 103,208-token chat, two rounds): **streaming first-token latency 452–454 ms → 264 ms (−190 ms, −42 %)**. One render + encode of that prompt costs 110 ms on the Studio, so the old path paid about two of them. Non-streaming requests never computed the boundary (`chat()` → `generate()`), so they are unchanged (301 → 293 ms). Agents stream. e2e `ssd_prefer` 6/6, `lazy_restore` 7/7, `short_system_share`, `divergence_log` all pass on the new LCPs.
+## 131. `patch: admission-order` — shortest-prefill-first admission with aging; misses re-matched at admission
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`next_admission`, `_rematch_at_admission`, `_uncached_tokens`, config + stats), `vllm_mlx/scheduler.py` (`_schedule_waiting` asks the hook for the next request), `tests/test_fork_invariants.py` (+7), `scripts/fork/e2e_admission.py`.
+
+**Gaps** (fork issues #44 and #46, verified in code):
+- `_schedule_waiting` popped the head of `waiting` and, when a co-batch gate deferred it, put it back and stopped. One deep cold request waiting on the KV budget blocked every short or cache-hit request behind it. Prefill is effectively serial on this box, and the 2026-09-17 data has the signature: the median turn prefilled ~15 s, but the median TTFT was 137 s, with requests waiting in 133 of 191 samples.
+- Cache matching happened only at enqueue. A follower that missed (its leader was still prefilling the shared prefix) and then waited behind the budget still prefilled cold, although the leader's entry had landed meanwhile.
+
+**Fix:**
+- **`VLLM_MLX_BATCHED_ADMISSION_ORDER=sjf`** (default `fcfs` = the old behaviour, byte-for-byte):
+  - The first `SJF_WINDOW` (8) waiting requests are ranked by tokens still to prefill (`remaining_tokens`, so cache hits rank by their uncached tail) minus `SJF_AGING_TOK_PER_S` (100) × seconds waited.
+  - The first candidate the existing co-batch gates accept is admitted; a deferred one no longer blocks those behind it.
+  - **No starvation:** once the oldest request has waited `SJF_MAX_WAIT_S` (240 s, under opencode's 300 s timeout) it is the only candidate, so nothing else is admitted, the running set drains, and it gets its seat (a request that runs alone is never deferred).
+  - Counters: `sjf_reorders`, `sjf_holds`.
+- **Re-match at admission (always on):** a request whose enqueue-time lookup was a `miss` peeks the RAM bag again at admission (a peek: no copy, no counters) and, on a hit, restores exactly as an enqueue-time hit would. Counter: `admission_rematches`.
+- Not built: #46(b) in-flight prefix dedup (hold a follower while a still-prefilling row shares its uncached prefix). It needs a boundary store under concurrency, and the issue gates it on stacked fan-out load returning.
+
+**Upstream:** fork-owned (one-line delegator in the upstream-owned scheduler).
