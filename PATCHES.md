@@ -3840,3 +3840,10 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 - Not built: #46(b) in-flight prefix dedup (hold a follower while a still-prefilling row shares its uncached prefix). It needs a boundary store under concurrency, and the issue gates it on stacked fan-out load returning.
 
 **Upstream:** fork-owned (one-line delegator in the upstream-owned scheduler).
+
+**Verification:**
+- **Unit:** 7 invariant tests. FCFS default unchanged; SJF admits past a deferred deep head; ranking by uncached tokens when idle; aging overtakes; the oldest past `SJF_MAX_WAIT_S` holds the line and gets in once the running set drains; a miss is re-matched at admission (and with nothing to match no counter moves); `_schedule_waiting` routes through the hook. Mutation-checked: FCFS-only fails 3, no hold fails 1, no re-match fails 1. Suite 4494 + 7.
+- **Real server** (`scripts/fork/e2e_admission.py`, `Qwen3.5-4B-4bit` on the Studio, small env budgets so the gates bite):
+  - Head-of-line: a short request queued behind a deferred deep one gets its first token at **9.6 s under FCFS vs 4.3 s under SJF**; the deep request's first token moves only 9.2 → 9.5 s.
+  - Re-match: two followers that waited behind their leader restored **2,048 and 3,321 tokens** at admission (`admission_rematches=2`) instead of prefilling cold. The second restored from the first follower's own entry.
+  - 6/6, no traceback.
