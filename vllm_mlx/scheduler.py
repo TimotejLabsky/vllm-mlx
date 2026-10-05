@@ -31,6 +31,9 @@ from .batch_compat import (
 )
 from . import batched_system_kv as _batched_kv
 from . import recurrent_state_eval as _recurrent_eval
+
+# Fork #133: feed generated tokens to stateful logits processors.
+_FEED_PROCESSORS = os.environ.get("VLLM_MLX_THINKING_FED", "1") != "0"
 from .memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
@@ -3109,6 +3112,14 @@ class Scheduler:
 
             # Append token to request
             request.append_output_token(response.token)
+            # Fork #133: hand the (now host-side) token to processors that
+            # track generation state, so they need not read ``tokens`` back
+            # from the GPU every step. VLLM_MLX_THINKING_FED=0 turns it off.
+            if _FEED_PROCESSORS:
+                for proc in request.sampling_params.logits_processors or ():
+                    note = getattr(proc, "note_generated", None)
+                    if note is not None:
+                        note(response.token)
 
             # Record first token time for TTFT metric
             if request.first_token_time is None and request.num_output_tokens > 0:
