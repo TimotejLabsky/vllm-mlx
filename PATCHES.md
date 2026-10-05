@@ -3865,3 +3865,40 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 **Verification:** `test_132_short_system_prompt_survives_a_deep_chain_thinning` (12-turn deep chain thinned to 8: anchor at 600 kept, a new session peeks 600, bookkeeping released), `test_132_the_anchor_survives_an_ssd_round_trip`, `test_132_thinning_never_evicts_the_anchor`. Mutation-checked: dropping the thinning pin fails 3; dropping the SSD flags fails 1; restoring the store-path leak fails 1. Suite 4512 passed. Supersedes fork PR #37.
 - **Real server A/B** (`scripts/fork/e2e_short_system_share.py`, `Qwen3.5-4B-4bit` on the Studio, now `--text-only` by default): a 22,853-token, 12-turn chat on its own ~1K system prompt runs cold and fills the ladder; then a brand-new session with the same system prompt asks one question. `main`: **cached 0/1027**. #132: **cached 1003/1027** (`anchor_cuts=2`). The #126 cases still pass on both.
+
+## 133. `patch: thinking-processor-fed` — no per-step GPU read while thinking
+
+**Files:** `vllm_mlx/constrained/thinking_processor.py` (`note_generated`, `_lagged_call`, `_near_limit`, `_end_would_complete`), `vllm_mlx/scheduler.py` (feeds each generated token; `VLLM_MLX_THINKING_FED=0` turns it off), `tests/test_fork_invariants.py` (+17).
+
+**Cost left after #129** (fork issue #54): on every decode step the processor read `tokens.tolist()`, which made the CPU wait for the previous step's sample before it could queue the next step. That broke mlx-lm's CPU/GPU overlap, at a cost of −3 % decode on the 27B even at short context. Reading the previous step's array instead does not help, because mlx-lm evaluates it in the same batch as that sample.
+
+**Fix:** the scheduler already holds each generated token as a host int (from the step's responses). It now feeds them to the processor (`note_generated`) one step late, and the processor answers from that state without reading `tokens`. This is exact by construction. In IDLE/THINKING the processor passes logits through anyway, so a one-token lag changes nothing, except when the still-unknown newest token closes the reasoning. In that case CONTENT masking must already apply, and it is decided on the GPU (`mx.where` on the newest token, no sync). The synchronous path is still used near the budget or watchdog limit (≤ 2 tokens), in TRANSITIONING, with an inner (structured-output) processor, or when the sequence length is not the expected +1 (e.g. several decode steps between feeds, #135). The MLLM path does not feed, so it is unchanged.
+
+**Verification:**
+- `test_133_fed_processor_is_identical_to_the_synchronous_one[16 seeds × budgets 0/3/8/60]` simulates mlx-lm's step order (lazy newest token, feed after the step), with sampling that respects masks and the forced end sequence. Returned logits and states must match the synchronous processor at every step.
+- `test_133_a_long_think_reads_the_gpu_only_near_the_budget`: ≤ 2 synchronous reads in 200 thinking steps.
+- Mutation-checked: dropping the GPU-side close check fails 5 cases (after fixing a test bug where both processors were given the same logits object and the in-place mask hid the difference); not feeding fails 1. Suite 4529.
+- **Real server** (exact live Qwen3.8-27B-4bit route, spare port, thinking, 1,500 tokens, T=0, two rounds; reasoning SHA identical in every arm):
+
+  | Prompt | Old code (budget on) | #133 (budget on) | #133, `VLLM_MLX_THINKING_FED=0` | No budget |
+  |---|---|---|---|---|
+  | short | 29.33–29.35 | **30.17–30.20** | 29.39 | 30.18 |
+  | 18.4K | 25.33–25.35 | **25.71–25.72** | — | ~25.7 |
+
+  The budget now costs nothing measurable.
+
+## 134. `patch: skip-zero-scan` — no full-weights scan on every strict=False load
+
+**Files:** `vllm_mlx/utils/tokenizer.py`.
+
+`_load_strict_false` (every checkpoint with a vision config, e.g. Qwen3.8-27B) ran `mx.all(v == 0).item()` over every weight tensor, one GPU sync each, only to log an all-zero count. It cost **0.76 s on every 27B load** (1,847 tensors, measured on the Studio). It now runs only with DEBUG logging. Part of fork issue #53, together with `HF_HUB_OFFLINE=1` on the routes (infra). Spawn breakdown on the Studio (27B): imports ~2.8 s (0.56 s of it is torch, imported unconditionally by transformers 5.17 `generation/logits_process.py`, not avoidable from the fork); Hub round-trip ~0.25 s; load + zero-scan 3.1–4.0 s; engine init ~1.4 s.
+
+## 135. `patch: decode-interleave` — decoding rows keep moving while another row prefills
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`interleave_decode_steps`, `interleaved_decode_steps` stat), `vllm_mlx/scheduler.py` (one hook in `step()`), `tests/test_fork_invariants.py` (+4).
+
+**Gap** (fork issue #45): mlx-lm's `BatchGenerator._next` runs one decode step, then one `prefill_step_size` (2048) chunk per prefilling row. A chunk takes ~10 s on the 27B, so every decoding row got one token per ~10 s for the whole of another request's deep prefill.
+
+**Fix:** with `VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL=K` (default 1 = off), `step()` runs K−1 extra decode-only steps (`GenerationBatch.next()`) while a prompt is mid-prefill and rows are decoding. Each extra step goes through the normal `_process_batch_responses` and `_cleanup_finished`, so stop strings, repetition stops and finishes apply per token exactly as before. The prefill pays (K−1) decode steps per chunk.
+
+**Verification:** 4 invariant tests (off by default; only while a prefill is in flight; each extra step processed and cleaned up separately; stops when the batch empties; `step()` runs the hook). Mutation-checked. Real-server measurement pending.
