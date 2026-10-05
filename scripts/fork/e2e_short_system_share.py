@@ -71,7 +71,7 @@ def main() -> int:
             sys.executable, "-m", "vllm_mlx.cli", "serve", MODEL,
             "--host", "127.0.0.1", "--port", str(PORT),
             "--continuous-batching", "--max-num-seqs", "4",
-            *os.environ.get("E2E_SERVE_ARGS", "").split(),
+            *os.environ.get("E2E_SERVE_ARGS", "--text-only").split(),
         ],
         stdout=log, stderr=subprocess.STDOUT, env=env,
     )  # fmt: skip
@@ -91,8 +91,28 @@ def main() -> int:
                     break
             except Exception:
                 time.sleep(1)
-        with httpx.Client(timeout=300) as client:
+        with httpx.Client(timeout=900) as client:
             rows = [_ask(client, user) for user in USERS]
+            # (#132) a deep chain on the same system prompt fills and thins
+            # the checkpoint ladder; the end-of-system checkpoint must stay.
+            history = [{"role": "system", "content": SYSTEM}]
+            for t in range(12):
+                history.append({"role": "user", "content": f"Step {t}: " + "lorem ipsum " * 900})
+                history.append({"role": "assistant", "content": f"Done step {t}."})
+            history.append({"role": "user", "content": "Summarise all steps."})
+            r = client.post(
+                f"{BASE}/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": history,
+                    "max_tokens": 8,
+                    "temperature": 0.0,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+            r.raise_for_status()
+            deep_prompt = r.json()["usage"]["prompt_tokens"]
+            after_deep = _ask(client, "A brand-new session: what is 2+2?")
             status = client.get(f"{BASE}/v1/status").json()
     finally:
         proc.terminate()
@@ -116,7 +136,15 @@ def main() -> int:
             cached >= 0.6 * prompt and cached < prompt,
             f"cached={cached}/{prompt}",
         )
+    prompt, cached = after_deep
+    check(
+        "after a deep chain thinned the ladder, a new session still reuses "
+        "the system prompt (#132)",
+        cached >= 0.6 * prompt and cached < prompt,
+        f"deep chain {deep_prompt} tokens; new session cached={cached}/{prompt}",
+    )
     cache = status.get("cache", {})
+    print(f"anchor_cuts={cache.get('anchor_cuts')}")
     print(f"cache: hits={cache.get('hits')} misses={cache.get('misses')}")
     bad = [ln for ln in open(log_path).read().splitlines() if "Traceback" in ln]
     check("server log has no traceback", not bad, "; ".join(bad[:2]))
