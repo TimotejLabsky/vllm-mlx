@@ -205,8 +205,13 @@ jobs:
           pip install -e ".[dev,vision,harmony]"
 
       # Fork: test against the production pins, not the newest PyPI releases.
+      # --force-reinstall: the mlx-lm git pin reports the same version as the
+      # PyPI release, so a plain install keeps PyPI's (different cache API).
       - name: Install production pins (fork)
-        run: pip install -r scripts/fork/prod-pins.txt
+        run: |
+          pip install --force-reinstall --no-deps -r scripts/fork/prod-pins.txt
+          pip freeze | grep -E "^(mlx|mlx-lm|mlx-metal|mlx-vlm|transformers)( |=)"
+          pip freeze | grep -q "^mlx-lm @ git+" || { echo "mlx-lm git pin not installed"; exit 1; }
 
       - name: Verify Apple Silicon
         run: |
