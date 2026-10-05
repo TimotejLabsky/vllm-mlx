@@ -3893,6 +3893,8 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 `_load_strict_false` (every checkpoint with a vision config, e.g. Qwen3.8-27B) ran `mx.all(v == 0).item()` over every weight tensor, one GPU sync each, only to log an all-zero count. It cost **0.76 s on every 27B load** (1,847 tensors, measured on the Studio). It now runs only with DEBUG logging. Part of fork issue #53, together with `HF_HUB_OFFLINE=1` on the routes (infra). Spawn breakdown on the Studio (27B): imports ~2.8 s (0.56 s of it is torch, imported unconditionally by transformers 5.17 `generation/logits_process.py`, not avoidable from the fork); Hub round-trip ~0.25 s; load + zero-scan 3.1–4.0 s; engine init ~1.4 s.
 
+**Measured** (27B-4bit, exact live route, n=3): ready time 7.1 s → **4.3 s** with `HF_HUB_OFFLINE=1` (online 8.2 → 5.5 s); load → scan-done 2.5–3.3 s → 0.7–1.0 s — the scan cost more than its isolated 0.76 s because it also forced the weight reads up front, and the first request after ready is unchanged (1.19–1.25 s both), so nothing was moved later.
+
 ## 135. `patch: decode-interleave` — decoding rows keep moving while another row prefills
 
 **Files:** `vllm_mlx/batched_system_kv.py` (`interleave_decode_steps`, `interleaved_decode_steps` stat), `vllm_mlx/scheduler.py` (one hook in `step()`), `tests/test_fork_invariants.py` (+4).
@@ -3901,4 +3903,4 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 **Fix:** with `VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL=K` (default 1 = off), `step()` runs K−1 extra decode-only steps (`GenerationBatch.next()`) while a prompt is mid-prefill and rows are decoding. Each extra step goes through the normal `_process_batch_responses` and `_cleanup_finished`, so stop strings, repetition stops and finishes apply per token exactly as before. The prefill pays (K−1) decode steps per chunk.
 
-**Verification:** 4 invariant tests (off by default; only while a prefill is in flight; each extra step processed and cleaned up separately; stops when the batch empties; `step()` runs the hook). Mutation-checked. Real-server measurement pending.
+**Verification:** 4 invariant tests (off by default; only while a prefill is in flight; each extra step processed and cleaned up separately; stops when the batch empties; `step()` runs the hook). Mutation-checked. Review fixes (pre-merge): a cache-corruption retry after an extra step merges into the step's output instead of replacing it (a finished request's end was dropped); a pending abort stops the extra steps; #133's feed count is re-anchored on the sync path so a rescheduled request regains the lagged path — 3 tests, each failing without its fix. Real-server measurement pending.
