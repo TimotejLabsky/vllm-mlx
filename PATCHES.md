@@ -3730,6 +3730,8 @@ Folded in (fork issue #57): `BatchedSystemKV`'s thread-contract docstring and th
 
 **Verification:** `test_125_lazy_ram_miss_ssd_hit_builds_nothing_until_admission` (enqueue builds nothing, the pre-admission promote hook leaves it alone, admission restores at the priced position via one SSD promote) and `test_125_eager_route_keeps_the_ssd_pending_promote`; both red with the fix reverted (mutation-checked).
 
+**Real server** (`scripts/fork/e2e_lazy_restore.py`, `Qwen3.5-4B-4bit` hybrid on the Studio, one-slot SSD phase where every second turn is a RAM miss served from disk): same traffic, `main` took both RAM-miss SSD hits through the early-materialise promote (`lazy_ssd_fallbacks=0`); with #125 both were deferred to admission (`lazy_ssd_deferred=2`, `lazy_ssd_fallbacks=2`), lazy == eager byte-for-byte, no pin left at idle, no traceback. The e2e now gates on `lazy_ssd_deferred > 0`.
+
 ## 126. `patch: keep-system-boundary` — a short shared system prompt gets its checkpoint
 
 **Files:** `vllm_mlx/batched_system_kv.py` (`find_message_boundaries` `first_min`, `insert_segmented`), `tests/test_fork_invariants.py` (+2).
@@ -3741,3 +3743,5 @@ Folded in (fork issue #57): `BatchedSystemKV`'s thread-contract docstring and th
 **Upstream:** fork-owned.
 
 **Verification:** `test_126_short_system_prompt_is_checkpointed_and_shared` (cold ~1K system prompt → a segment ends at the system boundary, and a second conversation restores exactly there; without the fix the segment ends are `[1603, 1608]` and nothing is shared) and `test_126_restored_prompt_keeps_the_min_step_rule`; both red with the fix reverted (mutation-checked).
+
+**Real server A/B** (`scripts/fork/e2e_short_system_share.py`, `Qwen3.5-4B-4bit` hybrid on the Studio, 1034-token prompt with a shared system message): `main` → conversations 2 and 3 `cached_tokens 0/1030` (hits 0, misses 3); #126 → `1003/1030` each (hits 2, misses 1). **Correctness of the new restore point:** boundary-restored vs fully cold answers at T=0 (`max_tokens` 96, 5 prompts) — 2 identical, 3 diverge late (char 62–224) between coherent synonyms ("gatekeeper"/"lock"): the argmax-tie drift a different prefill chunking already produces on this 4-bit 4B (`warm == cold` has always been informational in the lazy e2e), never garbage from the first token. Side effect on `e2e_lazy_restore.py`: its first concurrent burst now restores at the system checkpoint instead of prefilling cold, so "burst repeat == first burst" became informational like warm == cold; the gate stays lazy == eager on both bursts (7/7).
