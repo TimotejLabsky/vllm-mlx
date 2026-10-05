@@ -3864,3 +3864,4 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 **Upstream:** fork-owned.
 
 **Verification:** `test_132_short_system_prompt_survives_a_deep_chain_thinning` (12-turn deep chain thinned to 8: anchor at 600 kept, a new session peeks 600, bookkeeping released), `test_132_the_anchor_survives_an_ssd_round_trip`, `test_132_thinning_never_evicts_the_anchor`. Mutation-checked: dropping the thinning pin fails 3; dropping the SSD flags fails 1; restoring the store-path leak fails 1. Suite 4512 passed. Supersedes fork PR #37.
+- **Real server A/B** (`scripts/fork/e2e_short_system_share.py`, `Qwen3.5-4B-4bit` on the Studio, now `--text-only` by default): a 22,853-token, 12-turn chat on its own ~1K system prompt runs cold and fills the ladder; then a brand-new session with the same system prompt asks one question. `main`: **cached 0/1027**. #132: **cached 1003/1027** (`anchor_cuts=2`). The #126 cases still pass on both.
