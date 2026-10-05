@@ -1,7 +1,7 @@
 # Production package pins on the Mac Studio (/Users/ai/vllm-mlx-env).
 # CI's Apple-silicon job installs these over the package's loose ranges, so
 # the MLX-dependent tests run against what the fleet runs (latest PyPI mlx-lm
-# lacks APIs our git pin has: 10-04..10-05 CI was red on that alone).
+# has a different cache API than our git pin: 10-04..10-05 CI was red on that).
 # Update this file in the same PR as every dependency bump.
 mlx==0.32.2
 mlx-metal==0.32.2
