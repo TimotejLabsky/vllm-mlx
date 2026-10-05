@@ -38,13 +38,13 @@ USERS = [
 ]
 
 
-def _ask(client, user):
+def _ask(client, user, system=SYSTEM):
     r = client.post(
         f"{BASE}/v1/chat/completions",
         json={
             "model": MODEL,
             "messages": [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             "max_tokens": 24,
@@ -95,7 +95,10 @@ def main() -> int:
             rows = [_ask(client, user) for user in USERS]
             # (#132) a deep chain on the same system prompt fills and thins
             # the checkpoint ladder; the end-of-system checkpoint must stay.
-            history = [{"role": "system", "content": SYSTEM}]
+            # its OWN system prompt (differs at token 0), so the deep chain is
+            # the only entry that holds it and runs cold (places the anchor)
+            system_b = "You are a careful release planner. " + SYSTEM[36:]
+            history = [{"role": "system", "content": system_b}]
             for t in range(12):
                 history.append({"role": "user", "content": f"Step {t}: " + "lorem ipsum " * 900})
                 history.append({"role": "assistant", "content": f"Done step {t}."})
@@ -112,7 +115,9 @@ def main() -> int:
             )
             r.raise_for_status()
             deep_prompt = r.json()["usage"]["prompt_tokens"]
-            after_deep = _ask(client, "A brand-new session: what is 2+2?")
+            after_deep = _ask(
+                client, "A brand-new session: what is 2+2?", system=system_b
+            )
             status = client.get(f"{BASE}/v1/status").json()
     finally:
         proc.terminate()
