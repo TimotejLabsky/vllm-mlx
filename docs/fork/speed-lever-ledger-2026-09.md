@@ -163,6 +163,57 @@ clean process (PATCHES.md #103+):
   re-serialises the same ladder; a short entry is 3/4 fp32 GDN state), not a
   smarter RAM policy.
 
+### 2026-10-05 — speedup-research probes (fork issues #40, #41, #55)
+
+All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
+8791 with the production `Qwen3.6-35B-A3B-4bit` route's exact flags + env
+(MoE fusion on, SSD dir redirected), the resident HA group untouched.
+
+- **#40 wired-memory decay — REAL, kill gate passed.** mlx #4609's repro:
+  wired drops 18.1 → 1.3 GiB within 2–5 s of GPU idle; the next 16 GiB
+  compute takes 486–504 ms vs 23 ms warm (4 GiB: ~150 vs 6 ms, ~30–37
+  ms/GiB). On the real route, the same cached one-token request: 136 ms
+  back-to-back, 179 ms after 1 s idle, **441 ms after 3 s, ~575 ms after
+  10–30 s**; a fresh ~2K-token prompt 2.67 → 3.15 s after 10 s idle. ≈ +0.45 s
+  on every agent turn that follows a tool pause or user read, on a 19 GB
+  model. **Unlike the laptop repro, a 1 s tiny-op heartbeat DOES keep it
+  wired on the Studio** (lowest 17.8 GiB; first compute after 12 s idle 44
+  ms vs 486); re-calling `set_wired_limit` does not. Fixes: (a)
+  `sudo sysctl iogpu.disable_wired_collector=1` in the
+  `com.local.gpu-wired-limit` LaunchDaemon (infra, needs sudo — untested), or
+  (b) a fork idle heartbeat on the generation worker in the engine loop's
+  idle branch, for N minutes after the last request (llama.cpp #17766 uses
+  180 s). Not built.
+- **#41 Metal command-buffer limits — BIG decode win, small prefill cost.**
+  A/B/A/B + variants, T=0 SHA identical in every arm, prefill = 34,658-token
+  cold prompt:
+
+  | arm (`MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER`) | single tok/s | 4-stream agg | prefill tok/s | peak GB |
+  |---|---|---|---|---|
+  | default (×3) | 74.9–75.1 | 175.3–177.1 | 1166–1173 | 25.13–25.39 |
+  | 1000 / default | 74.5 | 177.0 | 1175 | 25.39 |
+  | default / 400 | 78.7 (+5 %) | 186.9 | 1108 | 25.39 |
+  | **1000 / 200** | **87.9 (+17 %)** | **196.0 (+12 %)** | 1118 (−4.6 %) | 24.87 |
+  | 1000 / 400 (×2) | 90.7–91.0 (+21 %) | 195.7–195.9 (+11 %) | 1092–1097 (−6.6 %) | 25.41 |
+
+  The two knobs only pay together (ops alone null, MB alone +5 %). Peak
+  memory moves within run-to-run noise (±0.26 GB) at 34.6K; the
+  "+88 GB at 30K" report was a far larger MB limit. Upstream's dense-null
+  result not re-checked here. Env-only, per route: the call is decode
+  +17–21 % against prefill −5–7 % on MoE routes.
+- **#55 499000 crash — the non-KV-states variant of mlx-lm #1911 FIXES it at
+  zero decode cost** (pure mlx-lm `BatchGenerator`, 512-token prompt, the
+  per-step `mx.async_eval` of every non-`BatchKVCache`/`BatchRotatingKVCache`
+  `.state` issued right after `BatchGenerator.next()` returns, i.e. where the
+  fork's scheduler would hook it): `Qwen3.8-27B-4bit` base **crashes at
+  10,561** (the documented wall), fixed runs **14,000 clean**, decode
+  30.13 vs 30.10 → 26.42 tok/s at matched windows (+0.1–1.1 %);
+  `Qwen3.5-4B-4bit` base crashes at 21,638, fixed runs 40,000 clean, same
+  speed at every window. (Our 08-30 "periodic eval of all cache state" probe
+  missed because it was periodic, not per step, and included the KV caches,
+  whose per-step eval is what costs the PR version 15–25 %.) Supersedes the
+  unarmed #84 clamp; not built yet.
+
 ## Watch list / open items
 
 - **GDN blocked_seq prefill kernel (from oMLX): REFUTED at the kill gate
