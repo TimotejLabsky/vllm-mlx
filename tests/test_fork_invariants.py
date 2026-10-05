@@ -1995,6 +1995,83 @@ def test_126_restored_prompt_keeps_the_min_step_rule():
     assert find_message_boundaries(toks, [_MARK], 120, first_min=0) == (100, 456)
 
 
+# ------------- #127 recurrent cache states are evaluated every decode step
+
+
+def test_127_only_recurrent_states_are_selected():
+    """mlx-lm #1911's fix evaluates EVERY cache state per step and costs
+    15-25 % decode (forcing the batch KV defeats its in-place update). Only the
+    recurrent states leak - so only they may be selected, CacheList included."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import (
+        ArraysCache,
+        BatchKVCache,
+        BatchRotatingKVCache,
+        CacheList,
+        KVCache,
+    )
+
+    from vllm_mlx import recurrent_state_eval as rse
+
+    gdn = ArraysCache(size=2)
+    gdn[0] = mx.zeros((1, 3, 4))
+    gdn[1] = mx.ones((1, 2, 2))
+    nested = ArraysCache(size=1)
+    nested[0] = mx.full((1, 2), 7.0)
+    caches = [
+        gdn,
+        BatchKVCache([0]),
+        BatchRotatingKVCache(max_size=8, left_padding=[0]),
+        CacheList(nested, KVCache()),
+    ]
+
+    states = rse.recurrent_states(caches)
+
+    assert len(states) == 2
+    assert states[0][0] is gdn.state[0] and states[1][0] is nested.state[0]
+
+
+def test_127_hook_reaches_the_pinned_generation_batch(monkeypatch):
+    """The hook reads mlx-lm private attributes; a pin bump that renames them
+    must fail here, not silently bring the 10.5K-token crash back."""
+    import inspect
+
+    from mlx_lm.generate import BatchGenerator, GenerationBatch
+
+    assert "self._generation_batch" in inspect.getsource(BatchGenerator.__init__)
+    assert "self.prompt_cache" in inspect.getsource(GenerationBatch)
+
+    from vllm_mlx import recurrent_state_eval as rse
+
+    seen = []
+    monkeypatch.setattr(rse.mx, "async_eval", lambda *a: seen.append(a))
+    rse.eval_recurrent_cache_states(SimpleNamespace(_generation_batch=None))
+    rse.eval_recurrent_cache_states(
+        SimpleNamespace(_generation_batch=SimpleNamespace(prompt_cache=[]))
+    )
+    assert seen == []  # nothing to evaluate -> no call
+
+
+def test_127_step_evaluates_after_every_next(monkeypatch):
+    from vllm_mlx import recurrent_state_eval as rse
+
+    calls = []
+    monkeypatch.setattr(rse, "eval_recurrent_cache_states", calls.append)
+    scheduler = _make_scheduler(monkeypatch)
+    _running_request(scheduler, "decode", 41, 3000)
+    generator = MagicMock()
+    generator.next.return_value = ([], [])
+    generator.prompt_cache_nbytes = 0
+    scheduler.batch_generator = generator
+
+    scheduler.step()
+    assert calls == [generator]
+
+    monkeypatch.setenv("VLLM_MLX_EVAL_RECURRENT_STATES", "0")
+    scheduler.step()
+    assert calls == [generator]  # the kill switch works
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
