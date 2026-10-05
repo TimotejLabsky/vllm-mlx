@@ -29,6 +29,7 @@ from .batch_compat import (
     _sanitize_batch_generator_logits_processors,
 )
 from . import batched_system_kv as _batched_kv
+from . import recurrent_state_eval as _recurrent_eval
 from .memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
@@ -3586,6 +3587,11 @@ class Scheduler:
                     _sanitize_batch_generator_logits_processors(self.batch_generator)
                     result = self.batch_generator.next()
                     output.has_work = True
+                    # Fork patch #127: the 499000 Metal resource-limit crash.
+                    if _recurrent_eval.enabled():
+                        _recurrent_eval.eval_recurrent_cache_states(
+                            self.batch_generator
+                        )
 
                     # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
                     # older versions returned a flat list.
