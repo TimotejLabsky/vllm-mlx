@@ -274,11 +274,16 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
 
     params = tree_flatten(model.parameters())
     total_params = len(params)
-    zero_params = sum(1 for _, v in params if mx.all(v == 0).item())
-    logger.info(
-        f"[strict=False] Loaded {total_params} parameters, "
-        f"{zero_params} all-zero tensors"
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        # (#134) One GPU sync per tensor, only for this log line: 0.76 s on
+        # every Qwen3.8-27B-4bit load (1,847 tensors). Debug only.
+        zero_params = sum(1 for _, v in params if mx.all(v == 0).item())
+        logger.debug(
+            f"[strict=False] Loaded {total_params} parameters, "
+            f"{zero_params} all-zero tensors"
+        )
+    else:
+        logger.info(f"[strict=False] Loaded {total_params} parameters")
     # Spot-check embedding weights
     if hasattr(model, "language_model"):
         emb = model.language_model.model.embed_tokens.weight
