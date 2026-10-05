@@ -183,7 +183,9 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
   `com.local.gpu-wired-limit` LaunchDaemon (infra, needs sudo — untested), or
   (b) a fork idle heartbeat on the generation worker in the engine loop's
   idle branch, for N minutes after the last request (llama.cpp #17766 uses
-  180 s). Not built.
+  180 s). Not built. **(a) APPLIED 2026-10-05** (runtime sysctl by Tim;
+  persisted in the infra LaunchDaemon, PR #692): the 16 GiB probe now holds
+  35.4–35.7 GiB wired through 12 s idle, first compute 29–79 ms (was ~490).
 - **#41 Metal command-buffer limits — BIG decode win, small prefill cost.**
   A/B/A/B + variants, T=0 SHA identical in every arm, prefill = 34,658-token
   cold prompt:
@@ -201,6 +203,13 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
   "+88 GB at 30K" report was a far larger MB limit. Upstream's dense-null
   result not re-checked here. Env-only, per route: the call is decode
   +17–21 % against prefill −5–7 % on MoE routes.
+  **DEPLOYED 2026-10-05 12:18 at 1000 / 200 on 5 MoE routes** (infra PR
+  #692). Post-deploy, each route's exact live cmd + env on a spare port, #41
+  off → on, T=0 byte-identical on every route: GLM-4.7-Flash 62.5 → 75.8
+  (+21 %), Nemotron-Cascade-2-30B-A3B 95.0 → 109.4 (+15 %), gpt-oss-20b
+  107.3 → 114.1 (+6 %), gemma-4-26b-a4b 84.8 → 90.1 (+6 %); 35B-A3B live
+  through llama-swap 77–78 → 84–85 tok/s. Not armed on the 45 GB class
+  (Coder-Next, Next-80B) until a deep-prefill peak check.
 - **#55 499000 crash — the non-KV-states variant of mlx-lm #1911 FIXES it at
   zero decode cost** (pure mlx-lm `BatchGenerator`, 512-token prompt, the
   per-step `mx.async_eval` of every non-`BatchKVCache`/`BatchRotatingKVCache`
@@ -212,7 +221,7 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
   speed at every window. (Our 08-30 "periodic eval of all cache state" probe
   missed because it was periodic, not per step, and included the KV caches,
   whose per-step eval is what costs the PR version 15–25 %.) Supersedes the
-  unarmed #84 clamp; not built yet.
+  unarmed #84 clamp. **Built as #127, DEPLOYED 2026-10-05** (`f41b6c4`).
 
 ## Watch list / open items
 

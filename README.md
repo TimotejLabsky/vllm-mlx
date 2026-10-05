@@ -110,6 +110,19 @@ admission.
 
 ## Recent changes
 
+> **2026-10-05 — long generations stop crashing; MoE decode +6–21 %**
+> (PATCHES.md #125–#127): hybrid models no longer die with `[metal::malloc]
+> Resource limit (499000)` after ~10.5K generated tokens — only the recurrent
+> cache states are evaluated each step, so it costs no decode speed (a 12K
+> completion on the 27B now finishes instead of returning 503). A short shared
+> system prompt (under 2,048 tokens) is now reused across conversations on
+> hybrid models, and a queued request's SSD hit no longer builds its restore
+> while it waits. Config-only, from the same round: Metal command-buffer
+> limits on the MoE routes (`MLX_MAX_OPS_PER_BUFFER=1000`,
+> `MLX_MAX_MB_PER_BUFFER=200`: +6–21 % decode, T=0 byte-identical) and
+> `iogpu.disable_wired_collector=1` (idle GPU memory stays wired: ~0.45 s off
+> every turn after a pause). Numbers: `docs/fork/speed-lever-ledger-2026-09.md`.
+>
 > **2026-09-21 — deep concurrent agent chains, stress-tested on the live 27B**
 > (PATCHES.md #106–#108): admission now projects the real memory peak before
 > co-batching (and makes what doesn't fit *wait*, never rejects); a queued
