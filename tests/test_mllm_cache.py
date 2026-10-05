@@ -144,7 +144,7 @@ class TestImageHashing:
             path2 = f2.name
 
         try:
-            # Order changes the visual input and therefore the KV state.
+            # Order is part of the model input (fork #136).
             hash_a = compute_images_hash([path1, path2])
             hash_b = compute_images_hash([path2, path1])
             assert hash_a != hash_b
@@ -421,7 +421,7 @@ class TestMLLMCacheManager:
             cache, hit = cache_manager.fetch_cache(images, prompt)
             assert hit is True
 
-            # Reversed media order must not reuse the previous KV state.
+            # Reversed image order must not reuse the entry (fork #136).
             cache, hit = cache_manager.fetch_cache([img2, img1], prompt)
             assert cache is None
             assert hit is False

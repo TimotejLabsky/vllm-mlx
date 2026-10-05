@@ -163,8 +163,8 @@ def compute_images_hash(images: list[str]) -> str:
     """
     Compute an order-sensitive combined hash for multiple images.
 
-    Image order is part of the model input. Reordering the same images changes
-    the visual embeddings and must not reuse the previous request's KV state.
+    Image order is part of the model input: the same images in a different
+    order must not reuse each other's cache entries (PATCHES.md #136).
 
     Args:
         images: List of image paths/URLs
