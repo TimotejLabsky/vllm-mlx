@@ -366,6 +366,11 @@ def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
     return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
 
 
+def _has_non_trimmable_layer(cache: list[Any]) -> bool:
+    """(#138) True when any layer cannot be rewound (hybrid/recurrent)."""
+    return any(not _is_cache_layer_trimmable(lc) for lc in cache)
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     """Create copies of cache layers with the last ``trim_by`` positions removed.
 
@@ -1438,6 +1443,23 @@ class MemoryAwarePrefixCache:
                     self._entries.move_to_end(tokens_key)
                     return True
 
+                # (#138, upstream #770) Hybrid caches are exempt from the
+                # proactive prefix eviction below.  It assumes the longer
+                # entry subsumes the shorter one, which holds only when the
+                # cache can be trimmed back.  Recurrent layers cannot be
+                # rewound — fetch() refuses LCP and supersequence reuse for
+                # them — so a strict-prefix entry is the only one a request
+                # that branches after it can ever hit.  LRU eviction under
+                # the memory limit is unaffected.  Guarding here (not at the
+                # call sites) covers every publish path, store() included.
+                if evict_prefixes and _has_non_trimmable_layer(entry.cache):
+                    evict_prefixes = False
+                    logger.debug(
+                        "[prefix_evict] skipped for new_entry=%s tokens: "
+                        "non-trimmable cache layers (hybrid model), prefix "
+                        "entries stay reusable",
+                        len(tokens_key),
+                    )
                 if evict_prefixes and self._sorted_keys:
                     to_remove = []
                     idx = bisect.bisect_left(self._sorted_keys, tokens_key)
@@ -1527,8 +1549,52 @@ class MemoryAwarePrefixCache:
         if idx < len(self._sorted_keys) and self._sorted_keys[idx] == key:
             self._sorted_keys.pop(idx)
 
+    def _find_superseded_lru(self) -> tuple[int, ...] | None:
+        """(#138, upstream #766) Oldest entry another resident entry subsumes.
+
+        Multi-turn conversations store one entry per turn, each a strict
+        prefix of the next.  Plain LRU then sacrifices an older
+        conversation's NEWEST turn (the one it is about to reuse) before a
+        newer conversation's already-superseded turns.
+
+        An entry ``K`` with a resident strict extension ``E`` counts as
+        superseded when:
+
+        - ``E`` is rewindable (all layers trimmable): fetch() trims ``E``
+          back for anything ``K`` served (supersequence/LCP), so ``K`` is
+          redundant; or
+        - ``E`` is non-trimmable (hybrid) AND was used more recently than
+          ``K``.  fetch() refuses to rewind ``E``, so ``K`` is the only
+          entry a branch below ``E`` can hit.  A ``K`` refreshed after
+          ``E`` is serving such branches (a shared system prefix) and is
+          NOT preferred — the fork's answer to the upstream review of #766;
+          a ``K`` untouched since ``E`` is a dead conversation turn.
+
+        Extensions of a key sort contiguously right after it in
+        ``_sorted_keys``.  Returns None when nothing qualifies (plain LRU).
+        """
+        if len(self._entries) < 2:
+            return None
+        recency = {key: i for i, key in enumerate(self._entries)}
+        n_sorted = len(self._sorted_keys)
+        for key in self._entries:  # OrderedDict iterates oldest-first (LRU)
+            klen = len(key)
+            idx = bisect.bisect_right(self._sorted_keys, key)
+            while idx < n_sorted:
+                ext = self._sorted_keys[idx]
+                if len(ext) <= klen or ext[:klen] != key:
+                    break
+                ext_entry = self._entries.get(ext)
+                if ext_entry is not None and (
+                    not _has_non_trimmable_layer(ext_entry.cache)
+                    or recency[ext] > recency[key]
+                ):
+                    return key
+                idx += 1
+        return None
+
     def _evict_lru(self) -> None:
-        """Evict the least recently used entry.
+        """Evict one entry, preferring a superseded prefix over the LRU one.
 
         If an SSD tier is attached, the entry is spilled to disk instead
         of being discarded.
@@ -1537,8 +1603,17 @@ class MemoryAwarePrefixCache:
             if not self._entries:
                 return
 
-            # popitem(last=False) removes oldest entry (FIFO order = LRU)
-            tokens_key, entry = self._entries.popitem(last=False)
+            # (#138) Prefer an entry another resident entry subsumes, else
+            # popitem(last=False) (oldest = LRU).  Only picks the victim once
+            # eviction is already required — never deletes proactively.
+            superseded = self._find_superseded_lru()
+            if superseded is not None:
+                tokens_key = superseded
+                entry = self._entries.pop(tokens_key)
+                evict_reason = "superseded"
+            else:
+                tokens_key, entry = self._entries.popitem(last=False)
+                evict_reason = "lru"
             self._current_memory -= entry.memory_bytes
             self._remove_from_sorted(tokens_key)
             self._stats.evictions += 1
@@ -1550,7 +1625,7 @@ class MemoryAwarePrefixCache:
             self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
 
         logger.debug(
-            f"[lru_evict] removed {len(tokens_key)} tokens, "
+            f"[lru_evict:{evict_reason}] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )

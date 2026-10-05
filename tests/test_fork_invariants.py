@@ -2590,3 +2590,33 @@ def test_118_harmony_final_channel_survives_stripped_eos(parser_name, tail):
     reasoning, content = get_parser(parser_name)().extract_reasoning(text)
     assert reasoning == "Think."
     assert content == "42"
+
+
+def test_138_commit_prepared_exempts_hybrid_prefixes():
+    """#138 (upstream #770): the hybrid exemption lives in commit_prepared,
+    so the MLLM publish path keeps strict prefixes even with the DEFAULT
+    evict_prefixes=True. Upstream's version guards a store() that predates
+    the prepare/commit split; a rebase taking it verbatim drops this."""
+    from tests.test_fork_138_mllm_prefix_eviction import _cache, _hybrid
+
+    cache = _cache()
+    assert cache.commit_prepared(cache.prepare_store([1, 2, 3], _hybrid()))
+    assert cache.commit_prepared(cache.prepare_store([1, 2, 3, 4], _hybrid()))
+    assert [1, 2, 3] in cache
+
+
+def test_138_refreshed_hybrid_prefix_is_not_a_superseded_victim():
+    """#138: upstream #766 as proposed evicts ANY strictly-extended prefix
+    first; for a hybrid cache the extension cannot be rewound, so a prefix
+    used after its extension (a shared system prefix) must fall back to
+    plain LRU. A rebase onto a merged #766 must keep the recency guard."""
+    from tests.test_fork_138_mllm_prefix_eviction import _cache, _hybrid
+
+    cache = _cache(max_entries=3)
+    assert cache.store([9, 9], _hybrid())
+    assert cache.store([1, 2, 3], _hybrid())
+    assert cache.store([1, 2, 3, 4], _hybrid())
+    assert cache.store([1, 2, 3], _hybrid())  # refresh S after S+A
+    cache._evict_lru()
+    assert [1, 2, 3] in cache
+    assert [9, 9] not in cache
