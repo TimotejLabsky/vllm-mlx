@@ -1524,14 +1524,19 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
-        # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(
-            messages,
-            tools,
-            chat_template_kwargs=chat_template_kwargs,
-        )
-        if prefix_boundary > 0:
-            kwargs["prefix_boundary"] = prefix_boundary
+        # Compute prefix boundary for cache. Fork #130: only the legacy
+        # chunked-prefill path (--chunked-prefill-tokens > 0) ever reads it;
+        # computing it renders and encodes the template twice more on the
+        # event loop (~0.3 s at 100K tokens) for every request otherwise.
+        chunked = getattr(self._scheduler_config, "chunked_prefill_tokens", 0) or 0
+        if not self._is_mllm and chunked > 0:
+            prefix_boundary = self._compute_prefix_boundary(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+            if prefix_boundary > 0:
+                kwargs["prefix_boundary"] = prefix_boundary
 
         async for output in self.stream_generate(
             prompt=prompt,

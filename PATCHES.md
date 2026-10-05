@@ -3806,3 +3806,18 @@ Host cost per step is now flat: ~0.04 ms thinking / ~0.01 ms answer at any lengt
   | 18.4K tokens | 24.96–25.0 | **25.37–25.39 (+1.5 %)** | 25.7 |
 
   At 18K #129 recovers about half of the budget's cost, and its share grows with depth (the removed host work is O(sequence)). The remaining ~0.3–1 tok/s is the per-step GPU sync while THINKING, which reads each new token to see `</think>`. Removing it would need the scheduler to feed token values one step late (budget enforcement shifts by a token), so it is a separate design. The same structural cost applies to every token-reading logits processor (cf. DRY's 3.7 %). In the answer phase #129 removes the sync entirely; this benchmark never reached it (1,500 thinking tokens).
+
+## 130. `patch: request-path-hygiene` — no dead template work per request; C-speed prefix matching
+
+**Files:** `vllm_mlx/engine/batched.py` (`stream_chat` guard), `vllm_mlx/system_kv.py` (`common_prefix_len`), `vllm_mlx/system_kv_ssd.py` (`_SystemKVIndex.lookup_shared_prefix`, `_blob_common_len`), `tests/test_fork_invariants.py` (+3, one parametrized ×6).
+
+**Found by the 2026-10-05 hot-path audit** (fork issue #52), re-verified on `main` before building:
+1. **`BatchedEngine.stream_chat` computed `prefix_boundary` for every request.** That is two more chat-template renders, two more encodes and a Python LCP, synchronously on the event loop: ~0.28 s at 97K tokens on the laptop, during which every SSE stream stalls and the GPU idles. The value is read only by the legacy chunked-prefill path, which is installed only with `--chunked-prefill-tokens > 0` (set on 0 of the fleet's routes) and an mlx-lm with the old `_process_prompts`/`active_batch` API (not our pin). Multimodal never reads it. **Now computed only when `chunked_prefill_tokens > 0` on a text engine.**
+2. **`common_prefix_len` walked token by token in Python** (3.0 ms per 95K-token match), over every bag entry, up to four times per request, on the generation worker between decode steps. **Now it bisects on C-speed slice comparisons:** 95K tokens 0.6–1.1 ms, 30K 0.18–0.34 ms (was 0.9). Mixed list/tuple/array arguments are normalized first, because `list == tuple` is always False and would have returned 0.
+3. **The SSD index's shared-prefix lookup used `os.path.commonprefix` on the token blobs**, which is a Python loop: 10.8 ms per 95K common tokens per candidate. It also decoded every candidate's token tuple, not just the `limit` returned. The fork's `_SystemKVIndex` (our own subclass; upstream's `ssd_cache.py` is untouched) now overrides it with a numpy compare over the raw int32 blobs and decodes only the returned rows. Same query, same results, same order.
+
+Not done from the issue: passing token ids instead of the prompt string to `add_request`. With (1) gone the template is rendered and encoded once, and moving that encode onto the event loop would make things worse, not better.
+
+**Upstream:** (1) could go upstream; (2)/(3) are fork-owned.
+
+**Verification:** `test_130_common_prefix_len_matches_the_token_walk[0-5]` (every divergence point including the 32-token bisect edges, list/tuple/numpy mixes), `test_130_ssd_shared_lookup_matches_upstream` (fork index vs upstream `SSDIndex`, identical results), `test_130_prefix_boundary_only_for_the_legacy_chunked_path`. Mutation-checked: dropping the type normalization fails 6, breaking the numpy divergence point fails 1, removing the guard fails 1.

@@ -2237,6 +2237,81 @@ def test_129_rollback_inside_content_stays_in_content():
     assert out[30].item() == 30.0  # answer logits untouched, nothing forced
 
 
+# ------------- #130 request-path hygiene: no dead template work, C-speed LCPs
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_130_common_prefix_len_matches_the_token_walk(seed):
+    """The bisecting LCP must equal the plain walk for every divergence
+    point, and stay right across list/tuple/array mixes (list == tuple is
+    always False - a slice compare between them would silently say 0)."""
+    import random
+
+    import numpy as np
+
+    from vllm_mlx.system_kv import common_prefix_len
+
+    def walk(a, b):
+        i = 0
+        while i < min(len(a), len(b)) and a[i] == b[i]:
+            i += 1
+        return i
+
+    rng = random.Random(seed)
+    base = [rng.randrange(150_000) for _ in range(rng.choice([5, 300, 5000]))]
+    points = {0, 1, 31, 32, 33, len(base) // 2, len(base) - 1, len(base)}
+    for div in sorted(d for d in points if 0 <= d <= len(base)):
+        other = base[:div] + [999_999] + base[div + 1 :] if div < len(base) else base[:]
+        other = other[: rng.randint(div, len(other))] if rng.random() < 0.3 else other
+        want = walk(base, other)
+        for a, b in (
+            (base, other),
+            (tuple(base), tuple(other)),
+            (base, tuple(other)),
+            (np.array(base), other),
+        ):
+            assert common_prefix_len(a, b) == want
+
+
+def test_130_ssd_shared_lookup_matches_upstream(tmp_path):
+    """The fork index's numpy divergence point must return exactly what
+    upstream's os.path.commonprefix version returns."""
+    from vllm_mlx.ssd_cache import SSDIndex
+    from vllm_mlx.system_kv_ssd import _SystemKVIndex
+
+    shared = list(range(1000, 1400))
+    chains = {
+        "a": shared + list(range(5000, 5300)),
+        "b": shared[:250] + list(range(6000, 6600)),
+        "c": shared + list(range(7000, 7010)),
+        "full": shared[:200],  # a full prefix of the query: excluded
+    }
+    query = tuple(shared + list(range(9000, 9100)))
+    got = []
+    for cls in (_SystemKVIndex, SSDIndex):
+        d = tmp_path / cls.__name__
+        d.mkdir()
+        idx = cls(str(d))
+        for name, toks in chains.items():
+            idx.insert_entry(tuple(toks), f"{name}.dir", 1024, len(toks))
+        got.append(idx.lookup_shared_prefix(query, limit=2))
+    assert got[0] == got[1]
+    assert [r["common_len"] for r in got[0]] == [400, 400]
+
+
+def test_130_prefix_boundary_only_for_the_legacy_chunked_path():
+    """Fork routes never set --chunked-prefill-tokens, so the boundary
+    (two extra template renders + encodes on the event loop) is dead work."""
+    import inspect
+
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    src = inspect.getsource(BatchedEngine.stream_chat)
+    call = src.index("self._compute_prefix_boundary(")
+    guard = src.rfind("chunked_prefill_tokens", 0, call)
+    assert guard != -1 and call - guard < 400
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
