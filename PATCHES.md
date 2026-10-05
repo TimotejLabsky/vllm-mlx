@@ -3715,3 +3715,17 @@ reached the template as one result for two calls — the Qwen template rendered 
 The unclosed-marker rule applies only to parsers with a start **and** end tag: the first cut also matched harmony's closer-less `<|channel|>` (#118) and cut gpt-oss's commentary block, so non-stream tool calls came back as content `'assistant'` — caught by the live sweep, pinned by `test_124_harmony_tool_call_survives_thinking_off` (mutation-checked).
 
 **Verified:** `test_124_thinking_off_never_surfaces_thoughts` (markerless kept, closed block → answer only, unclosed block → empty) replaces `test_27_…`, plus the harmony guard. Suite 4470 passed.
+
+## 125. `patch: lazy-ssd-miss-defers-promote` — a RAM-miss SSD hit is not materialised while the request waits
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`fetch_for_request` miss branch, `lazy_ssd_deferred` counter + stats key, thread-contract docstring/comments), `tests/test_fork_invariants.py` (+2).
+
+**Found by the 2026-10-05 hot-path audit** (fork issue #56). On a `LAZY_RESTORE` route a RAM **miss** with an SSD hit still took the eager `ssd_pending` path: `promote_ssd_pending` (a pre-admission `_schedule_waiting` hook) loaded the blob **and** built the multi-GB restore for a request that was still in the queue. That is exactly the copy #106 was built to defer (a multi-GB restore held by a WAITING request was one of the three causes of the 2026-09-21 OOMs), and the 09-21 stress runs showed every deep hit under load arriving via SSD promote. #117 had already moved the *SSD-beats-RAM-partial* case onto the lazy path; the total-miss case was left behind.
+
+**Fix:** on a lazy route a RAM-miss SSD candidate with a usable restore position is tagged `system_kv_pending`, priced at the candidate's `usable` length (so projected admission counts the restore), and left to `materialize_pending_restore`'s #107 SSD fallback, which promotes and fetches at admission, behind every gate. Eager routes and candidates with `usable == 0` keep `ssd_pending` unchanged. `lazy_ssd_deferred` counts the deferrals.
+
+Folded in (fork issue #57): `BatchedSystemKV`'s thread-contract docstring and three comments still said `fetch`/`check_ssd` run on the event loop. Since upstream's owner-thread change `engine_core` hands `add_request` to the generation worker under BatchedEngine, so the whole lookup runs there, between steps; comments only.
+
+**Upstream:** fork-owned.
+
+**Verification:** `test_125_lazy_ram_miss_ssd_hit_builds_nothing_until_admission` (enqueue builds nothing, the pre-admission promote hook leaves it alone, admission restores at the priced position via one SSD promote) and `test_125_eager_route_keeps_the_ssd_pending_promote`; both red with the fix reverted (mutation-checked).
