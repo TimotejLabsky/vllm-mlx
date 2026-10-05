@@ -1830,3 +1830,93 @@ def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
     kv.fetch(near, request_id="near")
 
     assert "near" not in kv._divergence
+
+
+_HARMONY_DELTAS = (
+    "<|channel|>analysis<|message|>",
+    "We need to answer.",
+    "<|end|><|start|>assistant<|channel|>final<|message|>",
+    "Red",
+    "<|return|>",
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
+async def test_118_harmony_thinking_off_stream_keeps_analysis_out(parser_name):
+    """#118: upstream #610's thinking-off latch engages only on a parser's
+    explicit ``start_token``/``end_token``. The channel-format parsers had
+    none, so with thinking off gpt-oss streamed its analysis channel into
+    ``content`` ("analysisWe need to answer...assistantfinalRed", seen live
+    after the 2026-10-04 rebase retired #27's always-run parser).
+    """
+    import json as _json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import vllm_mlx.server as srv
+    from vllm_mlx.reasoning import get_parser
+
+    async def fake_stream_chat(messages, **kwargs):
+        last = len(_HARMONY_DELTAS) - 1
+        for i, piece in enumerate(_HARMONY_DELTAS):
+            yield SimpleNamespace(
+                new_text=piece,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+                finished=i == last,
+                finish_reason="stop" if i == last else None,
+            )
+
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Name a colour.")],
+        max_tokens=16,
+    )
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = get_parser(parser_name)(), "test-model"
+    try:
+        body = "".join(
+            [
+                c
+                async for c in srv.stream_chat_completion(
+                    MagicMock(stream_chat=fake_stream_chat),
+                    request.messages,
+                    request,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+            ]
+        )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    content = reasoning = ""
+    for line in body.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for choice in _json.loads(line[len("data: ") :]).get("choices", []):
+            delta = choice.get("delta", {})
+            content += delta.get("content") or ""
+            reasoning += delta.get("reasoning") or ""
+    assert content == "Red"
+    assert reasoning == ""
+
+
+@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
+@pytest.mark.parametrize(
+    "tail", ["<|return|>", "", "<|end|>"], ids=["return", "eos-stripped", "end"]
+)
+def test_118_harmony_final_channel_survives_stripped_eos(parser_name, tail):
+    """#118: the engines stop ON <|return|> and drop it from the text, so the
+    final channel must close at end of text too — the harmony parser required
+    the token and returned content=None for every non-stream gpt-oss reply.
+    """
+    from vllm_mlx.reasoning import get_parser
+
+    text = (
+        "<|channel|>analysis<|message|>Think.<|end|>"
+        "<|start|>assistant<|channel|>final<|message|>42" + tail
+    )
+    reasoning, content = get_parser(parser_name)().extract_reasoning(text)
+    assert reasoning == "Think."
+    assert content == "42"
