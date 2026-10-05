@@ -3836,9 +3836,14 @@ def _extract_reasoning_and_tool_calls(
     *,
     allow_reasoning: bool = True,
     engine: BaseEngine | None = None,
+    chat_kwargs: dict | None = None,
 ) -> tuple[str | None, str | None, list[ToolCall] | None]:
     """
     Extract reasoning first, then parse tool calls from the cleaned content.
+
+    ``chat_kwargs`` (fork #121) lets a template that injects an open
+    ``<think>`` be detected, so output cut off before ``</think>`` is classed
+    as reasoning here too, as the streaming paths already do.
 
     Non-streaming responses can contain both a reasoning block and structured
     tool calls in the same final output. If tool parsing runs first and the
@@ -3856,10 +3861,24 @@ def _extract_reasoning_and_tool_calls(
         # _explicit_reasoning_markers_present).
         allow_reasoning = _explicit_reasoning_markers_present(output_text)
 
-    if _reasoning_parser and allow_reasoning:
-        reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
-            output_text
-        )
+    parser = _reasoning_parser
+    if (
+        parser
+        and allow_reasoning
+        and not suppress_reasoning
+        and engine is not None
+        and chat_kwargs is not None
+        and _detect_implicit_thinking(engine, chat_kwargs)
+    ):
+        # Request-local: the module parser is shared across concurrent
+        # requests, so its implicit-mode state must not be flipped (#121).
+        local = _build_reasoning_parser(engine)
+        if local is not None:
+            local.reset_state(implicit_mode=True)
+            parser = local
+
+    if parser and allow_reasoning:
+        reasoning_text, cleaned_reasoning_text = parser.extract_reasoning(output_text)
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
         elif reasoning_text is not None:
@@ -6520,6 +6539,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             request,
             allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
             engine=engine,
+            chat_kwargs=prepared.chat_kwargs,
         )
 
         # Process response_format if specified (after reasoning parser cleaned the text)
@@ -7011,6 +7031,7 @@ async def create_anthropic_message(
                 )
             ),
             engine=engine,
+            chat_kwargs=prepared.chat_kwargs,
         )
 
         if prepared.response_format and not tool_calls:

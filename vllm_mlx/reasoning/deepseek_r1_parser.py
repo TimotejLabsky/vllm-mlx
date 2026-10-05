@@ -59,8 +59,13 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         if self.end_token in model_output and self.start_token not in model_output:
             return self._extract_complete_reasoning(model_output)
 
-        # If neither token, return as pure content
-        if self.end_token not in model_output and self.start_token not in model_output:
+        # If neither token, return as pure content — unless the template opened
+        # <think> in the prompt (implicit mode, fork #121).
+        if (
+            self.end_token not in model_output
+            and self.start_token not in model_output
+            and not self._implicit_mode
+        ):
             return None, model_output
 
         # Use base class for standard case
