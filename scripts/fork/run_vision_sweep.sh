@@ -4,8 +4,8 @@
 # site-packages (no PYTHONPATH) so this measures the shipped fleet.
 set -u
 PORT=8096
-VENV=/Users/ai/vllm-mlx-env/bin/python
-OUT=/tmp/sweep_results.txt
+VENV=${VENV:-/Users/ai/vllm-mlx-env/bin/python}
+OUT=${OUT:-/tmp/sweep_results.txt}
 : > "$OUT"
 
 run_one() {
@@ -42,7 +42,7 @@ run_one qwen3_5      mlx-community/Qwen3.5-4B-4bit                       8
 run_one glm4v        mlx-community/GLM-4.6V-Flash-4bit                   8
 run_one mistral3     mlx-community/Devstral-Small-2-24B-Instruct-2512-4bit 4
 run_one gemma4       mlx-community/gemma-4-26B-A4B-it-qat-4bit           4
-run_one qwen3_vl_moe mlx-community/Qwen3-VL-30B-A3B-Instruct-8bit        4
+[ -n "${SKIP_BIG:-}" ] || run_one qwen3_vl_moe mlx-community/Qwen3-VL-30B-A3B-Instruct-8bit        4
 
 echo "" | tee -a "$OUT"
 echo "########## SWEEP COMPLETE ##########" | tee -a "$OUT"
