@@ -3955,13 +3955,25 @@ def _extract_reasoning_and_tool_calls(
                 text_for_tool_parse = ""
         if suppress_reasoning:
             # Keep the cleaned answer, but do not expose thoughts emitted
-            # despite enable_thinking=False. Fork #27 safety net: if the
-            # parse left no answer at all (e.g. an unclosed reasoning block),
-            # fold the reasoning-classified text back rather than return an
-            # empty message.
-            if reasoning_text and not (text_for_tool_parse or "").strip():
-                text_for_tool_parse = reasoning_text
+            # despite enable_thinking=False — also when the parse left no
+            # answer (reasoning cut off by max_tokens or a stop string): the
+            # streaming paths drop it too (fork #124 retired #27's fold).
             reasoning_text = None
+            # Some <think>-style parsers (qwen3, by upstream's tests) keep an
+            # opened but never-closed block as content: with thinking off that
+            # text is still reasoning, raw tag included. Only parsers with a
+            # start AND end tag: harmony's start_token (#118) has no closer
+            # and its commentary/tool-call blocks must reach the tool parser.
+            start = getattr(parser, "start_token", None)
+            end = getattr(parser, "end_token", None)
+            if (
+                start
+                and end
+                and text_for_tool_parse
+                and start in text_for_tool_parse
+                and end not in text_for_tool_parse
+            ):
+                text_for_tool_parse = text_for_tool_parse.partition(start)[0]
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
