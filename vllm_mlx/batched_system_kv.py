@@ -335,6 +335,8 @@ class BatchedSystemKV:
         # again at admission: a follower that waited behind the KV budget
         # used to prefill cold although its leader's entry had landed since.
         self.admission_rematches = 0
+        # (#135) extra decode-only steps run while a prompt was mid-prefill
+        self.interleaved_decode_steps = 0
         # (#107) request_id -> key of the entry a QUEUED request matched at
         # enqueue. Make-room and budget eviction spare these while anything
         # else can go: on 2026-09-21 a deep follow-up waited ~10 min behind
@@ -1628,6 +1630,7 @@ class BatchedSystemKV:
                 "sjf_reorders": self.sjf_reorders,
                 "sjf_holds": self.sjf_holds,
                 "admission_rematches": self.admission_rematches,
+                "interleaved_decode_steps": self.interleaved_decode_steps,
                 "divergence_events": self.divergence_events,
                 "divergence_at_think": self.divergence_at_think,
                 "divergence_depth_hist": dict(self.divergence_depth_hist),
@@ -1953,6 +1956,58 @@ def next_admission(scheduler):
     if len(candidates) == 1 and len(waiting) > 1:
         hybrid_kv.sjf_holds += 1
     return None
+
+
+def interleave_decode_steps(scheduler, output) -> int:
+    """step() hook (#135, fork issue #45): while a prompt is mid-prefill and
+    other rows are decoding, run extra decode-only steps before the next
+    prefill chunk.
+
+    mlx-lm's ``BatchGenerator`` runs ONE decode step, then one
+    ``prefill_step_size`` chunk per ``next()``. A 2048-token chunk takes
+    ~10 s on the 27B, so every decoding row got one token per ~10 s for the
+    whole of another request's deep prefill. With
+    ``VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL=K`` the decoding rows get K
+    tokens per chunk while the prefill pays (K-1) decode steps per chunk.
+    Each extra step goes through the normal response processing and
+    cleanup, so stop strings, repetition stops and finishes apply per token
+    exactly as before. Returns the number of extra steps run."""
+    k = _env_int("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", 1)
+    bg = scheduler.batch_generator
+    if k <= 1 or bg is None or not getattr(bg, "_currently_processing", None):
+        return 0
+    gen = getattr(bg, "_generation_batch", None)
+    stream = getattr(bg, "_stream", None)
+    if gen is None or stream is None:
+        return 0
+    import mlx.core as mx
+
+    from . import recurrent_state_eval as _recurrent_eval
+
+    ran = 0
+    for _ in range(k - 1):
+        if len(gen) == 0 or not scheduler.running:
+            break
+        if scheduler._pending_abort_ids:
+            break  # aborts drain at the next step(); don't decode them on
+        with mx.stream(stream):
+            responses = gen.next()
+        ran += 1
+        if _recurrent_eval.enabled():
+            _recurrent_eval.eval_recurrent_cache_states(bg)
+        if not responses:
+            continue
+        outputs, finished = scheduler._process_batch_responses(responses)
+        output.outputs = list(output.outputs or []) + list(outputs)
+        output.finished_request_ids = set(output.finished_request_ids or ()) | set(
+            finished
+        )
+        scheduler._cleanup_finished(finished)
+    if ran:
+        hybrid_kv = scheduler.hybrid_kv
+        if hybrid_kv is not None:
+            hybrid_kv.interleaved_decode_steps += ran
+    return ran
 
 
 def promote_ssd_pending(scheduler) -> None:

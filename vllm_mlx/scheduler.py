@@ -3548,9 +3548,16 @@ class Scheduler:
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
-                        output.outputs = outputs
-                        output.finished_request_ids = finished_ids
+                        # Merge, not assign: a retry after #135's extra steps
+                        # raised must keep the outputs already finished.
+                        output.outputs = list(output.outputs) + outputs
+                        output.finished_request_ids = (
+                            set(output.finished_request_ids) | finished_ids
+                        )
                         self._cleanup_finished(finished_ids)
+
+                    # Fork #135: decoding rows get K tokens per prefill chunk.
+                    _batched_kv.interleave_decode_steps(self, output)
 
                 # Success - break out of retry loop
                 break

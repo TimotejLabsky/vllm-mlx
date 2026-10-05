@@ -2615,6 +2615,120 @@ def test_133_a_rescheduled_request_gets_the_lagged_path_back():
     assert type(proc).syncs - syncs_before_restart <= 2
 
 
+# ------------- #135 decoding rows keep moving while another row prefills
+
+
+class _GenBatch:
+    """A GenerationBatch stand-in: each next() yields one token per row and
+    drops a row when its budget runs out (as mlx-lm's does)."""
+
+    def __init__(self, rows):
+        self.rows = dict(rows)  # uid -> tokens left
+        self.calls = 0
+
+    def __len__(self):
+        return len(self.rows)
+
+    def next(self):
+        self.calls += 1
+        out = [SimpleNamespace(uid=u, token=7) for u in self.rows]
+        self.rows = {u: n - 1 for u, n in self.rows.items() if n > 1}
+        return out
+
+
+def _interleave_sched(prefilling=True, rows=None):
+    import mlx.core as mx
+
+    gen = _GenBatch(rows or {1: 100})
+    bg = SimpleNamespace(
+        _currently_processing=[object()] if prefilling else [],
+        _generation_batch=gen,
+        _stream=mx.default_stream(mx.default_device()),
+    )
+    processed, cleaned = [], []
+
+    def process(responses):
+        processed.append(len(responses))
+        return [f"out{len(processed)}"], {f"fin{len(processed)}"}
+
+    sched = SimpleNamespace(
+        batch_generator=bg,
+        running={"r": object()},
+        _pending_abort_ids=set(),
+        hybrid_kv=BatchedSystemKV(_FakeModel()),
+        _process_batch_responses=process,
+        _cleanup_finished=cleaned.append,
+    )
+    return sched, gen, processed, cleaned
+
+
+def test_135_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", raising=False)
+    sched, gen, processed, _ = _interleave_sched()
+    assert bkv.interleave_decode_steps(sched, SimpleNamespace(outputs=[], finished_request_ids=set())) == 0
+    assert gen.calls == 0
+
+
+def test_135_k_decode_steps_per_prefill_chunk_each_processed(monkeypatch):
+    """Fork issue #45: a decoding row got ONE token per 2048-token prefill
+    chunk of another request (~10 s on the 27B). With K=4 it gets 3 more per
+    chunk, and every extra token goes through the normal processing and
+    cleanup (stop strings / finishes apply per token, not per burst)."""
+    monkeypatch.setenv("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", "4")
+    sched, gen, processed, cleaned = _interleave_sched()
+    output = SimpleNamespace(outputs=["out0"], finished_request_ids={"fin0"})
+
+    assert bkv.interleave_decode_steps(sched, output) == 3
+
+    assert gen.calls == 3 and processed == [1, 1, 1]
+    assert output.outputs == ["out0", "out1", "out2", "out3"]
+    assert output.finished_request_ids == {"fin0", "fin1", "fin2", "fin3"}
+    assert cleaned == [{"fin1"}, {"fin2"}, {"fin3"}]  # after EACH step
+    assert sched.hybrid_kv.stats()["interleaved_decode_steps"] == 3
+
+
+def test_135_only_while_a_prefill_is_in_flight_and_rows_decode(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", "4")
+    out = SimpleNamespace(outputs=[], finished_request_ids=set())
+    sched, gen, _, _ = _interleave_sched(prefilling=False)
+    assert bkv.interleave_decode_steps(sched, out) == 0 and gen.calls == 0
+    sched, gen, _, _ = _interleave_sched(rows={1: 2})  # finishes after 2 tokens
+    assert bkv.interleave_decode_steps(sched, out) == 2  # stops when the batch empties
+
+
+def test_135_pending_abort_stops_the_extra_steps(monkeypatch):
+    """An aborted row would otherwise decode K-1 more tokens per step until
+    the next step() drains ``_pending_abort_ids``."""
+    monkeypatch.setenv("VLLM_MLX_BATCHED_DECODE_STEPS_PER_PREFILL", "4")
+    sched, gen, _, _ = _interleave_sched()
+    sched._pending_abort_ids = {"r"}
+    out = SimpleNamespace(outputs=[], finished_request_ids=set())
+    assert bkv.interleave_decode_steps(sched, out) == 0 and gen.calls == 0
+
+
+def test_135_a_retry_keeps_outputs_already_finished():
+    """An extra step that raises after the main step finished a request goes
+    through the retry; the retry must merge into ``output``, not replace it,
+    or the finished request's client never sees its end."""
+    import inspect
+
+    from vllm_mlx.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler.step)
+    assert "output.outputs = outputs\n" not in src
+    assert "output.outputs = list(output.outputs) + outputs" in src
+
+
+def test_135_step_runs_the_hook():
+    import inspect
+
+    from vllm_mlx.scheduler import Scheduler
+
+    assert "_batched_kv.interleave_decode_steps(self, output)" in inspect.getsource(
+        Scheduler.step
+    )
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
