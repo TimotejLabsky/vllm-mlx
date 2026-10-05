@@ -40,6 +40,44 @@ def _hf_cached_file(repo_id: str, filename: str) -> Optional[Path]:
     return Path(cached) if isinstance(cached, str) else None
 
 
+EXTRA_EOS_ENV = "VLLM_MLX_EXTRA_EOS_TOKENS"
+
+
+def extra_eos_token_ids(tokenizer) -> set:
+    """Per-route extra stop tokens from ``VLLM_MLX_EXTRA_EOS_TOKENS`` (fork #122).
+
+    Comma-separated token strings (``<|end|>``) or integer ids. For conversions
+    that lost their turn terminator: lmstudio's Phi-4-mini-reasoning declares
+    only ``<|endoftext|>`` as EOS and ships no generation_config.json, so the
+    model ran past ``<|end|>`` into new ``<|assistant|>`` turns. Explicit per
+    route, never inferred: gpt-oss uses ``<|end|>`` *between* harmony
+    channels, so a template-derived guess would cut its replies.
+    Unknown tokens are skipped with a warning.
+    """
+    import os
+
+    raw = os.environ.get(EXTRA_EOS_ENV, "").strip()
+    if not raw:
+        return set()
+    ids = set()
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for item in (part.strip() for part in raw.split(",")):
+        if not item:
+            continue
+        if item.isdigit():
+            ids.add(int(item))
+            continue
+        try:
+            tid = tokenizer.convert_tokens_to_ids(item)
+        except Exception:
+            tid = None
+        if isinstance(tid, int) and tid >= 0 and tid != unk:
+            ids.add(tid)
+        else:
+            logger.warning("%s: unknown token %r skipped", EXTRA_EOS_ENV, item)
+    return ids
+
+
 def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     """Collect the full EOS/stop token-id set for a model.
 
@@ -97,6 +135,7 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
             elif config_eos is not None:
                 eos_ids.add(int(config_eos))
 
+    eos_ids.update(extra_eos_token_ids(tokenizer))
     return eos_ids
 
 
