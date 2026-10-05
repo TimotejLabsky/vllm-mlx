@@ -260,10 +260,14 @@ def main() -> int:
     check(
         "one-slot route: turns served from the SSD tier, lazy == eager",
         lazy_ssd["interleaved"] == eager_ssd["interleaved"]
-        and ssd_cache.get("ssd_promotes", 0) > 0,
+        and ssd_cache.get("ssd_promotes", 0) > 0
+        # (#125) the RAM-miss SSD hits were deferred to admission, not
+        # promoted and materialised while the request waited
+        and ssd_cache.get("lazy_ssd_deferred", 0) > 0,
         f"ssd_promotes={ssd_cache.get('ssd_promotes')} "
         f"lazy_restores={ssd_cache.get('lazy_restores')} "
         f"lazy_ssd_fallbacks={ssd_cache.get('lazy_ssd_fallbacks')} "
+        f"lazy_ssd_deferred={ssd_cache.get('lazy_ssd_deferred')} "
         f"pinned_entries={ssd_cache.get('pinned_entries')}",
     )
     check(
