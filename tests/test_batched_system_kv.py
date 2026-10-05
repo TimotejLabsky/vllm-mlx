@@ -12,6 +12,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache
 
 from vllm_mlx.batched_system_kv import BatchedSystemKV, batched_system_kv_enabled
+from vllm_mlx.cache_state_compat import legacy_state
 
 ENABLE_ENV = "VLLM_MLX_BATCHED_SYSTEM_KV"
 
@@ -419,7 +420,7 @@ def test_grow_after_divergent_restore_reuses_prefix_only():
     assert result[2] == len(divergent)
     # KV content across the segment seam must match a straight donor
     control = _donor_at(len(divergent))
-    assert mx.array_equal(result[0][0].state[0], control[0].state[0])
+    assert mx.array_equal(legacy_state(result[0][0])[0], legacy_state(control[0])[0])
 
 
 def test_boundary_final_grow_cascade():

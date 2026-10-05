@@ -683,9 +683,10 @@ class ArraysCacheSerializer(LayerSerializer):
     """
 
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        from .cache_state_compat import legacy_state
         from .system_kv import is_new_recurrent_state
 
-        st = layer.state
+        st = legacy_state(layer)
         arity3_n: int | None = None
         if is_new_recurrent_state(st):
             # 1632 shape (#81): flatten to cache items + the two metadata
@@ -884,11 +885,12 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
     if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
         return KVCacheSerializer()
     if hasattr(layer, "state"):
+        from .cache_state_compat import legacy_state
         from .system_kv import is_recurrent_state
 
         # Bare list (pre-1632) OR the (cache, left_padding, lengths)
         # 3-tuple (mlx-lm 11a6ce7+, fork #81).
-        if is_recurrent_state(getattr(layer, "state", None)):
+        if is_recurrent_state(legacy_state(layer)):
             return ArraysCacheSerializer()
     raise ValueError(
         f"Unsupported cache layer type: {type(layer).__name__}. "
