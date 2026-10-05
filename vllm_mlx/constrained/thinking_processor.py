@@ -48,6 +48,16 @@ class BoundedSuffixMatcher:
         self._buf.extend(state)
 
 
+# (#129) Generated tokens re-read on each step to confirm nothing before them
+# changed (a rollback). Deeper rewinds than this that leave the newest tokens
+# identical do not occur (mlx-lm appends one token per step; speculative
+# rewinds are a few tokens).
+_TAIL_OVERLAP = 16
+# (#129) Placeholder id for CONTENT-phase positions recorded without reading
+# the token: never a real id, so a rollback compare stops at it.
+_UNKNOWN = -1
+
+
 class Phase(enum.Enum):
     """Thinking lifecycle phases."""
 
@@ -242,6 +252,9 @@ class ThinkingAwareLogitsProcessor:
 
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
+        if self._prompt_len is not None and target_len > self._processed_len:
+            if self._try_fast_sync(tokens, target_len):
+                return
         token_ids = tokens.tolist()
 
         # mlx-lm passes the FULL sequence (prompt + generated) to a logits
@@ -282,13 +295,51 @@ class ThinkingAwareLogitsProcessor:
             self._restore_snapshot(max(common_len, self._prompt_len or 0))
         if target_len == self._processed_len:
             return
-        for token_id in token_ids[self._processed_len :]:
+        self._consume(token_ids[self._processed_len :])
+
+    def _try_fast_sync(self, tokens: mx.array, target_len: int) -> bool:
+        """(#129) Sync a sequence that only GREW without reading all of it.
+
+        The full path ran ``tokens.tolist()`` and a Python prefix compare over
+        prompt + generated on every decode step: 5.9 ms/step at 60K tokens
+        (vs a 33 ms 27B step), plus a forced GPU sync that cost ~3.4 % decode
+        even at 1.5K. Two cheaper cases, both falling back to the full walk
+        (return False) whenever anything before the new tokens changed:
+
+        * CONTENT with no inner processor: the phase is final and the mask is
+          static, so the token values are never needed - record the new
+          positions from the array's SHAPE (no sync at all). A later rollback
+          compares against ``_UNKNOWN`` and so restores no later than the
+          first unread position, which is in CONTENT, where every snapshot is
+          the same state.
+        * otherwise: read only the new tail plus ``_TAIL_OVERLAP`` already-
+          processed tokens, and check the overlap still matches.
+        """
+        if self._state == Phase.CONTENT and self._inner is None:
+            grown = target_len - self._processed_len
+            self._processed_token_ids.extend([_UNKNOWN] * grown)
+            self._processed_len = target_len
+            return True
+        start = max(0, self._processed_len - _TAIL_OVERLAP)
+        tail = tokens[start:].tolist()
+        seen = self._processed_len - start
+        if tail[:seen] != self._processed_token_ids[start : self._processed_len]:
+            return False
+        self._consume(tail[seen:])
+        return True
+
+    def _consume(self, new_ids) -> None:
+        for token_id in new_ids:
+            was_content = self._state == Phase.CONTENT
             self._advance_with_token(token_id)
             self._processed_token_ids.append(token_id)
             self._processed_len += 1
-            # Skip snapshots in CONTENT -- _advance_with_token is a no-op
-            # there, so snapshots would just waste memory on long generations.
-            if self._state != Phase.CONTENT:
+            # Skip snapshots once IN CONTENT -- _advance_with_token is a no-op
+            # there, so they would just waste memory on long generations. The
+            # token that ENTERS CONTENT still gets one (#129): without it the
+            # last snapshot was the pre-close TRANSITIONING/THINKING state, and
+            # a rollback to any CONTENT position resumed there instead.
+            if not was_content:
                 self._snapshots.append(self._snapshot_state())
 
     def _advance_with_token(self, token_id: int) -> None:
