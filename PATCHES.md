@@ -3779,3 +3779,30 @@ It also logs one INFO line with the decoded ±24-token windows of both sides. Of
 
 **Verification:** `test_128_think_stripped_rerender_is_a_deep_divergence`, `test_128_next_turn_extending_the_chain_is_not_a_divergence`, `test_128_off_by_default_and_never_scans`; all three red with the patch reverted. Suite 4480 passed.
 - **Real server** (`scripts/fork/e2e_divergence_log.py`, `Qwen3.5-4B-4bit` on the Studio, thinking on, turn 2 sends the history back without the reasoning): `divergence_events=1`, `divergence_at_think=1`, depth bucket `<256`; the logged window shows the cached side continuing `<think>\nThinking Process:` where the new prompt has the answer. 4/4, also under the mlx 0.32.3 bump venv.
+
+## 129. `patch: thinking-processor-incremental` — the thinking budget no longer re-reads the whole sequence every step
+
+**Files:** `vllm_mlx/constrained/thinking_processor.py` (`_try_fast_sync`, `_consume`, CONTENT-entry snapshot), `tests/test_fork_invariants.py` (+4, one parametrized ×12).
+
+**Cost** (fork issue #54, measured 2026-10-05): `--default-thinking-token-budget` attaches `ThinkingAwareLogitsProcessor` to every thinking request on the Qwen3.8 routes. Its `_sync_to_tokens` ran `tokens.tolist()` on the FULL sequence (prompt + generated) and a Python prefix compare over it on every decode step. On the live Qwen3.8-27B-4bit route config (spare port, A/B/A/B, T=0 identical) it cost **−3.4 % single / −3.1 % 4-stream decode at 1.5K tokens**. That is mostly the forced GPU sync; the host part grows with the sequence: 1.5 ms/step at 16K, 5.9 at 60K, 9.6 at 100K (Studio CPU), against a 33 ms decode step.
+
+**Fix:** when the sequence only grew (every normal decode step):
+- **in the answer phase (CONTENT, no inner processor)**, nothing depends on token values: the phase is final and the mask static. The new positions are recorded from the array's shape as `_UNKNOWN`, with **no read and no GPU sync**;
+- **otherwise**, only the new tail plus 16 already-seen tokens is read, and the overlap is checked;
+- anything else (a rollback, an overlap mismatch) falls back to the old full walk.
+
+Host cost per step is now flat: ~0.04 ms thinking / ~0.01 ms answer at any length (laptop; was 0.11–4.3 ms).
+
+**Bug fixed on the way:** the token that ENTERS CONTENT got no snapshot (snapshots stop in CONTENT), so a rollback to any CONTENT position restored the pre-close TRANSITIONING/THINKING state and could force the end sequence into the answer again. Only reachable through rewinds (MTP/speculative paths; MTP is off fleet-wide). The entering token now gets its snapshot.
+
+**Upstream:** the processor is upstream's (`constrained/`); this is a candidate PR.
+
+**Verification:** `test_129_fast_sync_is_equivalent_to_the_full_walk[0-11]` — random streams with think spans, budget exhaustion (budgets 0/2/5/40), the forced transition and random rollbacks, including CONTENT → THINKING. The fast path must match the full walk's state, thinking count and returned logits at every step. Also `test_129_content_phase_reads_no_token_values` and `test_129_rollback_inside_content_stays_in_content`. Mutation-checked: reverting the snapshot fix fails 12; removing the fast path fails the no-read test.
+- **Real server** (exact live Qwen3.8-27B-4bit route on a spare port, thinking, 1,500 tokens, T=0, two rounds, reasoning SHA identical in every arm):
+
+  | Prompt | Old code, budget on | #129, budget on | No budget (ceiling) |
+  |---|---|---|---|
+  | short | 29.15–29.3 | 29.3 | 30.2 |
+  | 18.4K tokens | 24.96–25.0 | **25.37–25.39 (+1.5 %)** | 25.7 |
+
+  At 18K #129 recovers about half of the budget's cost, and its share grows with depth (the removed host work is O(sequence)). The remaining ~0.3–1 tok/s is the per-step GPU sync while THINKING, which reads each new token to see `</think>`. Removing it would need the scheduler to feed token values one step late (budget enforcement shifts by a token), so it is a separate design. The same structural cost applies to every token-reading logits processor (cf. DRY's 3.7 %). In the answer phase #129 removes the sync entirely; this benchmark never reached it (1,500 thinking tokens).
