@@ -3689,3 +3689,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fix:** an explicit, per-route env var — comma-separated token strings or ids, unioned into both stop-token collectors (the batched LLM scheduler and `collect_eos_token_ids`, which feeds the MLLM scheduler and the SimpleEngine text route). Deliberately **not** inferred from the chat template: gpt-oss uses `<|end|>` between harmony channels, so a guessed terminator would cut its replies. Route config: `VLLM_MLX_EXTRA_EOS_TOKENS=<|end|>` on `Phi-4-mini-reasoning-MLX-4bit` only (Phi-4-reasoning-plus declares `<|im_end|>` correctly).
 
 **Verified:** 7 tests (unset, strings + ids, unknown skipped with a warning, blank values, batched scheduler).
+
+---
+
+## 123. `patch: thinking-off-marker-gate` — a split reasoning marker never leaks; the Anthropic latch reads the raw stream
+
+**Files:** `vllm_mlx/server.py` (`_ThinkingOffMarkerGate`, the three thinking-off latch sites), `tests/test_thinking_off_marker_gate.py`, `tests/test_harmony_stream_tool_calls.py`
+
+**Found 2026-10-05** after #122 let Phi-4-mini stop: streaming with thinking off returned `content='<think'`. Upstream #610's latch engages once a marker is *in the text*; a plain-text marker arrives split (`<think` + `>`), and the fragment before the split had already gone out as content. Writing the gate exposed a second, worse gap on `/v1/messages`: its latch read special-token-**stripped** text, so harmony's `<|channel|>` could never fire it — gpt-oss with thinking off streamed its analysis channel as text, and once latched the parser was fed stripped text (`raw_reasoning_stream` was gated on `use_reasoning`, False with thinking off) and emitted **nothing**. Both pre-existing; reachable now that #120 makes `thinking: disabled` real.
+
+**Fix:** one helper used by chat completions, Anthropic and Responses: `observe()` latches on the **raw** delta; `hold()` withholds a trailing fragment that may still become a marker (start or end token) and releases it on the latch (to the parser, never as content), on a false alarm (unchanged), or at end of stream. On the Anthropic path the raw reasoning/tool-stream flags switch on when the latch fires, and special-token-only deltas reach the latch.
+
+**Verified:** 16 tests — gate unit cases (split start/end markers, false alarm, flush at end, thinking on untouched, special-token marker), the split marker end-to-end through all three stream endpoints, and gpt-oss tool call + final answer with thinking off on Anthropic and Responses. Suite 4469 passed.
