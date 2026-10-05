@@ -1841,14 +1841,21 @@ def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> No
         hybrid_kv.discard_pending(request_id)
 
 
-def find_message_boundaries(tokens, marker_seqs, min_step) -> tuple:
+def find_message_boundaries(tokens, marker_seqs, min_step, first_min=None) -> tuple:
     """Positions in ``tokens`` where a template turn marker STARTS (#88) —
     checkpoint placement at message boundaries, on the token stream.
 
     ``min_step`` thins boundaries closer than that to the previous accepted
     cut (short-turn bursts must not shred the ladder); the LAST boundary is
     always kept regardless (llama.cpp #24176's rule — the newest turn start
-    is the likeliest divergence point of the next request)."""
+    is the likeliest divergence point of the next request).
+
+    (#126) With ``first_min`` set, the FIRST boundary at or past it is kept
+    too: on a cold prompt that is the end of the system message, the prefix
+    every other conversation shares. ``min_step`` measured it from token 0,
+    so a ~1K system prompt never got a checkpoint and a second conversation
+    restored nothing (the uniform interval and the newest turn both sit
+    past the shared prefix)."""
     if not marker_seqs:
         return ()
     n = len(tokens)
@@ -1872,7 +1879,14 @@ def find_message_boundaries(tokens, marker_seqs, min_step) -> tuple:
         return ()
     accepted = []
     last_cut = 0
+    if first_min is not None:
+        first = next((h for h in ordered if h >= first_min), None)
+        if first is not None:
+            accepted.append(first)
+            last_cut = first
     for h in ordered:
+        if h <= last_cut:
+            continue
         if h - last_cut >= min_step:
             accepted.append(h)
             last_cut = h
@@ -1901,7 +1915,11 @@ def insert_segmented(
             getattr(request, "prompt", None), tokenizer
         )
         boundaries = find_message_boundaries(
-            tokens, marker_seqs, hybrid_kv.boundary_min_step
+            tokens,
+            marker_seqs,
+            hybrid_kv.boundary_min_step,
+            # (#126) cold prompt: keep the end-of-system boundary
+            first_min=hybrid_kv.partial_min if not request.cached_tokens else None,
         )
         boundaries = hybrid_kv.add_divergence_cut(
             request.request_id, request.cached_tokens, len(tokens), boundaries
