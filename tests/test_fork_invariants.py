@@ -2429,6 +2429,79 @@ def test_131_schedule_waiting_uses_the_admission_hook(monkeypatch):
     assert "self.waiting.popleft()" not in src
 
 
+# ------------- #132 the end-of-system checkpoint is pinned (port of fork PR #37)
+
+_SYS600 = list(_MARK) + list(range(1000, 1597))  # 600-token system message
+
+
+def _deep_chain(turns=12, turn_len=2100):
+    toks = list(_SYS600)
+    for t in range(turns):
+        start = 10_000 * (t + 1)
+        toks += list(_MARK) + list(range(start, start + turn_len - 3))
+    return toks
+
+
+def _prefill_cold(kv, rid, tokens):
+    kv.boundary_marker_ids = lambda *_a: (_MARK,)
+    request = SimpleNamespace(request_id=rid, cached_tokens=0, prompt="<rendered>")
+    generator = MagicMock()
+    bkv.insert_segmented(kv, generator, request, tokens, {})
+    ([segments],), _kw = generator.insert_segments.call_args
+    end = 0
+    for seg in segments[:-1]:
+        end += len(seg)
+        kv.capture_segment(rid, end, _donor_at(end))
+    kv.store(rid, tokens, _donor_at(len(tokens)))
+
+
+def test_132_short_system_prompt_survives_a_deep_chain_thinning():
+    """#126 placed the end-of-system checkpoint, but as the ladder's lowest
+    boundary it has the smallest gap, so thinning dropped it FIRST once a
+    deep chain filled the 8 slots - and a new session sharing only the
+    system prompt restored nothing again."""
+    kv = BatchedSystemKV(_FakeModel())
+    _prefill_cold(kv, "deep", _deep_chain())
+
+    [entry] = kv._entries.values()
+    assert len(entry["checkpoints"]) == kv.ckpt_capacity  # the ladder was thinned
+    assert [cp["pos"] for cp in entry["checkpoints"] if cp.get("anchor")] == [600]
+    assert kv.stats()["anchor_cuts"] == 1
+    new_session = _SYS600 + list(_MARK) + list(range(90_000, 90_500))
+    assert kv.peek(new_session, touch=False) == 600
+    # (#132) per-request bookkeeping is released at store - it leaked before
+    assert "deep" not in kv._boundary_pos and "deep" not in kv._anchor_pos
+
+
+def test_132_the_anchor_survives_an_ssd_round_trip(monkeypatch, tmp_path):
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    _prefill_cold(writer, "deep", _deep_chain())
+    writer.close()
+
+    store = _make_ssd_cache(monkeypatch, tmp_path)._ssd
+    [row] = store._index.all_entries()
+    loaded = store.read_entry(tuple(_deep_chain()), row["file_path"])
+    assert [cp["pos"] for cp in loaded["checkpoints"] if cp.get("anchor")] == [600]
+    assert any(cp.get("boundary") for cp in loaded["checkpoints"])
+    store.close()
+
+
+def test_132_thinning_never_evicts_the_anchor():
+    from vllm_mlx.system_kv import append_checkpoint, thin_checkpoints
+
+    cps = [{"pos": 600, "states": {}, "metas": {}, "boundary": True, "anchor": True}]
+    cps += [
+        {"pos": p, "states": {}, "metas": {}, "boundary": True}
+        for p in (2700, 4800, 6900, 9000)
+    ]
+    assert [c["pos"] for c in thin_checkpoints(cps, 4)] == [600, 4800, 6900, 9000]
+    out = append_checkpoint([], 600, {}, {}, capacity=8, boundary=True, anchor=True)
+    out = append_checkpoint(out, 900, {}, {}, capacity=8)
+    assert out[0]["anchor"] is True and "anchor" not in out[1]
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
