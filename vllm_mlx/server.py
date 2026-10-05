@@ -3414,6 +3414,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     # thinking, so only cleaned content is emitted.
     thinking_off = _thinking_disabled(request, chat_kwargs)
     disabled_reasoning_latched = False
+    marker_gate = _ThinkingOffMarkerGate(reasoning_parser, thinking_off)  # #123
 
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
@@ -3463,16 +3464,18 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         # anyway. Parse them rather than letting them detokenize into visible
         # content. Latched: once markers appear, the rest of the stream is
         # parsed too, so a marker split across chunks cannot re-open the gate
-        # halfway through.
-        if (
-            reasoning_parser
-            and thinking_off
-            and not disabled_reasoning_latched
-            and _explicit_reasoning_markers_present(
-                raw_accumulated_text, reasoning_parser
-            )
-        ):
-            disabled_reasoning_latched = True
+        # halfway through. #123: until then a trailing fragment that may
+        # still become a marker is held back from the content stream (the
+        # parser reads raw_accumulated_text, so it never loses it).
+        if marker_gate.active:
+            was_latched = marker_gate.latched
+            disabled_reasoning_latched = marker_gate.observe(delta_text)
+            if not disabled_reasoning_latched:
+                delta_text = marker_gate.hold(delta_text, output_finished)
+                if not delta_text and not output_finished:
+                    continue
+            elif not was_latched:
+                marker_gate.hold("")  # the held fragment was marker text
 
         if use_reasoning or disabled_reasoning_latched:
             delta_msg = _extract_streaming_reasoning_delta(
@@ -3811,6 +3814,64 @@ def _strip_harmony_analysis_blocks(text: str) -> str:
     text is never handed to the tool parser, while commentary/final text is
     preserved."""
     return _HARMONY_ANALYSIS_BLOCK_RE.sub("", text)
+
+
+class _ThinkingOffMarkerGate:
+    """Thinking-off reasoning latch with partial-marker holdback (fork #123).
+
+    With thinking disabled the streaming paths run the reasoning parser only
+    once an explicit marker appears (upstream #610). A plain-text marker such
+    as ``<think>`` arrives split over several deltas (``<think`` + ``>``), and
+    the fragment before the split went out as content before the latch fired
+    (``content='<think'`` on Phi-4-mini). ``observe()`` latches on the *raw*
+    stream (special-token markers such as harmony's ``<|channel|>`` vanish from
+    filtered text); ``hold()`` withholds a trailing fragment that could still
+    become a marker and releases it once the stream resolves either way.
+    """
+
+    def __init__(self, parser, thinking_off: bool):
+        self.parser = parser
+        self.active = bool(parser) and bool(thinking_off)
+        self.latched = False
+        self._raw = ""
+        self._held = ""
+        markers = []
+        start = getattr(parser, "start_token", None)
+        end = getattr(parser, "end_token", None)
+        if start:
+            markers.append(start)
+        # Same exclusion as _explicit_reasoning_markers_present: gemma's
+        # <channel|> alone does not latch, so it is never worth holding.
+        if end and end != "<channel|>":
+            markers.append(end)
+        self._markers = tuple(markers)
+
+    def observe(self, raw_delta: str) -> bool:
+        """Feed the raw delta; return whether the latch is (now) set."""
+        if self.active and not self.latched and raw_delta:
+            self._raw += raw_delta
+            if _explicit_reasoning_markers_present(self._raw, self.parser):
+                self.latched = True
+        return self.latched
+
+    def hold(self, text: str, finished: bool = False) -> str:
+        """Text safe to emit now; a possible marker prefix stays held."""
+        if not self.active:
+            return text
+        text = self._held + (text or "")
+        self._held = ""
+        if self.latched or finished or not text:
+            return text
+        keep = 0
+        for marker in self._markers:
+            for k in range(min(len(marker) - 1, len(text)), keep, -1):
+                if marker.startswith(text[-k:]):
+                    keep = k
+                    break
+        if keep:
+            self._held = text[-keep:]
+            return text[:-keep]
+        return text
 
 
 def _parse_source_text(output: object) -> str:
@@ -7345,6 +7406,7 @@ async def _stream_anthropic_messages(
     # thinking, so only cleaned content is emitted into the already-open
     # text block (no thinking block is started).
     disabled_reasoning_latched = False
+    marker_gate = _ThinkingOffMarkerGate(reasoning_parser, thinking_off)  # #123
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -7372,12 +7434,14 @@ async def _stream_anthropic_messages(
     # control tokens, which SPECIAL_TOKENS_PATTERN deletes below — the
     # reasoning parser then never saw a channel and the whole gpt-oss
     # response (answer and tool call) streamed as nothing.
-    raw_reasoning_stream = use_reasoning and bool(
+    raw_reasoning_capable = bool(
         getattr(reasoning_parser, "CONSUMES_RAW_STREAM", False)
     )
-    raw_tool_stream = use_reasoning and bool(
-        getattr(tool_parser, "CONSUMES_RAW_STREAM", False)
-    )
+    raw_tool_capable = bool(getattr(tool_parser, "CONSUMES_RAW_STREAM", False))
+    # With thinking off these switch on when the #123 latch fires: a latched
+    # harmony parser fed filtered text never sees a channel and emits nothing.
+    raw_reasoning_stream = use_reasoning and raw_reasoning_capable
+    raw_tool_stream = use_reasoning and raw_tool_capable
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -7403,20 +7467,32 @@ async def _stream_anthropic_messages(
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
             if not filtered and not (
                 raw_reasoning_stream
+                or (marker_gate.active and raw_reasoning_capable)
                 or (use_reasoning and output_finished)
                 or (tool_parser and tool_markup_possible and output_finished)
             ):
                 continue
 
-            if (
-                reasoning_parser
-                and thinking_off
-                and not disabled_reasoning_latched
-                and _explicit_reasoning_markers_present(
-                    accumulated_text + filtered, reasoning_parser
-                )
-            ):
-                disabled_reasoning_latched = True
+            if marker_gate.active:
+                # #123: latch on the RAW delta (harmony's <|channel|> is a
+                # special token, absent from `filtered`), and hold a trailing
+                # fragment that may still become a plain-text marker.
+                was_latched = marker_gate.latched
+                disabled_reasoning_latched = marker_gate.observe(delta_text)
+                released = marker_gate.hold(filtered, output_finished)
+                fragment = released[: len(released) - len(filtered)]
+                if disabled_reasoning_latched and not was_latched:
+                    # The held fragment belongs to the marker: give it to
+                    # the parser instead of emitting it as content.
+                    filtered = released
+                    raw_reasoning_stream = raw_reasoning_capable
+                    raw_tool_stream = raw_tool_capable
+                    if raw_reasoning_stream:
+                        delta_text = fragment + delta_text
+                elif not disabled_reasoning_latched:
+                    filtered = released
+                    if not filtered and not output_finished:
+                        continue
 
             if not (use_reasoning or disabled_reasoning_latched):
                 # Simple path — no reasoning parsing
@@ -7832,9 +7908,9 @@ async def stream_chat_completion(
     # explicit reasoning marker; from that point deltas are parsed so raw
     # markers don't leak into content. Parsed reasoning is suppressed — the
     # request disabled thinking, so only cleaned content is emitted.
-    raw_stream_text = ""
     thinking_off = _thinking_disabled(request, kwargs)
     disabled_reasoning_latched = False
+    marker_gate = _ThinkingOffMarkerGate(reasoning_parser, thinking_off)  # #123
 
     # Track token counts for usage reporting
     prompt_tokens = 0
@@ -7884,16 +7960,11 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if reasoning_parser and delta_text:
-                raw_stream_text += delta_text
-                if (
-                    thinking_off
-                    and not disabled_reasoning_latched
-                    and _explicit_reasoning_markers_present(
-                        raw_stream_text, reasoning_parser
-                    )
-                ):
-                    disabled_reasoning_latched = True
+            if marker_gate.active:
+                disabled_reasoning_latched = marker_gate.observe(delta_text)
+                delta_text = marker_gate.hold(delta_text, output_finished)
+                if not delta_text and not output_finished:
+                    continue  # a possible marker prefix is held (#123)
 
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template

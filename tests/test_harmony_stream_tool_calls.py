@@ -216,7 +216,7 @@ def harmony_globals(monkeypatch):
     )
 
 
-async def _anthropic(deltas):
+async def _anthropic(deltas, chat_kwargs=None):
     msgs = [{"role": "user", "content": "Read a.txt"}]
     openai_request = ChatCompletionRequest(
         model="m", messages=msgs, max_tokens=400, tools=TOOLS
@@ -234,7 +234,10 @@ async def _anthropic(deltas):
         ],
     )
     prepared = srv.PreparedChatInvocation(
-        messages=msgs, chat_kwargs={}, response_format=None, json_logits_processor=None
+        messages=msgs,
+        chat_kwargs=dict(chat_kwargs or {}),
+        response_format=None,
+        json_logits_processor=None,
     )
     body = "".join(
         [
@@ -264,7 +267,7 @@ async def _anthropic(deltas):
     }
 
 
-async def _responses(deltas):
+async def _responses(deltas, chat_kwargs=None):
     from unittest.mock import patch
 
     request = srv.ResponsesRequest(
@@ -290,7 +293,7 @@ async def _responses(deltas):
         _engine(deltas),
         chat_request,
         [{"role": "user", "content": "Read a.txt"}],
-        {},
+        dict(chat_kwargs or {}),
     )
     with patch.object(
         srv, "_prepare_streaming_responses_request", return_value=prepared
@@ -351,3 +354,36 @@ async def test_responses_stream_final_answer(harmony_globals):
     out = await _responses(FINAL_ANSWER_DELTAS)
     assert out["text"] == "The sky is blue."  # used to be ""
     assert out["reasoning"] == "User wants a fact."
+
+
+# ---- fork #123: thinking OFF — the latch must read the raw stream ---------
+_OFF = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.mark.anyio
+async def test_123_anthropic_thinking_off_tool_call(harmony_globals):
+    out = await _anthropic(TOOL_CALL_DELTAS, _OFF)
+    assert out["tool_use"] == ["read"]
+    assert json.loads(out["args"]) == {"path": "a.txt"}
+    assert out["thinking"] == "" and out["text"] == ""
+
+
+@pytest.mark.anyio
+async def test_123_anthropic_thinking_off_final_answer(harmony_globals):
+    out = await _anthropic(FINAL_ANSWER_DELTAS, _OFF)
+    assert out["text"] == "The sky is blue."
+    assert out["thinking"] == ""
+
+
+@pytest.mark.anyio
+async def test_123_responses_thinking_off_tool_call(harmony_globals):
+    out = await _responses(TOOL_CALL_DELTAS, _OFF)
+    assert out["calls"] == [("read", {"path": "a.txt"})]
+    assert out["reasoning"] == "" and out["text"] == ""
+
+
+@pytest.mark.anyio
+async def test_123_responses_thinking_off_final_answer(harmony_globals):
+    out = await _responses(FINAL_ANSWER_DELTAS, _OFF)
+    assert out["text"] == "The sky is blue."
+    assert out["reasoning"] == ""
