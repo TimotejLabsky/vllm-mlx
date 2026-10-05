@@ -3847,3 +3847,4 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
   - Head-of-line: a short request queued behind a deferred deep one gets its first token at **9.6 s under FCFS vs 4.3 s under SJF**; the deep request's first token moves only 9.2 → 9.5 s.
   - Re-match: two followers that waited behind their leader restored **2,048 and 3,321 tokens** at admission (`admission_rematches=2`) instead of prefilling cold. The second restored from the first follower's own entry.
   - 6/6, no traceback.
+- **Under load on the real 27B** (2026-10-05 HA-down window; Qwen3.8-27B-4bit, exact live route, production budgets; one short turn decoding, a ~50K cold request the KV budget defers, then 5 short turns every 5 s): with FCFS the 5 short turns' first token came at a **median of 344 s** (past opencode's 300 s timeout); with SJF the **median was 23 s (max 33 s)**. The deep request finished at 339 s vs 326 s; 5 reorders, 0 holds.
