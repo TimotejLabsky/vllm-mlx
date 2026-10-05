@@ -98,6 +98,8 @@ class ThinkingAwareLogitsProcessor:
         "watchdog_was_enforced",
         "_no_final_content_token_limit",
         "_prompt_len",
+        "_fed",
+        "_fed_count",
     )
 
     def __init__(
@@ -141,6 +143,10 @@ class ThinkingAwareLogitsProcessor:
         self._processed_len = 0
         self._processed_token_ids: list[int] = []
         self._snapshots = [self._snapshot_state()]
+        # (#133) Generated tokens fed by the scheduler (``note_generated``),
+        # one step late but already host-side ints: no GPU sync to read them.
+        self._fed = False
+        self._fed_count = 0
 
     @property
     def state(self) -> Phase:
@@ -176,7 +182,17 @@ class ThinkingAwareLogitsProcessor:
                 return self._call_inner(tokens, logits)
             return logits
 
+        lagged = self._lagged_call(tokens, logits)
+        if lagged is not None:
+            return lagged
+
         self._sync_to_tokens(tokens)
+        if self._fed:
+            # Feeds lag one step, so every token but the newest has been fed.
+            # Re-anchoring here keeps the count right after a rollback (a
+            # rescheduled request restarts from its prompt with the same
+            # processor), which would otherwise keep the lagged path off.
+            self._fed_count = max(tokens.size - 1 - self._prompt_len, 0)
 
         if self._state == Phase.TRANSITIONING:
             return self._force_transition(logits)
@@ -185,6 +201,81 @@ class ThinkingAwareLogitsProcessor:
         if self._state == Phase.CONTENT:
             return self._call_inner(tokens, logits)
         return logits
+
+    def note_generated(self, token_id: int) -> None:
+        """(#133) The scheduler reports each generated token as a host int
+        once mlx-lm has materialised it - one step after the processor saw it
+        as the lazy newest element of ``tokens``. Advances the phase machine
+        without reading ``tokens``; a position a synchronous call already
+        consumed is skipped."""
+        self._fed = True
+        if self._prompt_len is None:
+            return
+        pos = self._prompt_len + self._fed_count
+        self._fed_count += 1
+        if pos < self._processed_len:
+            return  # already consumed by a synchronous read
+        if pos == self._processed_len:
+            if self._state == Phase.CONTENT and self._inner is None:
+                self._processed_token_ids.append(_UNKNOWN)
+                self._processed_len += 1
+            else:
+                self._consume([token_id])
+
+    def _near_limit(self) -> bool:
+        """True when the newest (still unknown) token could force a phase
+        change only a synchronous read can act on in time."""
+        if self._state in (Phase.TRANSITIONING,):
+            return True
+        if self._thinking_token_budget <= 2:
+            return True
+        if self._state == Phase.THINKING:
+            if self._thinking_token_budget - self._thinking_tokens <= 2:
+                return True
+            limit = self._no_final_content_token_limit
+            if limit is not None and limit - self._thinking_tokens <= 2:
+                return True
+        return False
+
+    def _lagged_call(self, tokens: mx.array, logits: mx.array):
+        """(#133) Answer from state known through the token BEFORE the newest,
+        without a host read of ``tokens`` - the per-step ``tolist()`` forced
+        the CPU to wait for the previous step's sample before building the
+        next one (~3.4 % decode on the 27B at short context).
+
+        Exact by construction: in IDLE/THINKING the processor passes logits
+        through, so a one-token lag changes nothing - except when the newest
+        token closes the reasoning, where CONTENT masking must already apply.
+        That case is decided on the GPU (``mx.where`` on the newest token, no
+        sync). Near the budget / watchdog limit, in TRANSITIONING, with an
+        inner processor, or when the length is not the expected +1, return
+        None and take the synchronous path. Returns None unless the scheduler
+        is feeding this processor (``note_generated``)."""
+        if (
+            not self._fed
+            or self._inner is not None
+            or self._prompt_len is None
+            or int(tokens.size) != self._processed_len + 1
+            or self._near_limit()
+        ):
+            return None
+        if self._state == Phase.CONTENT:
+            return self._mask_content_phase_control_tokens(logits)
+        if self._state == Phase.THINKING and self._end_would_complete():
+            closes = tokens.reshape(-1)[-1] == self._end_token_ids[-1]
+            masked = self._mask_content_phase_control_tokens(mx.array(logits))
+            return mx.where(closes, masked, logits)
+        return logits
+
+    def _end_would_complete(self) -> bool:
+        """Would the end sequence's LAST token complete it right now?"""
+        target = self._end_matcher.target
+        tail = (
+            list(self._end_matcher.snapshot())[-(len(target) - 1) :]
+            if len(target) > 1
+            else []
+        )
+        return tuple(tail) + (target[-1],) == target
 
     def _force_transition(self, logits: mx.array) -> mx.array:
         """Force the next token in the reasoning end sequence."""
