@@ -3848,3 +3848,19 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
   - Re-match: two followers that waited behind their leader restored **2,048 and 3,321 tokens** at admission (`admission_rematches=2`) instead of prefilling cold. The second restored from the first follower's own entry.
   - 6/6, no traceback.
 - **Under load on the real 27B** (2026-10-05 HA-down window; Qwen3.8-27B-4bit, exact live route, production budgets; one short turn decoding, a ~50K cold request the KV budget defers, then 5 short turns every 5 s): with FCFS the 5 short turns' first token came at a **median of 344 s** (past opencode's 300 s timeout); with SJF the **median was 23 s (max 33 s)**. The deep request finished at 339 s vs 326 s; 5 reorders, 0 holds.
+
+## 132. `patch: anchor-first-boundary` — the end-of-system checkpoint survives ladder thinning and SSD (port of fork PR #37)
+
+**Files:** `vllm_mlx/system_kv.py` (`thin_checkpoints`, `append_checkpoint`), `vllm_mlx/system_kv_ssd.py` (`flatten_checkpoints` / `unflatten_checkpoints`), `vllm_mlx/batched_system_kv.py` (`find_message_boundaries(with_anchor=)`, `note_scheduled(anchor=)`, `capture_segment`, `_anchor_pos`, store-path cleanup, `anchor_cuts` stat), `tests/test_fork_invariants.py` (+3).
+
+**Gap:** #126 places a checkpoint at the end of a cold prompt's system message. Fork PR #37 (2026-09-27, never merged, branch predates the 10-04 rebase) had found two more ways that checkpoint is lost:
+1. **Thinning.** It is the ladder's lowest boundary, with the smallest gap, so `thin_checkpoints` evicted it FIRST once a deep chain filled the 8 slots. A 600-token system prompt + 12 × 2.1K turns left no checkpoint at 600, and a new session that shares only the system prompt restored nothing again.
+2. **SSD round-trip.** `flatten_checkpoints` dropped the #88 `boundary` flags (and would drop `anchor`), so a promoted ladder was thinned by a different policy than a resident one.
+
+**Fix (the two #37 pieces #126 lacked):** `insert_segmented` reports #126's kept first boundary as the request's **anchor**. Its checkpoint carries `anchor=True`, and `thin_checkpoints` never evicts an anchor while another candidate exists (ladder cap unchanged, so no extra memory). Both flags are written to and read from the SSD meta (additive keys; format number unchanged; older readers ignore them).
+
+**Also fixed:** the store path never released a request's `_boundary_pos` entry (one small set leaked per stored request since #88); it and the new `_anchor_pos` are now dropped at store as well as at discard.
+
+**Upstream:** fork-owned.
+
+**Verification:** `test_132_short_system_prompt_survives_a_deep_chain_thinning` (12-turn deep chain thinned to 8: anchor at 600 kept, a new session peeks 600, bookkeeping released), `test_132_the_anchor_survives_an_ssd_round_trip`, `test_132_thinning_never_evicts_the_anchor`. Mutation-checked: dropping the thinning pin fails 3; dropping the SSD flags fails 1; restoring the store-path leak fails 1. Suite 4512 passed. Supersedes fork PR #37.
