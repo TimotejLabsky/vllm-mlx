@@ -31,7 +31,7 @@ BASE = f"http://127.0.0.1:{PORT}"
 GATES = {
     "VLLM_MLX_BATCHED_SYSTEM_KV": "1",
     "VLLM_MLX_BATCHED_BPT_FLOOR_KB": "64",  # price tokens at 64 KB
-    "VLLM_MLX_BATCHED_KV_BUDGET_MB": "600",  # ~2 seats at 4.5K tokens
+    "VLLM_MLX_BATCHED_KV_BUDGET_MB": "350",  # one 3K-token row at a time
 }
 
 
