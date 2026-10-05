@@ -2310,6 +2310,123 @@ def test_130_prefix_boundary_only_for_the_legacy_chunked_path():
     call = src.index("self._compute_prefix_boundary(")
     guard = src.rfind("chunked_prefill_tokens", 0, call)
     assert guard != -1 and call - guard < 400
+# ------------- #131 admission order: shortest-prefill-first with aging + re-match
+
+
+def _sjf_queue(monkeypatch, order="sjf", **env):
+    """A scheduler stand-in: real BatchedSystemKV, a waiting deque, and a
+    co-batch gate that defers anything deeper than 10K uncached tokens."""
+    import time
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_ADMISSION_ORDER", order)
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    kv = BatchedSystemKV(_FakeModel())
+    monkeypatch.setattr(
+        bkv,
+        "should_defer_cobatch",
+        lambda sched, req: bkv._uncached_tokens(req) > 10_000,
+    )
+    sched = SimpleNamespace(hybrid_kv=kv, waiting=deque(), running={})
+
+    def add(rid, n, age=0.0):
+        req = _queued(rid, list(range(n)))
+        req.arrival_time = time.time() - age
+        sched.waiting.append(req)
+        return req
+
+    return sched, kv, add
+
+
+def test_131_fcfs_default_still_blocks_behind_a_deferred_head(monkeypatch):
+    sched, kv, add = _sjf_queue(monkeypatch, order="fcfs")
+    sched.running["busy"] = object()
+    deep, short = add("deep", 60_000, age=5), add("short", 800)
+
+    assert bkv.next_admission(sched) is None
+    assert list(sched.waiting) == [deep, short]  # head kept, nothing reordered
+
+
+def test_131_sjf_admits_past_a_deferred_deep_head(monkeypatch):
+    """Fork issue #44: one deep cold request behind the KV budget held every
+    short / cache-hit request behind it (2026-09-17: median TTFT 137 s for a
+    ~15 s median prefill)."""
+    sched, kv, add = _sjf_queue(monkeypatch)
+    sched.running["busy"] = object()
+    deep, short = add("deep", 60_000, age=5), add("short", 800)
+
+    assert bkv.next_admission(sched) is short
+    assert list(sched.waiting) == [deep] and kv.sjf_reorders == 1
+    assert bkv.next_admission(sched) is None  # deep still deferred, still queued
+
+
+def test_131_sjf_runs_the_shortest_first_when_idle(monkeypatch):
+    sched, kv, add = _sjf_queue(monkeypatch)
+    add("deep", 60_000, age=2)
+    mid = add("mid", 5_000, age=1)
+    add("tiny-but-cached", 9_000).remaining_tokens = list(range(40))
+
+    first = bkv.next_admission(sched)
+
+    assert first.request_id == "tiny-but-cached"  # ranks by UNCACHED tokens
+    assert bkv.next_admission(sched) is mid
+
+
+def test_131_aging_lets_a_long_waiter_overtake(monkeypatch):
+    sched, kv, add = _sjf_queue(monkeypatch, VLLM_MLX_BATCHED_SJF_AGING_TOK_PER_S=100)
+    old = add("old", 6_000, age=60)  # 6,000 - 100 x 60 = 0
+    add("new", 1_000)
+
+    assert bkv.next_admission(sched) is old
+
+
+def test_131_the_oldest_past_max_wait_holds_the_line(monkeypatch):
+    """No starvation: once the oldest has waited SJF_MAX_WAIT_S nobody else
+    is admitted, so the running set drains and it gets its seat."""
+    sched, kv, add = _sjf_queue(monkeypatch, VLLM_MLX_BATCHED_SJF_MAX_WAIT_S=120)
+    sched.running["busy"] = object()
+    starving = add("starving", 60_000, age=130)
+    add("short", 800)
+
+    assert bkv.next_admission(sched) is None  # short waits too
+    assert kv.sjf_holds == 1 and sched.waiting[0] is starving
+    sched.running.clear()
+    assert bkv.next_admission(sched) is starving  # alone -> never deferred
+
+
+def test_131_a_miss_is_matched_again_at_admission(monkeypatch):
+    """Fork issue #46(a): a follower that missed at enqueue (its leader was
+    still prefilling) and waited behind the budget prefilled cold although
+    the leader's entry had landed meanwhile."""
+    kv = BatchedSystemKV(_FakeModel())
+    follower = _queued("follower", GROWN)
+    bkv.fetch_for_request(kv, follower)
+    assert follower.cache_hit_type == "miss"
+    before = (kv.hits, kv.misses)
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), follower)
+    assert follower.cache_hit_type == "miss"  # still nothing: no counters moved
+    assert (kv.hits, kv.misses) == before and kv.admission_rematches == 0
+
+    kv.store("leader", TOKENS, _donor_at(len(TOKENS)))  # the leader finishes
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), follower)
+
+    assert follower.cache_hit_type == "system_kv"
+    assert follower.cached_tokens > 0 and follower.prompt_cache is not None
+    assert follower.remaining_tokens == GROWN[follower.cached_tokens :]
+    assert kv.admission_rematches == 1
+
+
+def test_131_schedule_waiting_uses_the_admission_hook(monkeypatch):
+    """The real _schedule_waiting must go through next_admission (a rebase
+    that restores the inline popleft/appendleft silently drops #131)."""
+    import inspect
+
+    from vllm_mlx.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler._schedule_waiting)
+    assert "_batched_kv.next_admission(self)" in src
+    assert "self.waiting.popleft()" not in src
 
 
 _HARMONY_DELTAS = (
