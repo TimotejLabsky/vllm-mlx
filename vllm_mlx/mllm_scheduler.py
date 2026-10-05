@@ -136,6 +136,8 @@ class MLLMRequest:
     num_output_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Prompt tokens served from the MLLM prefix cache (#119).
+    cached_tokens: int = 0
 
     # Timing
     first_token_time: Optional[float] = None
@@ -746,6 +748,11 @@ class MLLMScheduler:
 
             if response.specprefill_outcome is not None:
                 request.specprefill_outcome = response.specprefill_outcome
+            # Prefix-cache hit size, stamped by the generator (#119); report it
+            # as usage.prompt_tokens_details.cached_tokens like the text path.
+            cached = getattr(response, "cached_tokens", None)
+            if cached:
+                request.cached_tokens = int(cached)
             # add_request counted the text-only prompt; the generator reports
             # the processor-expanded length (vision tokens included) (#115).
             expanded = getattr(response, "prompt_tokens", None)
@@ -865,6 +872,7 @@ class MLLMScheduler:
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
                 specprefill_outcome=request.specprefill_outcome,
+                cached_tokens=getattr(request, "cached_tokens", 0) or 0,
                 # Grammar verdict for THIS chunk, recorded at production time
                 # (#89) — see the field docstring on RequestOutput for why the
                 # consumer must not read it live off the collector.
@@ -1425,7 +1433,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": getattr(req, "cached_tokens", 0) or 0,
                 }
             )
 

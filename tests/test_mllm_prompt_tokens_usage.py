@@ -13,7 +13,7 @@ from vllm_mlx.mllm_scheduler import MLLMScheduler
 from vllm_mlx.request import RequestStatus
 
 
-def _resp(token, finish=None, prompt_tokens=None, uid=0):
+def _resp(token, finish=None, prompt_tokens=None, uid=0, cached_tokens=None):
     return MLLMBatchResponse(
         uid=uid,
         request_id="req-1",
@@ -21,6 +21,7 @@ def _resp(token, finish=None, prompt_tokens=None, uid=0):
         logprobs=mx.array([0.0]),
         finish_reason=finish,
         prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
     )
 
 
@@ -43,6 +44,7 @@ def _scheduler(estimate):
     req.first_token_time = None
     req.mtp_drafts = 0
     req.mtp_accepted = 0
+    req.cached_tokens = 0
     sched.running = {"req-1": req}
     return sched, req
 
@@ -83,3 +85,35 @@ def test_next_stamps_rows_from_before_and_after_the_step():
     gen._stamp_prompt_tokens(responses, leaving)
 
     assert [r.prompt_tokens for r in responses] == [7, 900, None]
+
+
+# --- #119: usage.prompt_tokens_details.cached_tokens on the MLLM path -------
+
+
+def test_119_prefix_hit_size_reaches_request_output():
+    sched, req = _scheduler(estimate=12)
+    outputs, _ = sched._process_batch_responses(
+        [_resp(100, prompt_tokens=4180, cached_tokens=4137)]
+    )
+    assert outputs[0].cached_tokens == 4137
+    # A later step's response with no stamp keeps the request's value.
+    outputs, _ = sched._process_batch_responses([_resp(101, finish="stop")])
+    assert outputs[0].cached_tokens == 4137
+
+
+def test_119_miss_reports_zero():
+    sched, _ = _scheduler(estimate=12)
+    outputs, _ = sched._process_batch_responses([_resp(100, cached_tokens=0)])
+    assert outputs[0].cached_tokens == 0
+
+
+def test_119_next_stamps_cached_tokens_per_row():
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    hit = SimpleNamespace(input_ids=mx.zeros((1, 50)), cached_tokens=40)
+    miss = SimpleNamespace(input_ids=mx.zeros((1, 9)), cached_tokens=0)
+    gen.active_batch = SimpleNamespace(uids=[0, 1], requests=[hit, miss])
+    responses = [_resp(1, uid=0), _resp(2, uid=1)]
+
+    gen._stamp_prompt_tokens(responses, None)
+
+    assert [r.cached_tokens for r in responses] == [40, 0]
