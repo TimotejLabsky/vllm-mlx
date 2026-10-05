@@ -2703,3 +2703,16 @@ def test_118_harmony_final_channel_survives_stripped_eos(parser_name, tail):
     reasoning, content = get_parser(parser_name)().extract_reasoning(text)
     assert reasoning == "Think."
     assert content == "42"
+
+
+def test_136_images_hash_is_order_sensitive():
+    """#136: both image-set hashes are order-sensitive. Upstream #726 fixes
+    only ``mllm_cache``; the production pixel cache (batched MLLM path) uses
+    ``vision_embedding_cache``'s own copy — a rebase that takes upstream's
+    file brings ``sorted`` back and reordered images hit each other's pixels.
+    """
+    from vllm_mlx.mllm_cache import compute_images_hash as simple_hash
+    from vllm_mlx.vision_embedding_cache import compute_images_hash as batched_hash
+
+    for h in (simple_hash, batched_hash):
+        assert h(["img-a", "img-b"]) != h(["img-b", "img-a"])

@@ -144,10 +144,10 @@ class TestImageHashing:
             path2 = f2.name
 
         try:
-            # Order shouldn't matter (sorted internally)
+            # Order is part of the model input (fork #136).
             hash_a = compute_images_hash([path1, path2])
             hash_b = compute_images_hash([path2, path1])
-            assert hash_a == hash_b
+            assert hash_a != hash_b
         finally:
             os.unlink(path1)
             os.unlink(path2)
@@ -421,9 +421,10 @@ class TestMLLMCacheManager:
             cache, hit = cache_manager.fetch_cache(images, prompt)
             assert hit is True
 
-            # Fetch same images in different order - should still hit (sorted internally)
+            # Reversed image order must not reuse the entry (fork #136).
             cache, hit = cache_manager.fetch_cache([img2, img1], prompt)
-            assert hit is True
+            assert cache is None
+            assert hit is False
         finally:
             os.unlink(img1)
             os.unlink(img2)
