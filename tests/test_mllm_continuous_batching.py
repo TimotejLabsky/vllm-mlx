@@ -2681,9 +2681,13 @@ class TestMLLMHybridPrefixCacheIsolation:
 
         first_processors = [mask_preferred_token] if bias_on_cold_request else None
         second_processors = None if bias_on_cold_request else [mask_preferred_token]
-        first = gen._process_prompts([self._request("first", first_processors)])
-        second = gen._process_prompts([self._request("second", second_processors)])
+        first_req = self._request("first", first_processors)
+        second_req = self._request("second", second_processors)
+        first = gen._process_prompts([first_req])
+        second = gen._process_prompts([second_req])
         unbiased = gen._process_prompts([self._request("unbiased")])
+        # Fork #119: the exact replay reports the whole prompt as cached.
+        assert (first_req.cached_tokens, second_req.cached_tokens) == (0, 4)
 
         if bias_on_cold_request:
             assert first.y.tolist() == [2]
@@ -2873,6 +2877,7 @@ class TestChunkedPrefillCacheHandling:
             1
         ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
         assert rewind_calls == []
+        assert req.cached_tokens == 3  # fork #119: 5 prompt - 2 remaining
 
     def test_abort_cleans_up_partial_prefill(self):
         """Aborting a request during chunked prefill must clean up _partial."""

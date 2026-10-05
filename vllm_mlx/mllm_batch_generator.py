@@ -237,6 +237,8 @@ class MLLMBatchRequest:
 
     # Text-only flag (no images/videos — eligible for prefix cache)
     is_text_only: bool = False
+    # Prompt tokens served from the prefix cache (usage cached_tokens, #119).
+    cached_tokens: int = 0
 
     # Generation state
     num_tokens: int = 0  # Tokens generated so far
@@ -288,6 +290,8 @@ class MLLMBatchResponse:
     # Processor-expanded prompt length (text + vision tokens), stamped in
     # next(); the scheduler's add-time count is a text-only estimate (#115).
     prompt_tokens: Optional[int] = None
+    # Prompt tokens restored from the prefix cache, stamped in next() (#119).
+    cached_tokens: Optional[int] = None
 
 
 def _error_kind_for(exc: BaseException) -> Optional[str]:
@@ -2181,6 +2185,7 @@ class MLLMBatchGenerator:
                     per_request_caches.append(request_cache)
                     req.vision_encoded = True
                     prompt_len = int(req.input_ids.size)
+                    req.cached_tokens = prompt_len
                     self._prefill_progress[req.request_id] = (
                         prompt_len,
                         prompt_len,
@@ -2191,6 +2196,7 @@ class MLLMBatchGenerator:
                     request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = req.input_ids.size - len(remaining_ids)
+                    req.cached_tokens = int(cached_count)
                     total_tokens = req.input_ids.size
                     remaining_count = len(remaining_ids)
 
@@ -2293,6 +2299,7 @@ class MLLMBatchGenerator:
                     request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = req.input_ids.size
+                    req.cached_tokens = int(total_tokens) - 1
                     self._prefill_progress[req.request_id] = (
                         total_tokens,
                         total_tokens,
@@ -2959,6 +2966,7 @@ class MLLMBatchGenerator:
         step, so look in the batch from before and after it.
         """
         sizes = {}
+        cached = {}
         for batch in (before, self.active_batch):
             if batch is None:
                 continue
@@ -2966,9 +2974,12 @@ class MLLMBatchGenerator:
                 ids = getattr(req, "input_ids", None)
                 if ids is not None:
                     sizes[uid] = int(ids.size)
+                cached[uid] = int(getattr(req, "cached_tokens", 0) or 0)
         for r in responses:
             if r.prompt_tokens is None:
                 r.prompt_tokens = sizes.get(r.uid)
+            if r.cached_tokens is None:
+                r.cached_tokens = cached.get(r.uid)
 
     def stats(self) -> MLLMBatchStats:
         """
@@ -4489,6 +4500,7 @@ def install_chunked_prefill_mllm(
                     remaining = input_ids
                     cached_count = 0
                     remaining_count = total_tokens
+                text_only_req.cached_tokens = int(cached_count)
 
                 checkpoint_at = None
                 checkpoint_key = None
