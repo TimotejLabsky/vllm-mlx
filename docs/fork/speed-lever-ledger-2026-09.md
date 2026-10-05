@@ -262,6 +262,16 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
   vision sweep 10/10 on gemma4, glm4v, mistral3, qwen3_5 (identical to prod;
   Qwen3-VL-30B-8bit skipped — too big beside the resident HA 35B).
 
+### 2026-10-05 (evening) — HA-down validation window
+
+- **#41 is architecture-dependent: OFF on the Qwen3-Next class.**
+  - Coder-Next and Next-80B (45 GB), exact live route config, A/B/A/B: decode +16 % (55 → 63.5 tok/s), T=0 identical. But a ~103K-token cold prefill **hits Metal OOM at 63.2–63.3 GB with the env on**; it completes at 51.15 GB without it (both models, both rounds). The +88 GB report in mlx #4521 was this failure mode. Not armed; the routes carry a do-not-arm comment.
+  - The 5 armed routes, re-checked near their 131K cap: the 35B-A3B at 127K completes, peak 26.98 → 26.97 GB, decode 78 → 90; Nemotron at 127K, 23.03 → 23.03 GB, 95.5 → 109.8; gemma-26b at 127K, 23.98 → 23.98 GB, 85.4 → 90.3; gpt-oss at 102K, 16.8 → 16.8 GB; GLM-4.7-Flash at 49K, 22.26 → 22.32 GB, 61.3 → 75.6. Prefill −0–4.5 %. No OOM anywhere.
+  - Side finding: GLM-4.7-Flash cannot finish a 108K prefill inside its 600 s route timeout, so its 131K cap is unreachable (config mismatch, pre-existing).
+- **#48 staged crash recipe on mlx 0.32.3 — PASS.** 27B-8bit exact live route, seeds 43.4K + 46.7K then a divergent 93.7K prefill: all 200, pressure relief evicted one entry at a **51.6 GB peak** (July: 50.1–51.6 GB), 0 Metal OOM, 0 recoveries.
+- **#131 SJF admission under load on the real Qwen3.8-27B-4bit** (exact live route, production budgets; one short turn decoding, a ~50K cold request the KV budget defers, then 5 short turns every 5 s): with **FCFS the 5 short turns got their first token at a median 344 s** (past opencode's 300 s timeout); with **SJF the median was 23 s (max 33 s)**. The deep request finished at 339 s vs 326 s (+13 s); 5 reorders, no starvation hold.
+- **Vision:** Qwen3-VL-30B-A3B-8bit sweep 10/10 on mlx 0.32.3 / mlx-vlm 0.7.4, which completes the 5-arch verification of the bump.
+
 ## Watch list / open items
 
 - **GDN blocked_seq prefill kernel (from oMLX): REFUTED at the kill gate
