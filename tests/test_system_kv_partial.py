@@ -16,6 +16,7 @@ import tempfile
 
 import mlx.core as mx
 
+from vllm_mlx.cache_state_compat import legacy_state, set_legacy_state
 from vllm_mlx.system_kv import (
     SystemKVManager,
     append_checkpoint,
@@ -142,15 +143,15 @@ def test_kvcache_trim_restore_real_cache():
 
     donor = KVCache()
     donor.update_and_fetch(*_kv_layer(700))
-    full_k, _ = donor.state
+    full_k, full_v = legacy_state(donor)
 
     target = KVCache()
-    target.state = (full_k[..., :512, :], donor.state[1][..., :512, :])
+    set_legacy_state(target, (full_k[..., :512, :], full_v[..., :512, :]))
     assert target.offset == 512
     # forward growth from the restored position works
     target.update_and_fetch(*_kv_layer(8))
     assert target.offset == 520
-    k_now, _ = target.state
+    k_now, _ = legacy_state(target)
     assert _arrays_equal(k_now[..., :512, :], full_k[..., :512, :])
 
 
@@ -443,7 +444,7 @@ def test_rotating_meta_roundtrip_exact_continuation():
         donor.update_and_fetch(k, v)
 
     # Snapshot exactly the way the engine does: state + meta_state.
-    snap_state = donor.state
+    snap_state = legacy_state(donor)
     snap_meta = capture_snapshot_meta([donor])[0]
     assert snap_meta is not None
 
@@ -471,7 +472,7 @@ def test_rotating_state_only_restore_would_desync():
     for _ in range(15):
         donor.update_and_fetch(*_kv_layer(1, dim=4, heads=1))
     bare = RotatingKVCache(max_size=window)
-    bare.state = donor.state
+    set_legacy_state(bare, legacy_state(donor))  # state WITHOUT meta
     assert (bare.offset, bare._idx) != (donor.offset, donor._idx)
 
 
