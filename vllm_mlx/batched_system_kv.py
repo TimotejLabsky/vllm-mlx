@@ -258,6 +258,10 @@ class BatchedSystemKV:
         # recorded at insert so capture_segment can flag boundary-aligned
         # checkpoints for the thinning policy.
         self._boundary_pos: dict[str, frozenset] = {}
+        # (#132) request_id -> ABSOLUTE position of a cold prompt's first
+        # message boundary (#126); its checkpoint is pinned against thinning.
+        self._anchor_pos: dict[str, int] = {}
+        self.anchor_cuts = 0
         # template family -> tuple of marker token-id sequences (encoded
         # once per family per process; markers are special tokens with
         # stable ids, so token-space scanning avoids the byte-offset
@@ -542,7 +546,7 @@ class BatchedSystemKV:
         return tuple(sorted({int(b) for b in boundaries} | {rel}))
 
     def note_scheduled(
-        self, request_id: str, cached_tokens: int, boundaries=()
+        self, request_id: str, cached_tokens: int, boundaries=(), anchor=None
     ) -> None:
         """Record the restored-prefix offset so segment positions (relative
         to the inserted tokens) map to absolute sequence positions — and
@@ -554,6 +558,9 @@ class BatchedSystemKV:
                 self._boundary_pos[request_id] = frozenset(
                     cached_tokens + int(b) for b in boundaries
                 )
+            if anchor is not None:
+                self._anchor_pos[request_id] = cached_tokens + int(anchor)
+                self.anchor_cuts += 1
 
     # -------------------------------------------------------------- capture
 
@@ -601,6 +608,7 @@ class BatchedSystemKV:
                 metas,
                 self.ckpt_capacity,
                 boundary=pos in self._boundary_pos.get(request_id, ()),
+                anchor=pos == self._anchor_pos.get(request_id),
             )
 
     def discard_pending(self, request_id: str) -> None:
@@ -608,6 +616,7 @@ class BatchedSystemKV:
             self._pending.pop(request_id, None)
             self._base_pos.pop(request_id, None)
             self._boundary_pos.pop(request_id, None)
+            self._anchor_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
             self._peeked.pop(request_id, None)
             self._divergence.pop(request_id, None)
@@ -778,6 +787,9 @@ class BatchedSystemKV:
         with self._lock:
             checkpoints = self._pending.pop(request_id, [])
             self._base_pos.pop(request_id, None)
+            # (#132) these leaked one entry per stored request before
+            self._boundary_pos.pop(request_id, None)
+            self._anchor_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
             self._divergence.pop(request_id, None)
             entry = self._insert_entry_locked(
@@ -1612,6 +1624,7 @@ class BatchedSystemKV:
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
                 "lazy_ssd_deferred": self.lazy_ssd_deferred,
+                "anchor_cuts": self.anchor_cuts,
                 "sjf_reorders": self.sjf_reorders,
                 "sjf_holds": self.sjf_holds,
                 "admission_rematches": self.admission_rematches,
@@ -2066,7 +2079,9 @@ def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> No
         hybrid_kv.discard_pending(request_id)
 
 
-def find_message_boundaries(tokens, marker_seqs, min_step, first_min=None) -> tuple:
+def find_message_boundaries(
+    tokens, marker_seqs, min_step, first_min=None, with_anchor=False
+) -> tuple:
     """Positions in ``tokens`` where a template turn marker STARTS (#88) —
     checkpoint placement at message boundaries, on the token stream.
 
@@ -2082,7 +2097,7 @@ def find_message_boundaries(tokens, marker_seqs, min_step, first_min=None) -> tu
     restored nothing (the uniform interval and the newest turn both sit
     past the shared prefix)."""
     if not marker_seqs:
-        return ()
+        return ((), None) if with_anchor else ()
     n = len(tokens)
     hits = set()
     for seq in marker_seqs:
@@ -2101,9 +2116,10 @@ def find_message_boundaries(tokens, marker_seqs, min_step, first_min=None) -> tu
             i += 1
     ordered = sorted(h for h in hits if 0 < h < n)
     if not ordered:
-        return ()
+        return ((), None) if with_anchor else ()
     accepted = []
     last_cut = 0
+    first = None
     if first_min is not None:
         first = next((h for h in ordered if h >= first_min), None)
         if first is not None:
@@ -2117,6 +2133,8 @@ def find_message_boundaries(tokens, marker_seqs, min_step, first_min=None) -> tu
             last_cut = h
     if not accepted or accepted[-1] != ordered[-1]:
         accepted.append(ordered[-1])  # newest boundary bypasses min_step
+    if with_anchor:  # (#132) also report the kept first boundary
+        return tuple(accepted), first
     return tuple(accepted)
 
 
@@ -2135,16 +2153,18 @@ def insert_segmented(
     template family) so checkpoints land where agent histories actually
     diverge; failure to detect degrades to the uniform interval."""
     boundaries = ()
+    anchor = None
     try:
         marker_seqs = hybrid_kv.boundary_marker_ids(
             getattr(request, "prompt", None), tokenizer
         )
-        boundaries = find_message_boundaries(
+        boundaries, anchor = find_message_boundaries(
             tokens,
             marker_seqs,
             hybrid_kv.boundary_min_step,
             # (#126) cold prompt: keep the end-of-system boundary
             first_min=hybrid_kv.partial_min if not request.cached_tokens else None,
+            with_anchor=True,
         )
         boundaries = hybrid_kv.add_divergence_cut(
             request.request_id, request.cached_tokens, len(tokens), boundaries
@@ -2152,7 +2172,10 @@ def insert_segmented(
     except Exception:
         logger.debug("[batched_system_kv] boundary detection failed", exc_info=True)
     hybrid_kv.note_scheduled(
-        request.request_id, request.cached_tokens, boundaries=boundaries
+        request.request_id,
+        request.cached_tokens,
+        boundaries=boundaries,
+        anchor=anchor,  # (#132) pinned against ladder thinning
     )
     return batch_generator.insert_segments(
         [hybrid_kv.split_segments(tokens, boundaries=boundaries)],
