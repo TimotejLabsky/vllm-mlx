@@ -29,6 +29,8 @@ import time
 import weakref
 from collections import OrderedDict, deque
 
+from .cache_state_compat import legacy_meta_state, legacy_state, set_legacy_state
+
 logger = logging.getLogger(__name__)
 
 # Every live CacheTimingRecorder registers here so the Prometheus exporter
@@ -366,12 +368,16 @@ def is_new_recurrent_state(st) -> bool:
     shape: ``(cache_list, left_padding, lengths)`` — element 0 is the
     recurrent array list, elements 1-2 are per-row metadata arrays
     (``mx.array([])`` when the row carries none). See PATCHES.md #81.
+    Post-mlx-lm#1778 the native state carries ``None`` there instead; the
+    fork reads through ``cache_state_compat.legacy_state`` (empty arrays),
+    but a native state that reaches a classifier is still recognised
+    (#137).
     """
     return (
         isinstance(st, tuple)
         and len(st) == 3
         and isinstance(st[0], list)
-        and all(hasattr(a, "ndim") for a in st[1:])
+        and all(a is None or hasattr(a, "ndim") for a in st[1:])
     )
 
 
@@ -485,7 +491,7 @@ def classify_layers(prompt_cache):
     """
     kinds = []
     for c in prompt_cache:
-        st = c.state
+        st = legacy_state(c)
         _warn_if_recurrent_shape_changed(c, st)
         _warn_if_kv_shape_changed(c, st)
         if is_recurrent_state(st) or type(c).__name__ == "RotatingKVCache":
@@ -509,7 +515,7 @@ def capture_snapshot_meta(prompt_cache):
     """
     metas = []
     for c in prompt_cache:
-        m = getattr(c, "meta_state", "")
+        m = legacy_meta_state(c, "")
         metas.append(m if m else None)
     return metas
 
@@ -520,10 +526,8 @@ def apply_snapshot_states(prompt_cache, states, metas=None):
     meta is applied AFTER state, mirroring mlx-lm's ``from_state`` order.
     """
     for i, st in enumerate(states):
-        prompt_cache[i].state = pin_state(st)
         m = metas[i] if metas and i < len(metas) else None
-        if m:
-            prompt_cache[i].meta_state = m
+        set_legacy_state(prompt_cache[i], pin_state(st), m)
 
 
 def capture_checkpoint_states(prompt_cache, kinds=None):
@@ -543,9 +547,9 @@ def capture_checkpoint_states(prompt_cache, kinds=None):
     for i, c in enumerate(prompt_cache):
         if kinds[i] != "ckpt":
             continue
-        st = c.state
+        st = legacy_state(c)
         states[i] = pin_state(st)
-        m = getattr(c, "meta_state", "")
+        m = legacy_meta_state(c, "")
         metas[i] = m if m else None
     return states, metas
 
