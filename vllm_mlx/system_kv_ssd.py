@@ -42,7 +42,16 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .ssd_cache import SSDIndex, _blob_to_tokens, _tokens_hash
+import numpy as np
+
+from .ssd_cache import (
+    _PREFIX_FILTER_TOKENS,
+    SSDIndex,
+    _blob_to_tokens,
+    _prefix_hash,
+    _tokens_hash,
+    _tokens_to_blob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +73,59 @@ class _SystemKVIndex(SSDIndex):
     """
 
     _SCHEMA_VERSION = 1
+
+    def lookup_shared_prefix(
+        self, query_tokens: tuple[int, ...], limit: int = 4
+    ) -> list[dict]:
+        """``SSDIndex.lookup_shared_prefix`` with a C-speed divergence point
+        (#130): upstream computes it with ``os.path.commonprefix`` on the raw
+        blobs - a Python loop, 10.9 ms per 95K common tokens per candidate -
+        and decodes every candidate's token tuple, not just the ``limit``
+        returned. Same query, same filtering, same results and order."""
+        query_len = len(query_tokens)
+        if query_len < _PREFIX_FILTER_TOKENS:
+            return []
+        query_blob = _tokens_to_blob(query_tokens)
+        query_arr = np.frombuffer(query_blob, dtype=np.int32)
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, "
+                "memory_bytes FROM entries WHERE prefix_hash = ?",
+                (_prefix_hash(query_tokens),),
+            ).fetchall()
+        results = []
+        for row in rows:
+            stored_blob = row["tokens_blob"]
+            n = row["num_tokens"]
+            # Full-prefix entries belong to lookup_prefix.
+            if n <= query_len and stored_blob == query_blob[: n * 4]:
+                continue
+            common_len = _blob_common_len(stored_blob, query_arr)
+            if common_len <= 0:
+                continue
+            results.append((common_len, row))
+        results.sort(key=lambda r: r[0], reverse=True)
+        return [
+            {
+                "token_hash": row["token_hash"],
+                "file_path": row["file_path"],
+                "memory_bytes": row["memory_bytes"],
+                "num_tokens": row["num_tokens"],
+                "common_len": common_len,
+                # The entry's own token key - read_entry needs it for index
+                # touch/quarantine (the query's prefix is NOT this key).
+                "tokens": _blob_to_tokens(row["tokens_blob"]),
+            }
+            for common_len, row in results[:limit]
+        ]
+
+
+def _blob_common_len(stored_blob: bytes, query_arr: np.ndarray) -> int:
+    """Common token-prefix length of an int32 token blob and a query array."""
+    stored = np.frombuffer(stored_blob, dtype=np.int32)
+    n = min(len(stored), len(query_arr))
+    diff = np.flatnonzero(stored[:n] != query_arr[:n])
+    return int(diff[0]) if diff.size else n
 
 
 @dataclass
