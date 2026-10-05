@@ -69,6 +69,12 @@ class GptOssReasoningParser(ReasoningParser):
         <|channel|>final <|constrain|>JSON<|message|>[content]<|return|>
     """
 
+    # Explicit marker for the server's thinking-disabled latch
+    # (_explicit_reasoning_markers_present reads start_token/end_token): any
+    # channel header means harmony structure follows, and gpt-oss reasons in
+    # the analysis channel whatever enable_thinking says (fork #118).
+    start_token = "<|channel|>"
+
     def extract_reasoning(
         self,
         model_output: str,
