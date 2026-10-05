@@ -194,10 +194,12 @@ def _model_slug(tokenizer: Any) -> str:
 class BatchedSystemKV:
     """LRU of hybrid-safe snapshot entries + per-request checkpoint ladders.
 
-    Thread contract: ``fetch`` runs on the event-loop thread
-    (``add_request``); ``capture_segment``/``store`` run on the scheduler's
-    executor thread (``step``). All entry/pending mutation is under one
-    lock. Stored states follow the patch-#6 aliasing discipline (list
+    Thread contract: under BatchedEngine everything here - ``add_request``'s
+    ``fetch``/``peek``/SSD probes included - runs on the single generation
+    worker, between steps (engine_core hands ``add_request`` to it; only a
+    standalone EngineCore without a worker runs it inline on the event
+    loop). The lock still guards every entry/pending mutation, so neither
+    placement can corrupt the bag. Stored states follow the patch-#6 aliasing discipline (list
     states shallow-copied, arrays immutable); restored caches are fresh
     ``make_prompt_cache`` objects, so nothing aliases the running batch.
     """
@@ -302,6 +304,9 @@ class BatchedSystemKV:
         # tokens cold (18 min). Watermark relief can still take everything.
         self._peeked: dict[str, int] = {}
         self.lazy_ssd_fallbacks = 0
+        # (#125) RAM-miss SSD hits deferred to admission instead of promoted
+        # (and materialised) while the request waits.
+        self.lazy_ssd_deferred = 0
         # (#117) SSD-vs-RAM-partial arbitration. ``fetch`` used to take ANY
         # RAM entry sharing >= PARTIAL_MIN tokens and only consulted the SSD on
         # a total miss: with a hybrid model the partial snaps DOWN to a
@@ -839,7 +844,8 @@ class BatchedSystemKV:
     # ------------------------------------------------------------- ssd tier
 
     def check_ssd(self, tokens: list) -> Optional[dict]:
-        """Index-level probe only (event-loop safe, no blob I/O): a
+        """Index-level probe only (no blob I/O - cheap enough for
+        ``add_request``, which shares the worker with the step loop): a
         full-prefix or shared-prefix SSD candidate, or None. The blob read
         happens on the executor via ``promote_ssd`` — the scheduler's
         ``ssd_pending`` pattern keeps disk reads out of ``add_request``.
@@ -901,7 +907,7 @@ class BatchedSystemKV:
         would land more than ``ssd_prefer_gain`` tokens past the RAM restore
         position ``ram_pos``; else None (keep the RAM hit).
 
-        Index/meta reads only — safe on the event loop. Whichever tier
+        Index/meta reads only — cheap enough for ``add_request``. Whichever tier
         wins, ``fetch`` still sees every RAM entry (a promoted entry joins
         the LRU first), so choosing the SSD can only add options."""
         if self._ssd is None or self.ssd_prefer_gain <= 0 or ram_pos <= 0:
@@ -1144,8 +1150,9 @@ class BatchedSystemKV:
         apply_snapshot_states(fresh, states, metas)
         # Realize NOW, on the thread that recorded the slice graphs.
         # build_partial_restore_states slices trim-layer KV lazily and fetch
-        # runs on the event-loop thread, while the batch steps on the
-        # engine-core executor — evaluating the slices over there trips the
+        # used to run on the event-loop thread (it runs on the generation
+        # worker now, but an inline EngineCore still calls it from the loop),
+        # while the batch steps on the engine-core executor — evaluating the slices over there trips the
         # MLX stream/thread mismatch (patch #28's crash class). Without this,
         # engine_core catches the first step's crash, self-heals to
         # model-thread stepping, and silently re-prefills the request COLD —
@@ -1511,6 +1518,7 @@ class BatchedSystemKV:
                 "lazy_restores": self.lazy_restores,
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
+                "lazy_ssd_deferred": self.lazy_ssd_deferred,
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")
@@ -1626,7 +1634,19 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
         request.cache_hit_type = "miss"
         request.remaining_tokens = request.prompt_token_ids
         candidate = hybrid_kv.check_ssd(request.prompt_token_ids)
-        if candidate is not None:
+        if candidate is not None and lazy and candidate.get("usable", 0) > 0:
+            # (#125) RAM miss + SSD hit on a lazy route: ssd_pending would
+            # promote AND build the multi-GB restore while the request still
+            # waits (promote_ssd_pending) - the copy #106 exists to defer, on
+            # the path every deep hit takes under load. Price it at the SSD
+            # length; materialize_pending_restore's #107 fallback promotes
+            # at admission, behind every gate.
+            usable = candidate["usable"]
+            request.cache_hit_type = "system_kv_pending"
+            request.cached_tokens = usable
+            request.remaining_tokens = request.prompt_token_ids[usable:]
+            hybrid_kv.lazy_ssd_deferred += 1
+        elif candidate is not None:
             request.cache_hit_type = "ssd_pending"
             request._ssd_candidate = candidate
 
@@ -1700,7 +1720,9 @@ def materialize_pending_restore(scheduler, request) -> None:
 def promote_ssd_pending(scheduler) -> None:
     """_schedule_waiting hook (#36): promote SSD candidates for waiting
     ssd_pending requests. Runs on the executor thread — the blob read +
-    array realize happen here, never on the event loop."""
+    array realize happen here, never on the event loop. It materialises the
+    restore for a request that is still WAITING, so LAZY_RESTORE routes
+    never route a hit here (#117/#125 tag them ``system_kv_pending``)."""
     hybrid_kv = scheduler.hybrid_kv
     # (#103) Snapshot: add_request appends to ``waiting`` on the event loop
     # while this runs on the executor — iterating the live deque raised

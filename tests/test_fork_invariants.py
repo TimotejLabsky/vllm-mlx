@@ -1873,6 +1873,64 @@ def test_117_no_cut_when_the_divergence_is_next_to_the_restore_point():
     assert "near" not in kv._divergence
 
 
+# ------------- #125 a RAM-miss SSD hit is not materialised while the request waits
+
+
+def _ssd_only_kv(monkeypatch, tmp_path, **env):
+    """A cache whose only copy of TOKENS is on disk (restart / RAM evicted)."""
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    writer = _make_ssd_cache(monkeypatch, tmp_path)
+    writer.store("seed", TOKENS, _donor_at(len(TOKENS)))
+    writer.close()  # drain the spill to disk
+    return _make_ssd_cache(monkeypatch, tmp_path)
+
+
+def test_125_lazy_ram_miss_ssd_hit_builds_nothing_until_admission(
+    monkeypatch, tmp_path
+):
+    """Audit 2026-10-05 (#56): on a lazy route, a RAM miss + SSD hit took
+    ``ssd_pending`` and promote_ssd_pending then loaded AND materialised the
+    multi-GB restore for a request still in the queue - the copy #106 defers,
+    on the path the 09-21 stress runs saw every deep hit take."""
+    kv = _ssd_only_kv(monkeypatch, tmp_path, VLLM_MLX_BATCHED_LAZY_RESTORE=1)
+    request = _queued("cold-ram", GROWN)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cache_hit_type == "system_kv_pending"
+    assert request.cached_tokens > 0 and request.prompt_cache is None
+    assert request.remaining_tokens == GROWN[request.cached_tokens :]
+    assert kv.lazy_ssd_deferred == 1
+
+    scheduler = SimpleNamespace(hybrid_kv=kv, waiting=[request])
+    bkv.promote_ssd_pending(scheduler)  # the pre-admission hook: must not touch it
+    assert request.prompt_cache is None and kv.stats()["ssd_promotes"] == 0
+
+    priced = request.cached_tokens
+    bkv.materialize_pending_restore(scheduler, request)
+
+    assert request.cache_hit_type == "system_kv"
+    assert request.cached_tokens == priced and request.prompt_cache is not None
+    assert kv.lazy_ssd_fallbacks == 1 and kv.stats()["ssd_promotes"] == 1
+    kv.close()
+
+
+def test_125_eager_route_keeps_the_ssd_pending_promote(monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_LAZY_RESTORE", raising=False)
+    kv = _ssd_only_kv(monkeypatch, tmp_path)
+    request = _queued("cold-ram", GROWN)
+
+    bkv.fetch_for_request(kv, request)
+    assert request.cache_hit_type == "ssd_pending" and kv.lazy_ssd_deferred == 0
+
+    bkv.promote_ssd_pending(SimpleNamespace(hybrid_kv=kv, waiting=[request]))
+    assert request.cache_hit_type == "system_kv" and request.prompt_cache is not None
+    kv.close()
+
+
 _HARMONY_DELTAS = (
     "<|channel|>analysis<|message|>",
     "We need to answer.",
