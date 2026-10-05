@@ -3639,3 +3639,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Verified:** 6 new invariant tests (both parsers × stream latch; both parsers × final channel with `<|return|>` / stripped / `<|end|>`), reproducing the live strings first. Suite 4419 passed. Real `cli serve` with the route's flags on a spare port: non-stream thinking off `'42'` and on `'42'` + reasoning (old: `''`), streaming both modes clean, tool calls / JSON schema / caching unchanged, Anthropic `/v1/messages` gives a `thinking` block + `text: 'Hello'`.
 
 **Not fixed (recorded):** a reply cut off by `max_tokens` inside GLM-4.7's implicit `<think>` comes back as `content` on the non-stream paths (streaming is right) — identical on the old tree; the Anthropic adapter ignores `thinking: {type: disabled}` / `budget_tokens` (never mapped); vision routes report `usage.prompt_tokens_details.cached_tokens = 0` although the MLLM prefix cache hits (status `tokens_saved` grows, turn 2 0.5 s vs 6.2 s) — #82 never covered the MLLM path.
+
+---
+
+## 119. `patch: mllm-cached-tokens` — vision routes report `usage.prompt_tokens_details.cached_tokens`
+
+**Files:** `vllm_mlx/mllm_batch_generator.py`, `vllm_mlx/mllm_scheduler.py`, `tests/test_mllm_prompt_tokens_usage.py`, `tests/test_mllm_continuous_batching.py`
+
+**Found 2026-10-05** by the post-rebase live sweep: on both vision routes (`GLM-4.6V-Flash`, `Qwen3-VL-30B`) the MLLM prefix cache hit on text follow-ups (status `hits` 3, `tokens_saved` ~11-12K, turn 2 0.5 s vs 6.2 s) but every response said `cached_tokens: 0`. Identical on the pre-rebase tree: #82 wired `cached_tokens` through the LLM scheduler only; the MLLM generator computed `cached_count` and dropped it.
+
+**Fix:** `MLLMBatchRequest.cached_tokens` is set at all five prefix-hit sites (exact replay with stored logits, LCP hit, exact one-token rewind in `_process_prompts`; hit/exact/miss in the chunked-prefill path), stamped onto `MLLMBatchResponse` in #115's `next()` choke point, copied into `MLLMRequest` and `RequestOutput` by the scheduler (and into `/v1/status` running rows). The engine already forwarded the field.
+
+**Verified:** 3 new tests + assertions on the real exact-replay (`(0, 4)`) and chunked partial-hit (`3`) paths.
