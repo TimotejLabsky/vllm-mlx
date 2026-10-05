@@ -3677,3 +3677,15 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fix:** both non-stream callers pass `prepared.chat_kwargs`; when thinking is on and `_detect_implicit_thinking` says the template opened `<think>`, the extractor parses with a **request-local** parser in implicit mode (the module parser is shared across concurrent requests). In implicit mode, untagged output is reasoning in the base think parser and in the `qwen3`/`deepseek_r1` overrides, which short-circuited to "pure content" without `</think>`. Explicit mode and closed blocks are unchanged; thinking-off requests never probe.
 
 **Verified:** 8 tests (3 parsers × implicit; explicit unchanged; server extractor with/without implicit template; shared parser untouched; thinking-off never probes). Suite 4442 passed.
+
+---
+
+## 122. `patch: extra-eos-tokens` — `VLLM_MLX_EXTRA_EOS_TOKENS` gives a route its missing turn terminator
+
+**Files:** `vllm_mlx/utils/tokenizer.py` (`extra_eos_token_ids`, `collect_eos_token_ids`), `vllm_mlx/scheduler.py` (`_get_stop_tokens`), `tests/test_extra_eos_tokens.py`
+
+**Found 2026-10-05** (live sweep; 7/14 on the pre-rebase tree too): `Phi-4-mini-reasoning-MLX-4bit` produced `'<think>42<|assistant|><think>\nOkay, let me figure out…'` — it never stopped at end of turn and generated new turns until `max_tokens`. The lmstudio conversion declares only `<|endoftext|>` (199999) as EOS and ships no `generation_config.json`; the turn terminator `<|end|>` (200020) is a stop token nowhere. The reasoning-parser failures on that route were downstream of this.
+
+**Fix:** an explicit, per-route env var — comma-separated token strings or ids, unioned into both stop-token collectors (the batched LLM scheduler and `collect_eos_token_ids`, which feeds the MLLM scheduler and the SimpleEngine text route). Deliberately **not** inferred from the chat template: gpt-oss uses `<|end|>` between harmony channels, so a guessed terminator would cut its replies. Route config: `VLLM_MLX_EXTRA_EOS_TOKENS=<|end|>` on `Phi-4-mini-reasoning-MLX-4bit` only (Phi-4-reasoning-plus declares `<|im_end|>` correctly).
+
+**Verified:** 7 tests (unset, strings + ids, unknown skipped with a warning, blank values, batched scheduler).

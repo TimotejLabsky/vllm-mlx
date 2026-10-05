@@ -1578,6 +1578,14 @@ class Scheduler:
                 else:
                     # Handle case where eos_token_ids is a single int
                     stop_tokens.add(tok.eos_token_ids)
+        # Per-route extra terminators (fork #122, VLLM_MLX_EXTRA_EOS_TOKENS).
+        from .utils.tokenizer import extra_eos_token_ids
+
+        source = getattr(self, "_actual_tokenizer", None) or getattr(
+            self, "tokenizer", None
+        )
+        if source is not None:
+            stop_tokens.update(extra_eos_token_ids(source))
         return stop_tokens
 
     def _create_batch_generator(
