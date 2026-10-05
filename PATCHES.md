@@ -3651,3 +3651,17 @@ reached the template as one result for two calls — the Qwen template rendered 
 **Fix:** `MLLMBatchRequest.cached_tokens` is set at all five prefix-hit sites (exact replay with stored logits, LCP hit, exact one-token rewind in `_process_prompts`; hit/exact/miss in the chunked-prefill path), stamped onto `MLLMBatchResponse` in #115's `next()` choke point, copied into `MLLMRequest` and `RequestOutput` by the scheduler (and into `/v1/status` running rows). The engine already forwarded the field.
 
 **Verified:** 3 new tests + assertions on the real exact-replay (`(0, 4)`) and chunked partial-hit (`3`) paths.
+
+---
+
+## 120. `patch: anthropic-thinking-field` — `/v1/messages` honours `thinking`
+
+**Files:** `vllm_mlx/api/anthropic_models.py`, `vllm_mlx/api/anthropic_adapter.py`, `vllm_mlx/server.py` (`_clamp_anthropic_thinking_budget`), `tests/test_anthropic_thinking.py`
+
+**Found 2026-10-05** by the post-rebase live sweep: on thinking routes, `thinking: {"type": "disabled"}` changed nothing (same 271-token thinking block as with no field). `AnthropicRequest` never declared `thinking`, so pydantic dropped it; identical before and after the rebase.
+
+**Fix:** `disabled` → `enable_thinking=False`; `enabled` → `enable_thinking=True` with `budget_tokens` as `thinking_token_budget`; `adaptive`/unknown/absent → route default. On the OpenAI path a request budget overrides the route's `--default-thinking-token-budget`; on `/v1/messages` it may only **tighten** it (`min`), because Claude Code sends budgets far above the 6144/8192 caps the looping-prone routes rely on.
+
+**Second gap, found by the live probe of the first fix:** `_prepare_anthropic_invocation` forwarded neither `enable_thinking` nor built the thinking-budget processor — so even mapped, `disabled` still thought (276 tokens for "Hello", the reasoning merely hidden by the latch), and the routes' `--default-thinking-token-budget` caps (6144/8192 on the Qwen3.8 routes) were **never enforced on `/v1/messages`**. The OpenAI builder's budget block is now `_attach_thinking_budget()`, shared by both builders; the Anthropic stream's reasoning-parser gate (`allowed=not logits_processors`) became `_anthropic_stream_reasoning_allowed()`, which treats the thinking processor as the thinking case and still disables the parser for structured output — the non-stream rule.
+
+**Verified:** 16 tests (mapping table, `_thinking_disabled` resolution, clamp table, invocation: `disabled` reaches engine kwargs and skips the budget, route budget now built on `/v1/messages`, client budget tightens it, stream gate with/without structured output). Live (spare port, GLM-4.7-Flash + Qwen3.5-9B): see the #118–#122 live block below.

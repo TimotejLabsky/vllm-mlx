@@ -931,6 +931,52 @@ def _apply_dry_structure_suppression(chat_kwargs: dict, request) -> None:
     logger.info("[dry] suppressed for structured output (%s)", reason)
 
 
+def _attach_thinking_budget(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    chat_kwargs: dict,
+    json_logits_processor,
+):
+    """Install the thinking-budget processor; return it (or None).
+
+    Shared by the OpenAI and Anthropic builders (fork #120: /v1/messages never
+    built it, so the routes' --default-thinking-token-budget caps were not
+    enforced there).
+    """
+    # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
+    # Only build when thinking is actually enabled for this request -- a CLI
+    # default budget should not alter non-thinking requests.
+    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
+    # Thinking can be switched off in the template kwargs alone (reasoning_effort
+    # "none", explicit chat_template_kwargs, a server default), leaving no
+    # top-level enable_thinking: a budget processor built then would start in
+    # THINKING for a prompt that has no <think> and force </think> into content.
+    if _thinking_disabled(request, chat_kwargs):
+        enable_thinking = False
+    else:
+        enable_thinking = chat_kwargs.get("enable_thinking", True)
+    thinking_proc = None
+    if thinking_budget is not None and enable_thinking is not False:
+        thinking_proc = _build_thinking_processor(
+            engine,
+            thinking_budget,
+            inner=json_logits_processor,
+            prompt_has_think_tag=bool(enable_thinking),
+        )
+        if thinking_proc is not None:
+            # Replace the logits_processors list: the thinking processor wraps
+            # the JSON processor as its inner delegate, so we don't double-add.
+            existing_processors = list(chat_kwargs.get("logits_processors") or [])
+            if (
+                json_logits_processor is not None
+                and existing_processors
+                and existing_processors[-1] is json_logits_processor
+            ):
+                existing_processors = existing_processors[:-1]
+            chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
+    return thinking_proc
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -1075,37 +1121,9 @@ def _prepare_chat_completion_invocation(
             chat_kwargs, json_logits_processor
         )
 
-    # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
-    # Only build when thinking is actually enabled for this request -- a CLI
-    # default budget should not alter non-thinking requests.
-    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
-    # Thinking can be switched off in the template kwargs alone (reasoning_effort
-    # "none", explicit chat_template_kwargs, a server default), leaving no
-    # top-level enable_thinking: a budget processor built then would start in
-    # THINKING for a prompt that has no <think> and force </think> into content.
-    if _thinking_disabled(request, chat_kwargs):
-        enable_thinking = False
-    else:
-        enable_thinking = chat_kwargs.get("enable_thinking", True)
-    thinking_proc = None
-    if thinking_budget is not None and enable_thinking is not False:
-        thinking_proc = _build_thinking_processor(
-            engine,
-            thinking_budget,
-            inner=json_logits_processor,
-            prompt_has_think_tag=bool(enable_thinking),
-        )
-        if thinking_proc is not None:
-            # Replace the logits_processors list: the thinking processor wraps
-            # the JSON processor as its inner delegate, so we don't double-add.
-            existing_processors = list(chat_kwargs.get("logits_processors") or [])
-            if (
-                json_logits_processor is not None
-                and existing_processors
-                and existing_processors[-1] is json_logits_processor
-            ):
-                existing_processors = existing_processors[:-1]
-            chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
+    thinking_proc = _attach_thinking_budget(
+        engine, request, chat_kwargs, json_logits_processor
+    )
 
     return PreparedChatInvocation(
         messages=messages,
@@ -1168,6 +1186,10 @@ def _prepare_anthropic_invocation(
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
 
+    # Anthropic ``thinking`` arrives as enable_thinking (fork #120).
+    if openai_request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = openai_request.enable_thinking
+
     if openai_request.tools and openai_request.tool_choice != "none":
         template_tools = convert_tools_for_template(openai_request.tools)
         template_tools, messages = _apply_forced_tool_choice(
@@ -1180,11 +1202,16 @@ def _prepare_anthropic_invocation(
             chat_kwargs, json_logits_processor
         )
 
+    thinking_proc = _attach_thinking_budget(
+        engine, openai_request, chat_kwargs, json_logits_processor
+    )
+
     return PreparedChatInvocation(
         messages=messages,
         chat_kwargs=chat_kwargs,
         response_format=response_format,
         json_logits_processor=json_logits_processor,
+        thinking_processor=thinking_proc,
     )
 
 
@@ -3730,6 +3757,20 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
         else json.dumps(payload)
     )
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _clamp_anthropic_thinking_budget(openai_request: ChatCompletionRequest) -> None:
+    """Anthropic ``budget_tokens`` (fork #120) may tighten a route's thinking
+    cap but never lift it: clients such as Claude Code send budgets far above
+    the caps the looping-prone routes rely on.
+    """
+    if (
+        openai_request.thinking_token_budget is not None
+        and _default_thinking_token_budget is not None
+    ):
+        openai_request.thinking_token_budget = min(
+            openai_request.thinking_token_budget, _default_thinking_token_budget
+        )
 
 
 def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
@@ -6876,6 +6917,7 @@ async def create_anthropic_message(
         openai_request = anthropic_to_openai(anthropic_request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _clamp_anthropic_thinking_budget(openai_request)
     total_timeout, deadline = _start_request_budget(None)
     engine = await _acquire_default_engine_for_request(
         request,
@@ -7199,6 +7241,26 @@ def _emit_content_pieces(
     return events, current_block_type, block_index
 
 
+def _anthropic_stream_reasoning_allowed(prepared, chat_kwargs: dict) -> bool:
+    """Whether the Anthropic stream may run the reasoning parser.
+
+    A structured-output processor makes the text the answer itself, so no
+    reasoning parse; the thinking-budget processor (fork #120, now built on
+    /v1/messages too) is exactly the thinking case. Same rule as the
+    non-stream ``allow_reasoning``.
+    """
+    json_proc = getattr(prepared, "json_logits_processor", None)
+    thinking_proc = getattr(prepared, "thinking_processor", None)
+    if json_proc is not None and not isinstance(
+        json_proc, _ThinkingAwareLogitsProcessor
+    ):
+        return False
+    return not any(
+        p is not thinking_proc and p is not json_proc
+        for p in (chat_kwargs.get("logits_processors") or [])
+    )
+
+
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -7248,7 +7310,7 @@ async def _stream_anthropic_messages(
         engine,
         openai_request,
         chat_kwargs,
-        allowed=not chat_kwargs.get("logits_processors"),
+        allowed=_anthropic_stream_reasoning_allowed(prepared, chat_kwargs),
         allow_disabled_thinking=True,
     )
     thinking_off = _thinking_disabled(openai_request, chat_kwargs)
