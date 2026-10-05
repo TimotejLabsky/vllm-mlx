@@ -20,14 +20,19 @@ import re
 from .base import DeltaMessage, ReasoningParser
 
 # Analysis channel blocks: <|channel|>analysis<|message|>...<|end|>
+# (or end of text: a generation cut off mid-analysis is still reasoning).
 _ANALYSIS_PATTERN = re.compile(
-    r"<\|channel\|>analysis\s*<\|message\|>(.*?)<\|end\|>",
+    r"<\|channel\|>analysis\s*<\|message\|>(.*?)(?:<\|end\|>|\Z)",
     re.DOTALL,
 )
 
-# Final channel content: <|channel|>final<|message|>...<|return|>
+# Final channel content: <|channel|>final<|message|>...<|return|>. The
+# engines stop ON <|return|> (it is the EOS token) and never include it in the
+# output text, so end of text must close the final message too (fork #118):
+# requiring the token returned content=None for every non-stream gpt-oss reply
+# that went through the parser.
 _FINAL_PATTERN = re.compile(
-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
+    r"<\|channel\|>final\s*<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|\Z)",
     re.DOTALL,
 )
 
@@ -76,6 +81,12 @@ class HarmonyReasoningParser(ReasoningParser):
     # structure lives in control tokens a special-token filter would delete
     # (fork #112 — the Anthropic path did exactly that).
     CONSUMES_RAW_STREAM = True
+
+    # Explicit marker for the server's thinking-disabled latch
+    # (_explicit_reasoning_markers_present reads start_token/end_token): any
+    # channel header means harmony structure follows, and gpt-oss reasons in
+    # the analysis channel whatever enable_thinking says (fork #118).
+    start_token = "<|channel|>"
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
