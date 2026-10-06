@@ -731,7 +731,7 @@ def test_cleanup_finished_stores_into_hybrid_kv(monkeypatch):
     scheduler._cleanup_finished({"req-1"})
 
     scheduler.hybrid_kv.store.assert_called_once_with(
-        "req-1", [1, 2, 3, 4, 5], ["layer0"]
+        "req-1", [1, 2, 3, 4, 5], ["layer0"], gen_start=3
     )
     assert request._extracted_cache is None
 
