@@ -1011,7 +1011,9 @@ Cherry-picks upstream open PR [#552](https://github.com/waybarrios/vllm-mlx/pull
 
 ---
 
-## 45. `fix(simple): keep media-bearing MLLM requests on the owner thread` — cherry-pick of upstream #551
+## 45. `fix(simple): keep media-bearing MLLM requests on the owner thread` — cherry-pick of upstream #551 — **RETIRED (in base as of `5021350`)**
+
+> **RETIRED (recorded 2026-10-06; effective on the 2026-08-17 rebase).** Upstream merged #551 as `fd45c557` (2026-08-12), first in base `5021350`. The routing condition now lives in the fork's own reshaped `stream_chat` branch (`0ea1dbc`); `tests/test_simple_engine_mllm_media_thread.py` is kept as a fork regression test. Section kept for history.
 
 **Files:** `vllm_mlx/engine/simple.py` (one condition), `tests/test_simple_engine_mllm_media_thread.py` (new)
 
@@ -1021,7 +1023,7 @@ Low urgency for us (VLM traffic runs through the separate vlm-server script; thi
 
 **Conflict surface:** the one-line flip; the PR's surrounding-context drift against our patch #15 block was resolved by hand.
 
-**Status:** TEMPORARY cherry-pick — **retire on the next rebase past upstream #551** (collaborator-approved, owner requested the admission-slot change we already have; author stale since 2026-06-11).
+**Status:** RETIRED — upstream #551 is in base (see note above). Was: TEMPORARY cherry-pick — retire on the next rebase past upstream #551 (collaborator-approved, owner requested the admission-slot change we already have; author stale since 2026-06-11).
 
 ---
 
@@ -1079,7 +1081,9 @@ Three env-gated changes, all under the existing `VLLM_MLX_BATCHED_MEM_WATERMARK_
 
 ---
 
-## 49. `patch: ssd-close-on-stop` — cherry-pick of upstream #634 + batched-tier extension
+## 49. `patch: ssd-close-on-stop` — cherry-pick of upstream #634 + batched-tier extension — **PARTIALLY RETIRED (#634 in base as of `4b654c0`)**
+
+> **PARTIALLY RETIRED (recorded 2026-10-06; effective on the 2026-08-23 rebase).** Upstream merged #634 as `2cd22301` (2026-08-20), first in base `4b654c0`; `Scheduler.close_ssd_tier()` and the `EngineCore.stop()` calls are upstream's code. **Still fork-only:** the batched-tier extension — `close_ssd_tier()` also drains `hybrid_kv` (patch #36's writer) and must not early-return when there is no memory-aware tier — plus the `getattr` guards on the `EngineCore` call sites (2026-08-27 rebase note). The `mlx-vlm != 0.6.4` exclusion is superseded by upstream's `mlx-vlm>=0.6.5`.
 
 **Files:** `vllm_mlx/engine_core.py`, `vllm_mlx/scheduler.py`, `vllm_mlx/mllm_scheduler.py`, `vllm_mlx/pyproject.toml` (dep exclusion), `tests/test_ssd_shutdown_wiring.py` (new), `tests/test_engine_core_thread_streams.py`, `tests/test_engine_core_idle_polling.py`
 
@@ -1091,7 +1095,7 @@ Cherry-picks upstream open PR [#634](https://github.com/waybarrios/vllm-mlx/pull
 
 **Verified:** 13 tests — #634's suite ported (writer joined + tier cleared on both engines' stop, queued spill flushed not dropped, no-op without tier, `_ssd_tier` exists pre-first-request) + fork extras (engine stop drains the batched writer; `close_ssd_tier` covers both tiers; no-op safety). Two test fakes gained `close_ssd_tier` no-ops. Full suite 2433 passed / 0 failed.
 
-**Upstreaming:** collapses automatically when #634 merges; the batched-tier extension rides with the #34-series branch.
+**Upstreaming:** #634 merged (see note above); only the batched-tier extension remains, riding with the #34-series branch.
 
 ---
 
@@ -1655,7 +1659,9 @@ If the PR breaks our patches (touches the same code), the rebase will surface th
 
 ---
 
-## 73. `patch: fail-closed structured output via llguidance` — adaptation of upstream #636
+## 73. `patch: fail-closed structured output via llguidance` — adaptation of upstream #636 — **RETIRED (in base as of `4b654c0`)**
+
+> **RETIRED (recorded 2026-10-06; effective on the 2026-08-23 rebase).** Upstream merged #636 as `515dd142` (2026-08-20), first in base `4b654c0`. The remaining fork diff in `vllm_mlx/constrained/llguidance_schema_processor.py` / `json_schema_processor.py` is patch #89's `is_accepting()` stop-vs-grammar protocol, not #73. Section kept for history.
 
 **Files:** `vllm_mlx/constrained/llguidance_schema_processor.py` (new), `vllm_mlx/constrained/json_schema_processor.py`, `vllm_mlx/constrained/__init__.py`, `vllm_mlx/api/tool_calling.py`, `vllm_mlx/server.py`, `pyproject.toml`, `tests/test_constrained_decoding.py`, `tests/test_structured_output.py`, `tests/test_server.py`
 
@@ -1671,7 +1677,7 @@ Adapts upstream open PR [#636](https://github.com/waybarrios/vllm-mlx/pull/636) 
 
 **Follow-up recorded, not built:** strict tool-argument schemas (constrain tool-call args JSON to the declared tool schema during decode — mistral.rs precedent, XGrammar-2 TagDispatch pattern); the roadmap doc carries it as the natural extension.
 
-**Upstreaming:** none needed — this *is* upstream's PR; if #636 merges, retire this patch on the next rebase (expect near-clean drop).
+**Upstreaming:** none needed — #636 merged (see note above).
 
 ---
 
