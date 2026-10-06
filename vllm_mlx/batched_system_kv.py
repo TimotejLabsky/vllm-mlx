@@ -203,6 +203,38 @@ def _divergence_bucket(n: int) -> str:
     return _DIVERGENCE_BUCKETS[-1]
 
 
+def _ws_free(text: str) -> str:
+    return "".join(text.split())
+
+
+def whitespace_aligned_end(tokenizer, tail, tokens, start, max_extra=256):
+    """(#139) End index ``j`` such that ``tokens[start:j]`` reads as ``tail``
+    up to whitespace, with the same trailing whitespace (so the seam onto
+    ``tokens[j:]`` is exact). None when no such span exists.
+
+    Per-token decodes only locate candidates cheaply; every candidate is
+    checked on the decoded slice, so a byte-split character can at worst
+    cost a splice, never produce a wrong one."""
+    target_text = tokenizer.decode(list(tail))
+    target = _ws_free(target_text)
+    if not target:
+        return None
+    trailing = target_text[len(target_text.rstrip()) :]
+    limit = min(len(tokens), start + len(tail) + max_extra)
+    seen = 0
+    for j in range(start + 1, limit + 1):
+        seen += len(_ws_free(tokenizer.decode([tokens[j - 1]])))
+        if seen < len(target):
+            continue
+        text = tokenizer.decode(list(tokens[start:j]))
+        got = _ws_free(text)
+        if len(got) > len(target) or not target.startswith(got):
+            return None
+        if got == target and text[len(text.rstrip()) :] == trailing:
+            return j
+    return None
+
+
 class BatchedSystemKV:
     """LRU of hybrid-safe snapshot entries + per-request checkpoint ladders.
 
@@ -355,6 +387,23 @@ class BatchedSystemKV:
         self.divergence_at_think = 0
         self.divergence_depth_hist = dict.fromkeys(_DIVERGENCE_BUCKETS, 0)
         self.divergence_reprefill_hist = dict.fromkeys(_DIVERGENCE_BUCKETS, 0)
+        # (#139) Generated-span reconciliation (fork issue #75). The client
+        # sends the model's last turn back as structured tool_calls and the
+        # template re-renders it - with different whitespace on some
+        # templates (Qwen3.8-27B-8bit joins parallel calls with "\n\n"; the
+        # model emits "\n"). The prompt then parts ways with the cached chain
+        # INSIDE that chain's generated output and everything past the last
+        # checkpoint before the split is re-prefilled. When the two sides
+        # differ only in whitespace, splice the model's own tokens back in.
+        self.reconcile_generated_on = (
+            _env_int("VLLM_MLX_BATCHED_RECONCILE_GENERATED", 0) > 0
+        )
+        self.reconcile_max_tail = max(
+            0, _env_int("VLLM_MLX_BATCHED_RECONCILE_MAX_TAIL", 4096)
+        )
+        self.reconcile_splices = 0
+        self.reconcile_tokens_kept = 0
+        self.reconcile_rejects = 0
         # (#117) SSD-vs-RAM-partial arbitration. ``fetch`` used to take ANY
         # RAM entry sharing >= PARTIAL_MIN tokens and only consulted the SSD on
         # a total miss: with a hybrid model the partial snaps DOWN to a
@@ -678,7 +727,9 @@ class BatchedSystemKV:
                 mx.eval(state_arrays(st))
         return kinds, snapshot, capture_snapshot_meta(cache_list), grown
 
-    def _insert_entry_locked(self, tokens_list, kinds, snapshot, metas, checkpoints):
+    def _insert_entry_locked(
+        self, tokens_list, kinds, snapshot, metas, checkpoints, gen_start=None
+    ):
         """Insert an entry, absorbing every existing entry whose tokens are a
         (proper or equal) PREFIX of the new chain: their ladders merge in
         (same token chain => their checkpoint states are valid here) and the
@@ -723,6 +774,8 @@ class BatchedSystemKV:
             "trim_bytes": trim_bytes,
             "fixed_bytes": snapshot_bytes - trim_bytes,
         }
+        if gen_start is not None and 0 <= gen_start <= len(tokens_list):
+            entry["gen_start"] = int(gen_start)  # (#139) generated output begins
         if tokens_list:
             # Learn bytes/token AT insert — a lazily-learned hint misses the
             # serial workload where relief empties the bag before anything
@@ -739,8 +792,11 @@ class BatchedSystemKV:
         self._enforce_budgets_locked()
         return entry
 
-    def store(self, request_id: str, tokens: list, cache_list) -> bool:
+    def store(self, request_id: str, tokens: list, cache_list, gen_start=None) -> bool:
         """Store the finished request's snapshot + its checkpoint ladder.
+
+        ``gen_start`` (#139) = where the generated output begins in
+        ``tokens``; ``reconcile_generated`` only rewrites inside that span.
 
         Grows from the request's donor chain when possible (O(delta));
         grown entries do NOT re-spill — SimpleEngine's policy: a restart
@@ -793,7 +849,7 @@ class BatchedSystemKV:
             self._restore_source.pop(request_id, None)
             self._divergence.pop(request_id, None)
             entry = self._insert_entry_locked(
-                tokens_list, kinds, snapshot, metas, checkpoints
+                tokens_list, kinds, snapshot, metas, checkpoints, gen_start
             )
             if grown:
                 self.grown_stores += 1
@@ -1281,6 +1337,58 @@ class BatchedSystemKV:
             theirs,
         )
 
+    def reconcile_generated(self, tokens: list) -> Optional[list]:
+        """(#139) ``tokens`` with the closest chain's generated output spliced
+        back in, or None to leave the prompt alone.
+
+        Fires only when the prompt parts ways with that chain INSIDE its
+        generated span (``gen_start`` <= split < chain end) and the rest of
+        that span re-appears in the prompt differing only in whitespace - a
+        template re-rendering the model's own turn. Anything else (a stripped
+        <think>, edited or truncated arguments, a different turn) differs in
+        non-whitespace text and is left to the normal partial match. The
+        model then sees exactly what it generated, and the request restores
+        the whole chain instead of re-prefilling from the last checkpoint."""
+        if not self.reconcile_generated_on or self._tokenizer is None:
+            return None
+        tokens = list(tokens)
+        with self._lock:
+            best_lcp, donor, gen_start = 0, None, None
+            for entry in self._entries.values():
+                lcp = common_prefix_len(tokens, entry["tokens"])
+                if lcp > best_lcp:
+                    best_lcp, donor = lcp, entry["tokens"]
+                    gen_start = entry.get("gen_start")
+        if donor is None or gen_start is None or best_lcp >= len(tokens):
+            return None
+        if not gen_start <= best_lcp < len(donor):
+            return None
+        tail = donor[best_lcp:]
+        if len(tail) > self.reconcile_max_tail:
+            self.reconcile_rejects += 1
+            return None
+        try:
+            end = whitespace_aligned_end(self._tokenizer, tail, tokens, best_lcp)
+        except Exception:
+            logger.debug("[batched_system_kv] reconcile decode failed", exc_info=True)
+            end = None
+        if end is None:
+            self.reconcile_rejects += 1
+            return None
+        spliced = list(donor) + tokens[end:]
+        self.reconcile_splices += 1
+        self.reconcile_tokens_kept += len(donor) - best_lcp
+        logger.info(
+            "[batched_system_kv] reconciled generated span: split=%d "
+            "chain=%d prompt %d -> %d tokens, kept %d generated tokens",
+            best_lcp,
+            len(donor),
+            len(tokens),
+            len(spliced),
+            len(donor) - best_lcp,
+        )
+        return spliced
+
     def peek(
         self,
         tokens: list,
@@ -1632,6 +1740,9 @@ class BatchedSystemKV:
                 "divergence_at_think": self.divergence_at_think,
                 "divergence_depth_hist": dict(self.divergence_depth_hist),
                 "divergence_reprefill_hist": dict(self.divergence_reprefill_hist),
+                "reconcile_splices": self.reconcile_splices,
+                "reconcile_tokens_kept": self.reconcile_tokens_kept,
+                "reconcile_rejects": self.reconcile_rejects,
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")
@@ -1699,7 +1810,18 @@ def maybe_create(model: Any, tokenizer: Any, idle_check=None):
 
 def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     """add_request hook: the restore match (``_fetch_for_request``) plus, with
-    ``VLLM_MLX_DIVERGENCE_LOG=1``, the #128 divergence record."""
+    ``VLLM_MLX_DIVERGENCE_LOG=1``, the #128 divergence record. (#139) First,
+    a prompt that re-renders a cached turn's output with other whitespace
+    gets the model's own tokens back, so every consumer below (match, lazy
+    restore, the finish store) sees one consistent prompt."""
+    if getattr(hybrid_kv, "reconcile_generated_on", False) is True:
+        try:
+            spliced = hybrid_kv.reconcile_generated(request.prompt_token_ids)
+            if spliced is not None:
+                request.prompt_token_ids = spliced
+                request.num_prompt_tokens = len(spliced)
+        except Exception:
+            logger.debug("[batched_system_kv] reconcile failed", exc_info=True)
     _fetch_for_request(hybrid_kv, request)
     if getattr(hybrid_kv, "divergence_log", False) is True:
         try:
@@ -2062,6 +2184,7 @@ def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> No
                 request_id,
                 full_token_sequence,
                 request._extracted_cache,
+                gen_start=len(request.prompt_token_ids),
             )
             logger.info(
                 f"[batched_system_kv] store request={request_id[:12]} "
