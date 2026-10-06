@@ -2131,6 +2131,125 @@ def test_128_off_by_default_and_never_scans(monkeypatch):
     assert kv.stats()["divergence_events"] == 0
 
 
+# ------------- #139 a re-rendered turn gets the model's own tokens back
+
+_RV = {
+    1: "\n",
+    2: "\n\n",
+    3: "</tool_call>",
+    4: "<tool_call>",
+    5: "<function=read>",
+    6: "README.md",
+    7: "USAGE.md",
+    8: "<|im_end|>",
+    9: "<|im_start|>",
+    10: "user",
+    11: "EDITED.md",
+    12: "<think>",
+}
+
+
+class _VocabTok:
+    name_or_path = "unit/test-model"
+
+    def decode(self, ids):
+        return "".join(_RV.get(i, "x") for i in ids)
+
+
+_HEAD = list(range(1000, 1600))  # system + user turn
+_MODEL = [4, 5, 6, 3, 1, 4, 5, 7, 3]  # two calls joined by "\n" (generated)
+_TEMPLATE = [4, 5, 6, 3, 2, 4, 5, 7, 3]  # the same calls joined by "\n\n"
+_NEXT = [8, 1, 9, 10, 1] + list(range(30000, 30050))  # tool results onwards
+
+
+def _reconcile_kv(monkeypatch, on=True, generated=_MODEL):
+    if on:
+        monkeypatch.setenv("VLLM_MLX_BATCHED_RECONCILE_GENERATED", "1")
+    else:
+        monkeypatch.delenv("VLLM_MLX_BATCHED_RECONCILE_GENERATED", raising=False)
+    kv = BatchedSystemKV(_FakeModel(), tokenizer=_VocabTok())
+    chain = _HEAD + generated
+    kv.store("turn1", chain, _donor_at(len(chain)), gen_start=len(_HEAD))
+    return kv
+
+
+def test_139_separator_rerender_restores_the_whole_chain(monkeypatch):
+    """Fork issue #75: the 27B-8bit template joins parallel tool calls with
+    "\\n\\n" where the model wrote "\\n"; the next prompt split from the cached
+    chain after the first call and re-prefilled from the last checkpoint."""
+    kv = _reconcile_kv(monkeypatch)
+    request = _queued("turn2", _HEAD + _TEMPLATE + _NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == _HEAD + _MODEL + _NEXT
+    assert request.num_prompt_tokens == len(_HEAD + _MODEL + _NEXT)
+    assert request.cached_tokens == len(_HEAD + _MODEL)  # nothing re-prefilled
+    st = kv.stats()
+    assert st["reconcile_splices"] == 1
+    assert st["reconcile_tokens_kept"] == len(_MODEL) - 4
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "edited_argument",
+        "think_stripped",
+        "split_before_output",
+        "whitespace_in_prompt",
+        "seam",
+    ],
+)
+def test_139_only_a_whitespace_rerender_of_the_output_is_rewritten(monkeypatch, case):
+    generated, prompt = _MODEL, None
+    if case == "edited_argument":  # client changed what the model wrote
+        prompt = _HEAD + [4, 5, 6, 3, 2, 4, 5, 11, 3] + _NEXT
+    elif case == "think_stripped":  # the #128 case: text, not whitespace
+        generated = [12, 1001, 1002] + _MODEL
+        prompt = _HEAD + _MODEL + _NEXT
+    elif case == "split_before_output":  # a different user turn
+        prompt = _HEAD[:500] + list(range(50000, 50400))
+    elif case == "whitespace_in_prompt":  # not model output: never rewritten
+        prompt = _HEAD[:550] + [1] + _HEAD[550:] + _MODEL + _NEXT
+    else:  # model ended on "\n", template on "\n\n": the seam would drift
+        generated = _MODEL + [1]
+        prompt = _HEAD + _TEMPLATE + [2] + _NEXT
+    kv = _reconcile_kv(monkeypatch, generated=generated)
+    request = _queued("turn2", prompt)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == prompt
+    assert kv.stats()["reconcile_splices"] == 0
+
+
+def test_139_off_by_default(monkeypatch):
+    kv = _reconcile_kv(monkeypatch, on=False)
+    prompt = _HEAD + _TEMPLATE + _NEXT
+    request = _queued("turn2", prompt)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == prompt
+    assert kv.stats()["reconcile_splices"] == 0
+
+
+def test_139_finish_store_records_where_the_output_begins(monkeypatch):
+    kv = BatchedSystemKV(_FakeModel(), tokenizer=_VocabTok())
+    n = len(_HEAD + _MODEL)
+    request = SimpleNamespace(
+        prompt_token_ids=list(_HEAD),
+        output_token_ids=list(_MODEL),
+        _extracted_cache=_donor_at(n),
+    )
+
+    bkv.store_finished(kv, "turn1", request)
+
+    (entry,) = kv._entries.values()
+    assert entry["tokens"] == _HEAD + _MODEL
+    assert entry["gen_start"] == len(_HEAD)
+
+
 # ------------- #129 the thinking-budget processor syncs incrementally
 
 
