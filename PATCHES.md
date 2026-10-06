@@ -3865,3 +3865,40 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 
 **Verification:** `test_132_short_system_prompt_survives_a_deep_chain_thinning` (12-turn deep chain thinned to 8: anchor at 600 kept, a new session peeks 600, bookkeeping released), `test_132_the_anchor_survives_an_ssd_round_trip`, `test_132_thinning_never_evicts_the_anchor`. Mutation-checked: dropping the thinning pin fails 3; dropping the SSD flags fails 1; restoring the store-path leak fails 1. Suite 4512 passed. Supersedes fork PR #37.
 - **Real server A/B** (`scripts/fork/e2e_short_system_share.py`, `Qwen3.5-4B-4bit` on the Studio, now `--text-only` by default): a 22,853-token, 12-turn chat on its own ~1K system prompt runs cold and fills the ladder; then a brand-new session with the same system prompt asks one question. `main`: **cached 0/1027**. #132: **cached 1003/1027** (`anchor_cuts=2`). The #126 cases still pass on both.
+
+## 137. `patch: mlxlm-1778-state-compat` — the cache stack speaks one state protocol on both mlx-lm builds
+
+**Status: draft — merge only together with the mlx-lm pin bump past #1778.**
+
+**Files:** `vllm_mlx/cache_state_compat.py` (new), `vllm_mlx/system_kv.py` (classify / capture / apply route through it; `is_new_recurrent_state` also accepts `None` metadata), `vllm_mlx/batched_system_kv.py` (`_build_snapshot`), `vllm_mlx/engine/simple.py` (system-KV snapshot/restore sites), `vllm_mlx/scheduler.py` (mid-prefill extract/reconstruct, SSD `ArraysCache` rebuild, MTP RNN snapshot), `vllm_mlx/prefix_cache.py` (`reconstruct_cache`), `vllm_mlx/ssd_cache.py` (`ArraysCacheSerializer`, dispatcher), `vllm_mlx/mllm_batch_generator.py` (generic layer copy), `tests/test_fork_137_mlxlm_state_compat.py` (16 new), `tests/test_fork_invariants.py` (+1), 3 shape-assuming tests made dual-shape (`test_system_kv_partial.py`, `test_memory_cache_mlx.py`, `test_batched_system_kv.py`).
+
+**Why.** mlx-lm #1778 (`ee19be4`, 2026-09-09, "Make 'state' of cache return full state") changes the protocol of every class in `mlx_lm.models.cache`: `meta_state` is removed and its scalars ride inside `state` (`KVCache.state` = `(keys, values, offset)`, `RotatingKVCache` = `(keys, values, offset, keep, max_size, _idx)`, …); `state` returns the **full over-allocated buffers** (the sliced view moved to `keys_and_values()`); `from_state(state, meta_state)` became `from_state(state)`; `ArraysCache.state` carries `None` metadata instead of `mx.array([])`; `CacheList.state` is `[(sub_state, class_name), …]`. This is the "next ceiling" #81's KV tripwire was written for. On the current pin nothing changes; past it, the unpatched stack fails as follows (measured, throwaway venv with mlx-lm `5cfec4c`): **83 failing tests**. Every attention layer classifies `opaque`, which turns the system-KV/batched cache into a permanent miss. The batched store raises `unexpected KV state arity 3`. Mid-prefill extraction silently returns `[]` (no `meta_state`). SSD `ArraysCache` spill raises in the serializer, and the SSD rebuild installs `mx.array([])` as real `left_padding`.
+
+**The hidden hazard: aliasing.** A post-#1778 `KVCache.state` returns the live buffer, which has spare capacity past `offset`. A snapshot taken from it natively and restored into two caches gives both the **same** array. mx `__setitem__` rebinds that shared object, so request B's next token overwrites request A's (reproduced: `a` reads B's value at position 3). The old sliced state restored an exactly-full buffer, so the first write after a restore always allocated a fresh one. That is what patches #6 and #81 rely on without saying so.
+
+**What it does.** `cache_state_compat` shows the **legacy** protocol (offset-sliced `state` + string-tuple `meta_state`) on both builds, so snapshots, ladders, SSD formats and every #81 helper stay as they are:
+
+- `NEW_STATE_SHAPE` is detected at import: single-argument `_BaseCache.from_state` and no `meta_state`.
+- `legacy_state(c)`, `legacy_meta_state(c[, default])`, `has_meta_state(c)`, `set_legacy_state(c, state, meta)`, `from_legacy_state(cls, state, meta)`. On the old pin each one is exactly the expression it replaces (`c.state`, `c.meta_state` / `getattr(...)`, `c.state = s; if m: c.meta_state = m`, `cls.from_state(s, m)`), so behaviour there is byte-identical. On the new shape they convert per class: KV / Rotating / Quantized / Chunked / Arrays / CacheList / BatchKV / BatchRotating, following the pre-#1778 getters and setters line for line. The one deliberate difference is that `BatchRotatingKVCache.rotated` is parsed correctly: the old code did `bool("False")`, which is `True`.
+- Dispatch is keyed on **which class's `state` property the object uses**, not on its name. The fork's `BatchMambaCache` and other `ArraysCache` subclasses convert like their base. mlx-vlm caches (0.6.17 and 0.7.4 both keep their own legacy `_BaseCache` with `meta_state`, checked against the 0.7.4 wheel), vendored model caches and unknown classes pass through untouched.
+
+**Deliberately not routed:** `mx.eval([c.state …])` sites (mx.eval ignores the new int/None leaves, verified), `recurrent_state_eval` (#127, same reason), the `_make_snapshot_destination` mirror (a native same-class round trip that `store()` then deep-copies), memory-cache detach (native round trip with copies), `models/mllm.py` / `mllm_cache.py` (mlx-vlm caches only; on the new shape `mllm_cache.memory_size` would at most over-count padding), and the MLLM MTP RNN snapshot (pre-existing, mlx-vlm caches).
+
+**Results.**
+
+| | old pin `f4f3b57` (laptop `.venv`) | new shape, mlx-lm `5cfec4c` (throwaway venv, same freeze otherwise) |
+|---|---|---|
+| before #137 | 4533 passed | **83 failed**, 4450 passed |
+| after #137 | **4550 passed** (incl. 17 new) | **6 failed**, 4544 passed, 1 skipped (old-pin-only test) |
+
+The 6 remaining new-shape failures have nothing to do with #1778:
+- **5 × `_left_pad_prompts`**. mlx-lm #1827 (`db0cfc2`, 2026-09-03, which lands *before* #1778) deleted `mlx_lm.generate._left_pad_prompts`, and `scheduler._install_chunked_prefill` imports it unconditionally. Chunked prefill would raise `ImportError` at install time. Fix: a local fallback (`[[0]*(L-len(p)) + p for p in prompts]`).
+- **1 × `test_tokenizer_wrapper_has_optimized_detokenizer`**. mlx-lm's `TokenizerWrapper` no longer has `_detokenizer_class`. This only affects the test.
+
+**Before the pin can actually be lifted:**
+1. Fix the `_left_pad_prompts` import (above).
+2. Run the suite **on the Studio** against the target mlx-lm (laptop `.venv` is mlx 0.32.2 / mlx-vlm 0.6.17, prod is 0.32.3 / 0.7.4), and update `scripts/fork/prod-pins.txt` in the same PR.
+3. Run real-server checks on a hybrid model and on a sliding-window model (below), including T=0 byte-identical warm-vs-cold at ≥2K.
+4. **mlx-lm #1911 (the 499000 leak fix) is still open.** The fork carries #127 (`recurrent_state_eval`) for it, and #127 works on both shapes (eval of the new state tolerates `None`/int leaves). Re-check #127 when #1911 lands, so the two do not double-evaluate.
+5. Expect one-time cache losses at the lift. Memory-cache disk persistence (`save_prompt_cache` format changed in #1778: metadata `[info, metadata, classes]` → `[metadata, classes, scalars]`) cannot read old entries; they are skipped per entry, not crashed on. The system-KV SSD and `ssd_cache` formats do **not** change: both serialize legacy states.
+6. Review the other ~70 mlx-lm commits between `f4f3b57` and the target for API drift outside the cache classes. #1827 was found only because a test hit it.
