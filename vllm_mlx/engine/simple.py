@@ -55,6 +55,7 @@ from ..mlx_streams import (
     snapshot_generation_streams,
 )
 from .. import system_kv as system_kv_mod
+from ..cache_state_compat import legacy_state, set_legacy_state
 from ..system_kv import SystemKVManager, pin_state
 
 logger = logging.getLogger(__name__)
@@ -362,7 +363,7 @@ class SimpleEngine(BaseEngine):
     @classmethod
     def _snapshot_prompt_cache(cls, prompt_cache: list[Any]) -> list[Any]:
         """Capture cache states without aliasing mutable state containers."""
-        return [cls._clone_cache_state(c.state) for c in prompt_cache]
+        return [cls._clone_cache_state(legacy_state(c)) for c in prompt_cache]
 
     @classmethod
     def _restore_prompt_cache(
@@ -370,7 +371,7 @@ class SimpleEngine(BaseEngine):
     ) -> None:
         """Restore cache states without letting decode mutate the saved snapshot."""
         for i, saved_state in enumerate(snapshot):
-            prompt_cache[i].state = cls._clone_cache_state(saved_state)
+            set_legacy_state(prompt_cache[i], cls._clone_cache_state(saved_state))
 
     @staticmethod
     def _iter_cache_state_arrays(value: Any):
@@ -1793,7 +1794,7 @@ class SimpleEngine(BaseEngine):
                     # attribute with a snapshot for a different system prefix
                     # between the gate check and this point.
                     for i, saved_state in enumerate(hit_snapshot):
-                        bc[i].state = saved_state
+                        set_legacy_state(bc[i], saved_state)
                 else:
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
@@ -1814,7 +1815,7 @@ class SimpleEngine(BaseEngine):
                     # the KV state, not residual activations from prefill.
                     mx.clear_cache()
 
-                    snapshot = [c.state for c in bc]
+                    snapshot = [legacy_state(c) for c in bc]
                     mx.eval([s for pair in snapshot for s in pair])
                     # Demote-then-store (inside the serialized worker):
                     # see SystemKVManager.store_snapshot.
@@ -2627,7 +2628,7 @@ class SimpleEngine(BaseEngine):
                                         if a is not None
                                     ])
                                     _grow_snapshot = [
-                                        pin_state(c.state)
+                                        pin_state(legacy_state(c))
                                         for c in backbone_cache
                                     ]
                                     mx.eval(

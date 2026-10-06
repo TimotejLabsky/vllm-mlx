@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 from vllm_mlx import batched_system_kv as bkv
 from vllm_mlx.batched_system_kv import BatchedSystemKV
+from vllm_mlx.cache_state_compat import legacy_state
 from vllm_mlx.system_kv_ssd import SystemKVSSDConfig, SystemKVSSDStore
 
 from tests.test_batched_flip_enablement import _mb, _watermarked
@@ -1013,7 +1014,7 @@ def test_106_a_lazy_restore_is_byte_identical_to_an_eager_one(monkeypatch):
         return a.shape == b.shape and bool(mx.array_equal(a, b))
 
     for lazy_layer, eager_layer in zip(lazy.prompt_cache, eager.prompt_cache):
-        assert same(lazy_layer.state, eager_layer.state)
+        assert same(legacy_state(lazy_layer), legacy_state(eager_layer))
 
 
 def test_106_an_entry_evicted_during_the_wait_degrades_to_a_miss(monkeypatch):
@@ -2590,3 +2591,30 @@ def test_118_harmony_final_channel_survives_stripped_eos(parser_name, tail):
     reasoning, content = get_parser(parser_name)().extract_reasoning(text)
     assert reasoning == "Think."
     assert content == "42"
+
+
+def test_137_system_kv_restores_never_share_a_writable_buffer():
+    """#137: a system-KV snapshot restored into two caches must leave each
+    with its OWN buffer. Post-mlx-lm#1778 ``KVCache.state`` is the live,
+    over-allocated buffer; a snapshot taken from it natively makes both
+    restored caches write their next token into the same array. The stack
+    reads/writes through ``cache_state_compat`` (sliced legacy view), on
+    either mlx-lm.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.system_kv import apply_snapshot_states, capture_snapshot_meta
+
+    donor = KVCache()
+    ones = mx.ones((1, 1, 3, 4))
+    donor.update_and_fetch(ones, ones)
+    snap = [legacy_state(donor)]
+    meta = capture_snapshot_meta([donor])
+    a, b = [KVCache()], [KVCache()]
+    apply_snapshot_states(a, snap, meta)
+    apply_snapshot_states(b, snap, meta)
+    a[0].update_and_fetch(mx.full((1, 1, 1, 4), 7.0), mx.full((1, 1, 1, 4), 7.0))
+    b[0].update_and_fetch(mx.full((1, 1, 1, 4), 9.0), mx.full((1, 1, 1, 4), 9.0))
+    assert float(legacy_state(a[0])[0][0, 0, 3, 0].item()) == 7.0
+    assert float(legacy_state(b[0])[0][0, 0, 3, 0].item()) == 9.0

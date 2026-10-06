@@ -39,6 +39,7 @@ import threading
 from collections import OrderedDict
 from typing import Any, Optional
 
+from .cache_state_compat import legacy_state
 from .memory_pressure import PressureManager
 
 from .system_kv import (
@@ -654,7 +655,7 @@ class BatchedSystemKV:
 
         snapshot = []
         for i, c in enumerate(cache_list):
-            st = c.state
+            st = legacy_state(c)
             if kinds[i] == "trim":
                 if grown and _is_segments(donor_snapshot[i]):
                     segs = _segments_upto(donor_snapshot[i], prefix_len)

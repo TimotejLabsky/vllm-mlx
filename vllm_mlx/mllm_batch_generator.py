@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .cache_state_compat import from_legacy_state, legacy_meta_state, legacy_state
 from .memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
@@ -1311,9 +1312,9 @@ class MLLMBatchGenerator:
         from_state = getattr(type(cache), "from_state", None)
         if not callable(from_state):
             raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
-        state = cls._copy_cache_state(cache.state)
-        meta_state = cls._copy_cache_state(cache.meta_state)
-        copied = from_state(state, meta_state)
+        state = cls._copy_cache_state(legacy_state(cache))
+        meta_state = cls._copy_cache_state(legacy_meta_state(cache))
+        copied = from_legacy_state(type(cache), state, meta_state)
         if "step" in getattr(cache, "__dict__", {}):
             copied.step = cache.step
         return copied
