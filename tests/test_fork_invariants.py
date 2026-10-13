@@ -2835,3 +2835,64 @@ def test_136_images_hash_is_order_sensitive():
 
     for h in (simple_hash, batched_hash):
         assert h(["img-a", "img-b"]) != h(["img-b", "img-a"])
+
+
+# ------------- #140 the SSD ladder leaves out dead and clustered checkpoints
+
+
+def test_140_spill_drops_the_tip_and_the_end_of_prompt_cluster(monkeypatch, tmp_path):
+    """#140: 31 of the Studio's 167 GB of spills were checkpoints no restore
+    needs - one AT the entry's length (``select_restore_pos`` restores a
+    fully shared chain from the snapshot) and the 1-7-token end-of-prompt
+    cluster. The disk ladder keeps the earliest of the cluster; every restore
+    still lands, at most ``min_gap - 1`` tokens earlier."""
+    from tests.test_batched_system_kv import _make_ssd_cache
+
+    n = len(TOKENS)
+    kv1 = _make_ssd_cache(monkeypatch, tmp_path)
+    kv1.note_scheduled("r1", 0)
+    for pos in (448, n - 7, n - 1, n):
+        kv1.capture_segment("r1", pos, _donor_at(pos))
+    kv1.store("r1", TOKENS, _donor_at(n))
+    kv1.close()
+    [resident] = kv1._entries.values()
+    assert [cp["pos"] for cp in resident["checkpoints"]][-2:] == [n - 1, n]
+
+    kv2 = _make_ssd_cache(monkeypatch, tmp_path)
+    [row] = kv2._ssd._index.all_entries()
+    on_disk = kv2._ssd.read_meta(row["file_path"])["checkpoints"]
+    assert [cp["pos"] for cp in on_disk] == [448, n - 7]
+
+    resend = kv2.check_ssd(TOKENS)
+    assert kv2.promote_ssd(resend) is True
+    assert kv2.fetch(TOKENS)[2] == n - 7  # was n - 1: 6 more tokens prefilled
+    assert kv2.fetch(TOKENS + [7, 8])[2] == n  # the snapshot, as before
+    assert kv2.fetch(TOKENS[:600] + [1, 2, 3])[2] == 448
+    kv2.close()
+
+
+def test_140_prune_keeps_the_earliest_and_carries_its_neighbours_flags():
+    from vllm_mlx.system_kv_ssd import prune_spill_ladder
+
+    late = {"pos": 905, "states": {}, "metas": {}, "boundary": True, "anchor": True}
+    ladder = [
+        {"pos": 100, "states": {}, "metas": {}},
+        {"pos": 900, "states": {}, "metas": {}},
+        late,
+        {"pos": 1000, "states": {}, "metas": {}},  # == num_tokens: dead
+    ]
+    kept, pruned = prune_spill_ladder(ladder, 1000, 16)
+    assert [cp["pos"] for cp in kept] == [100, 900]
+    assert kept[1].get("boundary") and kept[1].get("anchor")
+    assert "boundary" not in ladder[1]  # the resident ladder is not mutated
+    assert [cp["pos"] for cp in pruned] == [905, 1000]
+    # min_gap 0 keeps the cluster; the tip is dead either way
+    kept, _ = prune_spill_ladder(ladder, 1000, 0)
+    assert [cp["pos"] for cp in kept] == [100, 900, 905]
+
+
+def test_140_min_gap_env_kill_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_CKPT_MIN_GAP", "0")
+    assert SystemKVSSDConfig(cache_dir=str(tmp_path)).ckpt_min_gap == 0
+    monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_CKPT_MIN_GAP")
+    assert SystemKVSSDConfig(cache_dir=str(tmp_path)).ckpt_min_gap == 16

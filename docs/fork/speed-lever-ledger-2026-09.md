@@ -162,7 +162,8 @@ clean process (PATCHES.md #103+):
   relief thrash). What would move the needle next is *spill reliability and
   size* (SSD checkpoint dedup: every entry under one system prompt
   re-serialises the same ladder; a short entry is 3/4 fp32 GDN state), not a
-  smarter RAM policy.
+  smarter RAM policy. *2026-10-13:* the dedup half measured 1.12× (not built);
+  the size win was per-entry dead checkpoints, which #140 prunes (31 of 167 GB).
 
 ### 2026-10-05 — speedup-research probes (fork issues #40, #41, #55)
 
