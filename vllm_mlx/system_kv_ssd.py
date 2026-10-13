@@ -39,7 +39,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -146,6 +146,9 @@ class SystemKVSSDStats:
     # separately in /v1/status.
     backlog_drops: int = 0
     busy_writes: int = 0  # spills written while the engine was busy
+    # (#140) checkpoints left out of queued spills by prune_spill_ladder
+    ckpt_pruned: int = 0
+    ckpt_pruned_bytes: int = 0
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -165,7 +168,18 @@ class SystemKVSSDStats:
             "evictions": self.evictions,
             "backlog_drops": self.backlog_drops,
             "busy_writes": self.busy_writes,
+            "ckpt_pruned": self.ckpt_pruned,
+            "ckpt_pruned_bytes": self.ckpt_pruned_bytes,
         }
+
+
+def _default_ckpt_min_gap() -> int:
+    try:
+        return max(
+            0, int(os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_CKPT_MIN_GAP", "") or 16)
+        )
+    except ValueError:
+        return 16
 
 
 @dataclass
@@ -191,6 +205,9 @@ class SystemKVSSDConfig:
     # provided ``can_write_busy`` agrees (the caller's "not under memory
     # pressure" check). 0 = never write while busy (the SimpleEngine default).
     busy_write_after_s: float = 0.0
+    # (#140) Spilled checkpoints closer than this to the previous kept one
+    # are left out (see prune_spill_ladder). 0 keeps the whole ladder.
+    ckpt_min_gap: int = field(default_factory=_default_ckpt_min_gap)
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
@@ -331,6 +348,43 @@ def flatten_checkpoints(checkpoints: list | None) -> tuple[dict, list[dict]]:
                 cm[flag] = True
         ckpt_meta.append(cm)
     return tensors, ckpt_meta
+
+
+def prune_spill_ladder(
+    checkpoints: list | None, num_tokens: int, min_gap: int
+) -> tuple[list, list]:
+    """(#140) The checkpoints worth writing to disk: ``(kept, pruned)``.
+
+    Measured on the Studio's stores 2026-10-13: checkpoints were 86 of
+    167 GB, and 31 GB of them were one of two kinds of dead weight:
+
+    * at or past ``num_tokens`` (13 GB) - ``select_restore_pos`` restores a
+      fully shared chain from the snapshot itself and only searches the
+      ladder below ``donor_len``, so such a checkpoint is never used;
+    * within ``min_gap`` tokens of the previous kept one (18 GB) - the
+      end-of-prompt cluster (turn start, divergence cut, re-send point, 1-7
+      tokens apart). Keeping the EARLIEST is usable by every query the
+      later ones were, at <= ``min_gap - 1`` extra tokens of re-prefill.
+
+    The kept checkpoint inherits a dropped neighbour's ``boundary`` /
+    ``anchor`` flags so ladder thinning after a promote protects it the same
+    way. Kept dicts that gain a flag are copies - the input ladder belongs
+    to a resident entry and is never mutated.
+    """
+    kept: list = []
+    pruned: list = []
+    for cp in sorted(checkpoints or [], key=lambda c: c["pos"]):
+        if cp["pos"] >= num_tokens:
+            pruned.append(cp)
+            continue
+        if kept and min_gap > 0 and cp["pos"] - kept[-1]["pos"] < min_gap:
+            pruned.append(cp)
+            flags = [f for f in ("boundary", "anchor") if cp.get(f)]
+            if any(not kept[-1].get(f) for f in flags):
+                kept[-1] = dict(kept[-1], **{f: True for f in flags})
+            continue
+        kept.append(cp)
+    return kept, pruned
 
 
 def unflatten_checkpoints(tensors: dict, ckpt_meta: list[dict]) -> list:
@@ -702,6 +756,9 @@ class SystemKVSSDStore:
         writer runs; the actual disk write is on the writer thread.
         """
         try:
+            checkpoints, pruned = prune_spill_ladder(
+                checkpoints, len(tokens), self._config.ckpt_min_gap
+            )
             tensors, layer_meta = flatten_snapshot(snapshot)
             ckpt_tensors, ckpt_meta = flatten_checkpoints(checkpoints)
             tensors.update(ckpt_tensors)
@@ -749,6 +806,12 @@ class SystemKVSSDStore:
                     on_done,
                 )
             )
+            if pruned:
+                from .system_kv import ckpt_bytes
+
+                with self._lock:
+                    self._stats.ckpt_pruned += len(pruned)
+                    self._stats.ckpt_pruned_bytes += ckpt_bytes(pruned)
             return True
         except queue.Full:
             with self._lock:
