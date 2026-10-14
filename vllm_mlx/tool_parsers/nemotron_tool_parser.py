@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from .param_framing import strip_param_framing
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -48,7 +49,7 @@ class NemotronToolParser(ToolParser):
 
     # Pattern to extract parameters
     PARAM_PATTERN = re.compile(
-        r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>",
+        r"<parameter=([^>]+)>(.*?)</parameter>",
         re.DOTALL,
     )
 
@@ -91,11 +92,12 @@ class NemotronToolParser(ToolParser):
             if params:
                 arguments = {}
                 for param_name, param_value in params:
+                    param_value = strip_param_framing(param_value)
                     # Try to parse value as JSON (for nested objects)
                     try:
-                        arguments[param_name.strip()] = json.loads(param_value.strip())
+                        arguments[param_name.strip()] = json.loads(param_value)
                     except json.JSONDecodeError:
-                        arguments[param_name.strip()] = param_value.strip()
+                        arguments[param_name.strip()] = param_value
 
                 tool_calls.append(
                     {

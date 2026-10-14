@@ -2896,3 +2896,50 @@ def test_140_min_gap_env_kill_switch(monkeypatch, tmp_path):
     assert SystemKVSSDConfig(cache_dir=str(tmp_path)).ckpt_min_gap == 0
     monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_CKPT_MIN_GAP")
     assert SystemKVSSDConfig(cache_dir=str(tmp_path)).ckpt_min_gap == 16
+
+
+# ------------- #141 XML tool-call parameters keep their whitespace
+
+_XML_EDIT = (
+    "<tool_call>\n<function=edit>\n<parameter=filePath>\n/a.py\n</parameter>\n"
+    "<parameter=oldString>\n    return x\n\n</parameter>\n"
+    "<parameter=count>\n3\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+@pytest.mark.parametrize("name", ["hermes", "auto", "nemotron"])
+def test_141_xml_parameter_keeps_indentation_and_trailing_newline(name):
+    """#141: hermes/auto/nemotron matched ``\\s*(.*?)\\s*`` and stripped, so an
+    ``edit`` oldString lost the indentation and trailing newline it must match
+    (found via upstream #808, which fixed only ``qwen_tool_parser``)."""
+    from vllm_mlx.tool_parsers import ToolParserManager
+
+    parser = ToolParserManager.get_tool_parser(name)(None)
+    result = parser.extract_tool_calls(_XML_EDIT, None)
+    args = json.loads(result.tool_calls[0]["arguments"])
+    assert args["oldString"] == "    return x\n"
+    assert args["filePath"] == "/a.py"  # only the framing newlines go
+
+
+def test_141_hermes_streaming_keeps_the_whitespace_too():
+    from vllm_mlx.tool_parsers import ToolParserManager
+
+    parser = ToolParserManager.get_tool_parser("hermes")(None)
+    text, calls = "", []
+    for i in range(0, len(_XML_EDIT), 7):
+        prev, text = text, _XML_EDIT[: i + 7]
+        r = parser.extract_tool_calls_streaming(prev, text, text[len(prev) :])
+        if r and r.get("tool_calls"):
+            calls += r["tool_calls"]
+    args = json.loads(calls[-1]["function"]["arguments"])
+    assert args["oldString"] == "    return x\n"
+
+
+def test_141_strip_param_framing_edges():
+    from vllm_mlx.tool_parsers.param_framing import strip_param_framing as f
+
+    assert f("\nx\n") == "x"
+    assert f("x") == "x"  # unframed short values untouched
+    assert f("\n\n  a\n\n") == "\n  a\n"  # one per side, the rest is data
+    assert f("\n") == "\n" and f("\n\n") == ""
+    assert f("\n  b") == "  b"  # framing on one side only
