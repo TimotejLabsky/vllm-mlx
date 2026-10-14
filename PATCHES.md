@@ -3932,3 +3932,17 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 **Upstream:** fork-owned.
 
 **Verification:** mocked suite 4552 passed, 31 skipped. Invariants `test_140_*` (3): a batched round trip where the RAM ladder ends `[n-1, n]` and the disk ladder is `[448, n-7]`, after which re-send restores at n-7, extension at n (snapshot), divergence at 448; flag carry + no mutation + `min_gap=0`; env kill switch. Mutation check: disabling the prune fails 2, dropping the flag carry fails 1. **Real server** (`scripts/fork/e2e_spill_ladder.py`, Studio prod venv, `Qwen3.5-4B-4bit --text-only`, spare port, T=0, restart on the same SSD dir): gap 16 spilled `[1231, 1249]`, gap 0 spilled `[1231, 1249, 1255]` (the tip is pruned in both); **196 vs 247 MB on disk (−21 %)**; after the restart the re-send restored 1249/1311 and turn 3 1304/1372 in both arms, and T=0 output was identical across arms and to the first run. 10/10.
+
+- **Old-vs-new A/B, 2026-10-14** (`scripts/fork/ab_spill_ladder.py`, Studio prod venv, `52ac8fb` vs `dcbc222` via PYTHONPATH, each model's exact route env, spare port, 2 rounds in alternating order). Each arm sends three distinct conversations cold, then a follow-up turn and a re-send, restarts on the same SSD dir, and replays the re-send and a next turn through an SSD promote:
+
+  | | Qwen3.5-9B-4bit (6–14K) | Qwen3.8-27B-4bit (4–12K) |
+|---|---|---|
+  | SSD bytes written | 3305 → 2893 MB (**−12.5 %**) | 7368 → 6136 MB (**−16.7 %**) |
+  | avg promote latency | 49.6 → 44.2 ms (**−11 %**) | 342 → 287 ms (**−16 %**) |
+  | shutdown drain | 0.38 → 0.37 s | 1.58 → 1.06 s (**−33 %**) |
+  | restart re-send / next-turn TTFT | 0.468 / 0.222 → 0.461 / 0.220 s | 1.220 / 0.658 → 1.168 / 0.658 s |
+  | cached tokens after restart | identical | identical |
+  | cold TTFT, decode tok/s | 23.9 s, 88.4 → 23.9 s, 88.3 | 66.3 s, 30.4 → 66.3 s, 30.4 |
+  | T=0 texts old vs new | 6/6 identical | 6/6 identical |
+
+  No loss anywhere: the ≤ 15-token restore shift never triggered in these chains (cached tokens identical), and decode, prefill and in-RAM hits are flat. Fleet-wide the audit's 31 GB (19 %) of prunable bytes means about 23 % more entries per GB of SSD cap.
