@@ -201,12 +201,13 @@ def _eval_prompt_cache(cache: List[Any]) -> None:
 # (#142) Arches whose image requests may use the content-keyed prefix cache.
 # Each was checked on the Studio 2026-10-14: no cross-image aliasing, and a
 # restored follow-up equals a cold one at T=0 (glm4v 8/8, gemma4 8/8,
-# mistral3 7/7, qwen3_5 exact re-asks 7/7). NOT default: qwen3_vl_moe - hits
-# and is 4x faster, but restored follow-ups matched cold only 6/8 vs 8/8 for
-# its text-only control (late, coherent divergence; unproven, so opt-in);
-# qwen3_5_moe - untested. Override: VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS (comma
-# list of top-level config model_type).
-_MEDIA_PREFIX_DEFAULT_ARCHS = "glm4v,gemma4,mistral3,qwen3_5"
+# mistral3 7/7, qwen3_5 exact re-asks 7/7, qwen3_vl_moe 6/8). qwen3_vl_moe
+# was opt-in at first (its text-only control was 8/8), enabled 2026-10-14 by
+# Tim once the same kind of T=0 flip showed up between cold and prefix-hit
+# answers with no media caching involved (GLM, 2/3): near-ties across
+# equally valid compute paths, not wrong KV. qwen3_5_moe - untested.
+# Override: VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS (comma list of config model_type).
+_MEDIA_PREFIX_DEFAULT_ARCHS = "glm4v,gemma4,mistral3,qwen3_5,qwen3_vl_moe"
 
 
 @dataclass

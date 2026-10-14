@@ -3992,6 +3992,8 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 | qwen3_5 (4B) | no follow-up hit (template re-renders turn 1) | 0.03 s | 0 cached | 7/7 |
 | qwen3_vl_moe (Qwen3-VL-30B) | 0.88 → 0.20 s | 0.13 s | 0 cached | 6/8 (text control 8/8) → **opt-in** |
 
+> **2026-10-14, later:** qwen3_vl_moe **enabled by default** (Tim's call). The 9993c85 investigation showed that cold and prefix-hit answers disagree at T=0 with no media caching at all (GLM text, 2/3): near-ties across valid compute paths, with a bit-exact disk round trip. So Qwen3-VL's 2/8 image flips are that class, not wrong KV.
+
 Red/blue/red-again behind one prompt answered their own colour on every arch.
 
 ## 143. `patch: prefix-cache-disk-gc` — persisted prefix-cache dirs shed files no load can read
