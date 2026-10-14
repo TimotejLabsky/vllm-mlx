@@ -2983,3 +2983,30 @@ def test_30_text_only_wins_over_config_json_vlm_route(tmp_path, monkeypatch):
         force_text_only=True,
     )
     assert engine._is_mllm is False
+
+
+# ------------- #142 vision phase B: image requests are keyed on content
+
+
+def test_142_image_requests_never_alias_and_same_image_hits(tmp_path):
+    """#142: with the media prefix cache ON, a different image behind
+    byte-identical token ids must miss, the same image must hit, and the
+    continuation runs on REAL ids. A rebase that takes upstream's token-only
+    ``_prefix_cache_lookup`` (or drops the key mapping) brings back the
+    cross-image aliasing #56 fixed by turning caching off."""
+    from tests.test_fork_142_media_prefix_cache import (
+        IDS,
+        _finish,
+        _generator,
+        _PrefixDict,
+        _req,
+    )
+
+    cat, dog = tmp_path / "cat.png", tmp_path / "dog.png"
+    cat.write_bytes(b"cat")
+    dog.write_bytes(b"dog")
+    gen = _generator(_PrefixDict())
+    _finish(gen, _req(1, IDS, images=[str(cat)]))
+    assert gen._prefix_cache_lookup(_req(2, IDS, images=[str(dog)]))[:2] == (None, None)
+    kv, remaining, _ = gen._prefix_cache_lookup(_req(3, IDS + [9], images=[str(cat)]))
+    assert kv == "kv1" and remaining == [9]

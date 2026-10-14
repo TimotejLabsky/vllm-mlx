@@ -3968,3 +3968,28 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 **Upstream:** the same bug exists upstream in hermes/auto/nemotron; #808 fixed only `qwen_tool_parser`. Fork-owned helper, so there is minimal rebase surface.
 
 **Verification:** mocked suite 4557 passed. `test_141_*` (5): oldString keeps `"    return x\n"` and filePath loses only its framing on hermes/auto/nemotron; hermes streaming; helper edge cases. Mutation check: putting `.strip()` back in hermes fails 2.
+
+## 142. `patch: media-prefix-cache` — image follow-ups served from the prefix cache (vision phase B)
+
+**Files:** `vllm_mlx/mllm_media_key.py` (new, fork-owned: `image_digest`, `media_prefix_key`), `vllm_mlx/mllm_batch_generator.py` (`_prefix_cache_key`, `_prefix_cache_lookup` key-space → real-id mapping, completion store, miss-path prefill checkpoint, stats `media_prefix_enabled` / `media_hits` / `media_stores`, `_MEDIA_PREFIX_DEFAULT_ARCHS`), `tests/test_fork_142_media_prefix_cache.py` (new, 10), `tests/test_mllm_prefix_cache_media.py` (placeholder-guard tests now put the placeholder in the real ids), `tests/test_fork_invariants.py` (+1), `scripts/fork/e2e_media_prefix_cache.py` (new), `docs/fork/vision-caching.md`, `README.md`.
+
+**Gap:** #56 (phase A) kept every image request out of the token-keyed MLLM prefix cache, because placeholder tokens do not encode pixels and two different images behind an identical prompt aliased. The cost: every follow-up turn about the same image re-ran the vision tower and the whole prefill (GLM-4.6V, 1024 px image: 1389 prompt tokens, 0 cached, ~3.5 s every turn, even on an exact re-send). accounting-sro's invoice/receipt tasks are this shape: several tasks over one attachment.
+
+**Fix:** in the cache key only, every image placeholder token becomes a negative value derived from that image's full SHA-256 (files hashed by content; data URLs/base64 by the full string; `http(s)` URLs are not content and are never keyed). The same image and prompt give the same key; a different image diverges at its first placeholder, and the text before it stays shared. Negative values cannot equal a real token id, so text keys are unchanged and cannot match an image span. Per-image fingerprints when the k-th placeholder run is the k-th image (Qwen/GLM/gemma); one order-sensitive digest of all images otherwise (Pixtral rows). `fetch` answers in key space, and remaining is mapped back to the **real** ids by position. A hit still requires every image inside the cached prefix (the #56 remaining-ids guard), so the vision tower is skipped entirely. Video and audio stay phase A.
+- **mRoPE needs nothing persisted** (the original plan's rope-delta item): since upstream #744 each request derives its mRoPE state from the full prompt + `image_grid_thw` before the lookup, and restored continuations pass the sliced `position_ids`. Every mRoPE family here exposes `get_rope_index`.
+- **No SSD namespace bump:** text keys are unchanged, and a rollback's text-only lookups can only share an image entry's text prefix, whose KV does not depend on the image.
+- **Per-arch allowlist** (`VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS`, default `glm4v,gemma4,mistral3,qwen3_5`) and kill switch `VLLM_MLX_MLLM_MEDIA_PREFIX_CACHE=0`. A generator missing the flags (built via `__new__`) fails closed to phase A.
+
+**Upstream:** fork-owned. Upstream's batched MLLM path still has #56's aliasing hole.
+
+**Verification:** mocked suite 4726 passed. `test_fork_142_*` (10): key properties, no aliasing, same-image hit continues on real ids, a partial hit ending before an uncached image is refused, video/audio/URL/disabled stay out, text keys unchanged. `test_142_image_requests_never_alias_and_same_image_hits` invariant. Mutation check: no fingerprint fails 5, remaining left in key space fails 1. **Real server** (Studio, ON vs OFF, T=0, isolated HOME; the server persists the prefix cache under `~/.cache/vllm-mlx`, and a shared HOME let one run's entries legitimately serve the next):
+
+| Arch (model) | Follow-up TTFT | Re-ask | Other image, same ids | Restored == cold |
+|---|---|---|---|---|
+| glm4v (GLM-4.6V-Flash) | 1.83 → 0.19 s | 0.05 s | 0 cached | 8/8, e2e 7/7 |
+| mistral3 (Devstral-24B) | 4.00 → 0.27 s | 0.08 s | 0 cached | 7/7 |
+| gemma4 (26B-A4B) | 0.69 → 0.17 s | 0.05 s | 0 cached | 8/8 (one e2e near-tie) |
+| qwen3_5 (4B) | no follow-up hit (template re-renders turn 1) | 0.03 s | 0 cached | 7/7 |
+| qwen3_vl_moe (Qwen3-VL-30B) | 0.88 → 0.20 s | 0.13 s | 0 cached | 6/8 (text control 8/8) → **opt-in** |
+
+Red/blue/red-again behind one prompt answered their own colour on every arch.
