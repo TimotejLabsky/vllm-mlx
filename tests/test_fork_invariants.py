@@ -3010,3 +3010,22 @@ def test_142_image_requests_never_alias_and_same_image_hits(tmp_path):
     assert gen._prefix_cache_lookup(_req(2, IDS, images=[str(dog)]))[:2] == (None, None)
     kv, remaining, _ = gen._prefix_cache_lookup(_req(3, IDS + [9], images=[str(cat)]))
     assert kv == "kv1" and remaining == [9]
+
+
+# ------------- #143 persisted prefix-cache dirs are garbage-collected on save
+
+
+def test_143_save_to_disk_runs_the_disk_gc(tmp_path):
+    """#143: upstream's save_to_disk never deletes; a rebase that takes its
+    version drops the GC call and stale provenance subdirs (one per mlx
+    bump) accumulate again."""
+    import inspect
+
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    assert "gc_prefix_cache_dir(cache_dir, self._provenance_hash)" in inspect.getsource(
+        MemoryAwarePrefixCache.save_to_disk
+    )
+    assert "gc_prefix_cache_dir(" in inspect.getsource(
+        MemoryAwarePrefixCache.load_from_disk
+    )
