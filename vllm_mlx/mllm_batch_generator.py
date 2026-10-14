@@ -34,6 +34,7 @@ from .memory_cache import (
     is_text_only_prefix_cache_request,
 )
 from .memory_pressure import PressureManager
+from .mllm_media_key import media_prefix_key
 from .multimodal_processor import MultimodalProcessor
 from .mllm_specprefill import (
     SpecPrefillOutcome,
@@ -195,6 +196,17 @@ def _eval_prompt_cache(cache: List[Any]) -> None:
     tensors = _cache_eval_tensors(cache)
     if tensors:
         mx.eval(*tensors)
+
+
+# (#142) Arches whose image requests may use the content-keyed prefix cache.
+# Each was checked on the Studio 2026-10-14: no cross-image aliasing, and a
+# restored follow-up equals a cold one at T=0 (glm4v 8/8, gemma4 8/8,
+# mistral3 7/7, qwen3_5 exact re-asks 7/7). NOT default: qwen3_vl_moe - hits
+# and is 4x faster, but restored follow-ups matched cold only 6/8 vs 8/8 for
+# its text-only control (late, coherent divergence; unproven, so opt-in);
+# qwen3_5_moe - untested. Override: VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS (comma
+# list of top-level config model_type).
+_MEDIA_PREFIX_DEFAULT_ARCHS = "glm4v,gemma4,mistral3,qwen3_5"
 
 
 @dataclass
@@ -751,6 +763,36 @@ class MLLMBatchGenerator:
                 config=prefix_cache_config,
             )
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
+
+        # (#142) vision phase B: image requests get a content-keyed prefix
+        # key (vllm_mlx/mllm_media_key.py). Per-arch allowlist: an arch is on
+        # only once a real-model check showed cached == uncached output.
+        model_config = getattr(self.model, "config", None)
+        self._media_model_type = str(getattr(model_config, "model_type", "") or "")
+        archs = os.environ.get(
+            "VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS", _MEDIA_PREFIX_DEFAULT_ARCHS
+        )
+        self._media_prefix_enabled = (
+            self.prefix_cache is not None
+            and os.environ.get("VLLM_MLX_MLLM_MEDIA_PREFIX_CACHE", "1").lower()
+            not in ("0", "false", "no")
+            and self._media_model_type in {a.strip() for a in archs.split(",")}
+        )
+        self._media_placeholder_ids = tuple(
+            tok
+            for tok in (
+                getattr(model_config, "image_token_index", None),
+                getattr(model_config, "image_token_id", None),
+            )
+            if isinstance(tok, int)
+        )
+        self._media_prefix_hits = 0
+        self._media_prefix_stores = 0
+        if self._media_prefix_enabled:
+            logger.info(
+                "MLLMBatchGenerator: media prefix cache ON for %s (#142)",
+                self._media_model_type,
+            )
 
         # Normalize chat template for prefix-cache stability.
         # Qwen3.5 chat template retroactively changes formatting of earlier
@@ -2377,16 +2419,20 @@ class MLLMBatchGenerator:
                         # copy, so sampling must complete before that barrier.
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
+                        checkpoint_key = (
+                            self._prefix_cache_key(req)
+                            if self.prefix_cache is not None
+                            else None
+                        )
                         if (
-                            self.prefix_cache is not None
-                            and is_text_only_prefix_cache_request(req)
+                            checkpoint_key is not None
                             and self._needs_prefill_checkpoint(request_cache)
                             and callable(
                                 getattr(self.prefix_cache, "prepare_store", None)
                             )
                         ):
                             entry = self.prefix_cache.prepare_store(
-                                req.input_ids.reshape(-1).tolist(),
+                                checkpoint_key,
                                 request_cache,
                                 auxiliary={"last_logits": last_logits},
                             )
@@ -3038,32 +3084,34 @@ class MLLMBatchGenerator:
         entirely also closes the exact-match hole where the remaining-ids
         placeholder guard below never runs.)
         """
-        if (
-            self.prefix_cache is None
-            or getattr(req, "has_media", False)
-            or not is_text_only_prefix_cache_request(req)
-        ):
+        key = self._prefix_cache_key(req)
+        if self.prefix_cache is None or key is None:
             return None, None, None
 
         input_ids_list = req.input_ids.reshape(-1).tolist()
         cached_last_logits = None
         fetch_auxiliary = getattr(self.prefix_cache, "fetch_exact_auxiliary", None)
-        exact_aux = (
-            fetch_auxiliary(input_ids_list) if callable(fetch_auxiliary) else None
-        )
+        exact_aux = fetch_auxiliary(key) if callable(fetch_auxiliary) else None
         if exact_aux is not None and "last_logits" in exact_aux:
-            cached_kv, remaining_ids = self.prefix_cache.fetch(input_ids_list)
+            lookup_ids = key
+            cached_kv, remaining_key = self.prefix_cache.fetch(key)
             cached_last_logits = exact_aux["last_logits"]
         else:
             # Ordinary rewindable caches retain historical prefix matching by
             # stripping the think suffix from the lookup key (stored entries
-            # are also stripped) and appending it back to remaining so the
-            # model sees the full generation prompt (<think>\n).
+            # are also stripped); the model still sees the full generation
+            # prompt (<think>\n) because remaining comes from the real ids.
             S = self._think_suffix_len
-            lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-            cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
-            if cached_kv is not None and S > 0:
-                remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+            lookup_ids = key[:-S] if S > 0 else key
+            cached_kv, remaining_key = self.prefix_cache.fetch(lookup_ids)
+        # (#142) fetch answers in KEY space; positions map 1:1 onto the real
+        # ids (an image's fingerprint covers exactly its placeholders), so the
+        # model always runs on real tokens.
+        remaining_ids = (
+            input_ids_list[len(lookup_ids) - len(remaining_key) :]
+            if cached_kv is not None
+            else None
+        )
 
         # Defense in depth: if remaining tokens contain media placeholders
         # (a text-classified request should never carry them), the
@@ -3091,7 +3139,34 @@ class MLLMBatchGenerator:
             )
             return None, None, None
 
+        if cached_kv is not None and getattr(req, "has_media", False):
+            self._media_prefix_hits = getattr(self, "_media_prefix_hits", 0) + 1
         return cached_kv, remaining_ids, cached_last_logits
+
+    def _prefix_cache_key(self, req: MLLMBatchRequest) -> Optional[List[int]]:
+        """The token-space key a request may store/fetch under, or ``None``.
+
+        Text-only requests: their own ids (unchanged). Image requests (#142):
+        placeholders replaced by content fingerprints, only for allowlisted
+        arches and only for images with a trustworthy content digest. Video
+        and audio stay out (frame sampling / audio features are not in the key).
+        """
+        if is_text_only_prefix_cache_request(req):
+            return req.input_ids.reshape(-1).tolist()
+        if (
+            # getattr: partially built generators (tests, __new__) fail closed
+            not getattr(self, "_media_prefix_enabled", False)
+            or req.input_ids is None
+            or not req.images
+            or req.videos
+            or req.audio
+        ):
+            return None
+        return media_prefix_key(
+            req.input_ids.reshape(-1).tolist(),
+            getattr(self, "_media_placeholder_ids", ()),
+            req.images,
+        )
 
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
@@ -3109,13 +3184,12 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if getattr(req, "has_media", False):
-                continue
-            if is_text_only_prefix_cache_request(req):
+            key = self._prefix_cache_key(req)
+            if key is not None:
                 self._discard_prefill_checkpoint(req.request_id)
                 try:
                     extracted = batch.extract_cache(i)
-                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    input_ids_list = key  # (#142) == real ids for text
                     # Store prompt-only KV: trim generated tokens (+ think
                     # suffix) so the stored offset equals key length exactly.
                     # The exact-match path trims by 1 at fetch time to
@@ -3124,13 +3198,17 @@ class MLLMBatchGenerator:
                     S = self._think_suffix_len
                     total_trim = output_count + S
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                    self._store_prefix_snapshot(
+                    stored = self._store_prefix_snapshot(
                         cache_key,
                         extracted,
                         total_trim,
                         req.request_id,
                         "completion",
                     )
+                    if stored and getattr(req, "has_media", False):
+                        self._media_prefix_stores = (
+                            getattr(self, "_media_prefix_stores", 0) + 1
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
@@ -3147,7 +3225,13 @@ class MLLMBatchGenerator:
     def get_prefix_cache_stats(self) -> Dict[str, Any]:
         """Get KV prefix cache statistics."""
         if self.prefix_cache is not None:
-            return self.prefix_cache.get_stats()
+            stats = dict(self.prefix_cache.get_stats())
+            stats["media_prefix_enabled"] = getattr(
+                self, "_media_prefix_enabled", False
+            )
+            stats["media_hits"] = getattr(self, "_media_prefix_hits", 0)
+            stats["media_stores"] = getattr(self, "_media_prefix_stores", 0)
+            return stats
         return {
             "hits": 0,
             "misses": 0,
