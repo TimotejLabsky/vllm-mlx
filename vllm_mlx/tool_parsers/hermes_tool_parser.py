@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from .param_framing import strip_param_framing
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -78,7 +79,7 @@ class HermesToolParser(ToolParser):
     NEMOTRON_PATTERN = re.compile(
         r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL
     )
-    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
     REASONING_PATTERN = re.compile(
         r"<tool_call_reasoning>(.*?)</tool_call_reasoning>", re.DOTALL
     )
@@ -137,7 +138,9 @@ class HermesToolParser(ToolParser):
                 params = self.PARAM_PATTERN.findall(params_block)
                 arguments = {}
                 for p_name, p_value in params:
-                    arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                    arguments[p_name.strip()] = _parse_param_value(
+                        strip_param_framing(p_value)
+                    )
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
@@ -157,7 +160,9 @@ class HermesToolParser(ToolParser):
                 params = self.PARAM_PATTERN.findall(params_block)
                 arguments = {}
                 for p_name, p_value in params:
-                    arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                    arguments[p_name.strip()] = _parse_param_value(
+                        strip_param_framing(p_value)
+                    )
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),

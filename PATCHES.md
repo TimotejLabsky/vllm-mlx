@@ -3946,3 +3946,15 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
   | T=0 texts old vs new | 6/6 identical | 6/6 identical |
 
   No loss anywhere: the ≤ 15-token restore shift never triggered in these chains (cached tokens identical), and decode, prefill and in-RAM hits are flat. Fleet-wide the audit's 31 GB (19 %) of prunable bytes means about 23 % more entries per GB of SSD cap.
+
+## 141. `patch: xml-param-whitespace` — XML tool-call parameters keep their whitespace
+
+**Files:** `vllm_mlx/tool_parsers/param_framing.py` (new, fork-owned: `strip_param_framing`), `vllm_mlx/tool_parsers/hermes_tool_parser.py`, `auto_tool_parser.py`, `nemotron_tool_parser.py` (one regex + one call each), `tests/test_fork_invariants.py` (+5).
+
+**Bug** (found while reviewing upstream #808, which fixes only `qwen_tool_parser`): Qwen3.5/3.6/3.8 and Nemotron write `<parameter=name>\nvalue\n</parameter>`. The hermes parser (11 routes), auto (3) and nemotron (2) matched `\s*(.*?)\s*` and `.strip()`-ed the value. As a result, an `edit` call's `oldString` of `"    return x\n"` reached the client as `"return x"`: the indentation and trailing newline that an exact match needs were gone, and a multi-line `oldString` lost its first line's indentation. Live on the HA 35B (old code): the model was asked for an oldString with 8 leading spaces, and the client received `'return x + 1'` 3/3 times.
+
+**Fix:** remove exactly one framing newline per side and keep the rest as argument data. This is the rule the vendored `qwen3_xml` parser (vLLM's) and upstream's qwen parser already follow. A lone `"\n"` is kept as the value. JSON values still parse after the framing is removed. Streaming re-parses through `extract_tool_calls`, so it is covered by the same fix.
+
+**Upstream:** the same bug exists upstream in hermes/auto/nemotron; #808 fixed only `qwen_tool_parser`. Fork-owned helper, so there is minimal rebase surface.
+
+**Verification:** mocked suite 4557 passed. `test_141_*` (5): oldString keeps `"    return x\n"` and filePath loses only its framing on hermes/auto/nemotron; hermes streaming; helper edge cases. Mutation check: putting `.strip()` back in hermes fails 2.
