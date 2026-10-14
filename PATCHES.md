@@ -4045,3 +4045,15 @@ Verdict: **low priority**. Both changes are correct, but no deployed route has a
   - *GLM-4.6V (attention-only), `--cache-memory-mb` pressure, two conversations interleaved:* a no-op, as expected. Storing turn N+1 already proactively evicts turn N, because the trimmable longer entry serves everything N could, so superseded turns never accumulate and #766 has nothing to choose (one ~57 MB entry per conversation; the return turn A3 hit 1475/1491; 0 `superseded` evictions logged). The #142 image e2e on the branch: 9/9.
   - *Qwen3.5-4B (hybrid, MLLM path):* old and new identical. The template re-renders turn 1, so turn 2 never strictly extends turn 1 and the exempted prefix eviction never fires (re-ask of turn 1 1544/1544 on both).
   - Net: no regression and no change on any deployed attention-only route. The effect is confined to hybrid MLLM routes whose prompts form strict prefix chains (REAP-288 / qwen4_exp, not loadable beside the HA 35B; unmeasured).
+
+## 144. `patch: truncated-model-think` — a cut-off `<think>` the model opened is reasoning on non-stream paths too
+
+**Files:** `vllm_mlx/reasoning/qwen3_parser.py` (`extract_reasoning` guard), `tests/test_fork_invariants.py` (+1), `tests/test_reasoning_parser.py` (2 upstream assertions flipped to fork semantics).
+
+**Bug** (found 2026-10-14 verifying the critical paths): Qwen3-14B-6bit is accounting-sro's email classifier route, called non-stream. Its template does not open `<think>`; the model writes it as its first output. A reply cut off by `max_tokens` before `</think>` came back as `content='<think>\nOkay, so I need…'` with no reasoning, while streaming the same request reported it as reasoning. `Qwen3ReasoningParser` returned "no end token → pure content" before the base class could see the start tag. #121 had only exempted the template-opened (implicit) case.
+
+**Fix:** that early return now applies only when the output does not *begin* with `<think>`. An unclosed `<think>` that opens the output is reasoning (`content=None`), matching streaming. A `<think>` merely mentioned mid-answer is still content.
+
+**Upstream:** upstream's own tests pin the old behaviour ("missing end tag means no reasoning"); two of them are flipped here.
+
+**Verification:** mocked suite 4748 passed; `test_144_*` invariant (truncated, leading whitespace, mid-answer mention, complete and plain outputs unchanged); mutation (old guard back) fails it. Live check on the 14B route after deploy: see the infra deploy row.

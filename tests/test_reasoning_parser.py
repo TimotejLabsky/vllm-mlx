@@ -117,11 +117,12 @@ class TestQwen3Parser:
         assert content == output
 
     def test_only_start_tag_no_reasoning(self, parser):
-        """Qwen3 requires both tags - missing end tag means no reasoning."""
+        """Fork #144: an output that opens <think> and is cut off before
+        </think> is reasoning (as on the streaming path), not content."""
         output = "<think>Started thinking but never finished"
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        assert reasoning == "Started thinking but never finished"
+        assert content is None
 
     def test_only_end_tag_implicit_mode(self, parser):
         """Qwen3 supports implicit mode - when <think> is in prompt, only </think> in output."""
@@ -670,9 +671,9 @@ class TestQwen3SpecificCases:
         # Qwen3 requires </think> to extract reasoning (treats as pure content until then)
         output2 = "<think>incomplete reasoning"
         reasoning, content = parser.extract_reasoning(output2)
-        # No </think> = no reasoning extraction, entire output is content
-        assert reasoning is None
-        assert content == output2
+        # Cut off before </think>: everything after <think> is reasoning (fork #144)
+        assert reasoning == "incomplete reasoning"  # fork #144
+        assert content is None
 
     def test_qwen3_empty_think_tags(self, parser):
         """Test empty think tags."""

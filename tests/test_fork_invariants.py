@@ -3058,3 +3058,27 @@ def test_138_refreshed_hybrid_prefix_is_not_a_superseded_victim():
     cache._evict_lru()
     assert [1, 2, 3] in cache
     assert [9, 9] not in cache
+
+
+# ------------- #144 a truncated model-opened <think> is reasoning, non-stream too
+
+
+def test_144_truncated_model_opened_think_is_reasoning_not_content():
+    """#144: Qwen3-14B opens <think> itself; cut off by max_tokens before
+    </think>, the non-stream parser returned the raw '<think>...' as content
+    (accounting-sro's classifier is non-stream). Streaming already said
+    reasoning; #121 covered only the template-opened (implicit) case."""
+    from vllm_mlx.reasoning.qwen3_parser import Qwen3ReasoningParser
+
+    p = Qwen3ReasoningParser()
+    assert p.extract_reasoning("<think>\nOkay, so I need to figure out if 91") == (
+        "Okay, so I need to figure out if 91",
+        None,
+    )
+    assert p.extract_reasoning("  \n<think>partial") == ("partial", None)
+    # a <think> mentioned mid-answer, never closed, is still content
+    text = "Wrap your notes in a <think> tag like this."
+    assert p.extract_reasoning(text) == (None, text)
+    # complete and tag-free outputs unchanged
+    assert p.extract_reasoning("<think>r</think>answer") == ("r", "answer")
+    assert p.extract_reasoning("plain answer") == (None, "plain answer")
