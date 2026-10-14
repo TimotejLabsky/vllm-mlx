@@ -56,11 +56,15 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         Returns:
             (reasoning, content) tuple.
         """
-        # If no end token at all, treat as pure content — unless the template
-        # opened <think> in the prompt (implicit mode): then the output was
-        # cut off inside the reasoning block (fork #121).
+        # If no end token at all, treat as pure content — unless the output
+        # was cut off inside a reasoning block: the template opened <think>
+        # in the prompt (implicit mode, fork #121), or the model opened it
+        # itself as its first output (#144: Qwen3-14B under max_tokens; the
+        # streaming path already reported it as reasoning). A <think> merely
+        # mentioned mid-answer stays content.
         if self.end_token not in model_output and not self._implicit_mode:
-            return None, model_output
+            if not model_output.lstrip().startswith(self.start_token):
+                return None, model_output
 
         # Use base class implementation (handles both explicit and implicit)
         return super().extract_reasoning(model_output)
