@@ -8,3 +8,4 @@ mlx-metal==0.32.3
 mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@f4f3b57971c39b0bc0bcc2e0cab27e77ea9d53f5
 mlx-vlm==0.7.4
 transformers==5.17.0
+huggingface-hub==1.10.2
