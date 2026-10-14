@@ -135,7 +135,10 @@ check(
     f"reasoning {len(reasoning)} chars, content {(m.get('content') or '')[:40]!r}",
 )
 
-st = json.load(urllib.request.urlopen(f"{BASE}/upstream/{MODEL}/v1/status", timeout=30))
+try:  # via llama-swap, else straight at a server on a spare port
+    st = json.load(urllib.request.urlopen(f"{BASE}/upstream/{MODEL}/v1/status", timeout=30))
+except Exception:
+    st = json.load(urllib.request.urlopen(f"{BASE}/v1/status", timeout=30))
 check("route /v1/status reachable", isinstance(st, dict))
 print(
     "INFO  ssd:",
