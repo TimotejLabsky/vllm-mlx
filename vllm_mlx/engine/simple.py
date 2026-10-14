@@ -195,6 +195,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        model_path: str | None = None,
     ):
         """
         Initialize the simple engine.
@@ -230,7 +231,11 @@ class SimpleEngine(BaseEngine):
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = (force_mllm or is_mllm_model(model_name)) and not force_text_only
+        # (#780) load path vs identity: name heuristics key on model_name.
+        self._model_path = model_path or model_name
+        self._is_mllm = (
+            force_mllm or is_mllm_model(self._model_path)
+        ) and not force_text_only
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
@@ -452,7 +457,7 @@ class SimpleEngine(BaseEngine):
             from ..models.mllm import MLXMultimodalLM
 
             self._model = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
@@ -464,7 +469,8 @@ class SimpleEngine(BaseEngine):
             from ..models.llm import MLXLanguageModel
 
             self._model = MLXLanguageModel(
-                self._model_name,
+                self._model_path,
+                model_id=self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
                 mtp_num_draft_tokens=self._mtp_num_draft_tokens,
@@ -532,86 +538,7 @@ class SimpleEngine(BaseEngine):
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
             if self._is_mllm and self._should_route_text_through_text_model():
-                try:
-                    from ..text_model_from_vlm import build_text_model
-
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
-                    )
-
-                    if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
-                        self._supports_system_kv_cache = (
-                            self._probe_system_kv_cache_support(
-                                self._text_model,
-                                "mllm_text",
-                            )
-                        )
-
-                        # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
-                        if "qwen3" in self._model_name.lower():
-                            self._text_tokenizer.eos_token = "<|im_end|>"
-                            self._text_tokenizer.eos_token_id = (
-                                self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
-                            )
-
-                        # Register the model's FULL eos set (generation_config
-                        # may declare several terminators — gemma-4 has three)
-                        # so stream_generate stops on all of them instead of
-                        # leaking turn markers and running to max_tokens.
-                        try:
-                            from ..text_model_from_vlm import (
-                                wrap_tokenizer_with_eos,
-                            )
-
-                            self._text_tokenizer = wrap_tokenizer_with_eos(
-                                self._text_tokenizer, self._model_name
-                            )
-                        except Exception:
-                            logger.debug(
-                                "text-route eos wrap failed", exc_info=True
-                            )
-
-                        has_mtp = (
-                            hasattr(self._text_model, "mtp")
-                            and self._text_model.mtp is not None
-                        )
-                        logger.info(
-                            "MLLM text routing: text-only -> mlx_lm TextModel "
-                            "(MTP=%s), media -> mlx_vlm",
-                            has_mtp and self._mtp,
-                        )
-                    else:
-                        self._text_model = None
-                        self._text_tokenizer = None
-                        self._text_route_degraded = True
-                        self._text_route_degraded_reason = (
-                            "build_text_model returned None"
-                        )
-                        logger.warning(
-                            "MLLM text routing UNAVAILABLE for %s "
-                            "(build_text_model returned None): text requests fall "
-                            "back to the cacheless mlx_vlm path — full cold "
-                            "prefill every turn, NO system-KV cache. Pass "
-                            "--text-only to force the pure-LLM route and keep the "
-                            "13-32x prefix-cache win.",
-                            self._model_name,
-                        )
-
-                except Exception as e:
-                    self._text_model = None
-                    self._text_tokenizer = None
-                    self._text_route_degraded = True
-                    self._text_route_degraded_reason = f"setup error: {e}"
-                    logger.error(
-                        "MLLM text routing setup FAILED for %s (%s): text "
-                        "requests fall back to the cacheless mlx_vlm path — full "
-                        "cold prefill every turn, NO system-KV cache. Pass "
-                        "--text-only to force the pure-LLM route and keep the "
-                        "13-32x prefix-cache win.",
-                        self._model_name,
-                        e,
-                    )
+                self._initialize_text_model()
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -677,6 +604,82 @@ class SimpleEngine(BaseEngine):
         # worker thread retires with the engine.
         _restore_original_generation_streams()
         logger.info("SimpleEngine stopped")
+
+    def _initialize_text_model(self) -> None:
+        """Build the optional text-only MLLM route from already-loaded weights
+        (upstream's name for the block ``start()`` used to inline)."""
+        try:
+            from ..text_model_from_vlm import build_text_model
+
+            self._text_model = build_text_model(self._model.model, self._model_path)
+
+            if self._text_model is not None:
+                self._text_tokenizer = self._model.get_tokenizer()
+                self._supports_system_kv_cache = self._probe_system_kv_cache_support(
+                    self._text_model,
+                    "mllm_text",
+                )
+
+                # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
+                if "qwen3" in self._model_name.lower():
+                    self._text_tokenizer.eos_token = "<|im_end|>"
+                    self._text_tokenizer.eos_token_id = (
+                        self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                    )
+
+                # Register the model's FULL eos set (generation_config
+                # may declare several terminators — gemma-4 has three)
+                # so stream_generate stops on all of them instead of
+                # leaking turn markers and running to max_tokens.
+                try:
+                    from ..text_model_from_vlm import (
+                        wrap_tokenizer_with_eos,
+                    )
+
+                    self._text_tokenizer = wrap_tokenizer_with_eos(
+                        self._text_tokenizer, self._model_name
+                    )
+                except Exception:
+                    logger.debug("text-route eos wrap failed", exc_info=True)
+
+                has_mtp = (
+                    hasattr(self._text_model, "mtp")
+                    and self._text_model.mtp is not None
+                )
+                logger.info(
+                    "MLLM text routing: text-only -> mlx_lm TextModel "
+                    "(MTP=%s), media -> mlx_vlm",
+                    has_mtp and self._mtp,
+                )
+            else:
+                self._text_model = None
+                self._text_tokenizer = None
+                self._text_route_degraded = True
+                self._text_route_degraded_reason = "build_text_model returned None"
+                logger.warning(
+                    "MLLM text routing UNAVAILABLE for %s "
+                    "(build_text_model returned None): text requests fall "
+                    "back to the cacheless mlx_vlm path — full cold "
+                    "prefill every turn, NO system-KV cache. Pass "
+                    "--text-only to force the pure-LLM route and keep the "
+                    "13-32x prefix-cache win.",
+                    self._model_name,
+                )
+
+        except Exception as e:
+            self._text_model = None
+            self._text_tokenizer = None
+            self._text_route_degraded = True
+            self._text_route_degraded_reason = f"setup error: {e}"
+            logger.error(
+                "MLLM text routing setup FAILED for %s (%s): text "
+                "requests fall back to the cacheless mlx_vlm path — full "
+                "cold prefill every turn, NO system-KV cache. Pass "
+                "--text-only to force the pure-LLM route and keep the "
+                "13-32x prefix-cache win.",
+                self._model_name,
+                e,
+            )
 
     def _should_route_text_through_text_model(
         self, *, mllm_draft_requested: bool = False
@@ -1264,6 +1267,114 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
 
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> str:
+        """Render a textual prompt for the server's reasoning probe (#837).
+
+        Same renderer as ``stream_chat`` (``_render_chat_prompt``), so the
+        probe sees exactly what generation renders - #76's effort
+        normalization included."""
+        probe_kwargs = dict(chat_template_kwargs or {})
+        # The probe inspects text even when generation consumes token IDs.
+        probe_kwargs.pop("tokenize", None)
+        prompt, _, _ = self._render_chat_prompt(
+            messages, tools, probe_kwargs, enable_thinking
+        )
+        return prompt
+
+    def _render_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        enable_thinking: bool | None,
+    ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
+        """Return the prompt, template kwargs and normalized messages
+        (upstream #837's factoring of stream_chat's template block)."""
+        tokenizer = self._model.tokenizer
+        template_kwargs = None
+        safe_messages = None
+        if hasattr(tokenizer, "apply_chat_template"):
+            # Per-request enable_thinking override; default: True unless coder model.
+            if enable_thinking is None:
+                enable_thinking = "coder" not in self._model_name.lower()
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
+            }
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+            if template_tools:
+                template_kwargs["tools"] = template_tools
+            safe_messages = normalize_messages_for_chat_template(messages)
+
+            if getattr(self, "use_harmony_rendering", False):
+                # GPT-OSS / harmony-format models: render via openai-harmony
+                # instead of the Jinja chat_template. Bypasses the
+                # ``extract_multimodal_content`` text-flattening upstream
+                # (which drops structural ``tool_calls`` for non-native
+                # parsers) and uses OpenAI's canonical renderer. See #568.
+                from ..utils.harmony_render import (
+                    render_messages as _harmony_render_messages,
+                )
+
+                _reasoning_effort = None
+                if chat_template_kwargs:
+                    # harmony's vocabulary is low|medium|high; xhigh (Qwen3.8's
+                    # top level) folds onto high rather than being ignored by
+                    # render_messages' getattr guard.
+                    _reasoning_effort = normalize_reasoning_effort(
+                        chat_template_kwargs.get("reasoning_effort"),
+                        HARMONY_EFFORT_LEVELS,
+                        fallback=chat_template_kwargs.get(EFFORT_FALLBACK_KEY),
+                    )
+                prompt = _harmony_render_messages(
+                    safe_messages,
+                    tools=template_tools,
+                    reasoning_effort=_reasoning_effort,
+                )
+            else:
+                # Normalize reasoning_effort against this template's own
+                # vocabulary before it can reach a raise_exception (#76).
+                # Read the route's floor first — the helper pops it.
+                _effort_floor = template_kwargs.get(EFFORT_FALLBACK_KEY)
+                normalize_effort_in_template_kwargs(
+                    template_kwargs, getattr(tokenizer, "chat_template", None)
+                )
+
+                def _render_prompt(**tk: Any) -> Any:
+                    try:
+                        return tokenizer.apply_chat_template(safe_messages, **tk)
+                    except TypeError:
+                        # Some templates don't support all kwargs. Mutate the
+                        # shared dict: the system-prefix probe below re-renders
+                        # with it and must match what we rendered here.
+                        for key in [
+                            "tools",
+                            "enable_thinking",
+                            *chat_template_kwargs.keys(),
+                        ]:
+                            template_kwargs.pop(key, None)
+                            tk.pop(key, None)
+                        return tokenizer.apply_chat_template(safe_messages, **tk)
+
+                prompt = render_with_effort_fallback(
+                    _render_prompt,
+                    template_kwargs,
+                    model_name=self._model_name,
+                    fallback=_effort_floor,
+                )
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            prompt += "\nassistant:"
+        return prompt, template_kwargs, safe_messages
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -1468,81 +1579,12 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
-        if hasattr(tokenizer, "apply_chat_template"):
-            # Per-request enable_thinking override; default: True unless coder model.
-            enable_thinking = kwargs.pop("enable_thinking", None)
-            if enable_thinking is None:
-                enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
-            }
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            safe_messages = normalize_messages_for_chat_template(messages)
-
-            if getattr(self, "use_harmony_rendering", False):
-                # GPT-OSS / harmony-format models: render via openai-harmony
-                # instead of the Jinja chat_template. Bypasses the
-                # ``extract_multimodal_content`` text-flattening upstream
-                # (which drops structural ``tool_calls`` for non-native
-                # parsers) and uses OpenAI's canonical renderer. See #568.
-                from ..utils.harmony_render import (
-                    render_messages as _harmony_render_messages,
-                )
-
-                _reasoning_effort = None
-                if chat_template_kwargs:
-                    # harmony's vocabulary is low|medium|high; xhigh (Qwen3.8's
-                    # top level) folds onto high rather than being ignored by
-                    # render_messages' getattr guard.
-                    _reasoning_effort = normalize_reasoning_effort(
-                        chat_template_kwargs.get("reasoning_effort"),
-                        HARMONY_EFFORT_LEVELS,
-                        fallback=chat_template_kwargs.get(EFFORT_FALLBACK_KEY),
-                    )
-                prompt = _harmony_render_messages(
-                    safe_messages,
-                    tools=template_tools,
-                    reasoning_effort=_reasoning_effort,
-                )
-            else:
-                # Normalize reasoning_effort against this template's own
-                # vocabulary before it can reach a raise_exception (#76).
-                # Read the route's floor first — the helper pops it.
-                _effort_floor = template_kwargs.get(EFFORT_FALLBACK_KEY)
-                normalize_effort_in_template_kwargs(
-                    template_kwargs, getattr(tokenizer, "chat_template", None)
-                )
-
-                def _render_prompt(**tk: Any) -> Any:
-                    try:
-                        return tokenizer.apply_chat_template(safe_messages, **tk)
-                    except TypeError:
-                        # Some templates don't support all kwargs. Mutate the
-                        # shared dict: the system-prefix probe below re-renders
-                        # with it and must match what we rendered here.
-                        for key in [
-                            "tools",
-                            "enable_thinking",
-                            *chat_template_kwargs.keys(),
-                        ]:
-                            template_kwargs.pop(key, None)
-                            tk.pop(key, None)
-                        return tokenizer.apply_chat_template(safe_messages, **tk)
-
-                prompt = render_with_effort_fallback(
-                    _render_prompt,
-                    template_kwargs,
-                    model_name=self._model_name,
-                    fallback=_effort_floor,
-                )
-        else:
-            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-            prompt += "\nassistant:"
+        prompt, template_kwargs, safe_messages = self._render_chat_prompt(
+            messages,
+            template_tools,
+            chat_template_kwargs,
+            kwargs.pop("enable_thinking", None),
+        )
 
         # --- System-prompt KV caching on the pure-LLM stream_chat path ---
         # Mirrors the cache in _stream_generate_text. Locates the system prefix

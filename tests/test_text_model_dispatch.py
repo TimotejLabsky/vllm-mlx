@@ -167,11 +167,30 @@ def _install_recording_qwen3_5(monkeypatch):
         def train(self, mode=True):
             return self
 
+        # The fork's build_text_model fails closed unless the skeleton can
+        # run a one-token warmup forward on the build thread.
+        layers: list = []
+
+        def parameters(self):
+            return {}
+
+        def make_cache(self):
+            return []
+
+        def __call__(self, inputs, cache=None):
+            import mlx.core as mx
+
+            return mx.zeros((1, 1, 1))
+
     module = types.ModuleType("mlx_lm.models.qwen3_5")
     module.TextModel = TextModel
     module.TextModelArgs = TextModelArgs
     monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", module)
-    monkeypatch.setattr(text_model_from_vlm.mlx.utils, "tree_flatten", lambda _p: [])
+    # One shared name on both sides: the fork's fail-closed coverage guard
+    # refuses a skeleton the vlm weights do not cover (0 names = 0 %).
+    monkeypatch.setattr(
+        text_model_from_vlm.mlx.utils, "tree_flatten", lambda _p: [("w", None)]
+    )
     return seen, TextModel
 
 

@@ -7925,6 +7925,7 @@ async def stream_completion(
             exc.kind,
         )
         yield _stream_error_chunk(exc=exc)
+        yield "data: [DONE]\n\n"  # the finally no longer emits it (#825)
     except Exception:
         # PATCHES.md #91 — same silent-stream problem as the chat path.
         result = "error"

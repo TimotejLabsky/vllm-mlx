@@ -2943,3 +2943,43 @@ def test_141_strip_param_framing_edges():
     assert f("\n\n  a\n\n") == "\n  a\n"  # one per side, the rest is data
     assert f("\n") == "\n" and f("\n\n") == ""
     assert f("\n  b") == "  b"  # framing on one side only
+
+
+# ------------- #30 vs upstream #780: --text-only wins over config.json routing
+
+
+def test_30_text_only_wins_over_config_json_vlm_route(tmp_path, monkeypatch):
+    """Upstream #780 routes from the resolved snapshot's config.json, so a
+    checkpoint with ``vision_config`` (Qwen3.8, gemma-4, ...) now arrives with
+    ``force_mllm=True``. The whole text fleet runs ``--text-only``: if the
+    rebase loses #30's override, every text route silently moves onto the
+    MLLM path. Pins both halves: the CLI decision and the engine gate."""
+    from vllm_mlx import cli, server
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.utils import download
+
+    from tests.test_cli import _serve_args
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "vision_config": {"depth": 27}})
+    )
+    loaded = {}
+    monkeypatch.setattr(download, "ensure_model_downloaded", lambda *a, **k: snap)
+    monkeypatch.setattr(server, "load_model", lambda *a, **k: loaded.update(k))
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+    args = _serve_args(model="mlx-community/Qwen3.8-27B-4bit")
+    args.text_only = True
+    cli.serve_command(args)
+    assert loaded["force_text_only"] is True
+    assert loaded["force_mllm"] is False
+
+    engine = BatchedEngine(
+        "mlx-community/Qwen3.8-27B-4bit",
+        model_path=str(snap),
+        force_mllm=True,
+        force_text_only=True,
+    )
+    assert engine._is_mllm is False
