@@ -78,7 +78,7 @@ vs `VLLM_MLX_MLLM_MEDIA_PREFIX_CACHE=0`, T=0, isolated HOME):**
 | qwen3_5 (Qwen3.5-4B) | template re-renders turn 1 → no follow-up hit | 0.80 → 0.03 s | 0 cached | 7/7 |
 | qwen3_vl_moe (Qwen3-VL-30B) | 0.88 → **0.20 s** | 0.88 → 0.13 s | 0 cached | **6/8** (text-only control 8/8) |
 
-Default ON for glm4v, gemma4, mistral3, qwen3_5. **qwen3_vl_moe is opt-in**
+Default ON for glm4v, gemma4, mistral3, qwen3_5, and since 2026-10-14 (Tim's call) **qwen3_vl_moe**. It was opt-in at first
 (`VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS`): its two divergences are late (~15
 tokens) and coherent, consistent with MoE near-ties, but its text-only
 control was 8/8, so "exact" is not proven. Next check before enabling: a
