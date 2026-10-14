@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from .param_framing import strip_param_framing
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -71,7 +72,7 @@ class AutoToolParser(ToolParser):
         r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL
     )
     NEMOTRON_PARAM_PATTERN = re.compile(
-        r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL
+        r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL
     )
     BARE_BRACKET_PATTERN = re.compile(r"\[(\w+)\((\{.*?\})\)\]", re.DOTALL)
     BARE_BRACKET_PARTIAL_PATTERN = re.compile(r"\[\w+\($")
@@ -237,7 +238,10 @@ class AutoToolParser(ToolParser):
         nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
         for name, params_block in nemotron_matches:
             params = self.NEMOTRON_PARAM_PATTERN.findall(params_block)
-            arguments = {p_name.strip(): p_value.strip() for p_name, p_value in params}
+            arguments = {
+                p_name.strip(): strip_param_framing(p_value)
+                for p_name, p_value in params
+            }
             tool_calls.append(
                 {
                     "id": generate_tool_id(),
