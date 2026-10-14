@@ -115,8 +115,8 @@ admission.
 > instead of its placeholder tokens, so a follow-up turn or re-ask about the
 > same image restores its KV and skips the vision tower (GLM-4.6V 1.85 s →
 > 0.19 s, Devstral 4.0 s → 0.27 s TTFT), while a different image behind an
-> identical prompt still misses. On for glm4v / gemma4 / mistral3 / qwen3_5;
-> qwen3_vl_moe is opt-in until it is proven exact.
+> identical prompt still misses. On for glm4v / gemma4 / mistral3 / qwen3_5 /
+> qwen3_vl_moe (Qwen3-VL-30B 0.88 s → 0.20 s).
 >
 > **2026-10-05 — long generations stop crashing; MoE decode +6–21 %**
 > (PATCHES.md #125–#127): hybrid models no longer die with `[metal::malloc]
