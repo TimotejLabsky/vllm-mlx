@@ -3993,3 +3993,19 @@ Not done from the issue: passing token ids instead of the prompt string to `add_
 | qwen3_vl_moe (Qwen3-VL-30B) | 0.88 → 0.20 s | 0.13 s | 0 cached | 6/8 (text control 8/8) → **opt-in** |
 
 Red/blue/red-again behind one prompt answered their own colour on every arch.
+
+## 143. `patch: prefix-cache-disk-gc` — persisted prefix-cache dirs shed files no load can read
+
+**Files:** `vllm_mlx/prefix_cache_disk_gc.py` (new, fork-owned: `gc_prefix_cache_dir`), `vllm_mlx/memory_cache.py` (one call each in `save_to_disk` / `load_from_disk`), `tests/test_fork_143_prefix_cache_disk_gc.py` (new, 5), `tests/test_fork_invariants.py` (+1), `scripts/fork/e2e_prefix_cache_disk_gc.py` (new).
+
+**Gap:** the vision routes save their RAM prefix cache to `~/.cache/vllm-mlx/prefix_cache/<repo>/<provenance>/` on every shutdown and never delete anything. On the Studio (2026-10-14), **1.27 of 1.8 GB** was unreachable: legacy top-level caches from before upstream #747 (`load_from_disk` discards them; Qwen3-VL-30B 817 MB, Qwen3.5-4B 426 MB). Two more leaks are built in: the provenance hash covers the mlx / mlx-lm / mlx-vlm versions, so **every package bump orphans the previous subdir**; and a save with fewer entries leaves `entry_N` files its index no longer lists. The 1.27 GB was deleted by hand the same day (dry run first; only no-provenance top-level files).
+
+**Fix:** `gc_prefix_cache_dir(cache_dir, keep)` removes exactly those three kinds and nothing else:
+- regular cache-named files at the top level, only when no load can use them (the kept subdir has an index, or the top-level index is missing, unreadable or provenance-less; a provenance-carrying top-level index is upstream #747's fallback and stays);
+- sibling dirs named like a provenance hash (16 hex chars) other than the current one;
+- `entry_*` files in the kept subdir that its index does not list (left alone if the index is unreadable).
+It runs after every save and at load. The load-time call skips the top level, so `load_from_disk` still judges and logs a legacy index (its version check) before the next save removes it. It never raises, logs what it freed, and `VLLM_MLX_PREFIX_CACHE_DISK_GC=0` turns it off.
+
+**Upstream:** fork-owned module (upstream's `save_to_disk` has the same leak).
+
+**Verification:** mocked suite 4732 passed. `test_fork_143_*` (5) on real directory trees, including two real `save_to_disk` calls with 3 then 1 entries. Mutation check: dropping the save-time call fails 1. The invariant pins both calls. Writing the test caught the provenance trap again: a cache built under a fake `mlx_lm` gets its own subdir, which the GC then correctly removes. **Real server** (`scripts/fork/e2e_prefix_cache_disk_gc.py`, GLM-4.6V, isolated HOME, junk planted in all three classes): 7/7. The old subdir and legacy files are gone, the current subdir holds exactly its indexed entries, and after a restart the saved entry reloads and serves the re-ask (1421/1422 cached).

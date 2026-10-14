@@ -1971,6 +1971,10 @@ class MemoryAwarePrefixCache:
         index_path = os.path.join(real_dir, "index.json")
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
+        # (#143) stale entry files, stale provenance subdirs, legacy files
+        from .prefix_cache_disk_gc import gc_prefix_cache_dir
+
+        gc_prefix_cache_dir(cache_dir, self._provenance_hash)
 
         dt = _time.monotonic() - t0
         logger.info(
@@ -1988,6 +1992,12 @@ class MemoryAwarePrefixCache:
         import json
         import os
         import time as _time
+
+        # (#143) a route that never saves still sheds stale provenance
+        # subdirs / entry files; top-level legacy files go at the next save.
+        from .prefix_cache_disk_gc import gc_prefix_cache_dir
+
+        gc_prefix_cache_dir(cache_dir, self._provenance_hash, top_level=False)
 
         # Provenanced subdir owns current caches; top-level fallback
         # reads legacy orphans only, never migrates them.
