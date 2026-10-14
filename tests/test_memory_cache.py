@@ -851,6 +851,13 @@ def test_save_load_roundtrip_through_provenance_subdir(tmp_path):
         with open(path, "wb") as f:
             f.write(b"data")
 
+    # Built before the fake mlx_lm is patched in: the runtime-version string
+    # is part of the provenance hash, and reading it through the fake module
+    # gives the second cache a different subdir (fork env has real mlx-lm).
+    other = MemoryAwarePrefixCache(
+        model, MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+
     fake_mlx = types.ModuleType("mlx_lm")
     fake_models = types.ModuleType("mlx_lm.models")
     fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
@@ -868,9 +875,6 @@ def test_save_load_roundtrip_through_provenance_subdir(tmp_path):
         },
     ):
         assert cache.save_to_disk(str(tmp_path)) is True
-        other = MemoryAwarePrefixCache(
-            model, MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
-        )
         with patch(
             "vllm_mlx.memory_cache.estimate_kv_cache_memory",
             return_value=1024,

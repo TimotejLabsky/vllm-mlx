@@ -64,13 +64,14 @@ def test_batched_prepare_llm_model_realizes_on_load_thread(monkeypatch):
     monkeypatch.setattr(
         tokenizer_mod,
         "load_model_with_fallback",
-        lambda name, tokenizer_config=None: (model, object()),
+        lambda name, tokenizer_config=None, **_kw: (model, object()),
     )
 
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._model = None
     engine._tokenizer = None
     engine._model_name = "fake-model"
+    engine._model_path = "fake-model"  # upstream #780: load path vs identity
     engine._trust_remote_code = False
     engine._scheduler_config = None
     engine._configure_metal_memory_limits = lambda: None

@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 # logits from a mechanically compatible but architecturally different model.
 _VLM_ONLY_TEXT_MODEL_PREFIXES = ("qwen4_exp",)
 
+# (upstream #780 review) Dense VL families whose text tower is NOT the Qwen3.5
+# hybrid: built through the ``qwen3*`` -> qwen3_5 family fallback they would
+# load mechanically and serve wrong logits. Exact types, not prefixes - upstream
+# makes extraction opt-in for every family, but the fork resolves each type to
+# its own mlx-lm class (gemma4, ministral3, qwen3_vl_moe all extract correctly
+# on live routes), so only these are excluded. ``_text`` suffix stripped.
+_VLM_ONLY_TEXT_MODEL_TYPES = frozenset({"qwen2_vl", "qwen2_5_vl", "qwen3_vl"})
+
 
 def _import_text_model_classes(model_type: str):
     """Return ``(Model, ModelArgs)`` classes for a text config ``model_type``.
@@ -121,7 +129,13 @@ def build_text_model(
         model_type = str(
             text_config.get("model_type") or config.get("model_type") or ""
         )
-        if model_type.startswith(_VLM_ONLY_TEXT_MODEL_PREFIXES):
+        base_type = (
+            model_type[: -len("_text")] if model_type.endswith("_text") else model_type
+        )
+        if (
+            model_type.startswith(_VLM_ONLY_TEXT_MODEL_PREFIXES)
+            or base_type in _VLM_ONLY_TEXT_MODEL_TYPES
+        ):
             logger.info(
                 "Keeping model_type=%r on the mlx-vlm text path; no compatible "
                 "mlx-lm TextModel is registered",
