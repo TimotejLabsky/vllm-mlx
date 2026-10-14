@@ -110,7 +110,9 @@ class TestFetchMediaGuard:
         cache = _RecordingPrefixCache(fetch_result=(object(), [99, 5]))
         gen = _bare_generator(cache, model_config=SimpleNamespace(**{attr: media_tok}))
         gen._has_empty_rotating_cache = MagicMock(return_value=False)
-        req = _request()
+        # (#142) remaining is read from the REAL ids by position, so the
+        # placeholder has to sit where the fetch says the prompt continues.
+        req = _request(input_ids=mx.array([[1, 2, media_tok, 5]]))
 
         assert gen._prefix_cache_lookup(req)[:2] == (None, None)
 

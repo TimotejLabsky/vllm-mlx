@@ -1,6 +1,6 @@
 # Vision-route caching semantics (BatchedEngine MLLM branch)
 
-*Status: 2026-08-10 (arch coverage re-swept after the 08-03 dependency bump;
+*Status: 2026-10-14 — phase B (#142) built, see below. Earlier: 2026-08-10 (arch coverage re-swept after the 08-03 dependency bump;
 cache semantics unchanged since 2026-07-30, fork `9cf1e90`). Both VLM routes
 (GLM-4.6V-Flash-4bit,
 Qwen3-VL-30B-A3B-8bit) run BatchedEngine in production; `vlm-server.py` is
@@ -13,7 +13,7 @@ PATCHES.md #54–#69.*
 | Cache | What it saves | Media requests | Text requests on the route | Live evidence (Studio) |
 |---|---|---|---|---|
 | **Pixel cache** (`vision_embedding_cache.py`, level 1) | Image preprocessing: decode, resize, normalize, tokenize-with-placeholders | **ON** — keyed on sha256(image content) + prompt | n/a | `pixel_cache_hits=1` on both routes; same-image re-ask 0.4 s |
-| **Prefix-KV cache** (`memory_cache.py` `MemoryAwarePrefixCache`, RAM + SSD tier, namespace `mllm-v2`) | The prefill itself (KV reuse) | **OFF by design** — neither store nor fetch (patch #56, phase A) | **ON** | GLM route, 2.2 K-token text prompt repeated: 5.4 s → **1.0 s, hit, `tokens_saved=2189`** |
+| **Prefix-KV cache** (`memory_cache.py` `MemoryAwarePrefixCache`, RAM + SSD tier, namespace `mllm-v2`) | The prefill itself (KV reuse) | **ON since #142 (phase B)** for glm4v/gemma4/mistral3/qwen3_5, keyed on image content; phase A (off) for other arches, video, audio, URL images | **ON** | GLM route, 2.2 K-token text prompt repeated: 5.4 s → **1.0 s, hit, `tokens_saved=2189`** |
 | **Encoding cache** (`vision_embedding_cache.py`, level 2) | Full vision-tower forward output | Present in the module but not exercised by the batched serve path (`encoding_cache_hits/misses` stay 0) | n/a | all status snapshots show 0/0 |
 | **Batched system-KV** (`batched_system_kv.py`, #29–#40) | Text-fleet KV bag + SSD | *Not used by the MLLM branch at all* | *ditto* | text fleet (19 routes) unchanged |
 
@@ -41,17 +41,49 @@ Practical cost of phase A: a repeated *image* conversation re-prefills its KV.
 The pixel cache still absorbs the preprocessing, and vision prompts are short;
 no measured pain so far.
 
-## Phase B — when to build it
+## Phase B — BUILT 2026-10-14 (PATCHES.md #142)
 
-Designed (plan P19 + PATCHES.md "Future work"): prepend a fingerprint of the
-sha256 media hash (already computed by the pixel cache, currently discarded)
-to the token key — prefix, because `MemoryAwarePrefixCache` LCP-matches — and
-persist the row's rope-delta (#57) on the entry. Bump the SSD namespace on
-landing.
+Built as a *substitution*, not the planned prefix: every image placeholder
+token is replaced, **in the cache key only**, by negative values derived from
+that image's full SHA-256 (`vllm_mlx/mllm_media_key.py`). That keeps the text
+before the image shared, diverges at the image's first placeholder when the
+image differs, and can never equal a real token id. The k-th placeholder run
+is the k-th image (Qwen/GLM/gemma); split layouts (Pixtral rows) use one
+order-sensitive digest of all images. `http(s)` URL images, video and audio
+stay phase A.
 
-**Trigger:** `memory_aware_cache` hits pinned at 0 on a vision route while the
-same image repeats (multi-turn-over-one-image traffic). One-shot
-different-image traffic gains nothing — don't build it for that.
+What the original plan got wrong, checked in code:
+- **No rope-delta to persist.** Since upstream #744 every request derives its
+  mRoPE state from the full prompt + `image_grid_thw` at preprocessing
+  (`_derive_request_rope_deltas`), and restored continuations pass the sliced
+  `position_ids`; all mRoPE families here expose `get_rope_index`.
+- **No SSD namespace bump.** Text keys are unchanged and fingerprints are
+  negative, so `mllm-v2` entries stay valid both ways (a rollback's text-only
+  lookups can only share an image entry's text prefix, whose KV is
+  image-independent).
+
+A hit requires every image to lie inside the cached prefix (the
+remaining-ids placeholder guard), so a follow-up skips the vision tower
+entirely. Persisted prefix-cache entries reload on restart, so a re-asked
+image survives one.
+
+**Measured on the Studio (e2e `scripts/fork/e2e_media_prefix_cache.py`, ON
+vs `VLLM_MLX_MLLM_MEDIA_PREFIX_CACHE=0`, T=0, isolated HOME):**
+
+| Arch (model) | Same-image follow-up TTFT | Exact re-ask | Different image, identical ids | Restored == cold |
+|---|---|---|---|---|
+| glm4v (GLM-4.6V-Flash) | 1.83 → **0.19 s** | 1.88 → 0.05 s | 0 cached | 8/8 (+ e2e 7/7) |
+| mistral3 (Devstral-24B) | 4.00 → **0.27 s** | 3.97 → 0.08 s | 0 cached | 7/7 |
+| gemma4 (26B-A4B) | 0.69 → **0.17 s** | 0.73 → 0.05 s | 0 cached | 8/8 (one e2e near-tie) |
+| qwen3_5 (Qwen3.5-4B) | template re-renders turn 1 → no follow-up hit | 0.80 → 0.03 s | 0 cached | 7/7 |
+| qwen3_vl_moe (Qwen3-VL-30B) | 0.88 → **0.20 s** | 0.88 → 0.13 s | 0 cached | **6/8** (text-only control 8/8) |
+
+Default ON for glm4v, gemma4, mistral3, qwen3_5. **qwen3_vl_moe is opt-in**
+(`VLLM_MLX_MLLM_MEDIA_PREFIX_ARCHS`): its two divergences are late (~15
+tokens) and coherent, consistent with MoE near-ties, but its text-only
+control was 8/8, so "exact" is not proven. Next check before enabling: a
+larger image sample, or an in-process logits comparison of a restored vs cold
+continuation. Kill switch for everything: `VLLM_MLX_MLLM_MEDIA_PREFIX_CACHE=0`.
 
 ## Arch coverage (2026-07-30 fleet sweep)
 
