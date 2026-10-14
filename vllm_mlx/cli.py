@@ -245,12 +245,7 @@ def serve_command(args):
     # (rather than filename heuristics) before engine construction. This
     # reuses the download's own resolution, so a bare HF repo id gets an
     # authoritative check with no second network lookup.
-    from .api.utils import (
-        MllmRoute,
-        MllmRouteUndetermined,
-        is_mllm_model,
-        resolve_mllm_route,
-    )
+    from .api.utils import MllmRouteUndetermined, is_mllm_model, resolve_mllm_route
     from .utils.download import DownloadConfig, ensure_model_downloaded
 
     download_config = DownloadConfig(
@@ -270,24 +265,24 @@ def serve_command(args):
             is_mllm=is_mllm_model(model_arg),
         )
         resolved_model_path = str(resolved) if resolved is not None else None
-        try:
-            if getattr(args, "text_only", False):
-                # (#30) the operator already decided: no config.json probe,
-                # so an unreadable config cannot fail a text-only route.
-                mllm_route = MllmRoute(False, "--text-only")
-            else:
+        if getattr(args, "text_only", False):
+            # (#30) the operator already decided: no config.json probe, so
+            # an unreadable config cannot fail a text-only route.
+            logger.info("Model route: LLM (source=--text-only)")
+        else:
+            try:
                 mllm_route = resolve_mllm_route(
                     model_arg,
                     resolved_model_path,
                     force_mllm=getattr(args, "mllm", False),
                 )
-        except MllmRouteUndetermined as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        logger.info(
-            f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
-            f"(source={mllm_route.source})"
-        )
+            except MllmRouteUndetermined as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+            logger.info(
+                f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
+                f"(source={mllm_route.source})"
+            )
         if args.lazy_load_model:
             print(f"Registering model for lazy load: {model_arg}")
             print("Model will load on the first request.")
