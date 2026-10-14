@@ -52,6 +52,10 @@ def serve() -> None:
     sys.argv = [
         "vllm-mlx", "serve", MODEL, "--host", "127.0.0.1", "--port", str(PORT),
         "--continuous-batching", "--max-num-seqs", "4", "--enable-metrics",
+        # e.g. --text-only: since upstream #780 a checkpoint with a
+        # vision_config routes to the MLLM engine, which this injector
+        # (mlx-lm BatchGenerator.next) does not wrap.
+        *os.environ.get("E2E_SERVE_ARGS", "").split(),
     ]  # fmt: skip
     main()
 
