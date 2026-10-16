@@ -84,6 +84,42 @@ class TestHarmonyRender:
         user_pos = prompt.index("<|start|>user")
         assert sys_pos < dev_pos < user_pos
 
+    def test_caller_system_keeps_harmony_system_block(self):
+        """#145: a caller system message becomes the system block's model
+        identity; the rest of harmony's SystemContent (channel rules,
+        reasoning effort) survives. Forced tool_choice injects a system
+        message on every request."""
+        prompt = render_messages(
+            [
+                {"role": "system", "content": "You MUST call a tool."},
+                {"role": "user", "content": "Find the bug."},
+            ],
+            tools=TOOLS,
+            reasoning_effort="low",
+        )
+        system = prompt.split("<|start|>developer", 1)[0]
+        assert system.startswith("<|start|>system<|message|>You MUST call a tool.\n")
+        assert "You are ChatGPT" not in system
+        assert "Reasoning: low" in system
+        assert "Calls to these tools must go to the commentary channel" in system
+        developer = prompt.split("<|start|>developer", 1)[1].split("<|end|>", 1)[0]
+        assert "You MUST call a tool." not in developer
+        assert "namespace functions" in developer
+
+    def test_explicit_developer_message_keeps_tools(self):
+        """#145: an explicit developer message used to replace the tool
+        schema; its text now joins the instructions next to the tools."""
+        prompt = render_messages(
+            [
+                {"role": "developer", "content": "Prefer read_file."},
+                {"role": "user", "content": "Open main.py."},
+            ],
+            tools=TOOLS,
+        )
+        developer = prompt.split("<|start|>developer", 1)[1].split("<|end|>", 1)[0]
+        assert "Prefer read_file." in developer
+        assert "type read_file = (_:" in developer
+
     def test_assistant_tool_call_renders_commentary_channel(self):
         """Assistant ``tool_calls`` must render in the commentary channel
         addressed to ``functions.<name>`` (the format the model was trained
