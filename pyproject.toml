@@ -40,16 +40,10 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    # Floor stays 0.31.3 — the last PyPI RELEASE. mlx-lm has not released since
-    # April, so `>=0.32.0` is unsatisfiable from PyPI and makes this package
-    # uninstallable (CI caught exactly that). Raising it was also justified by a
-    # premise we later disproved: 0.31.3 does NOT corrupt our checkpoints (see
-    # PATCHES.md #78). Production separately pins a git commit, mlx-lm@f4f3b57
-    # (docs/llm/llm-stack.md in personal-infratructure). The old 9acef5f ceiling
-    # is gone: 11a6ce7 turned ArraysCache.state into a 3-tuple, and fork #81
-    # made both shapes native. The next pin lift crosses mlx-lm#1778 (cache
-    # `state` returns the full state), which #81's tripwires guard. Git pins
-    # all report 0.32.0, so no version bound can express this; test the pin.
+    # Floor stays 0.31.3; production pins mlx-lm==0.32.2 (scripts/fork/prod-pins.txt),
+    # past #1778 (0.32.1+; cache `state` returns the full state).
+    # Fork #137 (cache_state_compat) speaks both state protocols, so the old
+    # git pin (f4f3b57, reports 0.32.0) and 0.32.x releases both work.
     "mlx-lm>=0.31.3",
     "mlx-vlm>=0.6.5",  # 0.6.5+ fixes the Qwen3.5 sanitize double-run that made 0.6.4 corrupt (upstream #674; our old pin was >=0.6.2,!=0.6.4 — superseded)
 
