@@ -3110,3 +3110,34 @@ def test_137_system_kv_restores_never_share_a_writable_buffer():
     b[0].update_and_fetch(mx.full((1, 1, 1, 4), 9.0), mx.full((1, 1, 1, 4), 9.0))
     assert float(legacy_state(a[0])[0][0, 0, 3, 0].item()) == 7.0
     assert float(legacy_state(b[0])[0][0, 0, 3, 0].item()) == 9.0
+
+
+# ------------- #145 harmony keeps its own system block under a caller system
+
+
+def test_145_caller_system_message_does_not_replace_harmony_system_block():
+    """#145: upstream #581's render_messages REPLACED harmony's SystemContent
+    with the caller's system text, dropping the channel rules + reasoning
+    effort; gpt-oss then wrote ``<|channel|>functions.X`` headers (~1/3 of
+    forced tool calls failed). A rebase onto upstream's version undoes it."""
+    pytest.importorskip("openai_harmony")
+    from vllm_mlx.utils.harmony_render import render_messages
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    prompt = render_messages(
+        [{"role": "system", "content": "SYS"}, {"role": "user", "content": "u"}],
+        tools=tools,
+        reasoning_effort="high",
+    )
+    system = prompt.split("<|start|>developer", 1)[0]
+    assert "Reasoning: high" in system and "commentary channel" in system
+    # the caller text is the identity, not an extra "You are ChatGPT" rival
+    assert system.startswith("<|start|>system<|message|>SYS\n")
