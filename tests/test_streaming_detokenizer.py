@@ -205,10 +205,10 @@ class TestOptimizedDetokenizer:
 
     def test_tokenizer_wrapper_has_optimized_detokenizer(self, tokenizer_wrapper):
         """Verify TokenizerWrapper has optimized detokenizer class."""
-        assert hasattr(tokenizer_wrapper, "_detokenizer_class")
         assert hasattr(tokenizer_wrapper, "detokenizer")
-        # Qwen uses BPE tokenizer
-        assert tokenizer_wrapper._detokenizer_class == BPEStreamingDetokenizer
+        # Qwen uses BPE tokenizer (checked on the instance: mlx-lm past the
+        # f4f3b57 pin no longer keeps ``_detokenizer_class``)
+        assert type(tokenizer_wrapper.detokenizer) is BPEStreamingDetokenizer
 
     def test_optimized_detokenizer_correctness(self, tokenizer_wrapper):
         """Verify optimized detokenizer produces correct output."""
