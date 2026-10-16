@@ -5,7 +5,7 @@ patch on the real route config without touching the live route.
 
     python3 route_under_test.py ROUTE --src /tmp/rb1014 [--port 8771]
         [--drop-flag --continuous-batching] [--drop-flag --text-only]
-        [--ssd-dir /tmp/x] -- CHECK_CMD ...
+        [--ssd-dir /tmp/x] [--python /tmp/venv/bin/python] -- CHECK_CMD ...
 
 The route's ``cmd`` and ``env`` come from ~/llm-stack/config.yaml; the
 route-log-wrapper is skipped (the log goes to --log), ``${PORT}`` becomes
@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--drop-flag", action="append", default=[])
     ap.add_argument("--ssd-dir")
     ap.add_argument("--log")
+    ap.add_argument("--python", help="interpreter to run instead of the route's (e.g. a cloned venv)")
     raw = sys.argv[1:]
     cut = raw.index("--") if "--" in raw else len(raw)
     a = ap.parse_args(raw[:cut])
@@ -56,6 +57,8 @@ def main():
     argv = shlex.split(cmd.replace("${PORT}", str(a.port)))
     if argv and argv[0].endswith("route-log-wrapper.sh"):
         argv = argv[1:]
+    if a.python and argv and argv[0].endswith("/python"):
+        argv[0] = a.python
     for flag in a.drop_flag:
         argv = [x for x in argv if x != flag]
     ssd = a.ssd_dir or tempfile.mkdtemp(prefix="rut-ssd-")
