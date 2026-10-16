@@ -121,6 +121,43 @@ class TestHarmonyToolParser:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "simple_func"
 
+    def test_tool_call_bare_content_type(self, parser):
+        """#146: ``to=functions.X code<|message|>`` (bare content type, no
+        <|constrain|>) is a call; seen live from gpt-oss-20b."""
+        text = (
+            "<|end|><|start|>assistant<|channel|>commentary "
+            'to=functions.search_files code<|message|>{"path":"", "pattern":"mx.eval"}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "search_files"
+        assert json.loads(result.tool_calls[0]["arguments"])["pattern"] == "mx.eval"
+
+    def test_tool_call_repeated_commentary_channel(self, parser):
+        """#146: a recipient followed by a second ``<|channel|>commentary``
+        before the constrain token is still one call."""
+        text = (
+            "<|end|><|start|>assistant<|channel|>commentary to=functions.create_event"
+            "<|channel|>commentary <|constrain|>json<|message|>"
+            '{"title":"Standup","date":"2026-10-20"}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "create_event"
+        assert json.loads(result.tool_calls[0]["arguments"])["title"] == "Standup"
+
+    def test_bare_content_type_does_not_split_the_name(self, parser):
+        """#146: the bare content type needs whitespace, so a name followed
+        straight by <|message|> is never split by backtracking."""
+        text = (
+            '<|channel|>commentary to=functions.get_weather<|message|>{"c": 1}<|call|>'
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tool_calls[0]["name"] == "get_weather"
+
     def test_malformed_json_arguments(self, parser):
         """Handle malformed JSON gracefully by keeping raw string."""
         text = (
