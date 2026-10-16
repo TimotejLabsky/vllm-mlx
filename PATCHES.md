@@ -4101,3 +4101,37 @@ Verdict: **low priority**. Both changes are correct, but no deployed route has a
 **Upstream:** upstream's own tests pin the old behaviour ("missing end tag means no reasoning"); two of them are flipped here.
 
 **Verification:** mocked suite 4748 passed; `test_144_*` invariant (truncated, leading whitespace, mid-answer mention, complete and plain outputs unchanged); mutation (old guard back) fails it. Live check on the 14B route after deploy: see the infra deploy row.
+
+## 145. `patch: harmony-system-block` — a caller system message no longer replaces gpt-oss's harmony system block
+
+**Files:** `vllm_mlx/utils/harmony_render.py` (`render_messages`), `tests/test_harmony_render.py` (+2), `tests/test_fork_invariants.py` (+1).
+
+**Symptom.** About a third of gpt-oss-20b tool calls failed in production. On a 24-prompt, 4-tool T=0 A/B through the real server, prod got 16/24. The forced (`tool_choice="required"`) half was the worst at 4–6/12. Failed calls came back as content like `assistantfunctions.create_event`.
+
+**Cause.** `render_messages` (upstream #581) rendered a caller `system` message *as* the harmony system block. That threw away `SystemContent`: the `Reasoning:` effort line and the channel rules (`# Valid channels: …`, "Calls to these tools must go to the commentary channel: 'functions'"). Forced tool choice injects a system message on every request (`_apply_forced_tool_choice`), so those requests always ran without the rules. Raw output then showed `<|channel|>functions.get_weather` with no `commentary to=`, so no call was parsed. The same path silently ignored `reasoning_effort` whenever a system prompt was present. Separately, an explicit `developer` message replaced the tool schema.
+
+**Fix.** The system block is always harmony's own `SystemContent` (with the reasoning effort), and a caller system message becomes its `model_identity`. Explicit developer text becomes the developer block's `# Instructions`, next to the tools.
+
+**Why not OpenAI's mapping.** The first cut moved the system text into developer `# Instructions`, which is the canonical mapping. That keeps harmony's default "You are ChatGPT" identity, and next to a caller "You are a terse assistant…" the model looped at T=0 ("The system says we are ChatGPT." × N) and never answered.
+
+**Verification.** Studio spare port, exact route cmd+env, mlx 0.32.4 stack:
+- Tool A/B: **forced 12/12** (was 4–6), 23/24 overall with #146 (prod 16/24).
+- `live_route_smoke` 7/7. Its chat budget went 48 → 160 because gpt-oss now always gets `Reasoning: medium`, as the no-system path already did, and spends about 40–100 tokens reasoning.
+- Long-system-prompt chat answers in 99 tokens.
+- Suite 4773 passed.
+
+**Upstream:** `harmony_render.py` is upstream's file; this is a fork divergence pinned by `test_145_*`.
+
+## 146. `patch: harmony-header-variants` — two gpt-oss header forms of a well-formed call parse as tool calls
+
+**Files:** `vllm_mlx/tool_parsers/harmony_tool_parser.py` (`_COMMENTARY_BLOCK_PATTERN`), `tests/test_harmony_parsers.py` (+3), `tests/test_fork_invariants.py` (+1).
+
+**Why.** With #145 in place, the remaining `auto` failures captured raw were complete, valid calls in two header forms the pattern rejected:
+- `…commentary to=functions.search_files code<|message|>{…}`: a bare content type, which is valid harmony.
+- `…commentary to=functions.create_event<|channel|>commentary <|constrain|>json<|message|>{…}`: a repeated channel.
+
+Both now match. The bare content type needs whitespace before it, so a name followed directly by `<|message|>` can't be split by backtracking (there's a test for this). Streaming completes calls through the same `extract_tool_calls`, so it's covered too.
+
+**Left open.** One prompt of the 24 (`auto`, "What's the weather in Oslo?") produces no output at all after the analysis channel. Nothing to parse.
+
+**Upstream:** `harmony_tool_parser.py` was byte-identical to upstream until this patch; pinned by `test_146_*`.
