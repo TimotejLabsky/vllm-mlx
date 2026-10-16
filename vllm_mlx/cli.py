@@ -806,10 +806,10 @@ def bench_detok_command(args):
     # Benchmark streaming decode (new method)
     print("Benchmarking Streaming Detokenizer (NEW method)...")
     streaming_times = []
-    detok_class = tokenizer._detokenizer_class
     for _ in range(iterations):
-        detok = detok_class(tokenizer)
-        detok.reset()
+        # A fresh, reset copy on every mlx-lm (``_detokenizer_class`` is gone
+        # past the f4f3b57 pin).
+        detok = tokenizer.detokenizer
         start = time.perf_counter()
         for t in generated_tokens:
             detok.add_token(t)
