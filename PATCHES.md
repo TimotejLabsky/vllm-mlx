@@ -4135,3 +4135,15 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 **Left open.** One prompt of the 24 (`auto`, "What's the weather in Oslo?") produces no output at all after the analysis channel. Nothing to parse.
 
 **Upstream:** `harmony_tool_parser.py` was byte-identical to upstream until this patch; pinned by `test_146_*`.
+
+## 147. `patch: muse-glimmer-parsers` — ATEM reasoning + tool-call parsers for Muse Glimmer (port of upstream #812)
+
+**Files:** `vllm_mlx/reasoning/muse_glimmer_parser.py` (new), `vllm_mlx/tool_parsers/muse_glimmer_tool_parser.py` (new), both `__init__.py` registries, `vllm_mlx/tool_parsers/abstract_tool_parser.py` (`TOOL_MARKUP_IN_REASONING`), `vllm_mlx/server.py` (reserved tool-name check, reasoning→content redirect gate), tests from the upstream PR.
+
+**Why:** Meta's Muse-Glimmer-30B (`muse_glimmer`, dense 29.6B, Apache-2.0; mlx-lm support already inside our pin) addresses every assistant message to a recipient: `to=self` is reasoning, `to=user` the answer, `to=<tool>` a call (`<atem:invoke>`). Without parsers the channel markup leaks into `content` and tool calls are never recognised.
+
+**What:** squashed net diff of waybarrios/vllm-mlx#812 (head `27792ee2`, still open upstream) onto fork main. Tool names `self`/`user` are rejected with 400 (they would collide with the reserved channels). `ToolParser.TOOL_MARKUP_IN_REASONING` defaults to `True`, so every existing parser keeps the reasoning→content redirect; the ATEM parser opts out, so an example call inside reasoning is never treated as a call.
+
+**Upstream:** drop on the rebase that brings #812 in.
+
+**Verification:** suite 4822 passed (one flaky `test_client_acceptance_runner` case, green in isolation on main and branch). Studio spare port, `mlx-community/Muse-Glimmer-30B-4bit`, `--text-only --continuous-batching`: smoke 7/7 (plain answer + reasoning split, non-stream and streamed tool call, tool-result round trip, Slovak, reserved name 400, no markup leaks). **Known gap:** system-KV does not serve a 5.2K-token shared system prompt on this model (cold 30.2 s / warm 29.9 s); prefixes past the 2048-token sliding window are not restored. Speed (cold, 512 tokens): decode 28.7 / 27.4 / 25.6 tok/s at ~0.8K / 5.4K / 21K context, prefill ~205 tok/s, peak Metal 17.9 GB.
