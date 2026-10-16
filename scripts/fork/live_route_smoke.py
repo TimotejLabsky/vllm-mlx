@@ -47,7 +47,9 @@ def post(body, stream=False):
 
 
 def chat(messages, **kw):
-    return json.load(post({"messages": messages, "max_tokens": 48, **kw}))
+    # 160, not 48: gpt-oss reasons before answering even with thinking "off"
+    # (harmony has no off switch; ~40-100 tokens at Reasoning: medium).
+    return json.load(post({"messages": messages, "max_tokens": 160, **kw}))
 
 
 def find(d, k):
@@ -82,7 +84,7 @@ check(
 )
 
 text, done = "", False
-for raw in post({"messages": msgs, "max_tokens": 48, **off}, stream=True):
+for raw in post({"messages": msgs, "max_tokens": 160, **off}, stream=True):
     line = raw.decode().strip()
     if line == "data: [DONE]":
         done = True

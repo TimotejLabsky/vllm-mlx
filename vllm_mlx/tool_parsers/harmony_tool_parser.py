@@ -38,9 +38,14 @@ def _generate_tool_id() -> str:
 # <|channel|> are treated more strictly than explicit terminators — truncated
 # mid-block output, or args that would span into a later channel, must not
 # become a structured tool call with malformed/glued args.
+# Fork #146: two header variants gpt-oss-20b also writes for a well-formed
+# call are accepted: a repeated ``<|channel|>commentary`` after the recipient,
+# and a bare content type (``to=functions.X code<|message|>``, valid harmony)
+# instead of ``<|constrain|>json``.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
-    r"(?:\s*<\|constrain\|>\w+)?"
+    r"(?:\s*<\|channel\|>commentary)?"
+    r"(?:\s*<\|constrain\|>\w+|\s+\w+)?"
     r"\s*<\|message\|>((?:(?!<\|channel\|>).)*?)"
     r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|<\|channel\|>|\Z)",
     re.DOTALL,

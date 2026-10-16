@@ -3141,3 +3141,22 @@ def test_145_caller_system_message_does_not_replace_harmony_system_block():
     assert "Reasoning: high" in system and "commentary channel" in system
     # the caller text is the identity, not an extra "You are ChatGPT" rival
     assert system.startswith("<|start|>system<|message|>SYS\n")
+
+
+# ------------- #146 harmony header variants gpt-oss writes for real calls
+
+
+def test_146_harmony_header_variants_are_tool_calls():
+    """#146: harmony_tool_parser.py was byte-identical to upstream; a rebase
+    taking upstream's pattern drops these two live gpt-oss-20b header forms
+    (bare ``code`` content type, repeated commentary channel) back to text."""
+    from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
+
+    p = HarmonyToolParser(None)
+    for text in (
+        '<|channel|>commentary to=functions.f code<|message|>{"a": 1}',
+        "<|channel|>commentary to=functions.f<|channel|>commentary "
+        '<|constrain|>json<|message|>{"a": 1}',
+    ):
+        r = p.extract_tool_calls(text)
+        assert r.tools_called and r.tool_calls[0]["name"] == "f", text
