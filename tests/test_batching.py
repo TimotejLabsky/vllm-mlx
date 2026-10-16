@@ -309,7 +309,56 @@ class TestSchedulerBasic:
             mlx_generate,
             "_left_pad_prompts",
             lambda prompts, max_length=None: mx.array(prompts),
+            raising=False,  # deleted upstream by mlx-lm #1827
         )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=4)
+
+        responses = batch_gen._next()
+
+        assert responses == []
+        assert batch_gen._partial is not None
+        assert batch_gen._partial["prompt_checkpoint"] == 3
+        assert batch_gen._partial["processed"] == 2
+
+    def test_chunked_prefill_without_upstream_left_pad(self, monkeypatch):
+        """#137: mlx-lm #1827 deleted ``_left_pad_prompts``; chunked prefill
+        must still install and prefill through the local fallback."""
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+
+        class FakeBatchGenerator:
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [_MergeableFakeCache()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = set()
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = None
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = lambda _inputs, cache=None: None
+
+        monkeypatch.delattr(mlx_generate, "_left_pad_prompts", raising=False)
 
         batch_gen = FakeBatchGenerator()
         _install_chunked_prefill(batch_gen, budget=4)
@@ -381,6 +430,7 @@ class TestSchedulerBasic:
             mlx_generate,
             "_left_pad_prompts",
             lambda prompts, max_length=None: mx.array(prompts),
+            raising=False,  # deleted upstream by mlx-lm #1827
         )
 
         batch_gen = FakeBatchGenerator()
@@ -460,6 +510,7 @@ class TestSchedulerBasic:
             mlx_generate,
             "_left_pad_prompts",
             lambda prompts, max_length=None: mx.array(prompts),
+            raising=False,  # deleted upstream by mlx-lm #1827
         )
 
         batch_gen = FakeBatchGenerator()
@@ -541,6 +592,7 @@ class TestSchedulerBasic:
             mlx_generate,
             "_left_pad_prompts",
             lambda prompts, max_length=None: mx.array(prompts),
+            raising=False,  # deleted upstream by mlx-lm #1827
         )
 
         batch_gen = FakeBatchGenerator()

@@ -240,10 +240,18 @@ def _install_chunked_prefill(
     import time as _time
 
     from mlx_lm.generate import (
-        _left_pad_prompts,
         _merge_caches,
         _right_pad_prompts,
     )
+
+    try:
+        from mlx_lm.generate import _left_pad_prompts
+    except ImportError:
+        # mlx-lm #1827 (db0cfc2) deleted it; same body as the pre-#1827 helper.
+        def _left_pad_prompts(prompts, max_length=None):
+            if max_length is None:
+                max_length = max(len(p) for p in prompts)
+            return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
     try:
         from mlx_lm.generate import _lazy_extract_cache
