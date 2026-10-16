@@ -263,29 +263,40 @@ def render_messages(
     h_messages: list[Any] = []
     tool_descs = _build_tools(tools)
 
-    # 1. System block (inject default if caller didn't provide one).
-    if system_msgs:
-        for m in system_msgs:
-            h_messages.extend(_convert_message(m))
-    else:
-        sys_content = _oh.SystemContent.new()
-        if reasoning_effort:
-            try:
-                level = getattr(_oh.ReasoningEffort, reasoning_effort.upper())
-                sys_content = sys_content.with_reasoning_effort(level)
-            except Exception:  # noqa: BLE001
-                pass
-        h_messages.append(
-            _oh.Message.from_role_and_content(_oh.Role.SYSTEM, sys_content)
-        )
+    def _joined(msgs: list[dict]) -> str:
+        texts = (_content_to_text(m.get("content")) for m in msgs)
+        return "\n\n".join(t for t in texts if t.strip())
 
-    # 2. Developer block (tool schema). If caller passed an explicit
-    #    developer message, render that; otherwise synthesize from tools.
-    if developer_msgs:
-        for m in developer_msgs:
-            h_messages.extend(_convert_message(m))
-    elif tool_descs:
-        dev_content = _oh.DeveloperContent.new().with_function_tools(tool_descs)
+    # 1. System block: always harmony's own SystemContent (fork #145), with a
+    #    caller system message as its model identity. A caller system message
+    #    used to REPLACE SystemContent, dropping the reasoning effort and the
+    #    channel rules ("Calls to these tools must go to the commentary
+    #    channel"); forced tool_choice (always injects a system message) then
+    #    wrote ``<|channel|>functions.X`` headers. Not OpenAI's developer-
+    #    instructions mapping: next to the default "You are ChatGPT" identity
+    #    a caller "You are X" prompt sends gpt-oss-20b into a T=0 loop.
+    sys_content = _oh.SystemContent.new()
+    identity = _joined(system_msgs)
+    if identity:
+        sys_content = sys_content.with_model_identity(identity)
+    if reasoning_effort:
+        try:
+            level = getattr(_oh.ReasoningEffort, reasoning_effort.upper())
+            sys_content = sys_content.with_reasoning_effort(level)
+        except Exception:  # noqa: BLE001
+            pass
+    h_messages.append(_oh.Message.from_role_and_content(_oh.Role.SYSTEM, sys_content))
+
+    # 2. Developer block: explicit developer text becomes its
+    #    ``# Instructions`` next to the tool schema (it used to replace the
+    #    tools).
+    instructions = _joined(developer_msgs)
+    if instructions or tool_descs:
+        dev_content = _oh.DeveloperContent.new()
+        if instructions:
+            dev_content = dev_content.with_instructions(instructions)
+        if tool_descs:
+            dev_content = dev_content.with_function_tools(tool_descs)
         h_messages.append(
             _oh.Message.from_role_and_content(_oh.Role.DEVELOPER, dev_content)
         )
