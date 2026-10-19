@@ -4020,7 +4020,7 @@ It runs after every save and at load. The load-time call skips the top level, so
 
 ## 137. `patch: mlxlm-1778-state-compat` — the cache stack speaks one state protocol on both mlx-lm builds
 
-**Status: staged with the 2026-10-16 dependency bump (branch `deps/bump-2026-10-16`, NOT deployed).** mlx-lm 0.32.1 (2026-10-15) / 0.32.2 (2026-10-16) are the first PyPI releases past #1778; prod-pins now names `mlx-lm==0.32.2`.
+**Status: DEPLOYED 2026-10-19 with the dependency bump (mlx-lm 0.32.2 from PyPI on the Studio; infra PR #831).** Post-deploy sweep of all 20 llama-swap routes: no regression. Every smoke FAIL left was reproduced identically on a clone of the pre-bump stack; the Muse-Glimmer one is the smoke's 160-token budget (it reasons ~180 tokens vs 145 before). mlx-lm 0.32.1 (2026-10-15) / 0.32.2 (2026-10-16) are the first PyPI releases past #1778; prod-pins now names `mlx-lm==0.32.2`.
 
 **2026-10-16 lift (pre-lift items 1, 2, 6 done):**
 - *Item 1:* `_install_chunked_prefill` falls back to a local `_left_pad_prompts` (pre-#1827 body); `cli.py`'s detokenizer bench and `test_tokenizer_wrapper_has_optimized_detokenizer` use `tokenizer.detokenizer` (both builds) instead of the deleted `_detokenizer_class`; `test_batching`'s monkeypatches pass `raising=False`; new `test_chunked_prefill_without_upstream_left_pad`.
