@@ -4153,3 +4153,17 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 **Upstream:** drop on the rebase that brings #812 in.
 
 **Verification:** suite 4822 passed (one flaky `test_client_acceptance_runner` case, green in isolation on main and branch). Studio spare port, `mlx-community/Muse-Glimmer-30B-4bit`, `--text-only --continuous-batching`: smoke 7/7 (plain answer + reasoning split, non-stream and streamed tool call, tool-result round trip, Slovak, reserved name 400, no markup leaks). **Known gap:** system-KV does not serve a 5.2K-token shared system prompt on this model (cold 30.2 s / warm 29.9 s); prefixes past the 2048-token sliding window are not restored. Speed (cold, 512 tokens): decode 28.7 / 27.4 / 25.6 tok/s at ~0.8K / 5.4K / 21K context, prefill ~205 tok/s, peak Metal 17.9 GB.
+
+## 148. `patch: detach-release-snapshot` — a stored prefix-cache snapshot no longer pins a second copy until GC (port of upstream #842)
+
+**Files:** `vllm_mlx/memory_cache.py` (`_detach_cache_for_storage`), `tests/test_memory_cache.py` (+1, from the PR), `scripts/fork/e2e_detach_release.py` (new).
+
+**Cause.** `_detach_container` recurses through its own closure cell, a reference cycle, and through `_detach` that cycle also reaches `eval_targets`, the list of every array the call just copied. So each `prepare_store()` / `clone_for_replay()` left the whole snapshot reachable from garbage: after the entry was evicted, cleared or the replay clone dropped, the arrays stayed allocated until the next full cyclic GC pass. On the fleet this is the MLLM path (`MemoryAwarePrefixCache`, both vision routes); the text routes use `batched_system_kv.py` and never call it. It also inflates the resting memory that #48/#60 relief and #52 admission measure.
+
+**Fix.** Upstream's PR verbatim (open, head `00d38e83`): the root call empties `eval_targets` in a `finally`. The small closure cycle remains until GC but no longer reaches any array; `git diff -w` is 10 lines. The four self-recursive closures in `scheduler.py` (`_matches`, `_bound`, `_mirror`, `_offset_of`) were checked: they capture no arrays, so they are not the same bug.
+
+**Verification:**
+- **Red then green:** upstream's `test_detached_snapshot_is_freed_without_a_gc_pass` (real MLX, automatic GC off) fails without the fix and passes with it.
+- **Real server A/B** on the Studio (prod venv, spare port 8781, own HOME, `mlx-community/GLM-4.6V-Flash-4bit`, 4 image conversations × 2 turns with ~5K words of system text each, then `DELETE /v1/cache/prefix`; `scripts/fork/e2e_detach_release.py`). Active Metal memory, baseline → cache full → after clear: **control** (main `c2aac756`) 7.12 → 9.38 → **7.75 GB (+0.63)**; **fix** 7.09 → 9.38 → **7.20 GB (+0.11)**. The +0.11 GB residual is the same on both trees with small entries (no leak visible there: 9 entries were only ~0.24 GB), so it is unrelated. The control's leak is partial because ordinary GC passes during the run collected some of the cycles.
+
+**Upstreaming:** upstream PR #842. Drop this patch on the rebase that brings it in; keep the e2e script.
