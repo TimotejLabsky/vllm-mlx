@@ -1665,6 +1665,49 @@ def test_rebase_no_shadowed_definitions_after_auto_merge():
     )
 
 
+def _duplicate_class_fields(source, rel):
+    import ast
+
+    dupes = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        seen = set()
+        for stmt in node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                name = stmt.target.id
+                if name in seen:
+                    dupes.append(f"{rel}:{stmt.lineno} {node.name}.{name}")
+                seen.add(name)
+    return dupes
+
+
+def test_115_no_duplicate_class_fields_after_auto_merge():
+    """2026-10-21 rebase: upstream #761 added ``MLLMBatchResponse.prompt_tokens``
+    a few lines above #115's own and the two auto-merged without a marker; a
+    dataclass keeps one field (first position, last default), so nothing
+    failed. Pin the bug class: no class body in the package annotates the
+    same field twice.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    # Pre-existing inside upstream itself (identical defaults), not a merge
+    # artifact of ours.
+    allowed = {"GenerationOutput.mtp_drafts", "GenerationOutput.mtp_accepted"}
+    dupes = []
+    for path in sorted((root / "vllm_mlx").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        dupes += [
+            d
+            for d in _duplicate_class_fields(path.read_text(), rel)
+            if d.split(" ", 1)[1] not in allowed
+        ]
+    assert not dupes, "duplicate class fields (silent auto-merge?): " + "; ".join(
+        dupes
+    )
+
+
 def test_114_thinking_budget_skips_template_level_thinking_off():
     """#114: thinking switched off only in chat_template_kwargs (#76's
     reasoning_effort="none" mapping) must not arm the default thinking
