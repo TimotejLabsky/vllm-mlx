@@ -841,8 +841,7 @@ def bench_detok_command(args):
 
     # Verify correctness (strip for BPE edge cases with leading/trailing spaces)
     print("Verifying correctness...")
-    detok = detok_class(tokenizer)
-    detok.reset()
+    detok = tokenizer.detokenizer
     for t in generated_tokens:
         detok.add_token(t)
     detok.finalize()
