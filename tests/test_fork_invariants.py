@@ -3203,3 +3203,56 @@ def test_146_harmony_header_variants_are_tool_calls():
     ):
         r = p.extract_tool_calls(text)
         assert r.tools_called and r.tool_calls[0]["name"] == "f", text
+
+
+# ------- #149 a grown bag entry must own its delta (mx slices are views)
+
+
+def test_149_a_grown_store_does_not_pin_the_finished_row():
+    """#37 stored the grown delta as ``k[..., prefix:, :]`` — an mx VIEW,
+    which keeps the finished row's whole buffer alive however small its own
+    nbytes. On the 27B at 66K every turn pinned 4-5 GB (two stores per
+    turn) that no counter saw; the process sat at 45-52 GB between turns
+    with one 5 GB entry resident (Studio, 2026-10-25), and the 10-23 deep
+    turn started from 51.7 GB. The delta must own its buffer: dropping the
+    row frees the row (here a 100-token delta of a 900-token row: at most
+    ~1/9 of it may stay, plus allocator noise)."""
+    import gc
+
+    import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    from tests.test_batched_system_kv import _fill_recurrent
+
+    kv = BatchedSystemKV(_FakeModel())
+    kv.store("donor", TOKENS, _donor_at(len(TOKENS)))
+    grown = TOKENS + list(range(30000, 30100))
+    assert kv.fetch(grown, request_id="grower") is not None  # donor recorded
+
+    def big_row(n):
+        layers = []
+        for seed in (0.0, 100.0):
+            c = KVCache()
+            k = mx.random.normal((1, 16, n, 1024)).astype(mx.bfloat16) + seed
+            c.update_and_fetch(k, k + 0.5)
+            mx.eval(c.keys, c.values)
+            layers.append(c)
+        rec = ArraysCache(size=2)
+        _fill_recurrent(rec, n)
+        mx.eval(rec[0], rec[1])
+        return [layers[0], rec, layers[1]]
+
+    gc.collect()
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    row = big_row(len(grown))  # 4 arrays x 16 x 900 x 1024 x 2 B ~ 118 MB
+    row_bytes = mx.get_active_memory() - base
+    assert row_bytes > 100_000_000
+
+    assert kv.store("grower", grown, row) is True
+    assert kv.grown_stores >= 1
+    del row
+    gc.collect()
+    mx.clear_cache()
+    retained = mx.get_active_memory() - base
+    assert retained < row_bytes * 0.4, (retained, row_bytes)
