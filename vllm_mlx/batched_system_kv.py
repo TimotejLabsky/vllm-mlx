@@ -77,6 +77,107 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str) -> Optional[float]:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _int_field(obj: Any, name: str) -> int:
+    value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    try:
+        return int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _attention_geometry(model: Any) -> Optional[tuple]:
+    """(#150) ``(heads, kv_heads, head_dim)`` of the model's full-attention
+    layers, read from its mlx-lm ``ModelArgs`` — the ``text_config`` for
+    VLM-shaped checkpoints (qwen3_5, gemma3, …), the flat args otherwise.
+    ``VLLM_MLX_BATCHED_ATTN_GEOMETRY=heads,kv_heads,head_dim`` overrides.
+    None when nothing is found: the chunk-transient term is then 0."""
+    raw = os.environ.get("VLLM_MLX_BATCHED_ATTN_GEOMETRY", "")
+    if raw:
+        try:
+            heads, kv_heads, head_dim = (int(x) for x in raw.split(","))
+            if heads > 0 and head_dim > 0:
+                return (heads, kv_heads or heads, head_dim)
+        except ValueError:
+            pass
+        return None
+    owners = (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "model", None),
+    )
+    for owner in owners:
+        args = getattr(owner, "args", None)
+        if args is None:
+            continue
+        candidates = [args]
+        text_config = getattr(args, "text_config", None)
+        if isinstance(text_config, dict):
+            candidates.insert(0, text_config)
+        for cand in candidates:
+            heads = _int_field(cand, "num_attention_heads")
+            if heads <= 0:
+                continue
+            kv_heads = _int_field(cand, "num_key_value_heads") or heads
+            head_dim = _int_field(cand, "head_dim")
+            if head_dim <= 0:
+                hidden = _int_field(cand, "hidden_size")
+                head_dim = hidden // heads if hidden else 0
+            if head_dim > 0:
+                return (heads, kv_heads, head_dim)
+    return None
+
+
+def _probe_score_bytes_per_pair(
+    geometry: tuple, q_len: int = 1024, kv_len: int = 8192
+) -> float:
+    """(#150) Bytes one prefill attention call allocates per
+    (head, query, key) triple on THIS mlx build and geometry — measured, not
+    assumed. mlx's fused kernel serves head_dim <= 128 and the transient is
+    ~0; head_dim 256 (Qwen3.5/3.8) falls back to a materialised score
+    matrix and this returns ~2 (bf16). Run once per process at bag creation;
+    ~0.4 GB for the 27B geometry, freed on return. 0.0 off-Metal or on any
+    error (fails open like the rest of the guard)."""
+    heads, kv_heads, head_dim = geometry
+    try:
+        import mlx.core as mx
+
+        if not mx.metal.is_available():
+            return 0.0
+        q = mx.random.normal((1, heads, q_len, head_dim)).astype(mx.bfloat16)
+        k = mx.random.normal((1, kv_heads, kv_len, head_dim)).astype(mx.bfloat16)
+        v = mx.random.normal((1, kv_heads, kv_len, head_dim)).astype(mx.bfloat16)
+        rows = mx.arange(kv_len - q_len, kv_len)[:, None]
+        mask = (mx.arange(kv_len)[None] <= rows)[None, None]
+        mx.eval(q, k, v, mask)
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        mx.reset_peak_memory()
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=head_dim**-0.5, mask=mask
+        )
+        mx.eval(out)
+        per_pair = max(0.0, float(mx.get_peak_memory() - base)) / (
+            heads * q_len * kv_len
+        )
+        del q, k, v, mask, out
+        mx.clear_cache()
+    except Exception:
+        logger.debug("[batched_system_kv] attention probe failed", exc_info=True)
+        return 0.0
+    # Below half a byte per pair nothing is materialised (allocator noise).
+    return per_pair if per_pair >= 0.5 else 0.0
+
+
 def _derive_kinds(snapshot: list) -> list:
     """Shape-based kind fallback for legacy (pre-kinds) SSD entries: tuple =>
     trim, list => ckpt — correct for everything that could have produced
@@ -341,6 +442,27 @@ class BatchedSystemKV:
         self.solo_ceiling_pct = _env_int("VLLM_MLX_BATCHED_SOLO_CEILING_PCT", 95)
         self.solo_relief_passes = 0
         self.solo_rejections = 0
+        # (#150, infra issue #847) The per-chunk transient is NOT a constant.
+        # Where mlx's fused attention kernel does not apply (head_dim 256:
+        # Qwen3.5/3.8) a prefill chunk materialises its score matrix,
+        # heads x chunk x context x 2 B — 4.5 GB for 1,356 tokens at 68.8K,
+        # 15.6 GB for a 2,048 chunk at 140K on the 27B — while TRANSIENT_MB
+        # was calibrated at shallow context (+6.7 GB). The coefficient is
+        # probed once on the model's own geometry (0 on a fused path), so
+        # the guards price ``heads x min(remaining, step) x prompt x coeff``
+        # per admission; TRANSIENT_MB stays the fixed remainder.
+        # ``VLLM_MLX_BATCHED_SCORE_BYTES_PER_PAIR`` overrides the probe
+        # (0 disables the term). Priced only when a guard is armed.
+        self.attn_geometry = _attention_geometry(model)
+        self.score_bytes_per_pair = 0.0
+        override = _env_float("VLLM_MLX_BATCHED_SCORE_BYTES_PER_PAIR")
+        if override is not None:
+            self.score_bytes_per_pair = max(0.0, override)
+        elif self.attn_geometry is not None and (
+            self.solo_transient_mb > 0
+            or _env_int("VLLM_MLX_BATCHED_PROJECTED_ADMISSION", 0) > 0
+        ):
+            self.score_bytes_per_pair = _probe_score_bytes_per_pair(self.attn_geometry)
         # (#106) Two holes the 2026-09-17 OOMs (63.0-63.6 GB, three times in
         # 2.5 h) went through with KV_BUDGET_MB=8192, all with one signature:
         # a ~65-70K row decoding, a second deep row co-batched, and a 67-72K
@@ -1560,17 +1682,43 @@ class BatchedSystemKV:
         )
         return evicted
 
-    def solo_prefill_verdict(self, tokens_to_prefill: int) -> Optional[str]:
+    def chunk_transient_bytes(
+        self, tokens_to_prefill: int, prompt_tokens: int, step: Optional[int]
+    ) -> float:
+        """(#150) The attention score matrix one prefill chunk of this
+        request materialises: ``heads x min(remaining, step) x prompt x
+        bytes/pair``. The last chunk attends over the whole prompt, so the
+        prompt length is the context. 0 on a fused path (probe said so),
+        when the geometry is unknown, or when the term is disabled."""
+        if (
+            self.score_bytes_per_pair <= 0
+            or self.attn_geometry is None
+            or tokens_to_prefill <= 0
+        ):
+            return 0.0
+        chunk = tokens_to_prefill
+        if step is not None and step > 0:
+            chunk = min(chunk, int(step))
+        context = max(int(prompt_tokens or 0), chunk)
+        return (
+            float(self.attn_geometry[0]) * chunk * context * self.score_bytes_per_pair
+        )
+
+    def solo_prefill_verdict(
+        self, tokens_to_prefill: int, extra_bytes: float = 0.0, detail: str = ""
+    ) -> Optional[str]:
         """(#105) Examine a request about to run ALONE. None = admit;
         otherwise the ``error_kind`` to reject it with.
 
-        Projects ``active + tokens x bytes/token + one chunk's transient``
-        against the OOM wall. Over it, everything that is pure cache is given
-        back first (spill backlog, then the bag LRU-first, then the MLX
-        buffer cache) and the projection re-checked; only a request that
-        still cannot fit is rejected — before it costs a prefill and takes
-        the process's state down with it. Inert without TRANSIENT_MB, a
-        bytes/token estimate, or Metal."""
+        Projects ``active + tokens x bytes/token + one chunk's transient +
+        extra_bytes`` against the OOM wall. ``extra_bytes`` (#150) is what the
+        hook knows and this bag does not: the lazy restore the admission
+        will materialise and the chunk's attention scores. Over it,
+        everything that is pure cache is given back first (spill backlog,
+        then the bag LRU-first, then the MLX buffer cache) and the projection
+        re-checked; only a request that still cannot fit is rejected — before
+        it costs a prefill and takes the process's state down with it. Inert
+        without TRANSIENT_MB, a bytes/token estimate, or Metal."""
         if self.solo_transient_mb <= 0 or tokens_to_prefill <= 0:
             return None
         ceiling = self._pressure.ceiling_bytes()
@@ -1578,13 +1726,19 @@ class BatchedSystemKV:
         if not ceiling or bpt <= 0:
             return None
         limit = ceiling * self.solo_ceiling_pct / 100
-        need = tokens_to_prefill * bpt + self.solo_transient_mb * 1024 * 1024
+        need = (
+            tokens_to_prefill * bpt
+            + self.solo_transient_mb * 1024 * 1024
+            + max(0.0, float(extra_bytes or 0.0))
+        )
         try:
             import mlx.core as mx
 
-            if mx.get_active_memory() + need <= limit:
+            before = mx.get_active_memory()
+            if before + need <= limit:
                 return None
             relieved = False
+            shed_entries = 0
             if self._ssd is not None and self._ssd.drop_backlog():
                 self.pressure_backlog_drops += 1
                 relieved = True
@@ -1593,6 +1747,7 @@ class BatchedSystemKV:
                 self._drop_lru_entry(spare_pinned=True) or self._drop_lru_entry()
             ):
                 relieved = True
+                shed_entries += 1
                 mx.clear_cache()
             active = mx.get_active_memory()
         except Exception:
@@ -1600,17 +1755,33 @@ class BatchedSystemKV:
             return None
         if relieved:
             self.solo_relief_passes += 1
+            logger.info(
+                "[batched_system_kv] solo guard made room: %d tokens need ≈ %.1f GB "
+                "(%.1f KB/tok + %d MB transient%s) on top of %.1f GB active "
+                "> %d%% of %.1f GB working set; shed %d entries, active now %.1f GB",
+                tokens_to_prefill,
+                need / 1e9,
+                bpt / 1024,
+                self.solo_transient_mb,
+                detail,
+                before / 1e9,
+                self.solo_ceiling_pct,
+                ceiling / 1e9,
+                shed_entries,
+                active / 1e9,
+            )
         if active + need <= limit:
             return None
         self.solo_rejections += 1
         logger.warning(
             "[batched_system_kv] solo prefill rejected: %d tokens need ≈ %.1f GB "
-            "(%.1f KB/tok + %d MB chunk transient) on top of %.1f GB active "
+            "(%.1f KB/tok + %d MB chunk transient%s) on top of %.1f GB active "
             "> %d%% of %.1f GB working set, with the cache already emptied",
             tokens_to_prefill,
             need / 1e9,
             bpt / 1024,
             self.solo_transient_mb,
+            detail,
             active / 1e9,
             self.solo_ceiling_pct,
             ceiling / 1e9,
@@ -1746,6 +1917,10 @@ class BatchedSystemKV:
                 "pressure_backlog_drops": self.pressure_backlog_drops,
                 "solo_relief_passes": self.solo_relief_passes,
                 "solo_rejections": self.solo_rejections,
+                # (#150) what the guards price per chunk: 0 = fused path /
+                # unknown geometry / disabled; ~2 = materialised bf16 scores
+                "attn_score_bytes_per_pair": self.score_bytes_per_pair,
+                "attn_geometry": self.attn_geometry,
                 "lazy_restores": self.lazy_restores,
                 "lazy_restore_misses": self.lazy_restore_misses,
                 "lazy_ssd_fallbacks": self.lazy_ssd_fallbacks,
@@ -1928,12 +2103,38 @@ def solo_prefill_verdict(scheduler, request) -> Optional[str]:
     if hybrid_kv is None or scheduler.running:
         return None
     remaining = getattr(request, "remaining_tokens", None)
-    tokens = (
-        len(remaining)
-        if remaining is not None
-        else int(getattr(request, "num_prompt_tokens", 0) or 0)
-    )
-    return hybrid_kv.solo_prefill_verdict(tokens)
+    prompt_tokens = int(getattr(request, "num_prompt_tokens", 0) or 0)
+    tokens = len(remaining) if remaining is not None else prompt_tokens
+    # (#150) Two things this admission adds that the bag cannot see from
+    # ``tokens`` alone. With LAZY_RESTORE the restored prefix is NOT yet
+    # inside ``active``: materialize_pending_restore builds it right after
+    # this verdict (4.6 GB at 67K on the 27B — unpriced, that was the
+    # 2026-10-23 OOM). A request that missed at enqueue may be re-matched at
+    # admission (#131), so price what a fresh peek would restore. And the
+    # chunk's attention scores scale with chunk x context.
+    extra = 0.0
+    detail = ""
+    try:
+        restore = 0.0
+        hit_type = getattr(request, "cache_hit_type", None)
+        if hit_type == "system_kv_pending":
+            restore = hybrid_kv.restore_bytes(getattr(request, "cached_tokens", 0) or 0)
+        elif hit_type == "miss" and hasattr(hybrid_kv, "peek"):
+            restore = hybrid_kv.restore_bytes(
+                hybrid_kv.peek(request.prompt_token_ids, touch=False)
+            )
+        step = getattr(getattr(scheduler, "config", None), "prefill_step_size", None)
+        scores = hybrid_kv.chunk_transient_bytes(tokens, prompt_tokens, step)
+        extra = restore + scores
+        if extra > 0:
+            detail = (
+                f" + {restore / 1e9:.1f} GB restore + {scores / 1e9:.1f} GB "
+                f"attention scores at {prompt_tokens} ctx"
+            )
+    except Exception:
+        logger.debug("[batched_system_kv] solo guard extras failed open", exc_info=True)
+        extra, detail = 0.0, ""
+    return hybrid_kv.solo_prefill_verdict(tokens, extra_bytes=extra, detail=detail)
 
 
 def materialize_pending_restore(scheduler, request) -> None:
@@ -2487,10 +2688,19 @@ def should_defer_cobatch(scheduler, request) -> bool:
             if getattr(request, "cache_hit_type", None) == "system_kv_pending"
             else 0.0
         )
+        # (#150) plus the new row's first chunk's attention scores.
+        scores = 0.0
+        if hasattr(hybrid_kv, "chunk_transient_bytes"):
+            scores = hybrid_kv.chunk_transient_bytes(
+                len(remaining) if remaining is not None else request.num_prompt_tokens,
+                request.num_prompt_tokens,
+                getattr(getattr(scheduler, "config", None), "prefill_step_size", None),
+            )
         reason = hybrid_kv.projected_cobatch_verdict(
-            merged + growth + restore,
+            merged + growth + restore + scores,
             f"{merged / 1e9:.1f} GB merged KV at {len(lengths)} seats + "
-            f"{growth / 1e9:.1f} GB new-row growth + {restore / 1e9:.1f} GB restore",
+            f"{growth / 1e9:.1f} GB new-row growth + {restore / 1e9:.1f} GB restore"
+            + (f" + {scores / 1e9:.1f} GB attention scores" if scores else ""),
         )
 
     if reason is None and hybrid_kv.mem_watermark_pct > 0:
