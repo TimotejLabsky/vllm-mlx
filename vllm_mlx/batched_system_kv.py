@@ -119,6 +119,22 @@ def _trim_nbytes(snapshot: list, kinds: list) -> int:
     return n
 
 
+def _detached(a):
+    """(#149) A slice that owns its buffer. An mx slice is a VIEW: it keeps
+    the whole source buffer alive for as long as it lives, whatever its own
+    ``nbytes`` says — measured on mlx 0.32.4: a 0.8 MB tail slice of a 41 MB
+    array retains all 41 MB after the source is dropped, and so do
+    ``mx.contiguous``, ``mx.array(view)`` and a one-element concatenate. Only
+    an arithmetic op allocates fresh storage (upstream's memory_cache
+    ``_detach`` uses the same idiom). Stored by #37's grow-on-hit path, a
+    400-token delta pinned the finished row's entire 66K buffer: 4-5 GB per
+    turn that no counter saw and only watermark relief ever gave back."""
+    out = a + 0
+    if out.dtype != a.dtype:
+        out = out.astype(a.dtype)
+    return out
+
+
 def _segments_upto(segments: list, pos: int):
     """Store-side prefix reuse: whole segments by REFERENCE up to ``pos``;
     a boundary segment that straddles ``pos`` is sliced and EVALUATED on the
@@ -135,8 +151,8 @@ def _segments_upto(segments: list, pos: int):
         else:
             take = pos - acc
             if take > 0:
-                pk = k[..., :take, :]
-                pv = v[..., :take, :]
+                pk = _detached(k[..., :take, :])
+                pv = _detached(v[..., :take, :])
                 mx.eval(pk, pv)
                 out.append((pk, pv))
             acc = pos
@@ -710,8 +726,9 @@ class BatchedSystemKV:
                     segs = _segments_upto(donor_snapshot[i], prefix_len)
                     if prefix_len < len(tokens_list):
                         k, v = st
-                        dk = k[..., prefix_len:, :]
-                        dv = v[..., prefix_len:, :]
+                        # (#149) detached: a view here pinned the whole row
+                        dk = _detached(k[..., prefix_len:, :])
+                        dv = _detached(v[..., prefix_len:, :])
                         mx.eval(dk, dv)
                         segs.append((dk, dv))
                     if len(segs) > _SEGMENT_CONSOLIDATE_AT:
