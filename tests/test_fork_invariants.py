@@ -3205,7 +3205,160 @@ def test_146_harmony_header_variants_are_tool_calls():
         assert r.tools_called and r.tool_calls[0]["name"] == "f", text
 
 
-# ------- #149 a grown bag entry must own its delta (mx slices are views)
+# ------- #150 the solo guard prices the lazy restore and the chunk's scores
+
+
+def _solo_scheduler(kv, step=2048):
+    return SimpleNamespace(
+        hybrid_kv=kv, running={}, config=SimpleNamespace(prefill_step_size=step)
+    )
+
+
+def test_150_solo_guard_prices_the_lazy_restore_it_admits(monkeypatch):
+    """Since LAZY_RESTORE (#106) the restored prefix is NOT inside ``active``
+    when the guard runs: materialize_pending_restore builds it right after.
+    2026-10-23 (infra #847): 51.7 GB active, a 1,356-token chunk at 68.8K,
+    its 4.6 GB restore unpriced -> projected 60.4 < 61.2, admitted untouched,
+    Metal OOM. Here: 40 active + 6 KV + 10 transient = 56 would pass; with
+    the 50 MB restore priced it is 106 > 95 -> one entry shed -> 86 fits."""
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    pending = _queued("p", range(900))
+    pending.cache_hit_type = "system_kv_pending"
+    pending.cached_tokens = 800  # 800 x 64 KiB still to be materialised
+    pending.remaining_tokens = list(range(100))
+
+    assert bkv.solo_prefill_verdict(_solo_scheduler(kv), pending) is None
+
+    assert kv.solo_relief_passes == 1 and kv.solo_rejections == 0
+    assert kv.stats()["entry_count"] == 0
+
+
+def test_150_chunk_transient_scales_with_chunk_and_context(monkeypatch):
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.attn_geometry = (24, 4, 256)
+    kv.score_bytes_per_pair = 2.0
+    # the 2026-10-23 step: measured 4.48 GB on mlx 0.32.3 and 0.32.4
+    assert kv.chunk_transient_bytes(1356, 68846, 2048) == 24 * 1356 * 68846 * 2
+    # a cold deep prompt is chunked: the step caps the query side
+    assert kv.chunk_transient_bytes(76088, 91512, 2048) == 24 * 2048 * 91512 * 2
+    # a prompt shorter than the chunk attends over the chunk
+    assert kv.chunk_transient_bytes(300, 0, 2048) == 24 * 300 * 300 * 2
+    # fused path (probe said 0), unknown geometry, nothing to prefill -> 0
+    kv.score_bytes_per_pair = 0.0
+    assert kv.chunk_transient_bytes(1356, 68846, 2048) == 0.0
+    kv.score_bytes_per_pair = 2.0
+    kv.attn_geometry = None
+    assert kv.chunk_transient_bytes(1356, 68846, 2048) == 0.0
+    kv.attn_geometry = (24, 4, 256)
+    assert kv.chunk_transient_bytes(0, 68846, 2048) == 0.0
+
+
+def test_150_solo_guard_prices_the_chunks_attention_scores(monkeypatch):
+    """The transient was a constant calibrated at shallow context (+6.7 GB);
+    at head_dim 256 it is heads x chunk x context x 2 B. The same 100-token
+    chunk is harmless on a short prompt and worth shedding for at the end of
+    a 10,000-token chain (24 x 100 x 10,000 x 2 = 48 MB in the mocked scale);
+    a smaller prefill step bounds it (24 x 50 x 10,000 x 2 = 24 MB fits)."""
+    kv = _solo_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.attn_geometry = (24, 4, 256)
+    kv.score_bytes_per_pair = 2.0
+    warm = _queued("w", range(10_000))
+    warm.cache_hit_type = "system_kv"  # eager restore: already inside active
+    warm.remaining_tokens = list(range(100))
+
+    short = _queued("s", range(100))
+    short.remaining_tokens = list(range(100))
+    assert bkv.solo_prefill_verdict(_solo_scheduler(kv), short) is None
+    assert kv.solo_relief_passes == 0 and kv.stats()["entry_count"] == 1
+
+    assert bkv.solo_prefill_verdict(_solo_scheduler(kv, step=50), warm) is None
+    assert kv.solo_relief_passes == 0 and kv.stats()["entry_count"] == 1
+
+    # 40 + 6 KV + 10 transient + 48 scores = 104 > 95 -> shed one -> 84 fits
+    assert bkv.solo_prefill_verdict(_solo_scheduler(kv), warm) is None
+    assert kv.solo_relief_passes == 1 and kv.solo_rejections == 0
+    assert kv.stats()["entry_count"] == 0
+
+
+def test_150_gate4_prices_the_new_rows_attention_scores(monkeypatch):
+    """Co-batch admission (#106 gate 4) gets the same term: the 09-17 replay
+    needed one shed; with 16.8 MB of scores on top it needs two."""
+    kv = _projected_kv(monkeypatch, base_mb=20)
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT)))
+    _charge_entries(kv)
+    kv.attn_geometry = (24, 4, 256)
+    kv.score_bytes_per_pair = 20.0  # 24 x 50 x 700 x 20 = 16.8 MB
+    scheduler, candidate = _replay_0917(kv)
+    scheduler.config = SimpleNamespace(prefill_step_size=2048)
+
+    assert bkv.should_defer_cobatch(scheduler, candidate) is False
+
+    assert kv.stats()["entry_count"] == 0  # both shed, admitted with room made
+    assert kv.projected_relief_passes == 1 and kv.projected_defers == 0
+
+
+def test_150_attention_geometry_is_read_from_model_args(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_BATCHED_ATTN_GEOMETRY", raising=False)
+    vlm_shaped = SimpleNamespace(
+        args=SimpleNamespace(
+            text_config={
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "hidden_size": 5120,
+            }
+        )
+    )
+    assert bkv._attention_geometry(vlm_shaped) == (24, 4, 256)
+    flat = SimpleNamespace(
+        args=SimpleNamespace(
+            num_attention_heads=64, num_key_value_heads=8, hidden_size=4096
+        )
+    )
+    assert bkv._attention_geometry(flat) == (64, 8, 64)
+    assert bkv._attention_geometry(_FakeModel()) is None
+    # unknown geometry -> no probe, no term, nothing priced
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SOLO_TRANSIENT_MB", "8")
+    kv = BatchedSystemKV(_FakeModel())
+    assert kv.score_bytes_per_pair == 0.0
+    assert kv.chunk_transient_bytes(1356, 68846, 2048) == 0.0
+    monkeypatch.setenv("VLLM_MLX_BATCHED_ATTN_GEOMETRY", "24,4,256")
+    assert bkv._attention_geometry(_FakeModel()) == (24, 4, 256)
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SCORE_BYTES_PER_PAIR", "0")
+    kv = BatchedSystemKV(_FakeModel())
+    assert kv.attn_geometry == (24, 4, 256) and kv.score_bytes_per_pair == 0.0
+
+
+def test_150_probe_predicts_the_measured_transient():
+    """The coefficient is measured on this mlx build, not assumed: at
+    head_dim 256 the probe's number predicts a differently shaped call
+    within 25%; at head_dim 128 the fused kernel serves it and it reads 0."""
+    import mlx.core as mx
+
+    if not mx.metal.is_available():
+        pytest.skip("probe needs Metal")
+    assert bkv._probe_score_bytes_per_pair((24, 4, 128)) == 0.0
+    per = bkv._probe_score_bytes_per_pair((24, 4, 256))
+    assert per > 0.5
+
+    heads, kv_heads, head_dim, q_len, kv_len = 24, 4, 256, 1356, 16384
+    q = mx.random.normal((1, heads, q_len, head_dim)).astype(mx.bfloat16)
+    k = mx.random.normal((1, kv_heads, kv_len, head_dim)).astype(mx.bfloat16)
+    v = mx.random.normal((1, kv_heads, kv_len, head_dim)).astype(mx.bfloat16)
+    rows = mx.arange(kv_len - q_len, kv_len)[:, None]
+    mask = (mx.arange(kv_len)[None] <= rows)[None, None]
+    mx.eval(q, k, v, mask)
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    mx.reset_peak_memory()
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=head_dim**-0.5, mask=mask)
+    mx.eval(out)
+    measured = mx.get_peak_memory() - base
+    predicted = heads * q_len * kv_len * per
+    assert abs(measured - predicted) / predicted < 0.25, (measured, predicted)
 
 
 def test_149_a_grown_store_does_not_pin_the_finished_row():
