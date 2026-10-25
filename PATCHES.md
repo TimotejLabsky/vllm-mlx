@@ -4184,3 +4184,34 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 - Suite: 4848 passed / 32 skipped / 56 deselected.
 
 **Upstreaming:** fork-owned (`feat/batched-system-kv` series). Note for the SimpleEngine tier: `system_kv.py` has no grown-delta path; its checkpoint slices (`k[..., :p, :]`) are restore-side.
+
+## 150. `patch: solo-guard-prices-restore-and-scores` — the solo guard prices the lazy restore it admits and a context-proportional chunk transient
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`_attention_geometry`, `_probe_score_bytes_per_pair`, `chunk_transient_bytes`, `solo_prefill_verdict(extra_bytes, detail)`, the `_schedule_waiting` hook, gate 4), `tests/test_fork_invariants.py` (+6), `scripts/fork/e2e_solo_guard_deep_chunk.py`.
+
+**The 10-23 step, priced.** `scheduler._schedule_waiting` runs `solo_prefill_verdict` (#105) *before* `materialize_pending_restore` (#106). #105's design note says "a restored prefix is already resident (inside `active`)" — true for the eager restore it was written against, false since `VLLM_MLX_BATCHED_LAZY_RESTORE=1` was armed next to it on 2026-09-21: the restore is built right after the verdict. And `TRANSIENT_MB=8192` was calibrated at shallow context (+6.7 GB, 2026-09-16), but on this model (`head_dim` 256, 24 query heads) prefill attention is not served by mlx's fused kernel and materialises its score matrix: **24 × chunk × context × 2 B** — 4.5 GB for 1,356 tokens at 68.8K, 6.8 GB for a 2,048 chunk at 69K, 15.6 GB at 140K (the 09-15 ladder's `active 32.3 / peak 47.9`). The guard projected 51.7 + 0.1 + 8.6 = 60.4 GB < 61.2 → admitted untouched; the step needed 51.7 + 4.6 (restore) + 4.5 (scores) + ~0.8 ≈ 61.6 GB against a wall that both the 09-15 and the 10-23 OOMs put at ~62 GB (peak 62.0/62.1 right before each). Gate 4 (#106, co-batch) already added `restore_bytes`; the solo path did not.
+
+**Fix.**
+- The hook passes `extra_bytes` = the pending restore (`restore_bytes(cached_tokens)` for `system_kv_pending`; a fresh `peek` for a `miss`, which #131 may re-match at admission) + the chunk's attention scores, and a `detail` string for the log.
+- `chunk_transient_bytes(remaining, prompt_tokens, step)` = `heads × min(remaining, prefill_step_size) × prompt_tokens × bytes_per_pair`. The coefficient is **probed once per process** on the model's own geometry (`_attention_geometry`: `num_attention_heads` / `num_key_value_heads` / `head_dim` from the mlx-lm `ModelArgs`, `text_config` first; a 1024×8192 SDPA call, peak−active ÷ pairs): ~2 on an unfused path, 0 where the fused kernel serves it (head_dim ≤ 128 measured 0). `VLLM_MLX_BATCHED_SCORE_BYTES_PER_PAIR` overrides (0 disables), `VLLM_MLX_BATCHED_ATTN_GEOMETRY=heads,kv,dim` overrides detection; unknown geometry → term 0, i.e. the old behaviour. Probed only when a guard is armed. `TRANSIENT_MB` stays as the fixed remainder (GDN chunk state, logits).
+- Gate 4 adds the same term for the new row's first chunk.
+- A make-room pass now logs its arithmetic at INFO (`solo guard made room: … + X GB restore + Y GB attention scores at N ctx … shed K entries`).
+- `/v1/status` → `cache.attn_score_bytes_per_pair`, `cache.attn_geometry`.
+
+**Config:** none required on the armed route (the 27B-4bit keeps `SOLO_TRANSIENT_MB=8192` as the fixed part). The 8-bit sibling and every other text route still run without the #105/#106 rails; arming them is a config decision (infra).
+
+**Verification:**
+- **Red then green:** 6 tests, red with `vllm_mlx/` at `39d7aeeb`: the lazy restore is priced and shed for (the exact 10-23 arithmetic in the mocked scale: 56 would pass, 106 > 95 with the restore → one entry shed → admitted); the term scales with chunk × context and is capped by the prefill step; the solo guard sheds for a 100-token chunk at the end of a 10K chain but not on a short prompt; gate 4 gets the term; geometry from `text_config` / flat args / env, unknown → 0; the probe predicts a differently shaped SDPA call within 25 % at head_dim 256 and reads 0 at 128.
+- **Laptop microbench** (`/tmp/oom-68k-work/sdpa_bench.py`, mlx 0.32.3 vs 0.32.4, 24/4/256): 1356×68846 → 4.50 / 4.48 GB; 2048×68846 → 6.82 / 6.79 GB. The dependency bump did not change the transient.
+- **Real server (Studio, spare port, exact route cmd + env):**
+
+| Run | Tree | Chain | Resting active between turns | Deep turn | Peak | Outcome |
+|---|---|---|---|---|---|---|
+| 1 | base `39d7aeeb` | 45K → 50.5K, 4 s gaps | 45–52 GB, 1 entry | 1,902 tok @ 50.5K | 56.7 GB | held |
+| A | base | 66K → 71.5K, 0.5 s gaps | 45–49 GB, 1–3 entries | 2,533 tok @ 74K | 60.5 GB (+15 from 45.6) | held — from the 49 GB state two turns earlier it dies |
+| B | #149 + #150 | same as A | **27.0–27.8 GB, 3 entries** | 2,533 tok @ 74K | **42.7 GB** (+15 from 27.8) | held; T=0 answer byte-identical to run A (`46a804b8…`); 0 pressure evictions, 0 relief passes needed |
+
+- Suite: 4848 passed / 32 skipped / 56 deselected.
+- **Guard wiring live** (spare port, `VLLM_MLX_BATCHED_SOLO_CEILING_PCT=45` to force it, 20K chain): every turn logged `solo guard made room: 390 tokens need ≈ 10.4 GB (64.0 KB/tok + 8192 MB transient + 1.5 GB restore + 0.3 GB attention scores at 20522 ctx) on top of 19.6 GB active > 45% … shed 1 entries`; the 2,053-token deep turn priced 12.3 GB (2.0 GB scores at 24104 ctx — the probe read 1.69 B/pair on this process), shed the bag and was rejected with the #104 503 (`solo_rejections` 1, `generation_recoveries` 0). At the deployed 95% ceiling and with #149 in place neither path fires in the 66K replay (run B).
+
+**Upstreaming:** fork-owned.
