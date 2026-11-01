@@ -4250,3 +4250,15 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Fix.** Entries keep sorted `gen_spans`; absorbing a prefix chain carries its spans forward, including through the prompt-boundary store. `reconcile_generated` repeats for each span the prompt splits at, and donor ties go to the longest chain, or a stale shorter entry with the same split would stop the splice early. Spans live in RAM only: after an SSD promote the first re-render still misses, as it did before.
 
 **Verification:** 2 new `test_139_*` tests plus a `gen_spans` assertion, red before the fix. Mutation check: dropping the span carry, the tie-break, or the per-span loop each fails a test.
+
+## 154. `patch: media-digest-short-base64` — a small inline image keeps its content digest
+
+**Files:** `vllm_mlx/mllm_media_key.py` (`image_digest`), `tests/test_fork_invariants.py`, `scripts/fork/e2e_persist_round_trip.py` (new), `scripts/fork/e2e_invalid_schema.py` (new), `scripts/fork/e2e_reconcile_generated.py`.
+
+**Bug.** `image_digest` probes `Path(image).is_file()` for strings under 4096 chars, and past the filename limit that raises `ENAMETOOLONG`, which landed in the read-failure branch. An inline base64 image of 255–4095 chars, meaning under about 3 KB encoded, had no digest, so #142 silently skipped it: no store, no hit, no log line, and always a clean answer. Real photos are longer and were never affected. It is why GLM's disk cache stayed empty on probe-only days. Found when a persistence round trip stored nothing at 640px and worked at 768px.
+
+**Fix.** A failed path probe means "not a path", so the string is hashed as content. A read failure on a real file still returns no digest.
+
+**Verification:** `test_154_*`, red at 300/1500/4095 chars before the fix.
+
+**Real-server check of #151/#153 (Studio prod venv, spare ports, off the live routes):** `e2e_persist_round_trip.py` 13/13 on GLM-4.6V-Flash: three server runs, entries saved and loaded back, reused at 1112/1113 tokens, every image answers its own colour. It cannot force the corrupting order, which needs an entry moved to the LRU end unread, so `test_151_*` carries that case. `e2e_reconcile_generated.py` with a third tool-loop turn: `splices=2`, turn 3 restored 1289/1289 against 1260 in control. `e2e_media_prefix_cache.py` 9/9. `e2e_invalid_schema.py` on the 9B route: 422 for the bad schema, co-batched peer 200. 9B route smoke 7/7.
