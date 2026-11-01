@@ -876,6 +876,7 @@ class BatchedSystemKV:
         subsumed entries drop. Covers both the identical-re-send shadowing
         case (found by the e2e concurrent scenario) and prompt-boundary
         entries being replaced by their finished chain."""
+        gen_spans: set = set()  # (#139) carried along with absorbed chains
         absorbed = [
             k
             for k, e in self._entries.items()
@@ -888,6 +889,7 @@ class BatchedSystemKV:
                 popped = self._entries.pop(k)
                 # Subsumed, not lost — the chain lives on in the new entry.
                 self._timing.forget(timing_key(popped["tokens"]))
+                gen_spans.update(popped.get("gen_spans", ()))
                 for cp in popped["checkpoints"]:
                     merged[cp["pos"]] = cp
             for cp in checkpoints:
@@ -916,6 +918,10 @@ class BatchedSystemKV:
         }
         if gen_start is not None and 0 <= gen_start <= len(tokens_list):
             entry["gen_start"] = int(gen_start)  # (#139) generated output begins
+            if gen_start < len(tokens_list):
+                gen_spans.add((int(gen_start), len(tokens_list)))
+        if gen_spans:
+            entry["gen_spans"] = sorted(gen_spans)
         if tokens_list:
             # Learn bytes/token AT insert — a lazily-learned hint misses the
             # serial workload where relief empties the bag before anything
@@ -1481,10 +1487,11 @@ class BatchedSystemKV:
         """(#139) ``tokens`` with the closest chain's generated output spliced
         back in, or None to leave the prompt alone.
 
-        Fires only when the prompt parts ways with that chain INSIDE its
-        generated span (``gen_start`` <= split < chain end) and the rest of
-        that span re-appears in the prompt differing only in whitespace - a
-        template re-rendering the model's own turn. Anything else (a stripped
+        Fires only when the prompt parts ways with that chain INSIDE one of
+        its generated spans and the rest of that span re-appears in the prompt
+        differing only in whitespace - a template re-rendering the model's own
+        turn. The client re-renders every earlier turn, so this repeats for
+        each span the prompt splits at. Anything else (a stripped
         <think>, edited or truncated arguments, a different turn) differs in
         non-whitespace text and is left to the normal partial match. The
         model then sees exactly what it generated, and the request restores
@@ -1493,41 +1500,59 @@ class BatchedSystemKV:
             return None
         tokens = list(tokens)
         with self._lock:
-            best_lcp, donor, gen_start = 0, None, None
+            best_lcp, donor, gen_spans = 0, None, ()
             for entry in self._entries.values():
-                lcp = common_prefix_len(tokens, entry["tokens"])
-                if lcp > best_lcp:
-                    best_lcp, donor = lcp, entry["tokens"]
-                    gen_start = entry.get("gen_start")
-        if donor is None or gen_start is None or best_lcp >= len(tokens):
+                chain = entry["tokens"]
+                lcp = common_prefix_len(tokens, chain)
+                # Ties: a stale shorter chain would stop the splice early.
+                if lcp > best_lcp or (
+                    lcp == best_lcp and donor is not None and len(chain) > len(donor)
+                ):
+                    best_lcp, donor = lcp, chain
+                    gen_spans = entry.get("gen_spans", ())
+        if donor is None:
             return None
-        if not gen_start <= best_lcp < len(donor):
+        original_len, splices, kept = len(tokens), 0, 0
+        # The client re-renders every earlier turn, so one prompt can part ways
+        # at each of the chain's generated spans in turn.
+        for _ in gen_spans:
+            lcp = common_prefix_len(tokens, donor)
+            if lcp >= len(tokens) or lcp >= len(donor):
+                break
+            span_end = next((e for s, e in gen_spans if s <= lcp < e), None)
+            if span_end is None:
+                break
+            tail = donor[lcp:span_end]
+            if len(tail) > self.reconcile_max_tail:
+                self.reconcile_rejects += 1
+                break
+            try:
+                end = whitespace_aligned_end(self._tokenizer, tail, tokens, lcp)
+            except Exception:
+                logger.debug(
+                    "[batched_system_kv] reconcile decode failed", exc_info=True
+                )
+                end = None
+            if end is None:
+                self.reconcile_rejects += 1
+                break
+            tokens = tokens[:lcp] + list(tail) + tokens[end:]
+            splices += 1
+            kept += len(tail)
+            logger.info(
+                "[batched_system_kv] reconciled generated span: split=%d "
+                "chain=%d prompt %d -> %d tokens, kept %d generated tokens",
+                lcp,
+                len(donor),
+                original_len,
+                len(tokens),
+                len(tail),
+            )
+        if not splices:
             return None
-        tail = donor[best_lcp:]
-        if len(tail) > self.reconcile_max_tail:
-            self.reconcile_rejects += 1
-            return None
-        try:
-            end = whitespace_aligned_end(self._tokenizer, tail, tokens, best_lcp)
-        except Exception:
-            logger.debug("[batched_system_kv] reconcile decode failed", exc_info=True)
-            end = None
-        if end is None:
-            self.reconcile_rejects += 1
-            return None
-        spliced = list(donor) + tokens[end:]
-        self.reconcile_splices += 1
-        self.reconcile_tokens_kept += len(donor) - best_lcp
-        logger.info(
-            "[batched_system_kv] reconciled generated span: split=%d "
-            "chain=%d prompt %d -> %d tokens, kept %d generated tokens",
-            best_lcp,
-            len(donor),
-            len(tokens),
-            len(spliced),
-            len(donor) - best_lcp,
-        )
-        return spliced
+        self.reconcile_splices += splices
+        self.reconcile_tokens_kept += kept
+        return tokens
 
     def peek(
         self,

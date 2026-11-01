@@ -2278,6 +2278,37 @@ def test_139_off_by_default(monkeypatch):
     assert kv.stats()["reconcile_splices"] == 0
 
 
+def test_139_every_earlier_generated_span_is_reconciled(monkeypatch):
+    """Field 2026-11-01: turn N spliced at 8243, then turn N+1 (253 new tokens)
+    re-prefilled 3895 from the same split. The client re-renders EVERY earlier
+    parallel-call turn, and an entry only knew its newest span."""
+    kv = _reconcile_kv(monkeypatch)
+    turn2 = _HEAD + _MODEL + _NEXT
+    kv.store_prompt_boundary("turn2", turn2, _donor_at(len(turn2)))
+    chain = turn2 + _MODEL
+    kv.store("turn2", chain, _donor_at(len(chain)), gen_start=len(turn2))
+
+    request = _queued("turn3", _HEAD + _TEMPLATE + _NEXT + _TEMPLATE + _NEXT)
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == chain + _NEXT
+    assert request.cached_tokens == len(chain)
+    assert kv.stats()["reconcile_splices"] == 2
+
+
+def test_139_donor_ties_prefer_the_longest_chain(monkeypatch):
+    kv = _reconcile_kv(monkeypatch)
+    other = _HEAD + [4, 5, 6, 3] + [31000, 31001]
+    kv.store("sibling", other, _donor_at(len(other)), gen_start=len(_HEAD))
+    longer = _HEAD + _MODEL + _NEXT
+    kv.store("turn2", longer, _donor_at(len(longer)), gen_start=len(_HEAD))
+    request = _queued("turn3", _HEAD + _TEMPLATE + _NEXT + [32000, 32001])
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.cached_tokens == len(longer)
+
+
 def test_139_finish_store_records_where_the_output_begins(monkeypatch):
     kv = BatchedSystemKV(_FakeModel(), tokenizer=_VocabTok())
     n = len(_HEAD + _MODEL)
@@ -2292,6 +2323,7 @@ def test_139_finish_store_records_where_the_output_begins(monkeypatch):
     (entry,) = kv._entries.values()
     assert entry["tokens"] == _HEAD + _MODEL
     assert entry["gen_start"] == len(_HEAD)
+    assert entry["gen_spans"] == [(len(_HEAD), n)]
 
 
 # ------------- #129 the thinking-budget processor syncs incrementally
@@ -3472,7 +3504,9 @@ def test_151_save_never_overwrites_a_lazily_loaded_source(tmp_path):
     assert _151_first_key(third, c) == 3.0
 
 
-def test_151_interrupted_save_leaves_nothing_loadable_half_written(tmp_path, monkeypatch):
+def test_151_interrupted_save_leaves_nothing_loadable_half_written(
+    tmp_path, monkeypatch
+):
     """#151: the swap phase drops index.json first, so a crash between two
     os.replace calls can never pair one entry's KV with another's tokens."""
     pytest.importorskip("mlx.core")
