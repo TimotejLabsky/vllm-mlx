@@ -161,7 +161,11 @@ def test_nonrewindable_full_hit_keeps_cold_prefill(monkeypatch, with_kv):
     resident = scheduler.memory_aware_cache._entries[tuple(tokens)].cache
     if with_kv:
         assert resident[0].offset == len(tokens)
-    assert resident[-1].state[0].tolist() == [[1.0] * 4]
+    # mlx-lm 0.32 nests the arrays one level deeper than 0.31.3.
+    recurrent_state = resident[-1].state[0]
+    if isinstance(recurrent_state, list):
+        recurrent_state = recurrent_state[0]
+    assert recurrent_state.tolist() == [[1.0] * 4]
 
 
 def test_uncertain_coverage_keeps_cold_prefill(monkeypatch):

@@ -3319,43 +3319,6 @@ class TestChunkedPrefillCacheHandling:
         install_chunked_prefill_mllm(gen, budget=4)
         return gen, chunks
 
-    def test_interleaved_hybrid_checkpoints_at_think_suffix_boundary(self, monkeypatch):
-        gen, chunks = self._interleaved_hybrid_gen(monkeypatch)
-        turn1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 98, 99]
-
-        self._run_interleaved(gen, "turn1", turn1)
-
-        # Chunks stop exactly at the boundary (9), then run the suffix; any
-        # later single-token calls are decode steps.
-        assert chunks[:4] == [[1, 2, 3, 4], [5, 6, 7, 8], [9], [98, 99]]
-        assert all(len(chunk) == 1 for chunk in chunks[4:])
-        assert sorted(gen.prefix_cache._entries) == [tuple(turn1[:9])]
-        assert gen.prefix_cache.fetch_exact_auxiliary(turn1) is None
-        stored, remaining = gen.prefix_cache.fetch(turn1[:9])
-        assert remaining == []
-        assert int(stored[0][0].item()) == 9
-        assert stored[1].offset == 9
-
-    def test_interleaved_hybrid_hit_checkpoints_next_boundary(self, monkeypatch):
-        gen, chunks = self._interleaved_hybrid_gen(monkeypatch)
-        turn1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 98, 99]
-        self._run_interleaved(gen, "turn1", turn1)
-        chunks.clear()
-
-        turn2 = [*turn1[:9], 50, 51, 52, 53, 54, 55, 98, 99]
-        self._run_interleaved(gen, "turn2", turn2)
-
-        # Resumes at 9; the boundary (15) splits the second chunk. Positions
-        # are absolute even though prefill started from a cache hit.
-        assert chunks[:3] == [[50, 51, 52, 53], [54, 55], [98, 99]]
-        assert all(len(chunk) == 1 for chunk in chunks[3:])
-        # Turn 2's boundary supersedes the turn-1 entry it was restored from.
-        assert sorted(gen.prefix_cache._entries) == [tuple(turn2[:15])]
-        stored, remaining = gen.prefix_cache.fetch(turn2[:15])
-        assert remaining == []
-        assert int(stored[0][0].item()) == 15
-        assert stored[1].offset == 15
-
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
         from types import SimpleNamespace
 

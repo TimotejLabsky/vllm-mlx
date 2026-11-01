@@ -161,10 +161,11 @@ def test_identical_plain_kv_prompt_never_replays_a_supersequence():
     replay_tokens, replay_request = _generate(warm, "kv-identical", prompt)
     oracle_tokens, _ = _generate(_scheduler("kv"), "kv-cold", prompt)
 
-    # The only stored entry is N+completion tokens and must not be trimmed into
-    # an apparent N-token hit.  Cache coverage plus replay is therefore exactly N.
-    assert replay_request.cached_tokens == 0
-    assert replay_request.remaining_tokens == prompt
+    # Upstream #857: the N+completion entry is trimmed to N and rewound one more
+    # token, so only the last prompt token is replayed. The oracle check below
+    # is what proves that token is not duplicated in the KV.
+    assert replay_request.cached_tokens == len(prompt) - 1
+    assert replay_request.remaining_tokens == prompt[-1:]
     assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(
         prompt
     )
