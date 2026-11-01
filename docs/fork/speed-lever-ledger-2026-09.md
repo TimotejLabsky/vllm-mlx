@@ -52,6 +52,8 @@ inside mlx's Metal kernels:
 | 9 | mlx-lm PR #1824 fork-pin cherry-pick (`BatchKVCache` `.item()` → `tolist()`) | NULL at fleet scale: 123.1 vs 123.1 agg tok/s, 77.9 vs 77.9 single (35B-A3B, prod env, 6 staggered concurrent, SHAs identical). Upstream's +11.6% is a 0.5B-at-2370-tok/s effect; our per-retirement syncs ≈0.5%. Take it for free in the next routine pin bump | 2026-09-03 shadow A/B |
 | 10 | Plain-`quantized_matmul` same-input projection fusion (prototype "#97": GDN in_proj 4→1 + shared-expert gate/up + router gates; retro-covers dense QKV and dense MLP gate/up) | REFUTED twice: (a) perf FLAT (77.5 vs 77.5 tok/s with 110 groups fused — plain qmm dispatch is too cheap; #96's win was a `gather_qmm` property, not general); (b) **breaks the T=0 byte-identical gate** — the fused 12352-row matmul selects a different Metal kernel variant than separate 8192/4096/32/32 calls → accumulation-order rounding → stable-but-different output. Dense MLP gate/up additionally NULL in isolation (21504-row kernels are pure weight-bandwidth). Branch deleted; suite-green design recipe preserved in session memory (rebuild ~30 min if mlx ever unifies qmm variants) | 2026-09-03 live A/B |
 | 11 | Decode-interleave during another row's prefill (fork issue #45, built as #135, record branch `record/decode-interleave-135`): K−1 extra decode-only steps per prefill chunk | ZERO-SUM on one GPU. Stall is real (27B-4bit, 27K-token decoding row + 30K cold prefill: 28 tokens in 155 s, 9.4 s gaps = one 2048 chunk). K=4/8 gives the decoding row K tokens per chunk (hook fired 17×, +51 / +119 tokens) but B's prefill pays the same steps (155 → 157 → 160 s) and the extra tokens leave in one burst per chunk — gaps stay 9.5 s. Each token A gains costs B one ~43 ms decode step. Not merged. Note: the stall only exists for similar-length rows; the padded-KV co-batch rail defers a deep request behind a short decoding one entirely (A kept 33 ms/token there) | 2026-10-06 live A/B, exact live route, spare port |
+| 12 | oMLX 0.7.3 in-place batch KV update (#4916) | N/A: oMLX's own table shows 0 change with MTP off at 1–8 streams, and we run MTP off. Measured on our box the fork already uses less: peak RSS 5.8 vs 7.4 GB | 2026-11-01 PR read + head-to-head |
+| 13 | oMLX 0.7.3 shared system-prompt snapshot (#4994) | No gap: the fork already reuses it. 7.4K system prompt, 5 concurrent: warm TTFT 0.45 vs 1.00 s, sequential 0.16 vs 0.23 s, cached 7424 vs 7427 | 2026-11-01 head-to-head |
 
 ### Methodology lessons (paid for, don't re-learn)
 
@@ -365,3 +367,22 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
 - mlx-lm #1799 (gated-delta readout scale): CLOSED upstream as incorrect
   (2026-09) — the landmine defused itself; a plain pin bump can no longer
   pick it up.
+
+### 2026-11-01 head-to-head: fork vs oMLX 0.7.3 release build
+
+`Qwen3.5-9B-4bit` (hybrid), official DMG with its custom kernels, Studio spare port, natural prompts, T=0, thinking off, usage-counted tokens, 2 rounds in alternating order, HA route loaded. Rounds agreed within 1 % except oMLX 2-way (120.7 / 131.6).
+
+| Test | Fork | oMLX 0.7.3 | Read |
+|---|---|---|---|
+| Serial decode | 93.4 tok/s | 96.9 tok/s | oMLX +3.7 % |
+| 2 streams, aggregate | 134.7 | 126.2 | fork +7 % |
+| 4 streams, aggregate | 162.9 | 155.4 | fork +5 % |
+| 8 streams, aggregate | 177.4 | 333.9 | **oMLX 1.9×** |
+| 5 concurrent cold, 7.4K system | 48.8 s TTFT | 45.5 s TTFT | oMLX −7 % |
+| 5 concurrent warm, same system | 0.45 s | 1.00 s | fork −55 % |
+| Sequential warm, same system | 0.16 s | 0.23 s | fork −30 % |
+| Peak RSS | 5.8 GB | 7.4 GB | fork −22 % |
+
+The 8-stream gap is row-fused decode, which starts at 6+ rows (oMLX #4977). It also explains why it does not show at 4. Our route logs since October never show more than 4 running (27B-4bit: 1,085 samples at 1, 46 at 2, 10 at 3, 1 at 4; 35B, 14B: 1 only), so it pays nothing today, and mlx #4712 / #4728, already merged, bring M1–M4 row kernels with the next release. Do not build it. Worth a check after mlx 0.32.5: whether it also shifts the "~1.2× batching ceiling" (lever 2), which was measured before these kernels.
+
+Remaining small gaps: serial +3.7 % and cold prefill −7 % on this model. Not investigated; this is a single 9B result, so do not generalise it to the MoE routes. oQ quantisation (#4930) is untested here: it needs a requant and a quality run.
