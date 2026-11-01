@@ -4255,7 +4255,7 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 
 **Files:** `vllm_mlx/mllm_media_key.py` (`image_digest`), `tests/test_fork_invariants.py`, `scripts/fork/e2e_persist_round_trip.py` (new), `scripts/fork/e2e_invalid_schema.py` (new), `scripts/fork/e2e_reconcile_generated.py`.
 
-**Bug.** `image_digest` probes `Path(image).is_file()` for strings under 4096 chars, and past the filename limit that raises `ENAMETOOLONG`, which landed in the read-failure branch. An inline base64 image of 255–4095 chars, meaning under about 3 KB encoded, had no digest, so #142 silently skipped it: no store, no hit, no log line, and always a clean answer. Real photos are longer and were never affected. It is why GLM's disk cache stayed empty on probe-only days. Found when a persistence round trip stored nothing at 640px and worked at 768px.
+**Bug.** `image_digest` probes `Path(image).is_file()` for strings under 4096 chars, and past the filename limit that raises `ENAMETOOLONG`, which landed in the read-failure branch. An inline base64 image of 255–4095 chars, meaning under about 3 KB encoded, had no digest, so #142 silently skipped it: no store, no hit, no log line, and always a clean answer. Real photos are longer and were never affected. It does not explain GLM's empty disk cache on probe-only days: the probe and smoke images (96/224 px) make prompts that are very likely under the 128-token `min_prefix_tokens` floor, and the deployed fix still logged `nothing to save` after the smoke. Found when a persistence round trip stored nothing at 640px and worked at 768px.
 
 **Fix.** A failed path probe means "not a path", so the string is hashed as content. A read failure on a real file still returns no digest.
 
