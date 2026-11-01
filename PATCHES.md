@@ -4227,3 +4227,9 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 **Verification:** 2 tests in `test_fork_invariants.py`, red before the fix (`assert 2.0 == 1.0`: entry A read back entry B's value, no error). Upstream's version-mismatch test updated for the bump.
 
 **Upstreaming:** candidate; same bug upstream.
+
+## 152. `patch: anthropic-stream-stop-reason` — streaming `/v1/messages` reports `max_tokens` and `input_tokens` (port of upstream PR #861, open)
+
+**Files:** `vllm_mlx/server.py` (`_stream_anthropic_messages`), `tests/test_server.py`.
+
+Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so a client could not tell a truncated answer from a finished one. It now uses `_convert_anthropic_stop_reason`, like the non-streaming path, and includes `input_tokens` in `message_delta`. Code and test taken from the PR; drop this patch when it merges.
