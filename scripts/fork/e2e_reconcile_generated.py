@@ -140,7 +140,9 @@ def run(model_dir: str, workdir: str, armed: bool) -> dict:
                     {
                         "role": "tool",
                         "tool_call_id": call["id"],
-                        "content": "# Title\n\nSome documentation text. " * 20,
+                        "content": "# Title\n\nSome documentation text. " * 20
+                        + "\nNow call read for /repo/CHANGELOG.md and /repo/LICENSE "
+                        "in this one reply, in parallel.",
                     }
                 )
             second = ask(msgs)
@@ -151,6 +153,33 @@ def run(model_dir: str, workdir: str, armed: bool) -> dict:
             ) or 0
             reply = second["choices"][0]["message"]
             out["turn2_answered"] = bool(reply.get("content") or reply.get("tool_calls"))
+            # (#153) Turn 3 re-renders turn 1's parallel calls again; the entry
+            # now ends in turn 2's output, so turn 1's span must have survived.
+            # A tool continuation, like the field trace: a new USER message
+            # makes the template drop earlier <think> blocks, a split before
+            # any generated span that is not what this checks.
+            out["turn2_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            calls2 = reply.get("tool_calls") or []
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": reply.get("content") or "",
+                    "tool_calls": calls2,
+                }
+            )
+            for call in calls2:
+                msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": "More text. " * 20,
+                    }
+                )
+            third = ask(msgs)["usage"]
+            out["turn3_prompt"] = third["prompt_tokens"]
+            out["turn3_cached"] = (third.get("prompt_tokens_details") or {}).get(
+                "cached_tokens", 0
+            ) or 0
             out["cache"] = c.get(f"{BASE}/v1/status").json().get("cache", {})
     finally:
         proc.terminate()
@@ -203,6 +232,14 @@ def main() -> int:
         and armed["turn2_cached"] > control["turn2_cached"],
         f"cached {control['turn2_cached']} -> {armed['turn2_cached']} "
         f"(turn-1 chain {armed['turn1_tokens']}, prompt {armed['turn2_prompt']})",
+    )
+    check(
+        "armed: turn 3 still restores past the first split (#153)",
+        armed["turn3_cached"] >= armed["turn2_tokens"] - 2
+        and armed["turn3_cached"] > control["turn3_cached"],
+        f"cached {control['turn3_cached']} -> {armed['turn3_cached']} "
+        f"(turn-2 chain {armed['turn2_tokens']}, prompt {armed['turn3_prompt']}, "
+        f"splices={cache.get('reconcile_splices')})",
     )
     print(f"model: {MODEL} | logs: {workdir}")
     return 0 if all(results) else 1

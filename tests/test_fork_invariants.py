@@ -3539,3 +3539,24 @@ def test_151_interrupted_save_leaves_nothing_loadable_half_written(
     third = _151_cache()
     assert third.load_from_disk(str(tmp_path)) == 1
     assert _151_first_key(third, tokens) == 2.0
+
+
+@pytest.mark.parametrize("length", [300, 1500, 4095, 4096])
+def test_154_inline_image_digest_survives_the_path_probe(length):
+    """#154: a base64 image under 4096 chars went through Path.is_file(), which
+    raises ENAMETOOLONG past the filename limit, so a small image had no digest
+    and silently skipped the media prefix cache."""
+    from vllm_mlx.mllm_media_key import image_digest
+
+    first = image_digest("A" * length)
+    assert first is not None
+    assert first != image_digest("B" * length)
+
+
+def test_154_a_real_file_is_digested_by_content(tmp_path):
+    from vllm_mlx.mllm_media_key import image_digest
+
+    one, two = tmp_path / "1.png", tmp_path / "2.png"
+    one.write_bytes(b"same")
+    two.write_bytes(b"same")
+    assert image_digest(str(one)) == image_digest(str(two)) is not None

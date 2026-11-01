@@ -46,16 +46,21 @@ def image_digest(image: object) -> Optional[bytes]:
     if image.startswith(_URL_PREFIXES):
         return None
     try:
-        path = Path(image)
-        if len(image) < 4096 and path.is_file():
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-            return h.digest()
+        # (#154) A short inline base64 image is no path: past the filename
+        # limit is_file() raises ENAMETOOLONG, which is not a read failure.
+        is_file = len(image) < 4096 and Path(image).is_file()
     except (OSError, ValueError):
+        is_file = False
+    if not is_file:
+        return hashlib.sha256(image.encode()).digest()
+    try:
+        h = hashlib.sha256()
+        with open(image, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        return h.digest()
+    except OSError:
         return None
-    return hashlib.sha256(image.encode()).digest()
 
 
 def _fingerprint(digest: bytes, length: int) -> List[int]:
