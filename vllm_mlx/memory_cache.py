@@ -53,6 +53,7 @@ _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 # Version 5 rejects token-only entries from before media fetch/store isolation.
 # Those entries cannot identify whether their KV state includes media content.
 # Loading a cache with a different version is rejected automatically.
+# 5 (#151): version-4 saves may hold another entry's bytes under a valid key.
 _CACHE_PERSIST_VERSION = 5
 
 
@@ -2020,9 +2021,20 @@ class MemoryAwarePrefixCache:
             "entries": [],
         }
 
+        # (#151) Entries restored by load_from_disk are lazy views of the files
+        # in this directory, and LRU order moves them to other slots. Writing a
+        # slot in place destroys the source of an entry that has not been read
+        # yet: a smaller file fails the read, a same-size or larger one yields
+        # the other entry's bytes with no error. So write everything aside,
+        # which also materialises every entry, and swap names only afterwards.
+        for name in os.listdir(real_dir):
+            if ".tmp." in name:
+                os.remove(os.path.join(real_dir, name))
+
         saved = 0
+        swaps: list[tuple[str, str]] = []
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
-            entry_path = os.path.join(real_dir, f"entry_{i}.safetensors")
+            entry_path = os.path.join(real_dir, f"entry_{i}.tmp.safetensors")
             try:
                 # Dequantize _QuantizedCacheWrapper layers before saving.
                 # save_prompt_cache requires .state and .meta_state which
@@ -2039,13 +2051,19 @@ class MemoryAwarePrefixCache:
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
-                tokens_path = os.path.join(real_dir, f"entry_{i}_tokens.bin")
+                tokens_path = os.path.join(real_dir, f"entry_{i}_tokens.tmp.bin")
                 import array as _array
 
                 arr = _array.array("i", tokens_key)  # 32-bit signed ints
                 with open(tokens_path, "wb") as f:
                     arr.tofile(f)
 
+                swaps.append(
+                    (entry_path, os.path.join(real_dir, f"entry_{i}.safetensors"))
+                )
+                swaps.append(
+                    (tokens_path, os.path.join(real_dir, f"entry_{i}_tokens.bin"))
+                )
                 index["entries"].append(
                     {
                         "index": i,
@@ -2058,14 +2076,26 @@ class MemoryAwarePrefixCache:
                     f"[cache_persist] saved entry {i}: "
                     f"{len(tokens_key)} tokens, "
                     f"{entry.memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
-                    f"file={entry_path}"
+                    f"file={swaps[-2][1]}"
                 )
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
 
+        # (#151) No index during the swap: a crash between two renames must
+        # load nothing, not one entry's KV paired with another's tokens.
         index_path = os.path.join(real_dir, "index.json")
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2)
+        try:
+            if os.path.exists(index_path):
+                os.remove(index_path)
+            for source, target in swaps:
+                os.replace(source, target)
+            index_tmp = index_path + ".tmp.json"
+            with open(index_tmp, "w") as f:
+                json.dump(index, f, indent=2)
+            os.replace(index_tmp, index_path)
+        except OSError as e:
+            logger.warning(f"[cache_persist] save swap failed: {e}")
+            return False
         # (#143) stale entry files, stale provenance subdirs, legacy files
         from .prefix_cache_disk_gc import gc_prefix_cache_dir
 

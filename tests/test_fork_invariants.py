@@ -3409,3 +3409,99 @@ def test_149_a_grown_store_does_not_pin_the_finished_row():
     mx.clear_cache()
     retained = mx.get_active_memory() - base
     assert retained < row_bytes * 0.4, (retained, row_bytes)
+
+
+_151_MODEL = MagicMock()  # one model: the disk fingerprint must match
+
+
+def _151_kv(tokens: int, fill: float):
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    layer = KVCache()
+    keys = mx.full((1, 2, tokens, 4), fill, dtype=mx.float32)
+    layer.update_and_fetch(keys, keys + 1)
+    mx.eval(layer.keys, layer.values)
+    return layer
+
+
+def _151_cache():
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+    config = MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    return MemoryAwarePrefixCache(_151_MODEL, config)
+
+
+def _151_first_key(cache, tokens):
+    import mlx.core as mx
+
+    keys = cache._entries[tuple(tokens)].cache[0].state[0]
+    mx.eval(keys)
+    return keys[0, 0, 0, 0].item()
+
+
+def test_151_save_never_overwrites_a_lazily_loaded_source(tmp_path):
+    """#151: a loaded entry is a lazy view of entry_N.safetensors. LRU order
+    moves it to another slot, so an in-place save overwrites its source before
+    reading it: a smaller file raised "[read] Unable to read from file" on the
+    live Qwen3-VL route, a same-size or larger one returned the OTHER entry's
+    bytes with no error."""
+    pytest.importorskip("mlx.core")
+    a, b, c = list(range(1, 9)), list(range(101, 109)), list(range(201, 205))
+    first = _151_cache()
+    first.store(a, [_151_kv(8, 1.0)])
+    first.store(b, [_151_kv(8, 2.0)])
+    first.store(c, [_151_kv(4, 3.0)])
+    assert first.save_to_disk(str(tmp_path))
+
+    second = _151_cache()
+    assert second.load_from_disk(str(tmp_path)) == 3
+    second._entries.move_to_end(tuple(a))
+    assert second.save_to_disk(str(tmp_path))
+    assert not [p.name for p in tmp_path.rglob("*.tmp.*")]
+
+    # The live process keeps serving these arrays after a save.
+    assert _151_first_key(second, a) == 1.0
+    assert _151_first_key(second, b) == 2.0
+    assert _151_first_key(second, c) == 3.0
+
+    third = _151_cache()
+    assert third.load_from_disk(str(tmp_path)) == 3
+    assert _151_first_key(third, a) == 1.0
+    assert _151_first_key(third, b) == 2.0
+    assert _151_first_key(third, c) == 3.0
+
+
+def test_151_interrupted_save_leaves_nothing_loadable_half_written(tmp_path, monkeypatch):
+    """#151: the swap phase drops index.json first, so a crash between two
+    os.replace calls can never pair one entry's KV with another's tokens."""
+    pytest.importorskip("mlx.core")
+    tokens = list(range(1, 9))
+    first = _151_cache()
+    first.store(tokens, [_151_kv(8, 1.0)])
+    assert first.save_to_disk(str(tmp_path))
+
+    import os
+
+    calls = []
+    real_replace = os.replace
+
+    def crash_after_first(src, dst):
+        calls.append(dst)
+        if len(calls) == 2:
+            raise OSError("simulated crash mid-swap")
+        real_replace(src, dst)
+
+    second = _151_cache()
+    second.store(tokens, [_151_kv(8, 2.0)])
+    monkeypatch.setattr(os, "replace", crash_after_first)
+    assert not second.save_to_disk(str(tmp_path))
+    monkeypatch.undo()
+
+    assert _151_cache().load_from_disk(str(tmp_path)) == 0
+    # The next save starts clean.
+    assert second.save_to_disk(str(tmp_path))
+    assert not [p.name for p in tmp_path.rglob("*.tmp.*")]
+    third = _151_cache()
+    assert third.load_from_disk(str(tmp_path)) == 1
+    assert _151_first_key(third, tokens) == 2.0

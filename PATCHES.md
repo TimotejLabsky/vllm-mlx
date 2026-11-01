@@ -4215,3 +4215,15 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 - **Guard wiring live** (spare port, `VLLM_MLX_BATCHED_SOLO_CEILING_PCT=45` to force it, 20K chain): every turn logged `solo guard made room: 390 tokens need ≈ 10.4 GB (64.0 KB/tok + 8192 MB transient + 1.5 GB restore + 0.3 GB attention scores at 20522 ctx) on top of 19.6 GB active > 45% … shed 1 entries`; the 2,053-token deep turn priced 12.3 GB (2.0 GB scores at 24104 ctx — the probe read 1.69 B/pair on this process), shed the bag and was rejected with the #104 503 (`solo_rejections` 1, `generation_recoveries` 0). At the deployed 95% ceiling and with #149 in place neither path fires in the 66K replay (run B).
 
 **Upstreaming:** fork-owned.
+
+## 151. `patch: atomic-prefix-cache-save` — saving the disk prefix cache no longer overwrites entries it has not read yet
+
+**Files:** `vllm_mlx/memory_cache.py` (`save_to_disk`, `_CACHE_PERSIST_VERSION` 4 → 5), `tests/test_fork_invariants.py`, `tests/test_memory_cache.py`.
+
+**Bug.** `load_from_disk` restores entries as lazy mlx arrays backed by `entry_N.safetensors`, mlx reads them by path and offset, and `save_prompt_cache` truncates in place. LRU order moves a hit entry to another slot, so `save_to_disk` could overwrite a file before the entry backed by it had been read. A smaller replacement fails the read: `[cache_persist] failed to save entry N: [read] Unable to read from file.`, 4 times on `Qwen3-VL-30B` between 10-17 and 10-29, each losing an entry. A same-size or larger replacement raises nothing and stores the other entry's bytes under this entry's tokens. The silent case is shown through the real save/load path in the test; it was not observed on a live route, because nothing on the route would log it. Only the MLLM (vision) cache uses this path. Upstream `3af7d7d6` has the same save/load shape.
+
+**Fix.** Every entry goes to `entry_N.tmp.safetensors` / `entry_N_tokens.tmp.bin` first, which also materialises the arrays, so no lazy reference to the old files survives into the live process. Then `index.json` is removed, the files are renamed, and the index is written via its own rename. A crash mid-swap loads nothing instead of pairing one entry's KV with another's tokens; leftovers are removed at the start of the next save. The persist version bump discards existing saves, since any of them may hold swapped bytes: vision prefix caches start cold once.
+
+**Verification:** 2 tests in `test_fork_invariants.py`, red before the fix (`assert 2.0 == 1.0`: entry A read back entry B's value, no error). Upstream's version-mismatch test updated for the bump.
+
+**Upstreaming:** candidate; same bug upstream.
