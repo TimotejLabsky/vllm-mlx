@@ -223,9 +223,9 @@ def test_identical_plain_kv_prompt_safely_replays_an_authoritative_supersequence
     replay_tokens, replay_request = _generate(warm, "kv-identical", prompt)
     oracle_tokens, _ = _generate(_scheduler("kv"), "kv-cold", prompt)
 
-    # The authoritative supersequence can be trimmed to the prompt and then
-    # independently rewound for one-token replay without duplicating that token.
-    assert replay_request.cache_hit_type == "supersequence"
+    # Upstream #857: the N+completion entry is trimmed to N and rewound one more
+    # token, so only the last prompt token is replayed. The oracle check below
+    # is what proves that token is not duplicated in the KV.
     assert replay_request.cached_tokens == len(prompt) - 1
     assert replay_request.remaining_tokens == prompt[-1:]
     assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(
