@@ -4274,3 +4274,15 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Verification:** `test_155_*` (TestClient `/v1/responses` with a mocked engine returning a real `GenerationOutput` with cleaned `text` + `raw_text`), red before the fix.
 
 **Upstreaming:** candidate, same line upstream.
+
+## 156. `patch: harmony-recipient-first` — a call with the recipient before the channel is a tool call
+
+**Files:** `vllm_mlx/tool_parsers/harmony_tool_parser.py` (`_COMMENTARY_BLOCK_PATTERN`, named groups), `tests/test_fork_invariants.py`.
+
+**Bug.** Harmony allows the recipient in the role header: `<|start|>assistant to=functions.X<|channel|>commentary json<|message|>…`. openai-harmony's `render_conversation` uses exactly that form for earlier assistant calls, so every multi-turn gpt-oss prompt (#75) shows the model this form. The #146 pattern only took the recipient after the channel; on this input it returned `tool_calls=None, content='assistant {"city":"Paris"}'` on every endpoint (streaming completes calls through the same `extract_tool_calls`). Not yet seen in captured prod output; how often it happens is unmeasured.
+
+**Fix.** A second header alternative: an optional `<|start|>assistant`, then `to=functions.X<|channel|>commentary`, then the shared content-type / message / terminator tail. The optional start also covers a call that is the first generated message (` to=functions.X<|channel|>…`, with `<|start|>assistant` in the prompt), which upstream's open #867 misses.
+
+**Verification:** `test_156_*`: 3 header forms through the parser plus an analysis→call output through `_extract_reasoning_and_tool_calls`; all red before. The #146 and #124 harmony tests still pass.
+
+**Upstreaming:** fold into #867's review (the first-message form is the gap there).
