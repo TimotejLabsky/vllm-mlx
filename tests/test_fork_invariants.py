@@ -3630,3 +3630,72 @@ def test_155_responses_non_stream_keeps_gpt_oss_tool_calls(monkeypatch):
     assert [c["name"] for c in calls] == ["read_file"]
     assert json.loads(calls[0]["arguments"]) == {"path": "/etc/hosts"}
     assert "/etc/hosts" not in (body.get("output_text") or "")
+
+
+# ------- #156 harmony recipient-before-channel header (how harmony renders)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # openai-harmony's own rendering of an assistant call
+        "<|start|>assistant to=functions.f<|channel|>commentary json"
+        '<|message|>{"a": 1}<|call|>',
+        # same, constrain form
+        "<|start|>assistant to=functions.f<|channel|>commentary "
+        '<|constrain|>json<|message|>{"a": 1}<|call|>',
+        # the call is the first generated message (<|start|>assistant is in
+        # the prompt)
+        ' to=functions.f<|channel|>commentary json<|message|>{"a": 1}<|call|>',
+    ],
+)
+def test_156_harmony_recipient_before_channel_is_a_tool_call(text):
+    """#156: openai-harmony renders earlier assistant calls with the
+    recipient in the role position, so a multi-turn gpt-oss prompt teaches
+    that form; the #146 pattern only accepted it after the channel and the
+    call came back as text ``assistant {"a": 1}``. Upstream #867 (open)
+    takes the first form only."""
+    from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
+
+    r = HarmonyToolParser(None).extract_tool_calls(text)
+    assert r.tools_called, text
+    assert [(c["name"], json.loads(c["arguments"])) for c in r.tool_calls] == [
+        ("f", {"a": 1})
+    ]
+
+
+def test_156_recipient_first_call_after_analysis_via_server(monkeypatch):
+    import vllm_mlx.server as srv
+    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+
+    monkeypatch.setattr(srv, "_reasoning_parser", HarmonyReasoningParser())
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True, raising=False)
+    monkeypatch.setattr(srv, "_tool_call_parser", "harmony", raising=False)
+    monkeypatch.setattr(srv, "_tool_parser_instance", None, raising=False)
+    request = srv.ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Weather?"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+    output = (
+        "<|channel|>analysis<|message|>Need weather.<|end|>"
+        "<|start|>assistant to=functions.get_weather<|channel|>commentary "
+        '<|constrain|>json<|message|>{"city":"Paris"}<|call|>'
+    )
+    reasoning, content, tool_calls = srv._extract_reasoning_and_tool_calls(
+        output, request
+    )
+    assert [c.function.name for c in tool_calls or []] == ["get_weather"]
+    assert "Paris" not in (content or "")
+    assert reasoning == "Need weather."

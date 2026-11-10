@@ -42,11 +42,19 @@ def _generate_tool_id() -> str:
 # call are accepted: a repeated ``<|channel|>commentary`` after the recipient,
 # and a bare content type (``to=functions.X code<|message|>``, valid harmony)
 # instead of ``<|constrain|>json``.
+# Fork #156: the recipient may also come before the channel, the form
+# openai-harmony renders prior assistant calls in (and so the form a
+# multi-turn prompt teaches): ``<|start|>assistant to=functions.X<|channel|>
+# commentary json<|message|>``, or `` to=functions.X<|channel|>commentary...``
+# when the call is the first generated message (``<|start|>assistant`` is
+# then in the prompt).
 _COMMENTARY_BLOCK_PATTERN = re.compile(
-    r"<\|channel\|>commentary\s+to=functions\.(\w+)"
+    r"(?:<\|channel\|>commentary\s+to=functions\.(?P<name>\w+)"
     r"(?:\s*<\|channel\|>commentary)?"
+    r"|(?:<\|start\|>\s*assistant\s*)?to=functions\.(?P<name_first>\w+)"
+    r"\s*<\|channel\|>commentary)"
     r"(?:\s*<\|constrain\|>\w+|\s+\w+)?"
-    r"\s*<\|message\|>((?:(?!<\|channel\|>).)*?)"
+    r"\s*<\|message\|>(?P<args>(?:(?!<\|channel\|>).)*?)"
     r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|<\|channel\|>|\Z)",
     re.DOTALL,
 )
@@ -91,8 +99,8 @@ class HarmonyToolParser(ToolParser):
 
         # Extract tool calls from commentary channel blocks
         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
-            tool_name = match.group(1)
-            args_str = match.group(2).strip()
+            tool_name = match.group("name") or match.group("name_first")
+            args_str = match.group("args").strip()
             terminator = match.group("terminator")
             # End-of-string and a following channel boundary mean the args
             # did not stop at an explicit call terminator: truncated or moved
