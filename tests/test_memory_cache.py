@@ -769,7 +769,7 @@ def test_load_rejects_v4_cache_after_media_isolation_change(tmp_path, caplog):
         },
     ):
         assert cache.load_from_disk(str(tmp_path)) == 0
-    assert "version mismatch: disk=3 current=5" in caplog.text
+    assert "version mismatch: disk=4 current=5" in caplog.text
 
 
 def test_load_rejects_same_arch_different_snapshot_or_quant(tmp_path):

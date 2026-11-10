@@ -116,8 +116,8 @@ def build_text_model(
     if vlm_model is None:
         return None
 
-    model_path = _resolve_model_path(model_path)
-    if model_path is None:
+    local_model_path = _resolve_model_path(model_path)
+    if local_model_path is None:
         return None
 
     model_type = ""

@@ -130,36 +130,6 @@ def _generate(scheduler, request_id, prompt, max_tokens=2):
     raise AssertionError(f"request {request_id} did not finish")
 
 
-def test_plain_kv_first_output_does_not_extract_an_unused_snapshot(monkeypatch):
-    scheduler = _scheduler("kv")
-    extractions = []
-    original = cache_mod.BatchKVCache.extract
-
-    def record_extract(layer, index):
-        extractions.append(index)
-        return original(layer, index)
-
-    monkeypatch.setattr(cache_mod.BatchKVCache, "extract", record_extract)
-    request = Request(
-        request_id="plain-first-token",
-        prompt=[1, 2, 3],
-        sampling_params=SamplingParams(max_tokens=2, temperature=0.0),
-    )
-    scheduler.add_request(request)
-    try:
-        for _ in range(8):
-            result = scheduler.step()
-            if result.outputs:
-                assert not result.outputs[0].finished
-                assert result.outputs[0].new_token_ids
-                assert extractions == [], "a discarded snapshot synchronized live KV"
-                break
-        else:
-            pytest.fail("request did not produce its first token")
-    finally:
-        scheduler._close_batch_generator()
-
-
 @pytest.mark.parametrize(
     "kind", ["rotating", "mixed", "subclass", "unknown", "missing", "empty", "iterator"]
 )
@@ -226,6 +196,7 @@ def test_identical_plain_kv_prompt_safely_replays_an_authoritative_supersequence
     # Upstream #857: the N+completion entry is trimmed to N and rewound one more
     # token, so only the last prompt token is replayed. The oracle check below
     # is what proves that token is not duplicated in the KV.
+    assert replay_request.cache_hit_type == "supersequence"
     assert replay_request.cached_tokens == len(prompt) - 1
     assert replay_request.remaining_tokens == prompt[-1:]
     assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(

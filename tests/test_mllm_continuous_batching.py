@@ -2770,16 +2770,16 @@ class TestBatchedMLLMConfigWiring:
 
 @pytest.mark.parametrize("media_field", ["images", "videos", "audio"])
 def test_text_only_selectors_reject_every_media_kind(media_field):
-    from vllm_mlx.mllm_batch_generator import MLLMBatchRequest, _request_has_media
+    # Fork: upstream #728's `_request_has_media` is the fork's
+    # `MLLMBatchRequest.has_media` (#55), which every selector uses (#157).
+    from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
 
     request = MLLMBatchRequest(uid=1, request_id=media_field, prompt="same text")
     setattr(request, media_field, [f"{media_field}-input"])
 
-    assert _request_has_media(request) is True
+    assert request.has_media is True
     assert (
-        _request_has_media(
-            MLLMBatchRequest(uid=2, request_id="text", prompt="text only")
-        )
+        MLLMBatchRequest(uid=2, request_id="text", prompt="text only").has_media
         is False
     )
 

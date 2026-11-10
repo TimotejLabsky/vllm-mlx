@@ -11,14 +11,13 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
-import importlib
 import logging
 import os
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -183,7 +182,12 @@ def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -
     also installed, *it* takes over ``_process_prompts`` and invokes the
     callback itself, so call this **before** ``_install_chunked_prefill``.
     """
-    _orig_process_prompts = getattr(batch_gen, "_process_prompts")
+    _orig_process_prompts = batch_gen._process_prompts
+
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
+        _batch_cls = None  # extract_cache fallback handled in patched fn
 
     def _patched_process_prompts(prompts, _self=batch_gen):
         batch = _orig_process_prompts(prompts)
@@ -195,7 +199,7 @@ def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -
                     pass
         return batch
 
-    setattr(batch_gen, "_process_prompts", _patched_process_prompts)
+    batch_gen._process_prompts = _patched_process_prompts
 
 
 def _install_chunked_prefill(
@@ -243,11 +247,12 @@ def _install_chunked_prefill(
         def _lazy_extract_cache(cache, idx):
             return (c.extract(idx) for c in cache)
 
-    _batch_cls = getattr(_mlx_generate, "Batch", None)
-    if _batch_cls is None:
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
 
         @dataclass
-        class _FallbackBatch:
+        class _batch_cls:
             uids: List[int]
             y: Any
             logprobs: List[Any]
@@ -289,15 +294,13 @@ def _install_chunked_prefill(
             def extract_cache(self, idx):
                 return [c.extract(idx) for c in self.cache]
 
-        _batch_cls = _FallbackBatch
-
     # Keep references to originals
     _orig_next = batch_gen._next
     _orig_remove = batch_gen.remove
-    _orig_process_prompts = getattr(batch_gen, "_process_prompts")
+    _orig_process_prompts = batch_gen._process_prompts
 
     # Partial prefill state (None when no prefill in progress)
-    setattr(batch_gen, "_partial", None)
+    batch_gen._partial = None
 
     # Monkey-patch _process_prompts to capture prompt-only cache state.
     # At the point where _process_prompts returns, the Batch cache contains
@@ -317,7 +320,7 @@ def _install_chunked_prefill(
                         pass
             return batch
 
-        setattr(batch_gen, "_process_prompts", _patched_process_prompts)
+        batch_gen._process_prompts = _patched_process_prompts
 
     def _generation_step(self=batch_gen):
         """Run one generation step on the active batch. Returns responses."""
@@ -713,9 +716,9 @@ def _install_chunked_prefill(
                 mx.clear_cache()  # flush Metal encoders after dropping partial state
         _orig_remove(uids_to_remove)
 
-    setattr(batch_gen, "_next", _chunked_next)
-    setattr(batch_gen, "_generation_step", _generation_step)
-    setattr(batch_gen, "remove", _patched_remove)
+    batch_gen._next = _chunked_next
+    batch_gen._generation_step = _generation_step
+    batch_gen.remove = _patched_remove
 
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
@@ -898,7 +901,7 @@ def _install_mtp(
             "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
         }
 
-    setattr(batch_gen, "get_mtp_stats", _get_mtp_stats)
+    batch_gen.get_mtp_stats = _get_mtp_stats
 
     def _drain_mtp_uid_deltas() -> Tuple[Dict[int, int], Dict[int, int]]:
         """Return and clear the per-UID attempt/accept deltas accumulated
@@ -910,7 +913,7 @@ def _install_mtp(
         _mtp_accepted_by_uid.clear()
         return drafts, accepted
 
-    setattr(batch_gen, "drain_mtp_uid_deltas", _drain_mtp_uid_deltas)
+    batch_gen.drain_mtp_uid_deltas = _drain_mtp_uid_deltas
 
     def _mtp_bypass_reasons(input_tokens, prompt_cache):
         reasons = []
@@ -1216,7 +1219,7 @@ def _install_mtp(
     # the current _next implementation, because it sits at the top level.
     # Store as attribute so it's always the correct reference, even after
     # BatchGenerator recreation.
-    setattr(batch_gen, "_inner_next", batch_gen._next)
+    batch_gen._inner_next = batch_gen._next
 
     def _mtp_next(self=batch_gen):
         """Wrapper around _next that emits deferred MTP draft tokens.
@@ -1325,8 +1328,8 @@ def _install_mtp(
 
         return augmented
 
-    setattr(batch_gen, "_step", _mtp_step)
-    setattr(batch_gen, "_next", _mtp_next)
+    batch_gen._step = _mtp_step
+    batch_gen._next = _mtp_next
 
     if num_draft_tokens != 1:
         logger.warning(
@@ -1558,8 +1561,7 @@ class Scheduler:
         """
         Decode token IDs to text, handling both tokenizers and processors.
         """
-        decoded: str = self._actual_tokenizer.decode(token_ids)
-        return decoded
+        return self._actual_tokenizer.decode(token_ids)
 
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
@@ -1624,10 +1626,7 @@ class Scheduler:
                     f"tokens={processed}/{total}"
                 )
 
-        # mlx-lm's trie accepts individual token IDs as well as sequences,
-        # although its constructor annotation only lists sequences.
-        batch_generator_factory: Callable[..., BatchGenerator] = BatchGenerator
-        bg = batch_generator_factory(
+        bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -1644,7 +1643,7 @@ class Scheduler:
         )
         # Set callback as attribute — used by _install_chunked_prefill
         # monkey-patch. Not a BatchGenerator constructor parameter.
-        setattr(bg, "prompt_progress_callback", _prefill_progress)
+        bg.prompt_progress_callback = _prefill_progress
 
         # Install chunked prefill only when explicitly configured.
         # memory_aware_cache fetch/store works independently; the mid-prefill
@@ -2629,12 +2628,11 @@ class Scheduler:
             # a no-op on those architectures (DeepSeek-V4 groups three caches
             # per layer). BatchGenerator still gets max_kv_size as a backstop
             # for any sequence inserted without a cache.
-            bounded_kv_size = self._bounded_kv_size()
-            if cache_to_use is None and bounded_kv_size is not None:
+            if cache_to_use is None and self._bounded_kv_size() is not None:
                 from mlx_lm.models.cache import make_prompt_cache
 
                 cache_to_use = self._bound_cache_layers(
-                    make_prompt_cache(self.model), bounded_kv_size
+                    make_prompt_cache(self.model), self._bounded_kv_size()
                 )
 
             # Build per-request logits_processors from repetition_penalty and
@@ -2752,7 +2750,6 @@ class Scheduler:
                     if request.cached_tokens > 0
                     else ""
                 )
-                assert tokens_to_process is not None
                 tokens_to_prefill = len(tokens_to_process)
                 rep_info = (
                     f" rep_penalty={rep_penalty}"
@@ -2792,9 +2789,7 @@ class Scheduler:
             return False
 
     def _extract_cache_for_uid(self, uid: int) -> Any:
-        """Extract a sequence cache when a first-response snapshot may be needed."""
-        from mlx_lm.models.cache import BatchKVCache
-
+        """Pull one sequence's cache out of the live BatchGenerator batch."""
         bg = self.batch_generator
         if bg is None:
             return None
@@ -2803,17 +2798,6 @@ class Scheduler:
             uids = getattr(batch, "uids", None)
             if not uids or uid not in uids:
                 continue
-            layers = getattr(batch, "prompt_cache", None)
-            if (
-                isinstance(layers, (list, tuple))
-                and layers
-                and all(type(layer) is BatchKVCache for layer in layers)
-            ):
-                # Plain KV snapshots are discarded by the caller. Inspect the
-                # batched topology first: extracting it reads GPU padding
-                # scalars for every layer before returning plain KVCache.
-                # Unknown, mixed and sliding-window stacks retain extraction.
-                return None
             extract = getattr(batch, "extract_cache", None)
             if extract is None:
                 continue
@@ -3844,7 +3828,7 @@ class Scheduler:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get scheduler statistics."""
-        stats: Dict[str, object] = {
+        stats = {
             "num_waiting": len(self.waiting),
             "num_running": len(self.running),
             "num_requests_processed": self.num_requests_processed,
@@ -4074,7 +4058,6 @@ class Scheduler:
             if candidate is None:
                 continue
 
-            assert request.prompt_token_ids is not None
             memory_bytes = candidate["memory_bytes"]
 
             # Check RAM budget availability
@@ -4204,7 +4187,6 @@ class Scheduler:
             return False
 
         # Store in RAM cache under the matched prefix tokens
-        assert self.memory_aware_cache is not None
         self.memory_aware_cache.store(
             list(matched_tokens), reconstructed, evict_prefixes=False
         )

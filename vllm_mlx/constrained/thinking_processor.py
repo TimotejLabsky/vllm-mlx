@@ -346,7 +346,7 @@ class ThinkingAwareLogitsProcessor:
         if self._prompt_len is not None and target_len > self._processed_len:
             if self._try_fast_sync(tokens, target_len):
                 return
-        token_ids = tokens.tolist()
+        token_ids = cast(list[int], tokens.tolist())
 
         # mlx-lm passes the FULL sequence (prompt + generated) to a logits
         # processor. The phase machine must only ever walk GENERATED tokens.

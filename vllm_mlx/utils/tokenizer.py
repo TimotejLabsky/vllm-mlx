@@ -10,7 +10,11 @@ directly from tokenizer.json.
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+if TYPE_CHECKING:
+    from mlx.nn import Module
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
 
@@ -238,7 +242,11 @@ def _load_model_with_fallback(
         return _load_strict_false(model_name, tokenizer_config)
 
     try:
-        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
+        # return_config defaults to False, so mlx-lm returns exactly two values.
+        model, tokenizer = cast(
+            "tuple[Module, TokenizerWrapper]",
+            load(model_name, tokenizer_config=tokenizer_config),
+        )
         return model, tokenizer
     except ValueError as e:
         # Fallback for models with non-standard tokenizers

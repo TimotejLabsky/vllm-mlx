@@ -1649,10 +1649,17 @@ def test_rebase_no_shadowed_definitions_after_auto_merge():
                 node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
             ):
                 continue
-            if node.name in seen and not legit(node):
+            # The implementation after ``@overload`` stubs is not a shadow
+            # (upstream #865's ToolParserManager.register_module).
+            after_overload = seen.get(node.name) == "overload"
+            if node.name in seen and not legit(node) and not after_overload:
                 if (rel, scope, node.name) not in allowed:
                     shadowed.append(f"{rel}:{node.lineno} {scope}{node.name}")
-            seen[node.name] = node.lineno
+            is_overload = any(
+                "overload" in ast.unparse(d)
+                for d in getattr(node, "decorator_list", [])
+            )
+            seen[node.name] = "overload" if is_overload else node.lineno
             if isinstance(node, ast.ClassDef):
                 walk(rel, node.body, f"{scope}{node.name}.")
 

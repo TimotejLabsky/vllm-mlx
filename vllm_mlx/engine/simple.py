@@ -17,14 +17,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from ..models.llm import MLXLanguageModel
-    from ..models.mllm import MLXMultimodalLM
-    from mlx_lm.models.cache import LRUPromptCache
-    from mlx_lm.tokenizer_utils import TokenizerWrapper
-    from mlx.nn import Module
+from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
 # internal fallback paths inside _stream_chat_impl (which call back into
@@ -154,7 +147,7 @@ def _processors_can_retire(processors: list[Any] | None) -> bool:
     """True when any processor advertises a retire-to-content transition."""
     if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
         return False
-    return processors is not None and any(
+    return bool(processors) and any(
         isinstance(getattr(p, "is_retired", None), bool) for p in processors
     )
 
@@ -163,7 +156,7 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     """True when any retire-capable processor has entered its retired state."""
     if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
         return False
-    return processors is not None and any(
+    return bool(processors) and any(
         getattr(p, "is_retired", False) is True for p in processors
     )
 
@@ -304,7 +297,7 @@ class SimpleEngine(BaseEngine):
         # KV cache size limit
         self._max_kv_size = max_kv_size
 
-        self._model: "MLXLanguageModel | MLXMultimodalLM | None" = None
+        self._model = None
         self._loaded = False
 
         # Per-request routing state (MLLM+MTP mode)
@@ -312,7 +305,7 @@ class SimpleEngine(BaseEngine):
         self._text_tokenizer = None
 
         # SpecPrefill draft model (loaded at start if enabled)
-        self._draft_model: "Module | None" = None
+        self._draft_model = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
@@ -455,7 +448,7 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             processor = getattr(self._model, "processor", None)
             return getattr(processor, "tokenizer", processor)
-        return getattr(self._model, "tokenizer")
+        return self._model.tokenizer
 
     def prepare_for_start(self) -> None:
         """Load the backing model off the serving event loop."""
@@ -554,10 +547,8 @@ class SimpleEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
-                    # No return_config request means the result is a pair.
-                    self._draft_model, _ = cast(
-                        "tuple[Module, TokenizerWrapper]",
-                        mlx_lm_load(self._specprefill_draft_model_path),
+                    self._draft_model, _ = mlx_lm_load(
+                        self._specprefill_draft_model_path
                     )
                     logger.info(
                         "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
@@ -1014,7 +1005,6 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        assert self._model is not None
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -1028,7 +1018,7 @@ class SimpleEngine(BaseEngine):
                 use_specprefill = False
 
             if use_specprefill:
-                tokenizer = getattr(self._model, "tokenizer")
+                tokenizer = self._model.tokenizer
                 add_special = tokenizer.bos_token is None or not prompt.startswith(
                     tokenizer.bos_token
                 )
@@ -1445,7 +1435,6 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        assert self._model is not None
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
@@ -1837,9 +1826,7 @@ class SimpleEngine(BaseEngine):
                 from mlx_lm.models.cache import make_prompt_cache
                 from mlx_lm.sample_utils import make_sampler
 
-                assert self._model is not None
                 model = self._model.model
-                assert model is not None
                 sampler = make_sampler(temp=temperature, top_p=top_p)
 
                 if cache_hit:
@@ -2018,10 +2005,8 @@ class SimpleEngine(BaseEngine):
         """
         from threading import Event
 
-        assert self._model is not None
         model = self._model.model
-        assert self._model is not None
-        tokenizer = getattr(self._model, "tokenizer")
+        tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
         cancel_requested = Event()
 
@@ -2409,7 +2394,6 @@ class SimpleEngine(BaseEngine):
             enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
 
         # Apply chat template for full prompt
-        assert self._text_tokenizer is not None
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -2842,7 +2826,6 @@ class SimpleEngine(BaseEngine):
                 # processor-to-content handoff.
                 resume_kwargs["prompt_cache"] = prompt_cache + model.make_mtp_cache()
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
-            assert self._text_tokenizer is not None
             for resp in mlx_stream_generate(
                 model,
                 text_tokenizer,
@@ -3631,7 +3614,7 @@ class SimpleEngine(BaseEngine):
         # entry_count) render cache utilization for SimpleEngine services.
         if self._is_mllm and self._model is not None:
             try:
-                raw_cache = getattr(self._model, "get_cache_stats")()
+                raw_cache = self._model.get_cache_stats()
             except Exception:
                 raw_cache = None
             if raw_cache and raw_cache.get("enabled"):

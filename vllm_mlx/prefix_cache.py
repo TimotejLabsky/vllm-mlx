@@ -25,7 +25,7 @@ except ImportError:
     HAS_MLX = False
 
 from .cache_state_compat import from_legacy_state
-from .paged_cache import BlockTable, PagedCacheManager
+from .paged_cache import BlockCacheData, BlockTable, PagedCacheManager
 
 logger = logging.getLogger(__name__)
 

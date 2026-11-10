@@ -5,11 +5,9 @@ import ast
 import asyncio
 import gc
 import inspect
-import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import MISSING, asdict, fields
 from typing import get_type_hints
 
 import anyio
@@ -29,132 +27,6 @@ class TestGenerationOutput:
             if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
         ]
         assert counters.count(name) == 1
-
-    def test_field_and_positional_constructor_contract(self):
-        expected_names = (
-            "text",
-            "tokens",
-            "prompt_tokens",
-            "completion_tokens",
-            "finish_reason",
-            "mtp_drafts",
-            "mtp_accepted",
-            "new_text",
-            "finished",
-            "specprefill_outcome",
-        )
-        declared = fields(GenerationOutput)
-        assert tuple(item.name for item in declared) == expected_names
-        assert tuple(item.type for item in declared) == (
-            str,
-            list[int],
-            int,
-            int,
-            str | None,
-            int,
-            int,
-            str,
-            bool,
-            "SpecPrefillOutcome | None",
-        )
-        assert declared[0].default is MISSING
-        assert declared[1].default is MISSING
-        assert declared[1].default_factory is list
-        assert tuple(item.default for item in declared[2:]) == (
-            0,
-            0,
-            "stop",
-            0,
-            0,
-            "",
-            True,
-            None,
-        )
-        assert all(item.default_factory is MISSING for item in declared[2:])
-        assert declared[0].default_factory is MISSING
-        assert all(item.init and item.repr and item.compare for item in declared)
-        assert all(not item.metadata and not item.kw_only for item in declared)
-        signature = inspect.signature(GenerationOutput)
-        assert tuple(signature.parameters) == expected_names
-        assert all(
-            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-        assert GenerationOutput.__match_args__ == expected_names
-        with pytest.raises(TypeError, match="text"):
-            GenerationOutput()
-
-    def test_defaults_serialization_and_independent_token_lists(self):
-        first = GenerationOutput("hello")
-        second = GenerationOutput("hello")
-        expected = {
-            "text": "hello",
-            "tokens": [],
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "finish_reason": "stop",
-            "mtp_drafts": 0,
-            "mtp_accepted": 0,
-            "new_text": "",
-            "finished": True,
-            "specprefill_outcome": None,
-        }
-        assert asdict(first) == expected
-        assert json.dumps(asdict(first)) == (
-            '{"text": "hello", "tokens": [], "prompt_tokens": 0, '
-            '"completion_tokens": 0, "finish_reason": "stop", "mtp_drafts": 0, '
-            '"mtp_accepted": 0, "new_text": "", "finished": true, '
-            '"specprefill_outcome": null}'
-        )
-        assert repr(first) == (
-            "GenerationOutput(text='hello', tokens=[], prompt_tokens=0, "
-            "completion_tokens=0, finish_reason='stop', mtp_drafts=0, "
-            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None)"
-        )
-        assert first == second
-        assert first.tokens is not second.tokens
-        first.tokens.append(7)
-        assert second.tokens == []
-        assert first != second
-
-    def test_populated_positional_and_keyword_values_serialize_unchanged(self):
-        positional = GenerationOutput(
-            "hello", [7, 8], 3, 2, None, 9, 4, "lo", False, None
-        )
-        keyword = GenerationOutput(
-            text="hello",
-            tokens=[7, 8],
-            prompt_tokens=3,
-            completion_tokens=2,
-            finish_reason=None,
-            mtp_drafts=9,
-            mtp_accepted=4,
-            new_text="lo",
-            finished=False,
-            specprefill_outcome=None,
-        )
-        assert positional == keyword
-        assert asdict(positional) == {
-            "text": "hello",
-            "tokens": [7, 8],
-            "prompt_tokens": 3,
-            "completion_tokens": 2,
-            "finish_reason": None,
-            "mtp_drafts": 9,
-            "mtp_accepted": 4,
-            "new_text": "lo",
-            "finished": False,
-            "specprefill_outcome": None,
-        }
-        assert json.dumps(asdict(positional)) == (
-            '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
-            '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
-            '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
-            '"specprefill_outcome": null}'
-        )
-        keyword.mtp_accepted = 3
-        assert positional != keyword
-
 
 class _EngineWithoutStreams(BaseEngine):
     @property

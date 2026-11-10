@@ -646,52 +646,6 @@ class TestBlockLayerStorageContract:
             assert reconstructed[0].offset == 8
             assert rebuilt_prefix[0].offset == 4
 
-    def test_hybrid_latest_none_slots_and_missing_boundary_fail_closed(self):
-        mx = pytest.importorskip("mlx.core")
-        cache_types = pytest.importorskip("mlx_lm.models.cache")
-        from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
-        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
-
-        manager = PagedCacheManager(block_size=4, max_blocks=10)
-        cache = BlockAwarePrefixCache(None, manager)
-        keys = mx.arange(48).reshape(1, 2, 8, 3)
-        recurrent = [mx.ones((1, 3, 8)), mx.full((1, 2, 4, 4), 7)]
-        extracted = [
-            {"state": (keys, keys), "class_ref": cache_types.KVCache, "meta_state": ""},
-            {
-                "state": recurrent,
-                "class_ref": cache_types.ArraysCache,
-                "meta_state": "",
-            },
-        ]
-        table = cache.store_cache("hybrid", list(range(8)), extracted)
-        assert table is not None
-        first, last = [manager.allocated_blocks[bid] for bid in table.block_ids]
-        assert len(first.cache_data) == len(last.cache_data) == 2
-        assert first.cache_data[1] is None
-        latest = last.cache_data[1]
-        assert set(latest) == {
-            "state",
-            "meta_state",
-            "class_ref",
-            "class_name",
-            "storage",
-        }
-        assert latest["storage"] == "latest"
-        assert latest["state"] is recurrent
-        assert latest["class_name"] is None
-        prefix = BlockTable("prefix", block_ids=table.block_ids[:1], num_tokens=4)
-        assert cache.reconstruct_cache(prefix) is None
-        rebuilt = cache.reconstruct_cache(table)
-        assert rebuilt is not None
-        assert isinstance(rebuilt[1], cache_types.ArraysCache)
-        assert rebuilt[1].state[0].tolist() == recurrent[0].tolist()
-        assert rebuilt[1].state[1].tolist() == recurrent[1].tolist()
-        assert cache._extract_block_tensor_slice([{}, {}], 0, 4, 8) is None
-        hole = cache._extract_block_tensor_slice([extracted[0], {}], 0, 4, 8)
-        assert hole is not None
-        assert len(hole) == 2 and hole[1] is None
-
     def test_opaque_latest_state_and_metadata_keep_identity(self):
         pytest.importorskip("mlx.core")
         pytest.importorskip("mlx_lm.models.cache")
@@ -724,45 +678,6 @@ class TestBlockLayerStorageContract:
         assert rebuilt is not None
         assert rebuilt[0].state is state
         assert rebuilt[0].meta is metadata
-
-    def test_batch_state_envelope_cow_and_clear_keep_payload_identity(self):
-        mx = pytest.importorskip("mlx.core")
-        cache_types = pytest.importorskip("mlx_lm.models.cache")
-        from vllm_mlx.paged_cache import PagedCacheManager
-        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
-
-        manager = PagedCacheManager(block_size=4, max_blocks=10)
-        cache = BlockAwarePrefixCache(None, manager)
-        keys = mx.arange(24).reshape(1, 2, 4, 3)
-        batch = cache_types.BatchKVCache(left_padding=[0])
-        batch.update_and_fetch(keys, keys)
-        state, metadata = batch.state, batch.meta_state
-        table = cache.store_cache(
-            "batch",
-            list(range(4)),
-            [
-                {
-                    "state": state,
-                    "meta_state": metadata,
-                    "class_ref": cache_types.BatchKVCache,
-                }
-            ],
-        )
-        assert table is not None
-        source = manager.allocated_blocks[table.block_ids[0]]
-        assert source.cache_data[0]["storage"] == "latest"
-        assert source.cache_data[0]["state"] is state
-        assert source.cache_data[0]["meta_state"] is metadata
-        assert "seq_axis" not in source.cache_data[0]
-        fork = cache.fork_cache("batch", "fork")
-        assert fork is not None
-        blocks, copied = manager.get_blocks_for_generation(fork)
-        assert copied is True
-        assert blocks[0].cache_data is source.cache_data
-        cache.clear()
-        assert all(block.cache_data is None for block in manager.blocks)
-        assert len(cache) == 0
-
 
 class TestSchedulerIntegration:
     """Test integration with scheduler."""

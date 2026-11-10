@@ -45,6 +45,10 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
+from .drafter_capabilities import (
+    continuous_batching_capability,
+    explicit_bool,
+)
 from ..utils.reasoning_effort import (
     EFFORT_FALLBACK_KEY,
     HARMONY_EFFORT_LEVELS,
