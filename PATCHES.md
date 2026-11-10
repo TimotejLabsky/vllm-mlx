@@ -4262,3 +4262,15 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Verification:** `test_154_*`, red at 300/1500/4095 chars before the fix.
 
 **Real-server check of #151/#153 (Studio prod venv, spare ports, off the live routes):** `e2e_persist_round_trip.py` 13/13 on GLM-4.6V-Flash: three server runs, entries saved and loaded back, reused at 1112/1113 tokens, every image answers its own colour. It cannot force the corrupting order, which needs an entry moved to the LRU end unread, so `test_151_*` carries that case. `e2e_reconcile_generated.py` with a third tool-loop turn: `splices=2`, turn 3 restored 1289/1289 against 1260 in control. `e2e_media_prefix_cache.py` 9/9. `e2e_invalid_schema.py` on the 9B route: 422 for the bad schema, co-batched peer 200. 9B route smoke 7/7.
+
+## 155. `patch: responses-parse-raw-text` — non-streaming `/v1/responses` keeps gpt-oss tool calls
+
+**Files:** `vllm_mlx/server.py` (`_run_responses_request`), `tests/test_fork_invariants.py`.
+
+**Bug.** #72 moved the chat and Anthropic paths onto `_parse_source_text(output)` (the pre-clean `raw_text`), but `_run_responses_request` still handed `output.text` to the tool and reasoning parsers. For harmony, `clean_output_text` has already removed the `<|channel|>commentary to=functions.X…<|message|>` header there, so every non-streaming gpt-oss call came back as text: `Need the file.{"path": "/etc/hosts"}`, no `function_call` item (upstream issue #859's symptom). Streaming `/v1/responses` was fine, it parses the raw accumulation. Found in the 2026-11-10 upstream review; upstream's open PR #867 still has `output.text` on this line. Latent on the fleet: the gpt-oss route log shows only `/v1/chat/completions` traffic.
+
+**Fix.** Both parser calls read `_parse_source_text(output)`. Content is still cleaned downstream, as on the chat paths.
+
+**Verification:** `test_155_*` (TestClient `/v1/responses` with a mocked engine returning a real `GenerationOutput` with cleaned `text` + `raw_text`), red before the fix.
+
+**Upstreaming:** candidate, same line upstream.

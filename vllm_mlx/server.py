@@ -3410,12 +3410,14 @@ async def _run_responses_request(
         return None, []
     _raise_if_generation_error(output)
 
-    cleaned_text: str | None
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    # Fork #155: parse the pre-clean text, as the chat paths do; the cleaned
+    # ``output.text`` has lost gpt-oss's commentary headers (the #72 bug).
+    source_text = _parse_source_text(output)
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(source_text, chat_request)
     reasoning_text = None
     if _reasoning_parser:
         reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
-            output.text
+            source_text
         )
         if not tool_calls:
             cleaned_text = remaining_text

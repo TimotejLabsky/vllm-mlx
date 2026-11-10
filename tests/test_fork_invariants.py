@@ -3560,3 +3560,73 @@ def test_154_a_real_file_is_digested_by_content(tmp_path):
     one.write_bytes(b"same")
     two.write_bytes(b"same")
     assert image_digest(str(one)) == image_digest(str(two)) is not None
+
+
+# ------- #155 non-stream /v1/responses parses the pre-clean harmony text
+
+_HARMONY_CALL_RAW = (
+    "<|channel|>analysis<|message|>Need the file.<|end|>"
+    "<|start|>assistant<|channel|>commentary to=functions.read_file "
+    '<|constrain|>json<|message|>{"path": "/etc/hosts"}<|call|>'
+)
+
+
+def test_155_responses_non_stream_keeps_gpt_oss_tool_calls(monkeypatch):
+    """#155: _run_responses_request parsed ``output.text``, which the engine
+    has already cleaned (the commentary header is gone), so every non-stream
+    gpt-oss call came back as text ``Need the file.{"path": ...}`` (upstream
+    issue #859's symptom). The chat paths read ``_parse_source_text`` (#72);
+    a rebase taking upstream's hunk brings ``output.text`` back."""
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as srv
+    from vllm_mlx.engine.base import GenerationOutput
+    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+
+    engine = MagicMock()
+    engine.model_name = "m"
+    engine.preserve_native_tool_format = False
+    engine.chat = AsyncMock(
+        return_value=GenerationOutput(
+            text=srv.clean_output_text(_HARMONY_CALL_RAW),
+            raw_text=_HARMONY_CALL_RAW,
+            prompt_tokens=7,
+            completion_tokens=3,
+            finish_reason="tool_calls",
+        )
+    )
+    monkeypatch.setattr(srv, "_engine", engine)
+    monkeypatch.setattr(srv, "_model_name", "m")
+    monkeypatch.setattr(srv, "_api_key", None)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True, raising=False)
+    monkeypatch.setattr(srv, "_tool_call_parser", "harmony", raising=False)
+    monkeypatch.setattr(srv, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(srv, "_reasoning_parser", HarmonyReasoningParser())
+
+    resp = TestClient(srv.app).post(
+        "/v1/responses",
+        json={
+            "model": "m",
+            "input": "Read /etc/hosts",
+            "store": False,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    calls = [o for o in body["output"] if o["type"] == "function_call"]
+    assert [c["name"] for c in calls] == ["read_file"]
+    assert json.loads(calls[0]["arguments"]) == {"path": "/etc/hosts"}
+    assert "/etc/hosts" not in (body.get("output_text") or "")
