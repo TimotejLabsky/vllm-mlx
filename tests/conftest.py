@@ -87,3 +87,29 @@ def _bind_mlx_default_stream():
         mx.set_default_stream(mx.new_stream(mx.default_device()))
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _restore_generation_stream_globals():
+    """Put ``mlx_lm``/``mlx_vlm`` ``generation_stream`` back after each test.
+
+    The fork's SimpleEngine rebinds them in its worker thread and restores
+    only in ``stop()``; a test that never stops the engine leaves them naming
+    a dead thread's stream, and upstream #865's stream tests later fail with
+    "There is no Stream(gpu, N) in current thread" (2026-11-10, CI order).
+    Only modules already imported are touched: importing mlx_vlm here would
+    change tests that stub or assert on that import.
+    """
+    import sys
+
+    names = ("mlx_lm.generate", "mlx_vlm.generate")
+    saved = {
+        name: sys.modules[name].generation_stream
+        for name in names
+        if hasattr(sys.modules.get(name), "generation_stream")
+    }
+    yield
+    for name, stream in saved.items():
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "generation_stream"):
+            module.generation_stream = stream

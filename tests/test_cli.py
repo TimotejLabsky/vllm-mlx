@@ -121,6 +121,13 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
     download = ModuleType("vllm_mlx.utils.download")
     download.DownloadConfig = lambda **kwargs: SimpleNamespace(**kwargs)
     download.ensure_model_downloaded = lambda *args, **kwargs: None
+    # Fork #90: serve_command imports `.utils.logging_setup`, which the bare
+    # stub package above lacks (and the real one needs uvicorn.config, also
+    # stubbed). Without this the test passed only when an earlier test had
+    # imported logging_setup; #865's ordered CI step runs it first.
+    logging_setup = ModuleType("vllm_mlx.utils.logging_setup")
+    logging_setup.timestamped_log_config = lambda: None
+    utils.logging_setup = logging_setup
 
     for name, module in {
         "uvicorn": uvicorn,
@@ -131,6 +138,7 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
         "vllm_mlx.api.utils": api_utils,
         "vllm_mlx.utils": utils,
         "vllm_mlx.utils.download": download,
+        "vllm_mlx.utils.logging_setup": logging_setup,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
