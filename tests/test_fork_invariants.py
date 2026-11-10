@@ -3699,3 +3699,29 @@ def test_156_recipient_first_call_after_analysis_via_server(monkeypatch):
     assert [c.function.name for c in tool_calls or []] == ["get_weather"]
     assert "Paris" not in (content or "")
     assert reasoning == "Need weather."
+
+
+# ------- #157 audio is media at every text-only selection site
+
+
+def test_157_no_text_only_filter_ignores_audio():
+    """#55 moved two text-only filters onto ``has_media``; the chunked-prefill
+    inline short-request loop kept ``if r.images or r.videos: continue``, so
+    an audio row could be inlined through the text-only prefill and lose its
+    audio (upstream #728 fixed the same site). Pin the bug class: a skip on
+    images/videos that never looks at audio."""
+    import pathlib
+    import re
+
+    src = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "vllm_mlx"
+        / "mllm_batch_generator.py"
+    ).read_text()
+    offenders = [
+        m.group(0)
+        for m in re.finditer(
+            r"if (?:not )?(\w+)\.images (?:and|or) (?:not )?\1\.videos\s*:", src
+        )
+    ]
+    assert offenders == []

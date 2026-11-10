@@ -4203,7 +4203,10 @@ def install_chunked_prefill_mllm(
                         else req
                     )
                     for r in batch_gen.unprocessed_requests:
-                        if r.images or r.videos:
+                        # `has_media` (fork #157, the third #55 site): an
+                        # audio row inlined here prefills text-only and
+                        # silently drops its audio.
+                        if r.has_media:
                             continue
                         if not batch_gen._compatible_pending_requests(
                             [r], 1, reference=reference

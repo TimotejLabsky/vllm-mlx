@@ -4286,3 +4286,13 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Verification:** `test_156_*`: 3 header forms through the parser plus an analysis→call output through `_extract_reasoning_and_tool_calls`; all red before. The #146 and #124 harmony tests still pass.
 
 **Upstreaming:** fold into #867's review (the first-message form is the gap there).
+
+## 157. `fix(mllm): audio-is-media-inline` — the chunked-prefill inline loop treats audio as media
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`install_chunked_prefill_mllm` short-request loop), `tests/test_fork_invariants.py`.
+
+**Bug.** #55 moved two text-only selection filters onto `has_media`; the third, which inlines short pending requests during a long chunked prefill, kept `if r.images or r.videos: continue`. An audio request could be inlined through the text-only prefill and lose its audio. Upstream fixed the same site in #728 (merged after `3af7d7d6`). Latent: no live vision route takes audio.
+
+**Fix.** `if r.has_media: continue`.
+
+**Verification:** `test_157_no_text_only_filter_ignores_audio`, a source scan for any `X.images and/or X.videos:` test that never looks at audio. It flags exactly this line on the old tree. Driving the closure model-free costs more than the pin is worth.
