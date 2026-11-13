@@ -4168,7 +4168,9 @@ Both now match. The bare content type needs whitespace before it, so a name foll
 
 **Verification:** suite 4822 passed (one flaky `test_client_acceptance_runner` case, green in isolation on main and branch). Studio spare port, `mlx-community/Muse-Glimmer-30B-4bit`, `--text-only --continuous-batching`: smoke 7/7 (plain answer + reasoning split, non-stream and streamed tool call, tool-result round trip, Slovak, reserved name 400, no markup leaks). **Known gap:** system-KV does not serve a 5.2K-token shared system prompt on this model (cold 30.2 s / warm 29.9 s); prefixes past the 2048-token sliding window are not restored. Speed (cold, 512 tokens): decode 28.7 / 27.4 / 25.6 tok/s at ~0.8K / 5.4K / 21K context, prefill ~205 tok/s, peak Metal 17.9 GB.
 
-## 148. `patch: detach-release-snapshot` — a stored prefix-cache snapshot no longer pins a second copy until GC (port of upstream #842)
+## 148. `patch: detach-release-snapshot` — a stored prefix-cache snapshot no longer pins a second copy until GC (port of upstream #842) — **RETIRED (in base as of `3c228769`)**
+
+> **Status (2026-11-10 rebase, recorded 2026-11-13): RETIRED.** Upstream #842 merged 2026-10-26 as `43831784` and is in the `3c228769` base; the rebase absorbed the `memory_cache.py` change. The fork commit (`5ac419d8`) now only adds this section and `scripts/fork/e2e_detach_release.py`, which stays as a regression check.
 
 **Files:** `vllm_mlx/memory_cache.py` (`_detach_cache_for_storage`), `tests/test_memory_cache.py` (+1, from the PR), `scripts/fork/e2e_detach_release.py` (new).
 
