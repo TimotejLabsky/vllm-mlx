@@ -3732,3 +3732,27 @@ def test_157_no_text_only_filter_ignores_audio():
         )
     ]
     assert offenders == []
+
+
+# ------- #159 the MLLM assistant drafter on Qwen targets
+
+
+def test_159_mllm_drafter_guards_survive_a_rebase():
+    """Upstream owns ``install_mtp_mllm`` and rewrites it often. Three fork
+    guarantees live inside it (behaviour: tests/test_mllm_drafter_159.py):
+    a target without ``layer_type`` drafts with an empty shared-KV payload,
+    repeated draft/verify failures switch the drafter off, and a processor
+    that declares ``speculation_mask_ids`` does not bypass speculation."""
+    import inspect
+
+    from vllm_mlx import mllm_batch_generator as gen
+    from vllm_mlx.constrained.thinking_processor import (
+        ThinkingAwareLogitsProcessor,
+    )
+
+    src = inspect.getsource(gen.install_mtp_mllm)
+    assert "_target_has_shared_kv" in src
+    assert "_MTP_DISABLE_AFTER_ERRORS" in src
+    assert "speculation_mask_ids" in src
+    assert "pending_token" in src
+    assert callable(ThinkingAwareLogitsProcessor.speculation_mask_ids)

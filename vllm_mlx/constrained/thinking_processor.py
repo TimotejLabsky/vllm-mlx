@@ -277,6 +277,29 @@ class ThinkingAwareLogitsProcessor:
         )
         return tuple(tail) + (target[-1],) == target
 
+    def speculation_mask_ids(self, next_token: int) -> tuple[int, ...] | None:
+        """(#159) What this processor would do to the logits of the position
+        AFTER ``next_token``, without consuming it.
+
+        ``()`` means pass-through, a tuple of ids means "mask exactly these",
+        ``None`` means it cannot say (inner processor, near the budget or
+        watchdog limit, forcing the close tag) and the caller must not
+        speculate past ``next_token``. Same reasoning as ``_lagged_call``:
+        IDLE/THINKING pass logits through unless ``next_token`` closes the
+        reasoning, and CONTENT only masks the control tokens. Read-only.
+        """
+        if self._inner is not None or self._prompt_len is None or self._near_limit():
+            return None
+        if self._state == Phase.CONTENT:
+            return self._content_phase_mask_ids
+        if self._state == Phase.THINKING:
+            if self._end_would_complete() and next_token == self._end_token_ids[-1]:
+                return self._content_phase_mask_ids
+            return ()
+        if self._state == Phase.IDLE:
+            return ()
+        return None
+
     def _force_transition(self, logits: mx.array) -> mx.array:
         """Force the next token in the reasoning end sequence."""
         target_id = self._end_token_ids[self._transition_index]

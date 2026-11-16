@@ -3293,6 +3293,10 @@ def _draft_external_mtp_active_batch(
     )[:, 0]
 
 
+# (#159) Consecutive draft/verify failures before the drafter is switched off.
+_MTP_DISABLE_AFTER_ERRORS = 8
+
+
 def install_mtp_mllm(
     batch_gen: "MLLMBatchGenerator",
     language_model: Any,
@@ -3333,7 +3337,19 @@ def install_mtp_mllm(
             hidden = hidden[-1] if hidden else None
         return logits, hidden
 
+    # (#159) mlx-vlm keys the shared-KV payload by ``layer.layer_type``, which
+    # only Gemma-style targets define. Qwen3.5 layers have none (mlx-vlm feeds
+    # that drafter an empty dict through ``speculative_verify_hidden``, and the
+    # drafter discards the payload), so the helper raised AttributeError on
+    # every decode step and the drafter never ran.
+    _target_layers = getattr(getattr(language_model, "model", None), "layers", None)
+    _target_has_shared_kv = not isinstance(_target_layers, (list, tuple)) or any(
+        hasattr(layer, "layer_type") for layer in _target_layers
+    )
+
     def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
+        if not _target_has_shared_kv:
+            return {}
         from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
 
         return _mtp_shared_kv_from_prompt_cache(language_model, cache)
@@ -3363,6 +3379,10 @@ def install_mtp_mllm(
         "logits_processors": 0,
         "assistant_not_requested": 0,
     }
+    # (#159) A drafter that fails on every step used to cost a WARNING per
+    # token and nothing else. After this many consecutive draft/verify
+    # failures it is switched off for the process, with one ERROR line.
+    _failure_state: Dict[str, Any] = {"consecutive": 0, "disabled_reason": None}
 
     def _get_mtp_stats() -> Dict[str, Any]:
         with _mtp_stats_lock:
@@ -3388,9 +3408,18 @@ def install_mtp_mllm(
             "acceptance_rate": acceptance_rate,
             "bypass_counts": bypass_counts,
             "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
+            "disabled": _failure_state["disabled_reason"] is not None,
+            "disabled_reason": _failure_state["disabled_reason"],
         }
 
     batch_gen.get_mtp_stats = _get_mtp_stats
+
+    def _speculation_aware(processors: List[Callable]) -> bool:
+        # Looked up on the type: an object that answers any attribute (a
+        # proxy, a mock) must not be mistaken for a declared capability.
+        return all(
+            callable(getattr(type(p), "speculation_mask_ids", None)) for p in processors
+        )
 
     def _mtp_step(
         input_tokens: mx.array,
@@ -3413,9 +3442,13 @@ def install_mtp_mllm(
         # distributions and UID-keyed verified state.
         prefill_bypass = input_tokens.shape[1] > 1
         no_active_batch_bypass = batch_gen.active_batch is None
+        # (#159) Processors that can say what they do to the next position
+        # (the thinking budget) no longer switch speculation off; any other
+        # processor on any row still does.
         logits_processors_bypass = logits_processors is not None and any(
-            logits_processors
+            row and not _speculation_aware(row) for row in logits_processors
         )
+        disabled_bypass = _failure_state["disabled_reason"] is not None
         mrope_media_bypass = external_drafter and any(
             getattr(request, "images", None) or getattr(request, "videos", None)
             for request in active_requests
@@ -3430,6 +3463,7 @@ def install_mtp_mllm(
             or no_active_batch_bypass
             or logits_processors_bypass
             or assistant_not_requested_bypass
+            or disabled_bypass
         ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
@@ -3475,7 +3509,9 @@ def install_mtp_mllm(
             )
             skip_entries = []
 
+        pending_tokens: List[Optional[int]] = [None] * batch_size
         if skip_entries and all(skip_entries):
+            pending_tokens = [entry.get("pending_token") for entry in skip_entries]
             logits = mx.concatenate([entry["logits"] for entry in skip_entries], axis=0)
             hidden_states = mx.concatenate(
                 [entry["hidden"] for entry in skip_entries], axis=0
@@ -3506,10 +3542,14 @@ def install_mtp_mllm(
             for e in range(batch_size):
                 sample_logits = logits[e : e + 1]
                 if logits_processors[e]:
+                    # (#159) Skip-state logits sit one position past the
+                    # token the previous step verified into the cache; the
+                    # caller's context does not have that token yet.
+                    context = list(output_tokens[e])
+                    if pending_tokens[e] is not None:
+                        context.append(pending_tokens[e])
                     for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
+                        sample_logits = processor(mx.array(context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -3523,6 +3563,27 @@ def install_mtp_mllm(
             primary_tokens = mx.concatenate(sampled_list, axis=0)
         else:
             primary_tokens = batch_gen.sampler(logprobs)
+
+        # (#159) Ask each row's processors what they would do to the drafted
+        # position. Any "cannot say" keeps this step non-speculative.
+        row_mask_ids: List[Tuple[int, ...]] = [()] * batch_size
+        if logits_processors and any(logits_processors):
+            mx.eval(primary_tokens)
+            primary_list = primary_tokens.tolist()
+            unknown = False
+            for e in range(batch_size):
+                ids: Tuple[int, ...] = ()
+                for processor in logits_processors[e] or ():
+                    view = processor.speculation_mask_ids(int(primary_list[e]))
+                    if view is None:
+                        unknown = True
+                        break
+                    ids = ids + tuple(view)
+                row_mask_ids[e] = ids
+            if unknown:
+                with _mtp_stats_lock:
+                    _bypass_counts["logits_processors"] += 1
+                return primary_tokens, list(logprobs)
 
         # MTP draft + always-advance verify
         try:
@@ -3538,7 +3599,7 @@ def install_mtp_mllm(
                 from mlx_vlm.speculative.mtp import _mtp_draft_position
 
                 shared_kv = _shared_kv(cache)
-                if not shared_kv:
+                if not shared_kv and _target_has_shared_kv:
                     raise RuntimeError(
                         "Assistant MTP requires target shared-KV state from the batch cache"
                     )
@@ -3610,6 +3671,12 @@ def install_mtp_mllm(
                 verify_input, cache=cache, return_hidden=True, **model_kwargs
             )
             verify_logits, verify_hidden = _model_parts(verify_output)
+            verify_pos0 = verify_logits[:, 0, :]
+            if any(row_mask_ids):
+                verify_pos0 = mx.array(verify_pos0)
+                for row, ids in enumerate(row_mask_ids):
+                    for token_id in ids:
+                        verify_pos0[row, token_id] = float("-inf")
 
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
@@ -3620,7 +3687,7 @@ def install_mtp_mllm(
             if uses_stochastic_sampling and external_drafter:
                 verify_distribution = mx.concatenate(
                     [
-                        _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
+                        _sampling_logprobs(verify_pos0[row : row + 1], request)
                         for row, request in enumerate(active_requests)
                     ],
                     axis=0,
@@ -3639,7 +3706,7 @@ def install_mtp_mllm(
             elif uses_stochastic_sampling:
                 verify_distribution = mx.concatenate(
                     [
-                        _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
+                        _sampling_logprobs(verify_pos0[row : row + 1], request)
                         for row, request in enumerate(active_requests)
                     ],
                     axis=0,
@@ -3665,15 +3732,15 @@ def install_mtp_mllm(
                         residual_tokens_by_uid[uid] = int(residual_token.item())
                         residual_logprobs_by_uid[uid] = residual[0]
             else:
-                verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
+                verify_pred = mx.argmax(verify_pos0, axis=-1)
                 mx.eval(verify_pred, draft_tokens)
                 all_accepted = verify_pred.tolist() == draft_list
 
             if all_accepted and verify_hidden is not None:
                 # ACCEPT
                 mx.async_eval(verify_logits[:, 1, :], verify_hidden[:, -1:, :])
-                verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                    verify_logits[:, 0, :], axis=-1, keepdims=True
+                verify_lp = verify_pos0 - mx.logsumexp(
+                    verify_pos0, axis=-1, keepdims=True
                 )
                 accepted_logprobs = (
                     verify_distribution if uses_stochastic_sampling else verify_lp
@@ -3683,6 +3750,7 @@ def install_mtp_mllm(
                     _skip_state_by_uid[uid] = {
                         "logits": verify_logits[e : e + 1, 1, :],
                         "hidden": verify_hidden[e : e + 1, -1:, :],
+                        "pending_token": int(draft_list[e]),
                     }
                     _deferred_drafts[uid] = {
                         "token": draft_list[e],
@@ -3739,6 +3807,11 @@ def install_mtp_mllm(
                             _skip_state_by_uid[uid] = {
                                 "logits": rerun_logits[row : row + 1, -1, :],
                                 "hidden": rerun_hidden[row : row + 1, -1:, :],
+                                "pending_token": (
+                                    residual_tokens_by_uid.get(uid)
+                                    if sampled_reject
+                                    else None
+                                ),
                             }
                     else:
                         _skip_state_by_uid.clear()
@@ -3787,6 +3860,11 @@ def install_mtp_mllm(
                             _skip_state_by_uid[uid] = {
                                 "logits": rerun_logits[row : row + 1],
                                 "hidden": rerun_hidden[row : row + 1],
+                                "pending_token": (
+                                    residual_tokens_by_uid.get(uid)
+                                    if sampled_reject
+                                    else None
+                                ),
                             }
                     else:
                         _skip_state_by_uid.clear()
@@ -3807,11 +3885,26 @@ def install_mtp_mllm(
                     draft_model.accept_lens.append(0)
                     draft_model.draft_lens.append(1)
 
+            _failure_state["consecutive"] = 0
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
             _skip_state_by_uid.clear()
             with _mtp_stats_lock:
                 _mtp_stats["errors"] += 1
+            _failure_state["consecutive"] += 1
+            if (
+                _failure_state["consecutive"] >= _MTP_DISABLE_AFTER_ERRORS
+                and _failure_state["disabled_reason"] is None
+            ):
+                _failure_state["disabled_reason"] = f"{type(e).__name__}: {e}"
+                logger.error(
+                    "[MTP-MLLM] DISABLED for this process after %d consecutive "
+                    "draft/verify failures; decoding continues without "
+                    "speculation. Last error: %s",
+                    _failure_state["consecutive"],
+                    _failure_state["disabled_reason"],
+                    exc_info=True,
+                )
 
         # Log MTP stats every 50 steps
         with _mtp_stats_lock:
