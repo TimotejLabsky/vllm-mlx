@@ -4303,3 +4303,23 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Fix.** `if r.has_media: continue`.
 
 **Verification:** `test_157_no_text_only_filter_ignores_audio`, a source scan for any `X.images and/or X.videos:` test that never looks at audio. It flags exactly this line on the old tree. Driving the closure model-free costs more than the pin is worth.
+
+## 159. `patch: mllm-drafter-qwen` — the external MTP drafter runs on Qwen targets, fails loudly, and survives the thinking budget
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`install_mtp_mllm`), `vllm_mlx/constrained/thinking_processor.py` (`speculation_mask_ids`), `tests/test_mllm_drafter_159.py`, `tests/test_fork_invariants.py`.
+
+**Context.** 2026-11-16 bench of `mlx-community/Qwen3.8-27B-MTP-8bit` (drafter head, block size 3) against the 27B-8bit: raw mlx-vlm 0.7.12 gains +33-49% decode on the M1 Ultra, the fork's `--mllm --mllm-draft-model` route gained nothing. Three causes, all in the fork's drafter step.
+
+**Bug 1 — the drafter never ran on Qwen.** The step built a shared-KV payload with mlx-vlm's `_mtp_shared_kv_from_prompt_cache`, which reads `layer.layer_type`. Only Gemma-style layers have it; on Qwen3.5 it raised `AttributeError` on every decode step (3,476 times in one run) and the step fell back to plain decode. mlx-vlm itself hands the Qwen drafter an empty dict, and that drafter deletes the argument. **Fix:** a target whose layers define no `layer_type` gets `{}` and the helper is not called; a target that has it still must produce a payload.
+
+**Bug 2 — the failure was silent.** One WARNING per token, an `errors` counter, nothing else. **Fix:** after `_MTP_DISABLE_AFTER_ERRORS` (8) consecutive draft/verify failures the drafter is switched off for the process with one ERROR line (with traceback); `get_mtp_stats()` gains `disabled` / `disabled_reason`. A success resets the run.
+
+**Bug 3 — the thinking budget switched speculation off.** Any logits processor on any row bypassed the step, and every thinking request carries the budget processor (measured: 3,197 bypassed steps vs 56 attempted). **Fix:** `ThinkingAwareLogitsProcessor.speculation_mask_ids(next_token)` says, read-only, what the processor would do to the position after `next_token`: `()` pass-through (IDLE/THINKING), the two control-token ids (CONTENT, or the token closes the reasoning), or `None` (inner processor, within 2 tokens of the budget or watchdog, forcing the close). The step drafts only when every processor on every row answers, masks the verify position accordingly, and takes a plain step on `None`. Processors without the method (DRY, structured output) bypass as before. Looked up on the type, so a proxy object cannot claim it.
+
+**Latent bug fixed on the way.** After an accepted draft the next step's processors ran on a context without that draft token (the caller appends it later). Unreachable before, because processors bypassed the step. The verified token now rides in the skip state as `pending_token`.
+
+**Verification:** `tests/test_mllm_drafter_159.py`, 58 tests. The main one compares token streams: 12 seeds x 4 budgets, a fake model whose logits depend on the whole history and that tries to reopen the reasoning right after every close, speculative stream == one-processor-call-per-position reference. Mutation-checked: each of 9 single-line reverts fails at least one test (the hybrid-cache branch of the sampled-reject pending token is the one line no test drives). Suite 5406 passed / 32 skipped / 30 deselected (baseline 5347 + 59). `test_159_mllm_drafter_guards_survive_a_rebase` pins the guards.
+
+**Not yet verified:** no real-server run. The drafter weights are only on the Studio; the check is `--mllm --mllm-draft-model ... --mllm-draft-kind mtp` on a spare port with the production thinking budget, expecting `attempted` >> `bypass_counts.logits_processors` and `errors == 0`.
+
+**Scope.** This makes the existing `--mllm` path work; it does not make it the right route. That path has no usable prefix cache for this model (99 s per 21K turn against 0.9 s on the text route) and decodes ~20% slower than the text route before any drafter. The drafter on the cached text path is separate work, gated on a Studio spike.
