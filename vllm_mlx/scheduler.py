@@ -1697,6 +1697,11 @@ class Scheduler:
                     "(model.mtp is None). MTP will be disabled."
                 )
 
+        # Fork #160: external MTP drafter on the text path (env-gated).
+        from . import text_mtp
+
+        text_mtp.maybe_install(self, bg)
+
         return bg
 
     def _make_prompt_cache_save_callback(self):

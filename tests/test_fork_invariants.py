@@ -3756,3 +3756,29 @@ def test_159_mllm_drafter_guards_survive_a_rebase():
     assert "speculation_mask_ids" in src
     assert "pending_token" in src
     assert callable(ThinkingAwareLogitsProcessor.speculation_mask_ids)
+
+
+# ------- #160 external MTP drafter on the text path
+
+
+def test_160_text_mtp_is_hooked_and_guards_the_cache():
+    """The drafter lives in the fork-owned ``text_mtp`` module behind one
+    scheduler line. A rebase can drop that line, and an mlx-lm bump can rename
+    what the module wraps (behaviour: tests/test_text_mtp_160.py, including
+    ``test_160_recording_forward_matches_mlx_lm`` for the copied layer body)."""
+    import inspect
+
+    from mlx_lm.generate import BatchGenerator, GenerationBatch
+
+    from vllm_mlx import scheduler, text_mtp
+
+    assert "text_mtp.maybe_install(self, bg)" in inspect.getsource(
+        scheduler.Scheduler._create_batch_generator
+    )
+    # Every way mlx-lm reads or reshapes the batch cache must be wrapped.
+    for name in ("_step", "extract_cache", "filter", "extend"):
+        assert callable(getattr(GenerationBatch, name))
+    assert "_generation_batch" in inspect.getsource(BatchGenerator.__init__)
+    src = inspect.getsource(text_mtp._install_class_patches)
+    for name in ("_step", "extract_cache", "filter", "extend"):
+        assert f"GenerationBatch.{name} = " in src

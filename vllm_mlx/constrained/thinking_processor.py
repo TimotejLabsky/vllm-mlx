@@ -100,6 +100,7 @@ class ThinkingAwareLogitsProcessor:
         "_prompt_len",
         "_fed",
         "_fed_count",
+        "_feeds_off",
     )
 
     def __init__(
@@ -147,6 +148,9 @@ class ThinkingAwareLogitsProcessor:
         # one step late but already host-side ints: no GPU sync to read them.
         self._fed = False
         self._fed_count = 0
+        # (#160) Set by a caller that commits several tokens per step: the
+        # one-token-lag bookkeeping of ``note_generated`` does not hold there.
+        self._feeds_off = False
 
     @property
     def state(self) -> Phase:
@@ -208,6 +212,8 @@ class ThinkingAwareLogitsProcessor:
         as the lazy newest element of ``tokens``. Advances the phase machine
         without reading ``tokens``; a position a synchronous call already
         consumed is skipped."""
+        if self._feeds_off:
+            return
         self._fed = True
         if self._prompt_len is None:
             return
@@ -276,6 +282,46 @@ class ThinkingAwareLogitsProcessor:
             else []
         )
         return tuple(tail) + (target[-1],) == target
+
+    def disable_feeds(self) -> None:
+        """(#160) Ignore ``note_generated`` from here on and always sync from
+        the tokens handed to ``__call__``. For callers that commit more than
+        one token per step (text-path speculation)."""
+        self._feeds_off = True
+        self._fed = False
+
+    def speculation_plan(self, tokens) -> list[tuple[int, ...]]:
+        """(#160) For each token of ``tokens``, in order, the ids this
+        processor would mask at the position right after it - ``()`` for
+        pass-through. Stops (returns a shorter list) at the first position it
+        would force or cannot predict. Assumes the processor is synced through
+        the token before ``tokens[0]``; exact, because it runs the phase
+        machine on a copy of its state. Read-only."""
+        if self._inner is not None or self._prompt_len is None:
+            return []
+        saved = self._snapshot_state()
+        plan: list[tuple[int, ...]] = []
+        try:
+            for token in tokens:
+                self._advance_with_token(int(token))
+                if self._state == Phase.CONTENT:
+                    plan.append(self._content_phase_mask_ids)
+                elif self._state in (Phase.THINKING, Phase.IDLE):
+                    plan.append(())
+                else:
+                    break
+        finally:
+            (
+                self._state,
+                self._thinking_tokens,
+                self._transition_index,
+                start_state,
+                end_state,
+                self.watchdog_was_enforced,
+            ) = saved
+            self._start_matcher.restore(start_state)
+            self._end_matcher.restore(end_state)
+        return plan
 
     def speculation_mask_ids(self, next_token: int) -> tuple[int, ...] | None:
         """(#159) What this processor would do to the logits of the position
