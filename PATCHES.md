@@ -4468,3 +4468,17 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - Deployed 2026-11-17 18:49 (route recycled once the opencode session ended): smoke request OK, `cache.gen_span_registry_size` present, `gen_spans.json` written next to the SSD tier, drafter running with 0 errors.
 
 **Limit found on the way (not changed).** Grown stores never spill (#37 policy), so a turn whose finish store grew from its prompt-boundary entry leaves only the prompt on the SSD tier. After a route reload such a conversation restores from its last spilled chain, and the registry cannot help past it. Spilling grown chains would cost a full snapshot write per turn (~5.8 GB at 73K on the 27B-8bit) against a 20 GB tier.
+
+## 164. `patch: spill-grown-chains` — a long agent session survives a route reload
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`_grown_spill_due`, store), `vllm_mlx/system_kv_ssd.py` (`kvseg` layer kind), `vllm_mlx/system_kv.py` (`state_arrays` walks segments), `tests/test_batched_system_kv.py`.
+
+**Why.** #37 never spills a grown store: "a restart promotes the stored prefix and re-grows cheaply". For an agent session the stored prefix can be the first turn of a 100K chain. llama-swap starts the 27B-8bit route 39-59 times a day (2026-11-08..17), and of the 96 deep (>=20K) first requests after a start in that log, 30 recomputed more than half their prompt (1.34M tokens prefilled across the 96).
+
+**Not at shutdown.** llama-swap allows ~5 s from SIGTERM to SIGKILL and the drain is bounded at 4 s (#49); a 6-7 GB chain does not reliably fit.
+
+**Fix.** `VLLM_MLX_SSD_SPILL_GROWN_DELTA=<tokens>` (default 0 = off): a grown finish store spills once it is that many tokens past the longest copy of its chain already on disk (SSD index `lookup_prefix`, no blob I/O). The grown entry's KV is a list of segments shared by reference with older entries; it is written segment by segment as the new layer kind `kvseg`, so the spill copies nothing in memory, and read back as segments, which the batched restore handles natively (no O(chain) concat on promote). A pre-#164 reader meeting `kvseg` raises and quarantines the entry (same rollback cost as #81's `arrays3`). `state_arrays` now walks segment lists, so backlog and promote byte accounting see them. Stat `grown_spills`.
+
+**Cost.** One full-chain write per DELTA tokens of growth (at 16384: a 100K session writes ~6 chains of 4-7 GB, older ones evicted by the tier's LRU) through the existing writer (idle windows, or after 30 s if memory allows; backlog cap unchanged).
+
+**Verification.** `test_164_a_grown_chain_spills_past_the_delta_and_restores_exactly` (four grown turns, restart, the promoted chain is >= 700 of 800 tokens and restores bit-exactly), `test_164_off_by_default_grown_chains_do_not_spill`, `test_164_segmented_layer_round_trips_through_the_ssd_format`.

@@ -241,6 +241,10 @@ def flatten_snapshot(snapshot: list) -> tuple[dict, list[dict]]:
     -> ``l{i}_s{j}`` for the cache items plus ``l{i}_lp`` / ``l{i}_ln``,
     kind ``arrays3``. A pre-#81 reader hitting ``arrays3`` raises and the
     entry is quarantined — the documented rollback cost.
+    (#164) A grown batched entry's segmented KV layer (``[(k, v), ...]``)
+    -> ``l{i}_k{j}`` / ``l{i}_v{j}``, kind ``kvseg``: written segment by
+    segment, so spilling a grown chain copies nothing in memory. Same
+    rollback cost for a pre-#164 reader (quarantine).
     """
     from .system_kv import is_new_recurrent_state
 
@@ -253,6 +257,11 @@ def flatten_snapshot(snapshot: list) -> tuple[dict, list[dict]]:
             tensors[f"l{i}_lp"] = st[1]
             tensors[f"l{i}_ln"] = st[2]
             layer_meta.append({"i": i, "kind": "arrays3", "n": len(st[0])})
+        elif isinstance(st, list) and st and isinstance(st[0], tuple):
+            for j, (k, v) in enumerate(st):
+                tensors[f"l{i}_k{j}"] = k
+                tensors[f"l{i}_v{j}"] = v
+            layer_meta.append({"i": i, "kind": "kvseg", "n": len(st)})
         elif isinstance(st, tuple):
             if len(st) != 2:
                 raise ValueError(
@@ -293,6 +302,12 @@ def unflatten_snapshot(tensors: dict, layer_meta: list[dict]) -> list:
                 tensors[f"l{i}_lp"],
                 tensors[f"l{i}_ln"],
             ))
+        elif lm["kind"] == "kvseg":
+            # Kept as segments: only the batched tier writes these, and it
+            # restores segment lists natively - no O(chain) concat on load.
+            snapshot.append(
+                [(tensors[f"l{i}_k{j}"], tensors[f"l{i}_v{j}"]) for j in range(lm["n"])]
+            )
         else:
             raise ValueError(f"unknown layer kind {lm['kind']!r} at layer {i}")
     return snapshot

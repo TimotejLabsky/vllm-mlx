@@ -656,6 +656,14 @@ class BatchedSystemKV:
         )
         self.reconcile_registry_spans = 0
         self.reconcile_ssd_donors = 0
+        # (#164) Grown stores never spilled (#37: "a restart promotes the
+        # stored prefix and re-grows cheaply"). For an agent session the
+        # stored prefix can be the first turn of a 100K chain: after a route
+        # reload every turn since was re-prefilled. A grown chain now spills
+        # once it is this many tokens past the longest copy already on disk.
+        # 0 = the old behaviour.
+        self.spill_grown_delta = _env_int("VLLM_MLX_SSD_SPILL_GROWN_DELTA", 0)
+        self.grown_spills = 0
 
     @property
     def has_ssd(self) -> bool:
@@ -1018,7 +1026,22 @@ class BatchedSystemKV:
                 self.grown_stores += 1
         if not grown:
             self._spill(tokens_list, entry)
+        elif self._grown_spill_due(tokens_list):
+            self.grown_spills += 1
+            self._spill(tokens_list, entry)
         return True
+
+    def _grown_spill_due(self, tokens_list: list) -> bool:
+        """(#164) Is this grown chain far enough past the disk copy?"""
+        if self._ssd is None or self.spill_grown_delta <= 0:
+            return False
+        try:
+            row = self._ssd.lookup_prefix(tuple(tokens_list))
+            on_disk = row["num_tokens"] if row is not None else 0
+        except Exception:
+            logger.debug("[batched_system_kv] grown-spill probe failed", exc_info=True)
+            return False
+        return len(tokens_list) - on_disk >= self.spill_grown_delta
 
     def store_prompt_boundary(self, request_id: str, tokens: list, cache_list) -> bool:
         """Store an entry at the END-OF-PROMPT boundary, mid-request.
@@ -1082,9 +1105,9 @@ class BatchedSystemKV:
     def _spill(self, tokens_list: list, entry: dict) -> None:
         """Async write-through of an entry (post-subsumption: richest ladder).
 
-        Only non-grown entries spill, and their trim layers are single
-        segments by construction — unwrap them to the plain states the SSD
-        flattener expects."""
+        Single-segment trim layers are unwrapped to the plain states every
+        reader understands; a grown entry's multi-segment layers (#164) are
+        written segment by segment (format kind ``kvseg``)."""
         if self._ssd is None:
             return
         try:
@@ -2023,6 +2046,7 @@ class BatchedSystemKV:
                 "reconcile_registry_spans": self.reconcile_registry_spans,
                 "reconcile_ssd_donors": self.reconcile_ssd_donors,
                 "gen_span_registry_size": len(self._gen_spans),
+                "grown_spills": self.grown_spills,
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")
