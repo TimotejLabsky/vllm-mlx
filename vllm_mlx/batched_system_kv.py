@@ -598,6 +598,7 @@ class BatchedSystemKV:
         # SimpleEngine's (tokenizer-derived vs model-name) so the two engines
         # never share a directory — the store is single-writer.
         self._ssd = None
+        gen_span_path = None
         ssd_base = os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_DIR")
         if ssd_base:
             try:
@@ -632,6 +633,7 @@ class BatchedSystemKV:
                     can_write_busy=lambda: not self.under_pressure(),
                 )
                 self._ssd.start_writer()
+                gen_span_path = os.path.join(cache_dir, "gen_spans.json")
                 logger.info(
                     "[batched_system_kv] SSD persistence enabled: %s (cap %.0f GB)",
                     cache_dir,
@@ -642,6 +644,18 @@ class BatchedSystemKV:
                     "[batched_system_kv] SSD init failed; disabled", exc_info=True
                 )
                 self._ssd = None
+                gen_span_path = None
+        # (#163) Generated spans live apart from entries: an entry can be
+        # evicted, promoted from SSD or lost to a restart and its chain still
+        # needs #139's reconcile on every later turn.
+        from .gen_span_registry import GenSpanRegistry
+
+        self._gen_spans = GenSpanRegistry(
+            gen_span_path,
+            capacity=_env_int("VLLM_MLX_BATCHED_GEN_SPAN_MAX", 4096),
+        )
+        self.reconcile_registry_spans = 0
+        self.reconcile_ssd_donors = 0
 
     @property
     def has_ssd(self) -> bool:
@@ -922,6 +936,9 @@ class BatchedSystemKV:
                 gen_spans.add((int(gen_start), len(tokens_list)))
         if gen_spans:
             entry["gen_spans"] = sorted(gen_spans)
+            registry = getattr(self, "_gen_spans", None)
+            if registry is not None:
+                registry.add(tokens_list, entry["gen_spans"])
         if tokens_list:
             # Learn bytes/token AT insert — a lazily-learned hint misses the
             # serial workload where relief empties the bag before anything
@@ -1510,8 +1527,29 @@ class BatchedSystemKV:
                 ):
                     best_lcp, donor = lcp, chain
                     gen_spans = entry.get("gen_spans", ())
-        if donor is None:
+        # (#163) A chain that only the SSD tier still holds (evicted from RAM,
+        # or a restarted route) is a donor too. Asked only when RAM does not
+        # already cover the prompt, so an ordinary next turn costs nothing.
+        if self._ssd is not None and (
+            donor is None or best_lcp < min(len(tokens), len(donor))
+        ):
+            ssd_donor = self._ssd_reconcile_donor(tokens)
+            if ssd_donor is not None:
+                ssd_lcp = common_prefix_len(tokens, ssd_donor)
+                if ssd_lcp > best_lcp:
+                    best_lcp, donor, gen_spans = ssd_lcp, ssd_donor, ()
+                    self.reconcile_ssd_donors += 1
+        if donor is None or best_lcp >= min(len(tokens), len(donor)):
             return None
+        # (#163) The entry's own spans plus whatever the registry knows about
+        # this chain - an entry only carries spans of chains it absorbed.
+        known = set(gen_spans)
+        recovered = [
+            span for span in self._gen_spans.spans_for(donor) if span not in known
+        ]
+        if recovered:
+            self.reconcile_registry_spans += len(recovered)
+        gen_spans = sorted(known.union(recovered))
         original_len, splices, kept = len(tokens), 0, 0
         # The client re-renders every earlier turn, so one prompt can part ways
         # at each of the chain's generated spans in turn.
@@ -1553,6 +1591,27 @@ class BatchedSystemKV:
         self.reconcile_splices += splices
         self.reconcile_tokens_kept += kept
         return tokens
+
+    def _ssd_reconcile_donor(self, tokens: list) -> Optional[list]:
+        """The SSD-index chain sharing the longest prefix with ``tokens``
+        (index only, no blob I/O), or None."""
+        try:
+            toks = tuple(tokens)
+            best_len, best = 0, None
+            row = self._ssd.lookup_prefix(toks)
+            if row is not None:
+                best_len, best = row["num_tokens"], list(toks[: row["num_tokens"]])
+            # A divergent chain can share more than any full-prefix entry: it
+            # is the one that holds the turn the prompt re-renders.
+            for shared in self._ssd.lookup_shared(toks):
+                if shared.get("common_len", 0) > best_len:
+                    best_len, best = shared["common_len"], list(shared["tokens"])
+            return best
+        except Exception:
+            logger.debug(
+                "[batched_system_kv] SSD reconcile donor failed", exc_info=True
+            )
+        return None
 
     def peek(
         self,
@@ -1961,6 +2020,9 @@ class BatchedSystemKV:
                 "reconcile_splices": self.reconcile_splices,
                 "reconcile_tokens_kept": self.reconcile_tokens_kept,
                 "reconcile_rejects": self.reconcile_rejects,
+                "reconcile_registry_spans": self.reconcile_registry_spans,
+                "reconcile_ssd_donors": self.reconcile_ssd_donors,
+                "gen_span_registry_size": len(self._gen_spans),
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")

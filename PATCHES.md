@@ -4442,3 +4442,28 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - Suite 5470 passed / 32 skipped / 30 deselected.
 
 **Not verified.** A forced-ceiling run showing a request shed or rejected because of this term; the arithmetic is the guard's own (#105), only its input changed.
+
+## 163. `patch: gen-span-registry` — #139's reconcile keeps working when the entry that recorded a span is gone
+
+**Files:** `vllm_mlx/gen_span_registry.py` (new, fork-owned), `vllm_mlx/batched_system_kv.py` (registry wiring, `reconcile_generated` donor + span lookup, `_ssd_reconcile_donor`), `tests/test_gen_span_registry.py`, `tests/test_fork_invariants.py`.
+
+**Field case (2026-11-17, opencode on the 27B-8bit, one 61K→87K conversation).** Turns 2, 4 and 6 restored their whole previous chain; turns 3 and 5 re-prefilled 15,490 and 7,477 tokens where ~1.5K were new (about 100 s and 60 s of extra TTFT at that depth). Each re-prefill split exactly where #139 had reconciled the previous turn (token 64,788 and 77,663).
+
+**Cause.** #139 keeps the stretches of a chain the model generated as `gen_spans` on each cache entry, and passes them on only when a new entry absorbs an older one whose tokens are a prefix of it. Between turn 2's restore match and its own stores, two small background jobs (feed curator, invoice parser) stored entries and the RAM budget evicted turn 1's entry. Turn 2's entries therefore never absorbed it, knew only their own newest span, and turn 3's re-render of turn 1's output (whitespace only) found no span to repair; the request fell back to the last checkpoint before it.
+
+**Fix.** A registry of generated spans that lives apart from entry lifetime:
+- A span is stored as `(end, sha1(chain[:end])) -> start`, so any chain whose first `end` tokens hash the same contains it, from whichever entry or tier the chain came.
+- Every inserted entry registers its spans (its own plus absorbed ones). `reconcile_generated` uses the donor entry's spans plus every registry span the donor contains.
+- Bounded LRU (`VLLM_MLX_BATCHED_GEN_SPAN_MAX`, default 4096) and, with an SSD tier, persisted as `gen_spans.json` in the tier's directory, so it survives route reloads.
+- The reconcile donor may also come from the SSD index (full-prefix or longest shared chain, index only, no blob I/O), asked only when RAM does not already cover the prompt.
+- New stats: `reconcile_registry_spans` (spans the entry had lost), `reconcile_ssd_donors`, `gen_span_registry_size`.
+
+**Verification.**
+- `test_163_reconcile_survives_the_donor_being_evicted_before_the_store`: the field sequence; turn 3 restores the whole chain (3 splices, 1 span recovered from the registry). Fails without the registry lookup.
+- `test_163_reconcile_after_a_restart_uses_the_ssd_chain`: a fresh process over the same SSD dir splices and goes to the SSD chain.
+- `test_163_registry_only_applies_to_the_chain_it_was_recorded_on` and `tests/test_gen_span_registry.py` (prefix matching, LRU, persistence, a corrupt file).
+- Mutation-checked: 6 of 6 single-line breaks fail a test.
+- Suite 5477 passed / 32 skipped / 30 deselected.
+- Real-server: a scripted run on the Studio (small hybrid model, spare port) did **not** reproduce the field race: the background request cannot be made to store between another request's match and its prompt-boundary store deterministically. The live opencode traffic after deploy is the check.
+
+**Limit found on the way (not changed).** Grown stores never spill (#37 policy), so a turn whose finish store grew from its prompt-boundary entry leaves only the prompt on the SSD tier. After a route reload such a conversation restores from its last spilled chain, and the registry cannot help past it. Spilling grown chains would cost a full snapshot write per turn (~5.8 GB at 73K on the 27B-8bit) against a 20 GB tier.
