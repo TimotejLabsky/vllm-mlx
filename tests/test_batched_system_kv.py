@@ -953,3 +953,80 @@ def test_boundary_marker_ids_detects_family_and_caches(monkeypatch):
     assert kv.boundary_marker_ids(prompt, tok) is seqs  # cached per family
     assert kv.boundary_marker_ids("no markers here", tok) == ()
     assert kv.boundary_marker_ids(prompt, None) == ()
+
+
+# ------------------------------------------------- #164 grown chains spill
+
+
+def _grown_ssd_kv(monkeypatch, tmp_path, delta):
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MLX_SSD_SPILL_GROWN_DELTA", str(delta))
+    return BatchedSystemKV(_FakeModel(), tokenizer=NS(name_or_path="unit/test-model"))
+
+
+def _grow_turns(kv, turns):
+    """Turn 0 stores TOKENS[:400]; each later turn restores and grows by 100."""
+    kv.store("t0", TOKENS[:400], _donor_at(400))
+    length = 400
+    for n in range(1, turns + 1):
+        rid = f"t{n}"
+        assert kv.fetch(TOKENS[: length + 100], request_id=rid) is not None
+        length += 100
+        kv.store(rid, TOKENS[:length], _donor_at(length))
+    return length
+
+
+def test_164_a_grown_chain_spills_past_the_delta_and_restores_exactly(
+    monkeypatch, tmp_path
+):
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=250)
+    length = _grow_turns(kv, 4)  # 500, 600, 700, 800
+    st = kv.stats()
+    assert st["grown_stores"] == 4
+    # Disk holds 400 (non-grown). 500 and 600 are under 250 past it, 700 is
+    # not; 800 is 100 past 700 once that write has landed, 400 past otherwise.
+    assert st["grown_spills"] in (1, 2)
+    kv.close()  # drain: every queued spill lands
+
+    kv2 = _grown_ssd_kv(monkeypatch, tmp_path, delta=250)
+    try:
+        candidate = kv2.check_ssd(TOKENS[:length] + [7])
+        assert candidate is not None and len(candidate["tokens"]) >= 700
+        assert kv2.promote_ssd(candidate)
+        cache, remaining, pos = kv2.fetch(TOKENS[:length] + [7])
+        assert pos == len(candidate["tokens"])
+        control = _donor_at(pos)
+        for layer in (0, 2):
+            got, want = legacy_state(cache[layer]), legacy_state(control[layer])
+            assert mx.array_equal(got[0], want[0])
+            assert mx.array_equal(got[1], want[1])
+    finally:
+        kv2.close()
+
+
+def test_164_off_by_default_grown_chains_do_not_spill(monkeypatch, tmp_path):
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=0)
+    try:
+        _grow_turns(kv, 4)
+        assert kv.stats()["grown_spills"] == 0
+    finally:
+        kv.close()
+
+
+def test_164_segmented_layer_round_trips_through_the_ssd_format():
+    from vllm_mlx.system_kv import state_arrays
+    from vllm_mlx.system_kv_ssd import flatten_snapshot, unflatten_snapshot
+
+    a, b = _donor_at(300), _donor_at(500)
+    bk, bv = legacy_state(b[0])
+    seg = [legacy_state(a[0]), (bk[..., 300:, :] + 0, bv[..., 300:, :] + 0)]
+    snapshot = [seg, legacy_state(a[1]), legacy_state(a[2])]
+    tensors, meta = flatten_snapshot(snapshot)
+    assert meta[0] == {"i": 0, "kind": "kvseg", "n": 2}
+    back = unflatten_snapshot(tensors, meta)
+    assert [k.shape[2] for k, _ in back[0]] == [300, 200]
+    pairs = zip(state_arrays(back[0]), state_arrays(seg))
+    assert all(mx.array_equal(x, y) for x, y in pairs)
+    assert len(state_arrays(seg)) == 4  # byte accounting sees the segments

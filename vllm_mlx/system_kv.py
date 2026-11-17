@@ -406,6 +406,9 @@ def state_arrays(st) -> list:
     knows how to walk them for ``mx.eval`` / ``nbytes`` accounting."""
     if is_new_recurrent_state(st):
         items = list(st[0]) + [st[1], st[2]]
+    elif isinstance(st, list) and st and isinstance(st[0], tuple):
+        # (#164) a grown batched entry's trim layer: [(k, v), ...] segments
+        items = [a for segment in st for a in segment]
     elif isinstance(st, (list, tuple)):
         items = list(st)
     else:
