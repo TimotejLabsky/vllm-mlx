@@ -397,3 +397,11 @@ Full write-up in PATCHES.md #159/#160; data in `reports/mtp-drafter-2026-11-16/`
 - **4-bit pair: loss** (-6..-35%). Plain 4-bit decode is ~32 tok/s; the verify is not cheap enough there. Do not enable on 4-bit routes.
 - **T=0 output is unchanged** with the mlx-lm text model (300/300 tokens, zero cache difference). The byte divergence seen with raw mlx-vlm comes from its own states-emitting kernel, not from speculation as such.
 - **Method notes.** A model-free equivalence test with a tolerance needs a negative control (a wrong rollback is 0.24 off, float noise is 5e-6). A few runs stalled to 2-5 tok/s in plain and speculative decoding alike; read min/max, not only means.
+
+### 2026-11-17 (later) — drafter follow-ups: #161 SHIPPED, three levers REFUTED
+
+- **#161 (round overhead):** real server now +20..32% text, +30..33% tool calls over no drafter (was +10..18% / +22..25% with #160). The fix was a per-round check doing 24 tiny GPU round trips, not anything structural. Lesson: on this box a `.item()` on a lazy scalar costs ~0.3 ms; 24 of them per round is 10% of decode.
+- **`mx.async_eval` is not a free overlap** for a 27B graph: ~70 of 72 ms sit in the submit call. Overlapping rounds with emission bought ~2%.
+- **Two drafts per round: refuted on the server** (acceptance 62%, round 97 ms).
+- **Drafting with two concurrent requests: refuted** by forward timing (second position +12% at B=1, +53% at B=2 -> ~29 vs 30 tok/s aggregate). Plain batching on 8-bit is 30 positions/s at B=2 and 34 at B=4 against 18 single - better than the ~1.2x measured on 4-bit in lever #2.
+- **More CPU threads: nothing to gain**; a round is 59.5 ms of GPU body, 2.5 ms head, 3.2 ms drafter.

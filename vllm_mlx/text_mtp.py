@@ -22,6 +22,14 @@ Design (measured on the Studio 2026-11-16, ``reports/mtp-drafter-2026-11-16``):
   on drafted positions (the thinking budget can) nor be called with a drafted
   position's context (DRY can). Structured output is the one that bypasses.
 
+* **Rounds overlap with emission (#161).** A round is *launched* (graph
+  built, ``mx.async_eval``) as soon as its first token is known and
+  *completed* (accept walk, rollback) only when its results are needed. The
+  tokens of the previous round are returned by host-only steps while the GPU
+  already verifies the next one - the same overlap plain decoding gets from
+  mlx-lm's own ``async_eval``. ``VLLM_MLX_TEXT_MTP_OVERLAP=0`` blocks at
+  launch instead (the #160 behaviour), for A/B.
+
 Enable with ``VLLM_MLX_TEXT_MTP_DRAFTER=<repo or path>``; block size (verified
 positions per round) via ``VLLM_MLX_TEXT_MTP_BLOCK`` (default 2: one draft per round was
 the robust optimum at every context length measured).
@@ -32,6 +40,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -42,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 ENV_DRAFTER = "VLLM_MLX_TEXT_MTP_DRAFTER"
 ENV_BLOCK = "VLLM_MLX_TEXT_MTP_BLOCK"
+ENV_OVERLAP = "VLLM_MLX_TEXT_MTP_OVERLAP"
 DISABLE_AFTER_ERRORS = 8
 
 _REC = {"active": False}
@@ -68,6 +78,7 @@ class TextMTP:
     def __init__(self, path: str):
         self.path = path
         self.block = _block_size()
+        self.overlap = os.environ.get(ENV_OVERLAP, "1") != "0"
         self.drafter: Any = None
         self.lm: Any = None
         self.lock = threading.Lock()
@@ -81,6 +92,11 @@ class TextMTP:
             "sync_rollbacks": 0,
             "errors": 0,
         }
+        # Where a round's wall time goes (seconds, cumulative): building and
+        # submitting it, waiting for the GPU at completion, and everything
+        # the caller does between two steps of a speculating request.
+        self.seconds = {"launch": 0.0, "wait": 0.0, "between_steps": 0.0, "step": 0.0}
+        self.last_step_end: Optional[float] = None
         self.bypass = {
             "concurrent_batch": 0,
             "logits_processors": 0,
@@ -135,6 +151,7 @@ class TextMTP:
             "enabled": True,
             "implementation": "text_external_assistant",
             "mode": "transactional_verified",
+            "overlap": self.overlap,
             "draft_model": self.path,
             "requested_draft_tokens": self.block - 1,
             "effective_draft_tokens": self.block - 1,
@@ -147,6 +164,10 @@ class TextMTP:
             "bootstrap_rounds": c["bootstrap_rounds"],
             "rollbacks": c["rollbacks"],
             "sync_rollbacks": c["sync_rollbacks"],
+            "ms_per_round": {
+                k: round(1000.0 * v / rounds, 2) if rounds else 0.0
+                for k, v in dict(self.seconds).items()
+            },
             "bypass_counts": bypass,
             "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
             "disabled": self.disabled_reason is not None,
@@ -165,24 +186,64 @@ class TextMTP:
 class _BatchState:
     """Speculation state of one persistent GenerationBatch."""
 
-    __slots__ = ("mtp", "uid", "hidden", "queue", "round_h", "kept", "drafter_ready")
+    __slots__ = (
+        "mtp",
+        "uid",
+        "hidden",
+        "queue",
+        "round_h",
+        "kept",
+        "drafter_ready",
+        "pending",
+        "cache_ok",
+    )
 
     def __init__(self, mtp: TextMTP):
         self.mtp = mtp
         self.uid: Any = None
         self.hidden: Optional[mx.array] = None
-        # verified tokens already in the cache, not yet returned by _step
-        self.queue: Deque[Tuple[int, mx.array]] = deque()
+        # Tokens the cache already holds that _step has not returned yet, in
+        # emission order: (token, logprobs, is_draft). Accepted drafts of the
+        # last completed round, then the first token of the launched round.
+        self.queue: Deque[Tuple[int, mx.array, bool]] = deque()
         self.round_h: Optional[mx.array] = None
-        self.kept = 0  # tokens of the last round the cache currently holds
+        self.kept = 0  # tokens of the last COMPLETED round the cache holds
         self.drafter_ready = False
+        self.pending: Optional["_Pending"] = None  # launched, not completed
+        # The cache-shape check reads one scalar per recurrent layer off the
+        # GPU (24 round trips on the 27B). Its answer cannot change while the
+        # same request decodes alone - ``left_padding`` only ever decreases -
+        # so it is asked once per request, not once per round.
+        self.cache_ok = False
 
     def forget(self) -> None:
+        """Only from a clean state (after ``_sync``): drops, does not undo."""
         self.hidden = None
         self.round_h = None
         self.queue.clear()
         self.kept = 0
         self.drafter_ready = False
+        self.pending = None
+        self.cache_ok = False
+
+
+class _Pending:
+    """A launched round: everything needed to complete it or to undo it."""
+
+    __slots__ = (
+        "b",
+        "b_logprobs",
+        "snap",
+        "ctx_size",
+        "block",
+        "drafts",
+        "draft_list",
+        "h",
+        "logprobs",
+        "targets",
+        "limit",
+        "processors",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +424,14 @@ def _snapshot(cache: List[Any]) -> List[Any]:
     out = []
     for c in cache:
         if _is_recurrent(c):
-            out.append((list(c.cache), c.left_padding, c.lengths))
+            out.append(
+                (
+                    list(c.cache),
+                    c.left_padding,
+                    c.lengths,
+                    getattr(c, "_text_mtp_spec", None),
+                )
+            )
         else:
             out.append(getattr(c, "_idx", None))
     return out
@@ -373,6 +441,7 @@ def _restore(cache: List[Any], snap: List[Any]) -> None:
     for c, s in zip(cache, snap):
         if _is_recurrent(c):
             c.cache, c.left_padding, c.lengths = list(s[0]), s[1], s[2]
+            c._text_mtp_spec = s[3]
         elif s is not None:
             c.trim(c._idx - s)
 
@@ -396,24 +465,14 @@ def _cache_supported(cache: List[Any]) -> bool:
 # --------------------------------------------------------------------------
 # the step
 # --------------------------------------------------------------------------
-def _sync(batch: Any) -> None:
-    """Roll the cache back to the last token ``_step`` returned."""
-    state: Optional[_BatchState] = getattr(batch, "_text_mtp", None)
-    if state is None or not state.queue:
-        return
-    ahead = len(state.queue)
-    keep = state.kept - ahead
-    _rollback(batch.prompt_cache, state.kept, keep)
-    token, logprobs = state.queue[0]
-    batch._next_tokens = mx.array([token], dtype=batch._next_tokens.dtype)
-    batch._next_logprobs = [logprobs]
-    if batch.logits_processors and batch.logits_processors[0]:
-        batch._token_context[0]._size -= ahead
-    state.hidden = state.round_h[:, keep - 1 : keep, :]
-    state.queue.clear()
-    state.kept = keep
-    state.drafter_ready = False  # its own KV is now ahead; restart it cold
-    state.mtp.count("sync_rollbacks")
+def _greedy(logits: mx.array) -> mx.array:
+    return mx.argmax(logits, axis=-1)
+
+
+def _head(lm: Any, hidden: mx.array) -> mx.array:
+    if lm.args.tie_word_embeddings:
+        return lm.model.embed_tokens.as_linear(hidden)
+    return lm.lm_head(hidden)
 
 
 def _bypass_reason(batch: Any, state: _BatchState) -> Optional[str]:
@@ -431,189 +490,287 @@ def _bypass_reason(batch: Any, state: _BatchState) -> Optional[str]:
             return "logits_processors"
     if not mtp.ensure_loaded(batch.model):
         return "disabled"
-    if not _cache_supported(batch.prompt_cache):
-        return "cache_mismatch"
+    if not state.cache_ok:
+        if not _cache_supported(batch.prompt_cache):
+            return "cache_mismatch"
+        state.cache_ok = True
     return None
 
 
+def _processors(batch: Any) -> Optional[List[Any]]:
+    return (batch.logits_processors[0] if batch.logits_processors else None) or None
+
+
+def _sync(batch: Any) -> None:
+    """Make the cache hold exactly the tokens ``_step`` has returned."""
+    state: Optional[_BatchState] = getattr(batch, "_text_mtp", None)
+    if state is None or (state.pending is None and not state.queue):
+        return
+    cache = batch.prompt_cache
+    pending = state.pending
+    if pending is not None:
+        if state.queue and not state.queue[-1][2]:
+            # Its first token was never returned: the whole round goes.
+            state.queue.pop()
+            state.pending = None
+            _restore(cache, pending.snap)
+            if pending.ctx_size is not None:
+                batch._token_context[0]._size = pending.ctx_size
+            state.drafter_ready = False
+        else:
+            # Its first token is out, so the cache must keep it: finish the
+            # round, then drop whatever it accepted beyond that token.
+            _complete_or_recover(batch, state)
+    ahead = len(state.queue)
+    if not ahead:
+        return
+    keep = state.kept - ahead
+    _rollback(cache, state.kept, keep)
+    token, logprobs, _ = state.queue[0]
+    batch._next_tokens = mx.array([token], dtype=batch._next_tokens.dtype)
+    batch._next_logprobs = [logprobs]
+    if _processors(batch):
+        batch._token_context[0]._size -= ahead
+    state.hidden = state.round_h[:, keep - 1 : keep, :]
+    state.queue.clear()
+    state.kept = keep
+    state.drafter_ready = False  # its own KV is now ahead; restart it cold
+    state.mtp.count("sync_rollbacks")
+
+
+def _note_failure(mtp: TextMTP, where: str, e: Exception) -> None:
+    mtp.count("errors")
+    mtp.consecutive_errors += 1
+    logger.warning("[text-mtp] %s failed, plain decode continues: %s", where, e)
+    if mtp.consecutive_errors >= DISABLE_AFTER_ERRORS and mtp.disabled_reason is None:
+        mtp.disabled_reason = f"{type(e).__name__}: {e}"
+        logger.error(
+            "[text-mtp] DISABLED for this process after %d consecutive "
+            "failures; decoding continues without speculation. Last error: %s",
+            mtp.consecutive_errors,
+            mtp.disabled_reason,
+            exc_info=True,
+        )
+
+
 def _speculative_step(batch: Any, state: _BatchState):
+    mtp = state.mtp
+    now = time.perf_counter()
+    if mtp.last_step_end is not None and (state.queue or state.pending is not None):
+        mtp.seconds["between_steps"] += now - mtp.last_step_end
+    try:
+        return _speculative_step_inner(batch, state)
+    finally:
+        mtp.last_step_end = time.perf_counter()
+        mtp.seconds["step"] += mtp.last_step_end - now
+
+
+def _speculative_step_inner(batch: Any, state: _BatchState):
     if not batch.uids:
         return _orig["step"](batch)
     if state.uid != batch.uids[0] or len(batch.uids) != 1:
-        if state.queue:  # membership changed without a hook: resync first
-            _sync(batch)
+        _sync(batch)  # membership changed without a hook
         state.forget()
         state.uid = batch.uids[0]
 
+    if not state.queue:
+        if state.pending is not None:
+            _complete_or_recover(batch, state)
+        reason = _bypass_reason(batch, state)
+        # Tokens this request may still return, beyond what is queued.
+        room = batch.max_tokens[0] - batch._num_tokens[0] - len(state.queue)
+        if reason is None and room >= 1:
+            try:
+                _launch(batch, state, _processors(batch), max_block=room)
+            except Exception as e:  # noqa: BLE001 - decode must continue
+                _note_failure(state.mtp, "launch", e)
+        elif reason is not None and not state.queue:
+            state.mtp.count_bypass(reason)
+
     if state.queue:
-        token, logprobs = state.queue.popleft()
+        token, logprobs, _ = state.queue.popleft()
         batch.tokens[0].append(token)
         return [token], [logprobs]
-
-    reason = _bypass_reason(batch, state)
-    if reason is not None:
-        state.mtp.count_bypass(reason)
-        state.forget()
-        return _orig["step"](batch)
-
-    mtp = state.mtp
-    snap = _snapshot(batch.prompt_cache)
-    processors = batch.logits_processors[0] if batch.logits_processors else None
-    ctx_size = batch._token_context[0]._size if processors else None
-    try:
-        return _round(batch, state, processors)
-    except Exception as e:  # noqa: BLE001 - decode must continue
-        _REC["active"] = False
-        _restore(batch.prompt_cache, snap)
-        if ctx_size is not None:
-            batch._token_context[0]._size = ctx_size
-        state.forget()
-        mtp.count("errors")
-        mtp.consecutive_errors += 1
-        logger.warning("[text-mtp] round failed, plain step taken: %s", e)
-        if (
-            mtp.consecutive_errors >= DISABLE_AFTER_ERRORS
-            and mtp.disabled_reason is None
-        ):
-            mtp.disabled_reason = f"{type(e).__name__}: {e}"
-            logger.error(
-                "[text-mtp] DISABLED for this process after %d consecutive "
-                "failures; decoding continues without speculation. Last error: %s",
-                mtp.consecutive_errors,
-                mtp.disabled_reason,
-                exc_info=True,
-            )
-        return _orig["step"](batch)
+    # Nothing queued and nothing launched: the cache holds exactly what was
+    # returned and ``_next_tokens`` is the token to feed.
+    state.forget()
+    return _orig["step"](batch)
 
 
-def _greedy(logits: mx.array) -> mx.array:
-    return mx.argmax(logits, axis=-1)
-
-
-def _head(lm: Any, hidden: mx.array) -> mx.array:
-    if lm.args.tie_word_embeddings:
-        return lm.model.embed_tokens.as_linear(hidden)
-    return lm.lm_head(hidden)
-
-
-def _round(batch: Any, state: _BatchState, processors: Optional[List[Any]]):
+def _launch(
+    batch: Any,
+    state: _BatchState,
+    processors: Optional[List[Any]],
+    max_block: int,
+    enqueue: bool = True,
+) -> None:
+    """Build and start one round for the pending token ``b``. On an exception
+    the cache and the token context are left as they were."""
     mtp, lm, drafter = state.mtp, state.mtp.lm, state.mtp.drafter
     cache = batch.prompt_cache
-    current_tokens = batch._next_tokens
-    current_logprobs = batch._next_logprobs
-    b = int(current_tokens[0].item())
-
-    # Without the hidden state that predicted ``b`` there is nothing to draft
-    # from: verify ``b`` alone (a plain step that also yields the hidden).
-    block = mtp.block if state.hidden is not None else 1
-    if not state.drafter_ready:
-        # Cold start: the drafter's own KV begins at this position. Its
-        # attention is relative, so only consistency matters.
-        drafter.reset(lm)
-        drafter.set_shared_kv(
-            {}, kv_offset=len(batch.tokens[0]) + (0 if block > 1 else 1)
-        )
-        state.drafter_ready = True
-    if block > 1:
-        drafts = drafter.draft_block(
-            b, state.hidden, None, block, _greedy, mx.int32, greedy=True
-        ).astype(mx.int32)
-        verify_in = mx.concatenate([mx.array([[b]], dtype=mx.int32), drafts], axis=1)
-    else:
-        drafts = mx.zeros((1, 0), dtype=mx.int32)
-        verify_in = mx.array([[b]], dtype=mx.int32)
-
-    _REC["active"] = block > 1
+    b = int(batch._next_tokens[0].item())
+    tic = time.perf_counter()
+    snap = _snapshot(cache)
+    ctx_size = batch._token_context[0]._size if processors else None
     try:
-        h = lm.model(verify_in, cache)
-    finally:
-        _REC["active"] = False
-    logits = _head(lm, h)[0]  # (block, vocab)
-
-    draft_list: List[int] = drafts[0].tolist() if block > 1 else []
-    limit = block - 1  # how many drafts may be accepted
-    if processors:
-        context = batch._token_context[0].update_and_fetch(mx.array([b]))
-        first = logits[0:1]
-        for processor in processors:
-            processor_feeds_off = getattr(processor, "disable_feeds", None)
-            if processor_feeds_off is not None:
-                processor_feeds_off()
-            first = processor(context, first)
-        rows = [first]
-        masks: List[Tuple[int, ...]] = []
-        # Two kinds of processor get here (see _bypass_reason): one that can
-        # plan its effect on drafted positions (thinking budget), and one
-        # whose output depends only on the token context (DRY) and is simply
-        # called with each drafted position's context.
-        pure = [
-            p for p in processors if getattr(type(p), "speculation_context_pure", False)
-        ]
-        for processor in processors:
-            if processor in pure:
-                continue
-            plan = processor.speculation_plan(draft_list)
-            limit = min(limit, len(plan))
-            masks = (
-                plan[:limit]
-                if not masks
-                else [m + p for m, p in zip(masks[:limit], plan[:limit])]
+        # Without the hidden state that predicted ``b`` there is nothing to
+        # draft from: verify ``b`` alone (a plain step that yields the hidden).
+        block = mtp.block if state.hidden is not None else 1
+        block = max(1, min(block, max_block))
+        if not state.drafter_ready:
+            # Cold start: the drafter's own KV begins at this position. Its
+            # attention is relative, so only consistency matters.
+            drafter.reset(lm)
+            drafter.set_shared_kv(
+                {}, kv_offset=len(batch.tokens[0]) + (0 if block > 1 else 1)
             )
-        for j in range(1, limit + 1):
-            row = logits[j : j + 1]
-            if pure:
-                context_j = mx.concatenate(
-                    [context, mx.array(draft_list[:j], dtype=context.dtype)]
-                )
-                for processor in pure:
-                    row = processor(context_j, row)
-            ids = masks[j - 1] if masks else ()
-            if ids:
-                row = mx.array(row)
-                for token_id in ids:
-                    row[0, token_id] = float("-inf")
-            rows.append(row)
-        logits = mx.concatenate(rows, axis=0)
+            state.drafter_ready = True
+        if block > 1:
+            drafts = drafter.draft_block(
+                b, state.hidden, None, block, _greedy, mx.int32, greedy=True
+            ).astype(mx.int32)
+            verify_in = mx.concatenate(
+                [mx.array([[b]], dtype=mx.int32), drafts], axis=1
+            )
+        else:
+            drafts = mx.zeros((1, 0), dtype=mx.int32)
+            verify_in = mx.array([[b]], dtype=mx.int32)
 
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-    sampler = (batch.samplers[0] if batch.samplers else None) or batch.fallback_sampler
-    targets = mx.concatenate(
-        [sampler(logprobs[j : j + 1]) for j in range(logprobs.shape[0])], axis=0
-    )
-    mx.eval(targets)
-    target_list = targets.tolist()
+        _REC["active"] = block > 1
+        try:
+            h = lm.model(verify_in, cache)
+        finally:
+            _REC["active"] = False
+        mx.async_eval(h)  # the forward runs while processors do host work
+        logits = _head(lm, h)[0]  # (block, vocab)
+
+        draft_list: Optional[List[int]] = None
+        limit = block - 1  # how many drafts may be accepted
+        if processors:
+            draft_list = drafts[0].tolist() if block > 1 else []
+            context = batch._token_context[0].update_and_fetch(mx.array([b]))
+            first = logits[0:1]
+            for processor in processors:
+                feeds_off = getattr(processor, "disable_feeds", None)
+                if feeds_off is not None:
+                    feeds_off()
+                first = processor(context, first)
+            rows = [first]
+            masks: List[Tuple[int, ...]] = []
+            # Two kinds of processor get here (see _bypass_reason): one that
+            # can plan its effect on drafted positions (thinking budget), and
+            # one whose output depends only on the token context (DRY) and is
+            # simply called with each drafted position's context.
+            pure = [
+                p
+                for p in processors
+                if getattr(type(p), "speculation_context_pure", False)
+            ]
+            for processor in processors:
+                if processor in pure:
+                    continue
+                plan = processor.speculation_plan(draft_list)
+                limit = min(limit, len(plan))
+                masks = (
+                    plan[:limit]
+                    if not masks
+                    else [m + q for m, q in zip(masks[:limit], plan[:limit])]
+                )
+            for j in range(1, limit + 1):
+                row = logits[j : j + 1]
+                if pure:
+                    context_j = mx.concatenate(
+                        [context, mx.array(draft_list[:j], dtype=context.dtype)]
+                    )
+                    for processor in pure:
+                        row = processor(context_j, row)
+                ids = masks[j - 1] if masks else ()
+                if ids:
+                    row = mx.array(row)
+                    for token_id in ids:
+                        row[0, token_id] = float("-inf")
+                rows.append(row)
+            logits = mx.concatenate(rows, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampler = (
+            batch.samplers[0] if batch.samplers else None
+        ) or batch.fallback_sampler
+        targets = mx.concatenate(
+            [sampler(logprobs[j : j + 1]) for j in range(logprobs.shape[0])], axis=0
+        )
+        if mtp.overlap:
+            mx.async_eval(targets, drafts)
+        else:
+            mx.eval(targets, drafts)
+    except Exception:
+        _REC["active"] = False
+        _restore(cache, snap)
+        if ctx_size is not None:
+            batch._token_context[0]._size = ctx_size
+        state.hidden = None
+        state.drafter_ready = False
+        raise
+
+    pending = _Pending()
+    pending.b = b
+    pending.b_logprobs = batch._next_logprobs[0] if batch._next_logprobs else None
+    pending.snap = snap
+    pending.ctx_size = ctx_size
+    pending.block = block
+    pending.drafts = drafts
+    pending.draft_list = draft_list
+    pending.h = h
+    pending.logprobs = logprobs
+    pending.targets = targets
+    pending.limit = limit
+    pending.processors = processors
+    state.pending = pending
+    if enqueue:
+        state.queue.append((b, pending.b_logprobs, False))
+    mtp.seconds["launch"] += time.perf_counter() - tic
+
+
+def _complete(batch: Any, state: _BatchState) -> None:
+    """Finish the launched round: accept walk, rollback, next pending token.
+    Only called once the round's first token has been returned."""
+    mtp, lm, drafter = state.mtp, state.mtp.lm, state.mtp.drafter
+    p = state.pending
+    cache = batch.prompt_cache
+    block = p.block
+    tic = time.perf_counter()
+    target_list = p.targets.tolist()  # waits for the round
+    mtp.seconds["wait"] += time.perf_counter() - tic
+    draft_list = p.draft_list
+    if draft_list is None:
+        draft_list = p.drafts[0].tolist() if block > 1 else []
 
     accepted = 0
-    while accepted < limit and draft_list[accepted] == target_list[accepted]:
+    while accepted < p.limit and draft_list[accepted] == target_list[accepted]:
         accepted += 1
     new_tokens = draft_list[:accepted] + [int(target_list[accepted])]
     keep = accepted + 1
+    drafter.accept_verified_tokens(
+        p.h, p.drafts, accepted, new_tokens, _greedy, mx.int32, greedy=True
+    )
+    # Nothing below can fail: the round is committed from here on.
+    state.pending = None
     if keep < block:
         _rollback(cache, block, keep)
         mtp.count("rollbacks")
-
-    drafter.accept_verified_tokens(
-        h, drafts, accepted, new_tokens, _greedy, mx.int32, greedy=True
-    )
-    state.hidden = h[:, accepted : accepted + 1, :]
-    state.round_h = h
+    state.hidden = p.h[:, accepted : accepted + 1, :]
+    state.round_h = p.h
     state.kept = keep
-    state.queue = deque((int(draft_list[j]), logprobs[j]) for j in range(accepted))
-    if processors and accepted:
-        batch._token_context[0].update_and_fetch(mx.array(draft_list[:accepted]))
-
-    next_tokens = mx.array([new_tokens[-1]], dtype=current_tokens.dtype)
-    mx.eval(
-        state.hidden,
-        next_tokens,
-        [a for a in drafter.draft_eval_state() if a is not None],
+    state.queue.extend(
+        (int(draft_list[j]), p.logprobs[j], True) for j in range(accepted)
     )
-    # Nothing below can fail: the batch is only touched once the round is done.
-    batch._current_tokens = current_tokens
-    batch._current_logprobs = current_logprobs
-    batch._next_tokens = next_tokens
-    batch._next_logprobs = [logprobs[accepted]]
-    batch.tokens[0].append(b)
+    if p.processors and accepted:
+        batch._token_context[0].update_and_fetch(mx.array(draft_list[:accepted]))
+    dtype = batch._next_tokens.dtype
+    batch._current_tokens = mx.array([p.b], dtype=dtype)
+    batch._current_logprobs = [p.b_logprobs]
+    batch._next_tokens = mx.array([new_tokens[-1]], dtype=dtype)
+    batch._next_logprobs = [p.logprobs[accepted]]
 
     with mtp.lock:
         c = mtp.counters
@@ -627,4 +784,32 @@ def _round(batch: Any, state: _BatchState, processors: Optional[List[Any]]):
             mtp.consecutive_errors = 0
         else:
             c["bootstrap_rounds"] += 1
-    return [b], current_logprobs
+
+
+def _complete_or_recover(batch: Any, state: _BatchState) -> None:
+    """Complete the launched round. If that fails, its first token is already
+    out, so undo the round and verify that token alone, without the drafter;
+    an error there is a real engine error and propagates."""
+    p = state.pending
+    try:
+        _complete(batch, state)
+        return
+    except Exception as e:  # noqa: BLE001 - decode must continue
+        _note_failure(state.mtp, "round", e)
+    state.pending = None
+    _restore(batch.prompt_cache, p.snap)
+    if p.ctx_size is not None:
+        batch._token_context[0]._size = p.ctx_size
+    state.hidden = None
+    state.drafter_ready = True  # block 1 never touches the drafter...
+    _launch(batch, state, p.processors, max_block=1, enqueue=False)
+    q = state.pending
+    state.pending = None
+    token = int(q.targets.tolist()[0])
+    dtype = batch._next_tokens.dtype
+    batch._current_tokens = mx.array([q.b], dtype=dtype)
+    batch._current_logprobs = [q.b_logprobs]
+    batch._next_tokens = mx.array([token], dtype=dtype)
+    batch._next_logprobs = [q.logprobs[0]]
+    state.forget()  # ...and it restarts cold on the next round
+    state.mtp.count("bootstrap_rounds")
