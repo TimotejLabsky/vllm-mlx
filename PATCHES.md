@@ -4373,3 +4373,32 @@ Drafter counters for that run: 2,056 rounds, 78.5% accepted, 0 errors, 0 bypasse
 **Not verified.** SSD-tier restore after a restart of a drafter-written entry (the store path is unchanged and the entry is the plain state, but it was not exercised). Concurrent load beyond the two-request unit test. A real agent session. Memory admission does not count the drafter (~0.5 GB weights; peak was 29.0 GB short and 39.1 GB at 62K in the spike).
 
 **Rebase notes.** `_recording_gdn_call` copies mlx-lm 0.32.2's `GatedDeltaNet.__call__`; `test_160_recording_forward_matches_mlx_lm` fails if that layer changes. `test_160_text_mtp_is_hooked_and_guards_the_cache` pins the scheduler hook and the four wrapped methods.
+
+## 161. `patch: text-mtp-round-overhead` — the text-path drafter stops paying 24 GPU round trips per round; rounds launch early
+
+**Files:** `vllm_mlx/text_mtp.py`, `tests/test_text_mtp_160.py`.
+
+**Why.** #160 gave +10..18% on text on the real server where the offline spike gave +25..28%. Measured cause, in order of size:
+
+1. **A per-round cache-shape check that read one scalar per recurrent layer off the GPU** (`left_padding.max().item()`, 24 round trips on the 27B, ~6-8 ms per round). Its answer cannot change while one request decodes alone, so it is now asked once per request (`_BatchState.cache_ok`, cleared by `forget()`).
+2. **Rounds did not overlap with emission.** A round is now *launched* (`mx.async_eval`) as soon as its first token is known and *completed* when its results are needed; the previous round's tokens are returned by host-only steps meanwhile. This is worth only ~2%: on a graph this size `async_eval` spends nearly all of the GPU time inside the submit call (70.0 ms launch, 1.6 ms wait per round), so there is little to overlap. Kept because it costs nothing and removes the end-of-request over-draft (below). `VLLM_MLX_TEXT_MTP_OVERLAP=0` restores the blocking launch for A/B.
+
+**Also.** A round is capped to the tokens the request may still return, so a `max_tokens` finish no longer needs a rollback. `get_mtp_stats()` gains `ms_per_round` (`launch`, `wait`, `between_steps`, `step`) and `overlap`.
+
+**Undo paths with a launched round.** `_sync` (before `extract_cache` / `filter` / `extend`) now has three cases: a launched round whose first token was not returned yet is discarded from a zero-copy snapshot (which also carries the previous round's recorded states); one whose first token is already out is completed and its accepted drafts dropped; accepted drafts still queued are rolled back as before. A completion that fails after its first token went out undoes the round and verifies that token alone, without the drafter.
+
+**Measured (Studio, 27B-8bit, production flags, spare port; `reports/mtp-drafter-2026-11-16/step4-patch161/`).**
+
+| Test | No drafter | #160 | #161 | vs no drafter |
+|---|---|---|---|---|
+| code / prose, 600 tok (5 runs) | 19.0-19.3 | 20.9-22.7 | 22.7-25.2 | +20..32% |
+| tool calls (3 runs) | 19.4 | 23.5-24.4 | 25.1-25.9 | +30..33% |
+
+Round: 72.7 ms in the step + 1.75 ms between steps, against an ideal of ~67 ms (body 2 positions 59.5, head+argmax 2.5, drafter forward+argmax 3.2, sampler 1.8, log-softmax 0.3). Under 10% left in overhead.
+
+**Refuted in the same session (do not re-propose without new evidence).**
+- *Two drafts per round on the server:* 20.4-24.3 tok/s, worse than one (acceptance 62%, round 97 ms).
+- *Drafting with two concurrent requests.* Forward cost relative to a plain 1x1 step (55 ms): 1x2 = x1.12, 2x1 = x1.20, 2x2 = x1.83, 2x3 = x2.57, 4x1 = x2.12. The second position is +12% for one request and +53% for two, so with ~78% acceptance a drafted pair yields ~29 tok/s aggregate against 30 for plain batching (per-row ragged accept would reach ~32, +6%, for a lot of machinery). The `concurrent_batch` bypass is the right behaviour. Plain batching itself is good on 8-bit: 30 positions/s at B=2, 34 at B=4, against 18 single.
+- *CPU parallelism / the drafter's head as the bottleneck:* the head is 2.5 ms and the drafter 3.2 ms; decode is the 59.5 ms body on the GPU.
+
+**Correctness.** `scripts/fork/e2e_text_mtp.py` on this build: 7/7 (answers identical cold / warm / follow-up with and without the drafter; a drafter-written SSD entry restores after a restart). `tests/test_text_mtp_160.py` 60 tests: adds a stop-token sweep over ten positions with a check that it reaches all three undo paths, a failure after the forward inside a launch, the length-finish cap, overlap off. Mutation-checked: 17 of 17 single-line breaks fail a test. Suite 5467 passed / 32 skipped / 30 deselected.

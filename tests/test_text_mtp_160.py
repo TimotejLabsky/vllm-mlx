@@ -217,27 +217,28 @@ def test_160_tokens_and_cache_match_plain_decoding(model, block, max_tokens):
         assert stats["rollbacks"] > 0
 
 
-def test_160_finish_inside_a_round_rolls_the_cache_back(model):
-    """max_tokens lands while verified tokens are still queued: the cache at
-    finish must not contain them."""
+def test_160_length_finish_never_drafts_past_max_tokens(model):
+    """(#161) A round is capped to the tokens the request may still return,
+    so a length finish needs no rollback - and the cache is still exact."""
     ref = _run(model, 40)[0][0]
-    hit = False
-    for max_tokens in range(4, 16):
+    for max_tokens in range(1, 16):
         plain = _run(model, max_tokens)
-        tokens, caches, _, mtp = _run(
+        tokens, caches, reasons, mtp = _run(
             model, max_tokens, ref=ref, block=4, wrong_every=0
         )
-        assert tokens[0] == plain[0][0]
+        assert tokens[0] == plain[0][0] and reasons[0] == "length"
         assert _max_diff(caches[0], plain[1][0]) < TOL
-        hit = hit or mtp.stats()["sync_rollbacks"] > 0
-    assert hit
+        assert mtp.stats()["sync_rollbacks"] == 0
 
 
-def test_160_stop_token_inside_a_round(model):
+@pytest.mark.parametrize("stop_index", range(4, 14))
+def test_160_stop_token_inside_a_round(model, stop_index):
+    """The stop token lands on a first token or on an accepted draft, with
+    further drafts and an already launched round behind it (#161): all of
+    that must be undone before the cache is handed back."""
     ref = _run(model, 40)[0][0]
-    stop_at = ref[9]
     global STOP
-    saved, STOP = STOP, stop_at
+    saved, STOP = STOP, ref[stop_index]
     try:
         plain_tokens, plain_caches, plain_reasons, _ = _run(model, 40, stop=True)
         tokens, caches, reasons, _ = _run(
@@ -248,6 +249,42 @@ def test_160_stop_token_inside_a_round(model):
     assert plain_reasons[0] == "stop" and reasons[0] == "stop"
     assert tokens[0] == plain_tokens[0]
     assert _max_diff(caches[0], plain_caches[0]) < TOL
+
+
+def test_160_stop_sweep_reaches_every_undo_path(model):
+    """The sweep above only means something if it produces: a stop on a first
+    token, a stop on a draft with drafts still queued, and a launched round
+    whose first token was / was not returned yet."""
+    seen = set()
+    real_sync = text_mtp._sync
+
+    def spy(batch):
+        state = getattr(batch, "_text_mtp", None)
+        if state is not None and (state.pending is not None or state.queue):
+            seen.add(
+                (
+                    state.pending is not None,
+                    bool(state.queue) and not state.queue[-1][2],
+                    sum(1 for item in state.queue if item[2]) > 0,
+                )
+            )
+        return real_sync(batch)
+
+    ref = _run(model, 40)[0][0]
+    global STOP
+    saved = STOP
+    text_mtp._sync = spy
+    try:
+        for stop_index in range(4, 14):
+            STOP = ref[stop_index]
+            _run(model, 40, ref=ref, block=4, wrong_every=0, stop=True)
+    finally:
+        STOP = saved
+        text_mtp._sync = real_sync
+    # (round launched, its first token still queued, drafts queued)
+    assert (True, True, True) in seen
+    assert (True, True, False) in seen
+    assert (True, False, False) in seen
 
 
 @pytest.mark.parametrize("budget", [0, 2, 5, 11, 1000])
@@ -507,3 +544,35 @@ def test_160_dry_is_applied_at_drafted_positions(model, block):
     stats = mtp.stats()
     assert stats["bypass_counts"]["logits_processors"] == 0
     assert stats["accepted"] > 20 and stats["errors"] == 0
+
+
+def test_160_failure_after_the_forward_inside_a_launch(model, monkeypatch):
+    """(#161) A launch that fails after its forward advanced the cache must
+    put the cache back before the plain step runs."""
+    plain_tokens, plain_caches, _, _ = _run(model, 40)
+    real_head = text_mtp._head
+    calls = {"n": 0}
+
+    def flaky_head(lm, hidden):
+        calls["n"] += 1
+        if calls["n"] % 5 == 3:
+            raise RuntimeError("head exploded")
+        return real_head(lm, hidden)
+
+    monkeypatch.setattr(text_mtp, "_head", flaky_head)
+    tokens, caches, _, mtp = _run(model, 40, ref=plain_tokens[0], wrong_every=0)
+
+    assert tokens[0] == plain_tokens[0]
+    assert _max_diff(caches[0], plain_caches[0]) < TOL
+    stats = mtp.stats()
+    assert stats["errors"] > 2 and stats["accepted"] > 0
+    assert stats["disabled"] is False
+
+
+def test_160_overlap_off_gives_the_same_stream(model, monkeypatch):
+    plain_tokens, plain_caches, _, _ = _run(model, 40)
+    monkeypatch.setenv(text_mtp.ENV_OVERLAP, "0")
+    tokens, caches, _, mtp = _run(model, 40, ref=plain_tokens[0])
+    assert mtp.overlap is False
+    assert tokens[0] == plain_tokens[0]
+    assert _max_diff(caches[0], plain_caches[0]) < TOL
