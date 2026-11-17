@@ -4323,3 +4323,53 @@ Streaming hard-coded `end_turn`/`tool_use` and never reported `input_tokens`, so
 **Not yet verified:** no real-server run. The drafter weights are only on the Studio; the check is `--mllm --mllm-draft-model ... --mllm-draft-kind mtp` on a spare port with the production thinking budget, expecting `attempted` >> `bypass_counts.logits_processors` and `errors == 0`.
 
 **Scope.** This makes the existing `--mllm` path work; it does not make it the right route. That path has no usable prefix cache for this model (99 s per 21K turn against 0.9 s on the text route) and decodes ~20% slower than the text route before any drafter. The drafter on the cached text path is separate work, gated on a Studio spike.
+
+## 160. `patch: text-mtp-drafter` — external MTP drafter on the text path, where the cache works
+
+**Files:** `vllm_mlx/text_mtp.py` (new, fork-owned), `vllm_mlx/scheduler.py` (one hook line in `_create_batch_generator`), `vllm_mlx/constrained/thinking_processor.py` (`speculation_plan`, `disable_feeds`), `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`.
+
+**What.** `VLLM_MLX_TEXT_MTP_DRAFTER=<repo>` arms a drafter head (`mlx-community/Qwen3.8-27B-MTP-8bit`, loaded through mlx-vlm) on the BatchedEngine text route. Each round the head proposes the next token(s) from the target's last hidden state and the target verifies them in one forward. `VLLM_MLX_TEXT_MTP_BLOCK` sets verified positions per round (default 2 = one draft). Off unless the env is set; nothing is patched in a process without it.
+
+**Why here and not `--mllm` (#159).** That route has no usable prefix cache for this model (99 s per 21K turn against under 1 s) and decodes ~20% slower before any drafter.
+
+**Design.**
+- *Transactional rollback.* The verify forward records the GatedDeltaNet state after every position (`_recording_gdn_call`: mlx-lm's layer body with the recurrence stepped per position, projections still batched), so a partial accept selects a state. No snapshot copy, no target re-run. KV layers are trimmed. The fork's `--mllm` drafter replays a full target forward on every reject.
+- *The cache never shows an unemitted token.* `GenerationBatch.next()` returns one token per call, so a round can leave the cache up to `block - 1` verified tokens ahead. `extract_cache`, `filter` and `extend` are wrapped to roll the cache (and the processor token context) back to the emitted position first. A finish by `max_tokens`, a stop token or a stop string therefore stores the state plain decoding would.
+- *Processors.* The thinking-budget processor runs for real on the first verified position and reports the rest with `speculation_plan` (exact: the phase machine on a copy of its state). The accept walk stops where the processor would force a token. `note_generated` feeds are switched off for the request, since their one-token-lag bookkeeping does not hold with multi-token steps. Any other processor (DRY, structured output) bypasses the round.
+- *Single stream.* More than one row in the batch takes the plain step (counted).
+- *Failure.* A failing round restores the cache from a zero-copy snapshot and takes the plain step; 8 consecutive failures disable the drafter with one ERROR line.
+
+**Measured (M1 Ultra, 27B-8bit, mlx 0.32.4 / mlx-lm 0.32.2 / mlx-vlm 0.7.12; data in `reports/mtp-drafter-2026-11-16/`).**
+
+Offline spike on the text model, 342 runs (`step2-text-spike/summary.txt`), one draft per round, cold drafter:
+
+| Context | Greedy | Production sampler |
+|---|---|---|
+| short | +24..53% | +25..28% |
+| 21K | +27..34% | +24..29% (one prose baseline stalled; excluded) |
+| 62K | +11..15% | +4..13% |
+
+Two and three drafts per round are no better at short context and worse at 62K. A drafter KV prefilled from prompt hidden states adds 3-8 points, but those states do not exist on a cache hit, so it is not built. **4-bit pair: a loss** (-6..-35%, one +13..15% cell): plain 4-bit decode is ~32 tok/s and the verify pass is not cheap enough. Keep it off the 4-bit route.
+
+Real server, production text-route flags, spare port, one run each (`step3-patch160-real-server/`):
+
+| Test | No drafter | Drafter | Change |
+|---|---|---|---|
+| code / prose, 600 tok | 19.0-19.3 | 20.9-22.7 | +10..18% |
+| tool calls | 19.4 | 23.5-24.4 | +22..25% |
+| decode at 21K | 17.2-17.5 | 20.8-22.1 | +22..26% |
+| 21K warm turn / new conversation TTFT | 0.74 s / 0.60 s | 0.92 s / 0.60 s | cache hits kept |
+
+Drafter counters for that run: 2,056 rounds, 78.5% accepted, 0 errors, 0 bypasses, 5 finish-time rollbacks.
+
+**The server gets less than the spike** (+10..26% against +24..34%). Plain decoding overlaps host work with the next forward (`mx.async_eval`); a round blocks on the verify and the queued tokens are returned by host-only steps. Launching the next round while the queue drains should recover it. Not built.
+
+**Correctness.**
+- Spike, real model: every greedy run matched plain decoding token for token (300/300, 8-bit and 4-bit), and all 48 cache comparisons against a one-token-at-a-time run showed zero difference. A deliberately wrong rollback gives 0.24 relative difference and diverges at token 68.
+- Real server: both T=0 answers identical to the no-drafter run.
+- `tests/test_text_mtp_160.py`, 46 tests on mlx-lm's real `BatchGenerator` with a tiny random Qwen3.5 and an oracle drafter that is wrong every third draft: tokens and finish-time cache equal plain decoding for block 2/3/4, finish inside a round, stop token inside a round, thinking budgets 0/2/5/11/1000, a second request joining mid-round, a drafter failing before and after the verify. Mutation-checked: 13 of 14 single-line breaks fail a test; the survivor (re-adding the verified positions to a non-positive `left_padding` counter) changes nothing observable.
+- Suite 5453 passed / 32 skipped / 30 deselected.
+
+**Not verified.** SSD-tier restore after a restart of a drafter-written entry (the store path is unchanged and the entry is the plain state, but it was not exercised). Concurrent load beyond the two-request unit test. A real agent session. Memory admission does not count the drafter (~0.5 GB weights; peak was 29.0 GB short and 39.1 GB at 62K in the spike).
+
+**Rebase notes.** `_recording_gdn_call` copies mlx-lm 0.32.2's `GatedDeltaNet.__call__`; `test_160_recording_forward_matches_mlx_lm` fails if that layer changes. `test_160_text_mtp_is_hooked_and_guards_the_cache` pins the scheduler hook and the four wrapped methods.

@@ -41,7 +41,7 @@ inside mlx's Metal kernels:
 
 | # | Lever | Verdict | When / where measured |
 |---|---|---|---|
-| 1 | Speculative decode / MTP | 0.5–0.76× on chat; 2026-09-02 re-test: DFlash2 is the first >1× on M1 (code 1.14×, math 1.30×) but chat 0.82× + integration cost → do not build. Flips positive only on M5-class silicon | 2026-06-24, re-measured 2026-09-02 |
+| 1 | Speculative decode / MTP (draft MODEL, native head) — **superseded for the 8-bit 27B by the 2026-11-16 entry below: an external MTP head with transactional rollback is +10..26% on the real server** | 0.5–0.76× on chat; 2026-09-02 re-test: DFlash2 is the first >1× on M1 (code 1.14×, math 1.30×) but chat 0.82× + integration cost → do not build. Flips positive only on M5-class silicon | 2026-06-24, re-measured 2026-09-02 |
 | 2 | Continuous batching as a *speed* lever | ~1.2× aggregate ceiling (MLX decode not memory-bound at 4-bit/8–35B). Deployed fleet-wide for capacity/multiplexing, not speed | 2026-06-24 |
 | 3 | KV-quant 4-bit | quality/speed loss at fleet shapes. Caveat: verdict predates fused-kernel approaches; see mlx-qsdpa in the watch list before ever re-opening | 2026-06 |
 | 4 | GQA-8 two-pass attention (mlx #4077) | NULL on M1 Ultra (−0.14% at n=6); 27B-4bit is GQA-6 and can't even exercise it | 2026-08-31 |
@@ -386,3 +386,14 @@ All on the Studio (M1 Ultra 64 GB, macOS 27.0.1, mlx 0.32.2), spare port
 The 8-stream gap is row-fused decode, which starts at 6+ rows (oMLX #4977). It also explains why it does not show at 4. Our route logs since October never show more than 4 running (27B-4bit: 1,085 samples at 1, 46 at 2, 10 at 3, 1 at 4; 35B, 14B: 1 only), so it pays nothing today, and mlx #4712 / #4728, already merged, bring M1–M4 row kernels with the next release. Do not build it. Worth a check after mlx 0.32.5: whether it also shifts the "~1.2× batching ceiling" (lever 2), which was measured before these kernels.
 
 Remaining small gaps: serial +3.7 % and cold prefill −7 % on this model. Not investigated; this is a single 9B result, so do not generalise it to the MoE routes. oQ quantisation (#4930) is untested here: it needs a requant and a quality run.
+
+### 2026-11-16/17 — external MTP drafter head on the 27B-8bit: SHIPPED as #160 (text path), 4-bit REFUTED
+
+Full write-up in PATCHES.md #159/#160; data in `reports/mtp-drafter-2026-11-16/`.
+
+- **What changed since lever #1 was refuted.** Not the hardware. A 457 MB drafter *head* (`Qwen3.8-27B-MTP-8bit`) costs almost nothing per draft, and on the 8-bit weights a 2-position verify forward is far from 2x a 1-position one. A separate draft *model* is still a loss.
+- **Text model, offline, 342 runs:** one draft per round +24..34% up to 21K context, +4..15% at 62K. More drafts per round do not help.
+- **Real server, production flags:** +10..18% text, +22..25% tool calls, +22..26% at 21K, cache hits unchanged. The gap to the offline number is lost host/GPU overlap (plain decode pipelines with `mx.async_eval`); open follow-up.
+- **4-bit pair: loss** (-6..-35%). Plain 4-bit decode is ~32 tok/s; the verify is not cheap enough there. Do not enable on 4-bit routes.
+- **T=0 output is unchanged** with the mlx-lm text model (300/300 tokens, zero cache difference). The byte divergence seen with raw mlx-vlm comes from its own states-emitting kernel, not from speculation as such.
+- **Method notes.** A model-free equivalence test with a tolerance needs a negative control (a wrong rollback is 0.24 off, float noise is 5e-6). A few runs stalled to 2-5 tok/s in plain and speculative decoding alike; read min/max, not only means.
