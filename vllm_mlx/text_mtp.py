@@ -72,6 +72,73 @@ def _block_size() -> int:
         return 2
 
 
+# --------------------------------------------------------------------------
+# memory admission (#162)
+# --------------------------------------------------------------------------
+_weight_bytes_cache: Dict[str, int] = {}
+
+
+def _drafter_weight_bytes(path: str) -> int:
+    """Size of the drafter's weights on disk (what loading adds to active
+    memory). 0 when it cannot be resolved offline - the guard fails open."""
+    if path in _weight_bytes_cache:
+        return _weight_bytes_cache[path]
+    total = 0
+    try:
+        local = path
+        if not os.path.isdir(local):
+            from huggingface_hub import snapshot_download
+
+            local = snapshot_download(
+                path, local_files_only=True, allow_patterns=["*.safetensors"]
+            )
+        total = sum(
+            os.path.getsize(os.path.join(local, name))
+            for name in os.listdir(local)
+            if name.endswith(".safetensors")
+        )
+    except Exception:  # noqa: BLE001 - pricing must never block a request
+        logger.debug("[text-mtp] drafter weight size unavailable", exc_info=True)
+    _weight_bytes_cache[path] = total
+    return total
+
+
+def _round_state_bytes(model: Any, block: int) -> int:
+    """Recurrent states one round keeps until the next: one float32 state per
+    verified position per recurrent layer, plus the copy a rollback makes."""
+    lm = getattr(model, "language_model", model)
+    layers = getattr(getattr(lm, "model", None), "layers", None) or []
+    per_position = 0
+    for layer in layers:
+        m = getattr(layer, "linear_attn", None)
+        if m is not None:
+            per_position += (
+                int(m.num_v_heads) * int(m.head_v_dim) * int(m.head_k_dim) * 4
+            )
+    return per_position * (block + 1)
+
+
+def admission_extra_bytes(scheduler: Any) -> float:
+    """What a request that will decode alone adds to active memory because
+    the drafter runs, beyond its own KV: the drafter's weights if they are
+    not loaded yet (they load on the first drafted round, AFTER the admission
+    check), and one round's recorded recurrent states. 0 without the env or
+    once the drafter is disabled. On the 27B-8bit: 451 MB + 453 MB."""
+    path = drafter_path()
+    if path is None:
+        return 0.0
+    mtp = getattr(scheduler, "_text_mtp", None)
+    if mtp is not None and mtp.disabled_reason is not None:
+        return 0.0
+    loaded = mtp is not None and mtp.drafter is not None
+    block = mtp.block if mtp is not None else _block_size()
+    try:
+        states = _round_state_bytes(getattr(scheduler, "model", None), block)
+    except Exception:  # noqa: BLE001
+        states = 0
+    return float((0 if loaded else _drafter_weight_bytes(path)) + states)
+
+
 class TextMTP:
     """Per-scheduler drafter and counters; survives generator re-creation."""
 

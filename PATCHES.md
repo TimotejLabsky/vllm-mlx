@@ -4422,3 +4422,23 @@ Round: 72.7 ms in the step + 1.75 ms between steps, against an ideal of ~67 ms (
 - **Live route log since the deploy:** no traceback, no warning beyond the two startup notices, 27 stores and 4 SSD spills, no pressure eviction.
 
 Still open: memory admission does not count the drafter (measured +0.45 GB peak at 62K).
+
+## 162. `patch: text-mtp-admission` — the solo admission check prices the drafter
+
+**Files:** `vllm_mlx/text_mtp.py` (`admission_extra_bytes`), `vllm_mlx/batched_system_kv.py` (`solo_prefill_verdict` hook, 3 lines), `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`.
+
+**Gap.** Admission here is measured: `mx.get_active_memory()` plus a projected need (#105/#150). Two things the text-path drafter (#160) adds were in neither:
+
+- **Its weights.** They load on the first drafted round, which is after the first request's solo verdict. 451 MB on the 27B-8bit (239 MB for the 4-bit drafter).
+- **One round's recorded recurrent states**, kept until the next round: one float32 state per verified position per recurrent layer plus the copy a rollback makes. 48 layers x 3 x 3.1 MB = 453 MB on the 27B at block 2.
+
+Together ~0.9 GB for the first request after a route load and ~0.45 GB for every later one, against a wall the 2026-10-23 incident put at ~62 GB.
+
+**Fix.** `text_mtp.admission_extra_bytes(scheduler)` returns weights-if-not-loaded (safetensors size on disk, resolved offline, cached) plus the round states (from the model's layer geometry and the block size); the solo hook adds it to `extra_bytes` and names it in the guard's log line (`+ 0.9 GB drafter`). 0 without the env or once the drafter is disabled; an unresolvable weight size prices only the states. Co-batch admission is unchanged: the drafter does not run with more than one row.
+
+**Verification.**
+- Real model on the Studio (27B-8bit, `adm_check.py` in `reports/mtp-drafter-2026-11-16/step5-verification/`): priced 451 MB weights + 453 MB states = 904 MB before load; loading the drafter added exactly 451 MB to active memory; 453 MB priced after.
+- `test_162_admission_prices_unloaded_weights_and_round_states`, `test_162_admission_is_zero_without_the_env_and_fails_open`, and `test_162_solo_admission_hands_the_drafter_bytes_to_the_guard` (invariants: a spy guard receives the bytes and the detail string).
+- Suite 5470 passed / 32 skipped / 30 deselected.
+
+**Not verified.** A forced-ceiling run showing a request shed or rejected because of this term; the arithmetic is the guard's own (#105), only its input changed.
