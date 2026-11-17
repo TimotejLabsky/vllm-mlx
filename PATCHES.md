@@ -4482,3 +4482,13 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 **Cost.** One full-chain write per DELTA tokens of growth (at 16384: a 100K session writes ~6 chains of 4-7 GB, older ones evicted by the tier's LRU) through the existing writer (idle windows, or after 30 s if memory allows; backlog cap unchanged).
 
 **Verification.** `test_164_a_grown_chain_spills_past_the_delta_and_restores_exactly` (four grown turns, restart, the promoted chain is >= 700 of 800 tokens and restores bit-exactly), `test_164_off_by_default_grown_chains_do_not_spill`, `test_164_segmented_layer_round_trips_through_the_ssd_format`.
+
+## 165. `patch: turn-hold` — an agent's next turn goes before background work queued during its last one
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`note_turn_finished`, `_turn_hold_pick`, `next_admission`), `tests/test_fork_invariants.py`.
+
+**Why.** 2026-11-17 on the 27B-8bit: the feed curator and invoice parser send 0.3-4K-token requests every few minutes. They cannot share a batch with an 80K opencode turn (padding a 3K row to 80K costs ~5 GB, over `PAD_WASTE_MB`), so they wait for it - and are admitted in the 1-5 s gap before opencode's next turn arrives (its tool execution time). That turn then waited for them: 17-73 s per turn, 5 of 6 turns in one session. SJF (#131) cannot help: when the gap opens the agent's turn has not arrived yet.
+
+**Fix.** `VLLM_MLX_BATCHED_TURN_HOLD_S=<seconds>` (default 0 = off) and `VLLM_MLX_BATCHED_TURN_HOLD_MIN_TOKENS` (default 16384). When a turn of at least that many tokens (prompt + output) finishes normally with nothing else running, for up to HOLD_S only a request that arrived after it and shares at least half of its chain is admitted; it goes first, then the hold ends. If none arrives the hold expires and admission continues as before, so background work waits at most HOLD_S longer. An aborted turn arms no hold; a hold never applies while something already runs. Stats `turn_holds`, `turn_hold_hits`, `turn_hold_expired`.
+
+**Verification.** `test_165_background_work_waits_for_the_agents_next_turn`, `test_165_hold_expires_and_ignores_unrelated_or_aborted_turns`, `test_165_off_by_default_and_only_when_idle`.

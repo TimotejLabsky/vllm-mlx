@@ -664,6 +664,21 @@ class BatchedSystemKV:
         # 0 = the old behaviour.
         self.spill_grown_delta = _env_int("VLLM_MLX_SSD_SPILL_GROWN_DELTA", 0)
         self.grown_spills = 0
+        # (#165) Turn affinity. An agent sends its next turn 1-5 s after the
+        # previous one finished (tool execution). A background request queued
+        # meanwhile was admitted in that gap and the deep turn then waited
+        # for it: 17-73 s per opencode turn on 2026-11-17. After a turn of at
+        # least TURN_HOLD_MIN_TOKENS finishes with nothing else running, only
+        # a request that continues that chain is admitted for TURN_HOLD_S.
+        # 0 = off.
+        self.turn_hold_s = _env_float("VLLM_MLX_BATCHED_TURN_HOLD_S") or 0.0
+        self.turn_hold_min_tokens = _env_int(
+            "VLLM_MLX_BATCHED_TURN_HOLD_MIN_TOKENS", 16384
+        )
+        self._turn_hold = None  # (finished_at, chain tokens)
+        self.turn_holds = 0
+        self.turn_hold_hits = 0
+        self.turn_hold_expired = 0
 
     @property
     def has_ssd(self) -> bool:
@@ -2047,6 +2062,9 @@ class BatchedSystemKV:
                 "reconcile_ssd_donors": self.reconcile_ssd_donors,
                 "gen_span_registry_size": len(self._gen_spans),
                 "grown_spills": self.grown_spills,
+                "turn_holds": self.turn_holds,
+                "turn_hold_hits": self.turn_hold_hits,
+                "turn_hold_expired": self.turn_hold_expired,
                 "pinned_entries": len(set(self._peeked.values()) & set(self._entries)),
                 "spill_pending_entries": sum(
                     1 for e in self._entries.values() if e.get("spill_pending")
@@ -2364,6 +2382,10 @@ def next_admission(scheduler):
     if not waiting:
         return None
     hybrid_kv = scheduler.hybrid_kv
+    if hybrid_kv is not None:
+        held = _turn_hold_pick(scheduler)
+        if held is not _NO_HOLD:
+            return held
     if hybrid_kv is None or not getattr(hybrid_kv, "admission_sjf", False):
         request = waiting[0]
         if (
@@ -2509,9 +2531,69 @@ def capture_checkpoints(scheduler, prompt_responses) -> None:
             )
 
 
+_ABORTED = {"abort", "aborted", "cancelled", "error"}
+
+
+def note_turn_finished(hybrid_kv: "BatchedSystemKV", request) -> None:
+    """(#165) Arm the turn hold for a deep turn that finished normally."""
+    hold_s = getattr(hybrid_kv, "turn_hold_s", 0)
+    if not isinstance(hold_s, (int, float)) or hold_s <= 0:
+        return  # off, or a test double without the attribute
+    reason = getattr(request, "finish_reason", None)
+    if reason in _ABORTED:
+        return
+    chain = list(getattr(request, "prompt_token_ids", None) or []) + list(
+        getattr(request, "output_token_ids", None) or []
+    )
+    if len(chain) < hybrid_kv.turn_hold_min_tokens:
+        return
+    import time
+
+    hybrid_kv._turn_hold = (time.time(), chain)
+    hybrid_kv.turn_holds += 1
+
+
+_NO_HOLD = object()
+
+
+def _turn_hold_pick(scheduler):
+    """(#165) While a hold is live and nothing runs: the waiting request that
+    continues the held chain, or None (admit nothing yet). ``_NO_HOLD`` when
+    there is no live hold."""
+    hybrid_kv = scheduler.hybrid_kv
+    hold = getattr(hybrid_kv, "_turn_hold", None)
+    if not isinstance(hold, tuple) or scheduler.running:
+        return _NO_HOLD
+    import time
+
+    finished_at, chain = hold
+    if time.time() - finished_at >= hybrid_kv.turn_hold_s:
+        hybrid_kv._turn_hold = None
+        hybrid_kv.turn_hold_expired += 1
+        return _NO_HOLD
+    for request in scheduler.waiting:
+        if getattr(request, "arrival_time", 0) < finished_at:
+            continue  # queued before the turn ended: not its continuation
+        shared = common_prefix_len(list(request.prompt_token_ids), chain)
+        if shared * 2 >= len(chain):
+            scheduler.waiting.remove(request)
+            hybrid_kv._turn_hold = None
+            hybrid_kv.turn_hold_hits += 1
+            logger.info(
+                "[batched_system_kv] turn hold: admitting request=%s, which "
+                "continues the %d-token chain, ahead of %d waiting",
+                request.request_id[:12],
+                len(chain),
+                len(scheduler.waiting),
+            )
+            return request
+    return None
+
+
 def store_finished(hybrid_kv: "BatchedSystemKV", request_id: str, request) -> None:
     """_cleanup_finished hook (#34/#37): store the finished chain (grows
     from its donor when possible) and release the extraction reference."""
+    note_turn_finished(hybrid_kv, request)
     if getattr(request, "_extracted_cache", None) is not None:
         try:
             full_token_sequence = list(request.prompt_token_ids) + list(

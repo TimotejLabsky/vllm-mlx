@@ -3918,3 +3918,72 @@ def test_163_reconcile_after_a_restart_uses_the_ssd_chain(monkeypatch, tmp_path)
         assert request.cache_hit_type == "ssd_pending"
     finally:
         kv2.close()
+
+
+# ------- #165 turn hold: an agent's next turn goes before background work
+
+
+def _hold_queue(monkeypatch, hold_s="5"):
+    sched, kv, add = _sjf_queue(monkeypatch, VLLM_MLX_BATCHED_TURN_HOLD_S=hold_s,
+                                VLLM_MLX_BATCHED_TURN_HOLD_MIN_TOKENS=1000)  # fmt: skip
+    chain = list(range(20_000))
+    finished = SimpleNamespace(
+        prompt_token_ids=chain[:19_000],
+        output_token_ids=chain[19_000:],
+        finish_reason="stop",
+    )
+    return sched, kv, add, chain, finished
+
+
+def test_165_background_work_waits_for_the_agents_next_turn(monkeypatch):
+    """2026-11-17: the feed job queued during an opencode turn was admitted in
+    the 1-5 s gap before opencode's next turn, which then waited 17-73 s."""
+    import time
+
+    sched, kv, add, chain, finished = _hold_queue(monkeypatch)
+    background = add("feed", 800, age=30)  # queued while the turn ran
+    bkv.note_turn_finished(kv, finished)
+
+    assert bkv.next_admission(sched) is None  # held: nothing admitted yet
+    nxt = _queued("turn", chain + [7] * 300)
+    nxt.arrival_time = time.time()
+    sched.waiting.append(nxt)
+
+    assert bkv.next_admission(sched) is nxt
+    assert kv.stats()["turn_hold_hits"] == 1
+    assert bkv.next_admission(sched) is background  # hold released
+
+
+def test_165_hold_expires_and_ignores_unrelated_or_aborted_turns(monkeypatch):
+    import time
+
+    sched, kv, add, chain, finished = _hold_queue(monkeypatch, hold_s="0.05")
+    background = add("feed", 800, age=30)
+    bkv.note_turn_finished(kv, finished)
+    other = _queued("other-client", list(range(50_000, 50_900)))
+    other.arrival_time = time.time()
+    sched.waiting.append(other)
+    assert bkv.next_admission(sched) is None  # not a continuation: held
+
+    time.sleep(0.06)
+    assert bkv.next_admission(sched) in (background, other)
+    assert kv.stats()["turn_hold_expired"] == 1
+
+    sched2, kv2, add2, chain2, finished2 = _hold_queue(monkeypatch)
+    finished2.finish_reason = "abort"
+    bkv.note_turn_finished(kv2, finished2)
+    queued = add2("feed", 800)
+    assert bkv.next_admission(sched2) is queued and kv2.stats()["turn_holds"] == 0
+
+
+def test_165_off_by_default_and_only_when_idle(monkeypatch):
+    sched, kv, add, chain, finished = _hold_queue(monkeypatch, hold_s="0")
+    background = add("feed", 800)
+    bkv.note_turn_finished(kv, finished)
+    assert bkv.next_admission(sched) is background
+
+    sched2, kv2, add2, chain2, finished2 = _hold_queue(monkeypatch)
+    bkv.note_turn_finished(kv2, finished2)
+    sched2.running["co-batched"] = object()  # something already runs
+    queued = add2("feed", 800)
+    assert bkv.next_admission(sched2) is queued
