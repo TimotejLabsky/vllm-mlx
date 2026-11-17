@@ -3782,3 +3782,56 @@ def test_160_text_mtp_is_hooked_and_guards_the_cache():
     src = inspect.getsource(text_mtp._install_class_patches)
     for name in ("_step", "extract_cache", "filter", "extend"):
         assert f"GenerationBatch.{name} = " in src
+
+
+# ------- #162 solo admission prices the text-path drafter
+
+
+def test_162_solo_admission_hands_the_drafter_bytes_to_the_guard(monkeypatch, tmp_path):
+    """The drafter's weights load on the first drafted round, AFTER the solo
+    admission verdict, and every round keeps per-position recurrent states
+    (451 MB + 453 MB on the 27B-8bit). The hook must add both to what it
+    asks the guard to fit."""
+    from vllm_mlx import text_mtp
+
+    (tmp_path / "model.safetensors").write_bytes(b"x" * 5000)
+    text_mtp._weight_bytes_cache.clear()
+    seen = {}
+
+    class SpyKV:
+        def restore_bytes(self, n):
+            return 0.0
+
+        def peek(self, tokens, touch=False):
+            return 0
+
+        def chunk_transient_bytes(self, tokens, prompt_tokens, step):
+            return 0.0
+
+        def solo_prefill_verdict(self, tokens, extra_bytes=0.0, detail=""):
+            seen["extra"], seen["detail"] = extra_bytes, detail
+            return None
+
+    layer = SimpleNamespace(
+        linear_attn=SimpleNamespace(num_v_heads=4, head_v_dim=8, head_k_dim=8)
+    )
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    )
+    scheduler = SimpleNamespace(hybrid_kv=SpyKV(), running={}, model=model, config=None)
+    request = SimpleNamespace(
+        remaining_tokens=None,
+        num_prompt_tokens=100,
+        cache_hit_type=None,
+        prompt_token_ids=[1, 2, 3],
+    )
+
+    monkeypatch.delenv(text_mtp.ENV_DRAFTER, raising=False)
+    assert bkv.solo_prefill_verdict(scheduler, request) is None
+    assert seen["extra"] == 0.0
+
+    monkeypatch.setenv(text_mtp.ENV_DRAFTER, str(tmp_path))
+    monkeypatch.delenv(text_mtp.ENV_BLOCK, raising=False)
+    assert bkv.solo_prefill_verdict(scheduler, request) is None
+    assert seen["extra"] == 5000 + (4 * 8 * 8 * 4) * 3
+    assert "drafter" in seen["detail"]

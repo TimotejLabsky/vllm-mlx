@@ -2150,12 +2150,19 @@ def solo_prefill_verdict(scheduler, request) -> Optional[str]:
             )
         step = getattr(getattr(scheduler, "config", None), "prefill_step_size", None)
         scores = hybrid_kv.chunk_transient_bytes(tokens, prompt_tokens, step)
-        extra = restore + scores
+        # (#162) The text-path drafter: its weights load after this verdict,
+        # and each round keeps per-position recurrent states.
+        from . import text_mtp
+
+        drafter = text_mtp.admission_extra_bytes(scheduler)
+        extra = restore + scores + drafter
         if extra > 0:
             detail = (
                 f" + {restore / 1e9:.1f} GB restore + {scores / 1e9:.1f} GB "
                 f"attention scores at {prompt_tokens} ctx"
             )
+            if drafter > 0:
+                detail += f" + {drafter / 1e9:.1f} GB drafter"
     except Exception:
         logger.debug("[batched_system_kv] solo guard extras failed open", exc_info=True)
         extra, detail = 0.0, ""

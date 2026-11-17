@@ -576,3 +576,53 @@ def test_160_overlap_off_gives_the_same_stream(model, monkeypatch):
     assert mtp.overlap is False
     assert tokens[0] == plain_tokens[0]
     assert _max_diff(caches[0], plain_caches[0]) < TOL
+
+
+def _tiny_scheduler(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    (tmp_path / "model.safetensors").write_bytes(b"x" * 1000)
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setenv(text_mtp.ENV_DRAFTER, str(tmp_path))
+    monkeypatch.delenv(text_mtp.ENV_BLOCK, raising=False)
+    text_mtp._weight_bytes_cache.clear()
+    layers = [
+        SimpleNamespace(
+            linear_attn=SimpleNamespace(num_v_heads=2, head_v_dim=3, head_k_dim=5)
+        ),
+        SimpleNamespace(self_attn=object()),
+        SimpleNamespace(
+            linear_attn=SimpleNamespace(num_v_heads=2, head_v_dim=3, head_k_dim=5)
+        ),
+    ]
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
+    )
+    return SimpleNamespace(model=model)
+
+
+def test_162_admission_prices_unloaded_weights_and_round_states(tmp_path, monkeypatch):
+    scheduler = _tiny_scheduler(tmp_path, monkeypatch)
+    # two recurrent layers x (2*3*5 float32) x (block 2 positions + 1 rollback copy)
+    states = 2 * (2 * 3 * 5 * 4) * 3
+    assert text_mtp.admission_extra_bytes(scheduler) == 1000 + states
+
+    mtp = text_mtp.TextMTP(str(tmp_path))
+    scheduler._text_mtp = mtp
+    assert text_mtp.admission_extra_bytes(scheduler) == 1000 + states
+    mtp.drafter = object()  # loaded: its weights are inside active memory now
+    assert text_mtp.admission_extra_bytes(scheduler) == states
+    mtp.block = 4
+    assert text_mtp.admission_extra_bytes(scheduler) == 2 * (2 * 3 * 5 * 4) * 5
+    mtp.disabled_reason = "broken"
+    assert text_mtp.admission_extra_bytes(scheduler) == 0.0
+
+
+def test_162_admission_is_zero_without_the_env_and_fails_open(tmp_path, monkeypatch):
+    scheduler = _tiny_scheduler(tmp_path, monkeypatch)
+    monkeypatch.setenv(text_mtp.ENV_DRAFTER, str(tmp_path / "missing"))
+    text_mtp._weight_bytes_cache.clear()
+    # unresolvable weights: only the states are priced, nothing raises
+    assert text_mtp.admission_extra_bytes(scheduler) == 2 * (2 * 3 * 5 * 4) * 3
+    monkeypatch.delenv(text_mtp.ENV_DRAFTER)
+    assert text_mtp.admission_extra_bytes(scheduler) == 0.0
