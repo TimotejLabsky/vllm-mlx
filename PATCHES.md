@@ -4481,7 +4481,7 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 **Cost.** One full-chain write per DELTA tokens of growth (at 16384: a 100K session writes ~6 chains of 4-7 GB, older ones evicted by the tier's LRU) through the existing writer (idle windows, or after 30 s if memory allows; backlog cap unchanged).
 
-**Verification.** `test_164_a_grown_chain_spills_past_the_delta_and_restores_exactly` (four grown turns, restart, the promoted chain is >= 700 of 800 tokens and restores bit-exactly), `test_164_off_by_default_grown_chains_do_not_spill`, `test_164_segmented_layer_round_trips_through_the_ssd_format`.
+**Verification.** `test_164_a_grown_chain_spills_past_the_delta_and_restores_exactly` (four grown turns, restart, the promoted chain is >= 700 of 800 tokens and restores bit-exactly), `test_164_off_by_default_grown_chains_do_not_spill`, `test_164_segmented_layer_round_trips_through_the_ssd_format`. Real server (`scripts/fork/e2e_grown_spill_turn_hold.py`, Studio, `Qwen3.5-4B-4bit`, spare port, DELTA=300): four turns, restart over the same SSD dir, turn 5 restored 2,129 of 2,162 tokens; control (DELTA=0) 773, turn 1's chain only.
 
 ## 165. `patch: turn-hold` — an agent's next turn goes before background work queued during its last one
 
@@ -4491,4 +4491,4 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 **Fix.** `VLLM_MLX_BATCHED_TURN_HOLD_S=<seconds>` (default 0 = off) and `VLLM_MLX_BATCHED_TURN_HOLD_MIN_TOKENS` (default 16384). When a turn of at least that many tokens (prompt + output) finishes normally with nothing else running, for up to HOLD_S only a request that arrived after it and shares at least half of its chain is admitted; it goes first, then the hold ends. If none arrives the hold expires and admission continues as before, so background work waits at most HOLD_S longer. An aborted turn arms no hold; a hold never applies while something already runs. Stats `turn_holds`, `turn_hold_hits`, `turn_hold_expired`.
 
-**Verification.** `test_165_background_work_waits_for_the_agents_next_turn`, `test_165_hold_expires_and_ignores_unrelated_or_aborted_turns`, `test_165_off_by_default_and_only_when_idle`.
+**Verification.** `test_165_background_work_waits_for_the_agents_next_turn`, `test_165_hold_expires_and_ignores_unrelated_or_aborted_turns`, `test_165_off_by_default_and_only_when_idle`. Real server (same script, 1 MB co-batch threshold to keep the rows apart as padding does at depth, HOLD_S=6): a background request queued during a turn, the conversation's next turn 1 s after it ended - with the hold the next turn ran first (log `turn hold: admitting`), without it the background request did.
