@@ -3835,3 +3835,86 @@ def test_162_solo_admission_hands_the_drafter_bytes_to_the_guard(monkeypatch, tm
     assert bkv.solo_prefill_verdict(scheduler, request) is None
     assert seen["extra"] == 5000 + (4 * 8 * 8 * 4) * 3
     assert "drafter" in seen["detail"]
+
+
+# ------- #163 generated spans outlive the entries that recorded them
+
+
+def test_163_reconcile_survives_the_donor_being_evicted_before_the_store(monkeypatch):
+    """Live 2026-11-17, opencode on the 27B-8bit: turn 2 matched turn 1's
+    chain and #139 spliced it, but two small background jobs stored in
+    between and the RAM budget evicted turn 1's entry before turn 2's own
+    stores. Those stores could not absorb it, so turn 1's span was forgotten
+    and turn 3 re-prefilled 15,490 tokens from the last checkpoint."""
+    kv = _reconcile_kv(monkeypatch)
+    turn2 = _HEAD + _TEMPLATE + _NEXT
+    request = _queued("turn2", turn2)
+    bkv.fetch_for_request(kv, request)
+    assert request.prompt_token_ids == _HEAD + _MODEL + _NEXT
+
+    kv._entries.clear()  # the RAM budget took turn 1's entry
+    kv.store_prompt_boundary(
+        "turn2", request.prompt_token_ids, _donor_at(len(request.prompt_token_ids))
+    )
+    chain = request.prompt_token_ids + _MODEL
+    kv.store(
+        "turn2", chain, _donor_at(len(chain)), gen_start=len(_HEAD + _MODEL + _NEXT)
+    )
+    assert [e.get("gen_spans") for e in kv._entries.values()] == [
+        [(len(_HEAD + _MODEL + _NEXT), len(chain))]
+    ]  # the entry itself only knows its newest span: that was the bug
+
+    turn3 = _queued("turn3", _HEAD + _TEMPLATE + _NEXT + _TEMPLATE + _NEXT)
+    bkv.fetch_for_request(kv, turn3)
+
+    assert turn3.prompt_token_ids == chain + _NEXT
+    assert turn3.cached_tokens == len(chain)
+    st = kv.stats()
+    assert st["reconcile_registry_spans"] == 1
+    assert st["reconcile_splices"] == 3  # turn 2: 1, turn 3: 2
+
+
+def test_163_registry_only_applies_to_the_chain_it_was_recorded_on(monkeypatch):
+    """A span is keyed by a digest of everything before its end: the same
+    generated tokens after a different history are not the model's output
+    there, and must not be spliced."""
+    kv = _reconcile_kv(monkeypatch)
+    kv._entries.clear()
+    other_head = list(range(2000, 2600))
+    chain = other_head + _MODEL + _NEXT
+    kv.store("other", chain, _donor_at(len(chain)))  # no gen_start: no spans
+    prompt = other_head + _TEMPLATE + _NEXT
+    request = _queued("x", prompt)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == prompt
+    assert kv.stats()["reconcile_splices"] == 0
+
+
+def test_163_reconcile_after_a_restart_uses_the_ssd_chain(monkeypatch, tmp_path):
+    """llama-swap reloads the 27B-8bit route many times a day. After a
+    reload RAM is empty: the chain is on the SSD tier and the spans in the
+    registry file next to it, so the first follow-up turn is still spliced
+    and restores the whole chain from disk."""
+    monkeypatch.setenv("VLLM_MLX_BATCHED_RECONCILE_GENERATED", "1")
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    kv1 = BatchedSystemKV(_FakeModel(), tokenizer=_VocabTok())
+    chain = _HEAD + _MODEL
+    kv1.store("turn1", chain, _donor_at(len(chain)), gen_start=len(_HEAD))
+    kv1.close()  # drain the writer: process exit
+
+    kv2 = BatchedSystemKV(_FakeModel(), tokenizer=_VocabTok())
+    try:
+        assert kv2.stats()["entry_count"] == 0
+        assert kv2.stats()["gen_span_registry_size"] == 1
+        request = _queued("turn2", _HEAD + _TEMPLATE + _NEXT)
+
+        bkv.fetch_for_request(kv2, request)
+
+        assert request.prompt_token_ids == _HEAD + _MODEL + _NEXT
+        st = kv2.stats()
+        assert st["reconcile_ssd_donors"] == 1 and st["reconcile_splices"] == 1
+        assert request.cache_hit_type == "ssd_pending"
+    finally:
+        kv2.close()
