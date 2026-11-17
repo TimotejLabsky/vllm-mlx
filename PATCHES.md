@@ -4402,3 +4402,21 @@ Round: 72.7 ms in the step + 1.75 ms between steps, against an ideal of ~67 ms (
 - *CPU parallelism / the drafter's head as the bottleneck:* the head is 2.5 ms and the drafter 3.2 ms; decode is the 59.5 ms body on the GPU.
 
 **Correctness.** `scripts/fork/e2e_text_mtp.py` on this build: 7/7 (answers identical cold / warm / follow-up with and without the drafter; a drafter-written SSD entry restores after a restart). `tests/test_text_mtp_160.py` 60 tests: adds a stop-token sweep over ten positions with a check that it reaches all three undo paths, a failure after the forward inside a launch, the length-finish cap, overlap off. Mutation-checked: 17 of 17 single-line breaks fail a test. Suite 5467 passed / 32 skipped / 30 deselected.
+
+**#161 verification on the deployed build (2026-11-17, fork `2afd9037`; data in `reports/mtp-drafter-2026-11-16/step5-verification/`).** This closes the "not verified" items of #160/#161.
+
+- **Long context, drafter on vs off** (`scripts/fork/e2e_text_mtp_long_ctx.py`, spare port, production flags, T=0, 400 tokens each):
+
+  | Context | Turn | No drafter | Drafter | Change | TTFT (both) | Text |
+  |---|---|---|---|---|---|---|
+  | 21K | cold | 17.1 tok/s | 23.0 | +35% | 100.4 s | identical |
+  | 21K | warm follow-up | 17.3 | 22.9 | +32% | 0.6 s | identical |
+  | 62K | cold | 14.8 | 20.3 | +37% | 252 s | identical |
+  | 62K | warm follow-up | 15.0 | 19.8 | +32% | 1.0 s | identical |
+
+  Acceptance was 93% on this code-heavy prompt (834 rounds, 0 errors, 88 ms per round at depth), so this is the favourable end; the offline spike's 62K prompts accepted ~80% and gained +4..15% before #161. Peak memory 42.1 GB with the drafter, 41.7 GB without.
+- **Agent session on the live route** (`scripts/fork/live_agent_session.py`, through llama-swap): 12 turns of a tool loop to a correct finish; every follow-up turn a cache hit (TTFT 0.85-2.05 s at 8-9K context); all tool-call arguments valid JSON; decode 20.6-24.4 tok/s, mean 22.2.
+- **Concurrent load on the live route** (`scripts/fork/live_concurrent_load.py`): three staggered waves of four T=0 requests (one with DRY), then one alone. 12/12 answers correct with identical token counts per question in every wave; 67 drafted rounds interleaved with 122 `concurrent_batch` bypasses; the lone request drafted normally (191 rounds); 0 drafter errors, 0 generation recoveries; peak 34.6 GB.
+- **Live route log since the deploy:** no traceback, no warning beyond the two startup notices, 27 stores and 4 SSD spills, no pressure eviction.
+
+Still open: memory admission does not count the drafter (measured +0.45 GB peak at 62K).
