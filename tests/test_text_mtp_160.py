@@ -475,3 +475,35 @@ def test_160_feeds_are_ignored_once_disabled():
         proc.note_generated(token)
     assert proc.state.value == "thinking"
     assert proc.thinking_tokens == 3
+
+
+def _dry_and_thinking(budget):
+    from vllm_mlx.dry_sampler import DRYLogitsProcessor
+
+    def make():
+        return [
+            DRYLogitsProcessor(5.0, allowed_length=1, window=64),
+            *_thinking(budget)(),
+        ]
+
+    return make
+
+
+@pytest.mark.parametrize("block", [2, 4])
+def test_160_dry_is_applied_at_drafted_positions(model, block):
+    """DRY depends only on the token context, so it is called with each
+    drafted position's context instead of switching speculation off."""
+    plain = _run(model, 70, processors=_dry_and_thinking(6))
+    ref = plain[0][0]
+    # DRY really shapes this stream; otherwise the comparison proves nothing.
+    assert ref != _run(model, 70, processors=_thinking(6))[0][0]
+
+    tokens, caches, _, mtp = _run(
+        model, 70, ref=ref, block=block, wrong_every=0, processors=_dry_and_thinking(6)
+    )
+
+    assert tokens[0] == ref
+    assert _max_diff(caches[0], plain[1][0]) < TOL
+    stats = mtp.stats()
+    assert stats["bypass_counts"]["logits_processors"] == 0
+    assert stats["accepted"] > 20 and stats["errors"] == 0
