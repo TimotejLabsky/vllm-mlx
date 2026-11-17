@@ -119,6 +119,11 @@ class DRYLogitsProcessor:
     engine does).
     """
 
+    # (#160) Past the first call the output depends only on ``tokens``, so a
+    # speculative step may call it for a drafted position with that
+    # position's context.
+    speculation_context_pure = True
+
     def __init__(
         self,
         multiplier: float,

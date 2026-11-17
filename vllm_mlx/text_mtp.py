@@ -18,8 +18,9 @@ Design (measured on the Studio 2026-11-16, ``reports/mtp-drafter-2026-11-16``):
   cache back to the emitted position. A cached entry is therefore the same
   state plain decoding produces (the spike measured zero difference).
 * **Single stream only.** With more than one row in the batch the plain step
-  runs; so does it for any logits processor that cannot say what it does to
-  drafted positions (DRY, structured output).
+  runs; so does it for any logits processor that can neither plan its effect
+  on drafted positions (the thinking budget can) nor be called with a drafted
+  position's context (DRY can). Structured output is the one that bypasses.
 
 Enable with ``VLLM_MLX_TEXT_MTP_DRAFTER=<repo or path>``; block size (verified
 positions per round) via ``VLLM_MLX_TEXT_MTP_BLOCK`` (default 2: one draft per round was
@@ -423,7 +424,10 @@ def _bypass_reason(batch: Any, state: _BatchState) -> Optional[str]:
         return "concurrent_batch"
     processors = (batch.logits_processors or [None])[0] or ()
     for p in processors:
-        if not callable(getattr(type(p), "speculation_plan", None)):
+        if not (
+            callable(getattr(type(p), "speculation_plan", None))
+            or getattr(type(p), "speculation_context_pure", False)
+        ):
             return "logits_processors"
     if not mtp.ensure_loaded(batch.model):
         return "disabled"
@@ -538,7 +542,16 @@ def _round(batch: Any, state: _BatchState, processors: Optional[List[Any]]):
             first = processor(context, first)
         rows = [first]
         masks: List[Tuple[int, ...]] = []
+        # Two kinds of processor get here (see _bypass_reason): one that can
+        # plan its effect on drafted positions (thinking budget), and one
+        # whose output depends only on the token context (DRY) and is simply
+        # called with each drafted position's context.
+        pure = [
+            p for p in processors if getattr(type(p), "speculation_context_pure", False)
+        ]
         for processor in processors:
+            if processor in pure:
+                continue
             plan = processor.speculation_plan(draft_list)
             limit = min(limit, len(plan))
             masks = (
@@ -548,7 +561,13 @@ def _round(batch: Any, state: _BatchState, processors: Optional[List[Any]]):
             )
         for j in range(1, limit + 1):
             row = logits[j : j + 1]
-            ids = masks[j - 1]
+            if pure:
+                context_j = mx.concatenate(
+                    [context, mx.array(draft_list[:j], dtype=context.dtype)]
+                )
+                for processor in pure:
+                    row = processor(context_j, row)
+            ids = masks[j - 1] if masks else ()
             if ids:
                 row = mx.array(row)
                 for token_id in ids:
