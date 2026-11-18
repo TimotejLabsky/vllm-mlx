@@ -32,6 +32,7 @@ SimpleEngine stack: ``VLLM_MLX_SYSTEM_KV_SLOTS`` (default 4),
 checkpoint capture; keep aligned with ``prefill_step_size``).
 """
 
+import json
 import logging
 import os
 import re
@@ -353,6 +354,81 @@ def whitespace_aligned_end(tokenizer, tail, tokens, start, max_extra=256):
     return None
 
 
+# (#166) Tool calls whose arguments the client re-rendered in another order.
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
+_FUNCTION_RE = re.compile(r"\s*<function=([^>]*)>(.*)</function>\s*", re.S)
+_PARAM_RE = re.compile(r"<parameter=([^>]*)>(.*?)</parameter>", re.S)
+
+
+def _canonical_call(body: str) -> Optional[str]:
+    """One tool call's body with its arguments in a fixed order, or None
+    when it is not a well-formed call. Two forms: Qwen's XML-style
+    ``<function=f><parameter=k>v</parameter>...</function>`` and Hermes JSON
+    ``{"name": f, "arguments": {...}}``. Argument order carries no meaning to
+    either tool parser; everything else is kept."""
+    text = body.strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return None
+        return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    m = _FUNCTION_RE.fullmatch(text)
+    if m is None:
+        return None
+    params = _PARAM_RE.findall(m.group(2))
+    if _ws_free(_PARAM_RE.sub("", m.group(2))):
+        return None  # text between parameters: not just a reordering
+    params = sorted((_ws_free(k), _ws_free(v)) for k, v in params)
+    return f"<function={_ws_free(m.group(1))}>" + "".join(
+        f"<parameter={k}>{v}</parameter>" for k, v in params
+    )
+
+
+def _tool_canonical(text: str) -> Optional[str]:
+    """``text`` up to whitespace with every complete tool call canonical."""
+    out, pos = [], 0
+    for m in _TOOL_CALL_RE.finditer(text):
+        call = _canonical_call(m.group(1))
+        if call is None:
+            return None
+        out.append(text[pos : m.start()])
+        out.append(f"<tool_call>{call}</tool_call>")
+        pos = m.end()
+    out.append(text[pos:])
+    return _ws_free("".join(out))
+
+
+def tool_order_aligned_end(tokenizer, tail, tokens, start, max_extra=256):
+    """(#166) Like ``whitespace_aligned_end``, but ``tokens[start:j]`` may
+    also list each tool call's arguments in another order. ``tail`` must
+    start at a ``<tool_call>`` and contain one, and both sides must hold the
+    same calls with the same values. None when no such span exists."""
+    target_text = tokenizer.decode(list(tail))
+    if "<tool_call>" not in target_text:
+        return None
+    target = _tool_canonical(target_text)
+    if not target:
+        return None
+    raw_len = len(_ws_free(target_text))
+    slack = max(16, raw_len // 20)  # JSON re-serialisation may re-escape
+    trailing = target_text[len(target_text.rstrip()) :]
+    limit = min(len(tokens), start + len(tail) + max_extra)
+    seen = 0
+    for j in range(start + 1, limit + 1):
+        seen += len(_ws_free(tokenizer.decode([tokens[j - 1]])))
+        if seen < raw_len - slack:
+            continue
+        if seen > raw_len + slack:
+            return None
+        text = tokenizer.decode(list(tokens[start:j]))
+        if text[len(text.rstrip()) :] != trailing:
+            continue
+        if _tool_canonical(text) == target:
+            return j
+    return None
+
+
 class BatchedSystemKV:
     """LRU of hybrid-safe snapshot entries + per-request checkpoint ladders.
 
@@ -543,6 +619,14 @@ class BatchedSystemKV:
         self.reconcile_splices = 0
         self.reconcile_tokens_kept = 0
         self.reconcile_rejects = 0
+        # (#166) Also splice when the client re-rendered a tool call's
+        # arguments in another order (field 2026-11-18 07:42: Hermes sent
+        # web_search's query before limit, the model wrote limit first; 21K
+        # re-prefilled). Only inside generated spans, only same calls+values.
+        self.reconcile_tool_order_on = (
+            _env_int("VLLM_MLX_BATCHED_RECONCILE_TOOL_ORDER", 0) > 0
+        )
+        self.reconcile_reorders = 0
         # (#117) SSD-vs-RAM-partial arbitration. ``fetch`` used to take ANY
         # RAM entry sharing >= PARTIAL_MIN tokens and only consulted the SSD on
         # a total miss: with a hybrid model the partial snaps DOWN to a
@@ -1595,15 +1679,27 @@ class BatchedSystemKV:
             lcp = common_prefix_len(tokens, donor)
             if lcp >= len(tokens) or lcp >= len(donor):
                 break
-            span_end = next((e for s, e in gen_spans if s <= lcp < e), None)
-            if span_end is None:
+            span = next(((s, e) for s, e in gen_spans if s <= lcp < e), None)
+            if span is None:
                 break
+            span_start, span_end = span
             tail = donor[lcp:span_end]
             if len(tail) > self.reconcile_max_tail:
                 self.reconcile_rejects += 1
                 break
+            split = lcp
             try:
                 end = whitespace_aligned_end(self._tokenizer, tail, tokens, lcp)
+                if end is None and self.reconcile_tool_order_on:
+                    # (#166) Compare from the tool call the split is in.
+                    call = self._tool_call_start(donor, span_start, lcp)
+                    if call is not None:
+                        end = tool_order_aligned_end(
+                            self._tokenizer, donor[call:span_end], tokens, call
+                        )
+                        if end is not None:
+                            split, tail = call, donor[call:span_end]
+                            self.reconcile_reorders += 1
             except Exception:
                 logger.debug(
                     "[batched_system_kv] reconcile decode failed", exc_info=True
@@ -1612,7 +1708,7 @@ class BatchedSystemKV:
             if end is None:
                 self.reconcile_rejects += 1
                 break
-            tokens = tokens[:lcp] + list(tail) + tokens[end:]
+            tokens = tokens[:split] + list(tail) + tokens[end:]
             splices += 1
             kept += len(tail)
             logger.info(
@@ -1629,6 +1725,16 @@ class BatchedSystemKV:
         self.reconcile_splices += splices
         self.reconcile_tokens_kept += kept
         return tokens
+
+    def _tool_call_start(self, chain: list, span_start: int, at: int) -> Optional[int]:
+        """(#166) Index of the last ``<tool_call>`` token at or before ``at``
+        inside the generated span, or None (no call, or a tokenizer that
+        does not keep the tag in one token)."""
+        low = max(span_start, at - self.reconcile_max_tail)
+        for j in range(min(at, len(chain) - 1), low - 1, -1):
+            if "<tool_call>" in self._tokenizer.decode([chain[j]]):
+                return j
+        return None
 
     def _ssd_reconcile_donor(self, tokens: list) -> Optional[list]:
         """The SSD-index chain sharing the longest prefix with ``tokens``
@@ -2058,6 +2164,7 @@ class BatchedSystemKV:
                 "reconcile_splices": self.reconcile_splices,
                 "reconcile_tokens_kept": self.reconcile_tokens_kept,
                 "reconcile_rejects": self.reconcile_rejects,
+                "reconcile_reorders": self.reconcile_reorders,
                 "reconcile_registry_spans": self.reconcile_registry_spans,
                 "reconcile_ssd_donors": self.reconcile_ssd_donors,
                 "gen_span_registry_size": len(self._gen_spans),

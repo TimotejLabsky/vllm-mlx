@@ -3987,3 +3987,105 @@ def test_165_off_by_default_and_only_when_idle(monkeypatch):
     sched2.running["co-batched"] = object()  # something already runs
     queued = add2("feed", 800)
     assert bkv.next_admission(sched2) is queued
+
+
+# ------------- #166 a tool call re-rendered with its arguments reordered
+
+_TV = {
+    1: "\n",
+    2: "\n\n",
+    3: "</tool_call>",
+    4: "<tool_call>",
+    20: "<function=read>",
+    21: "<parameter=path>",
+    22: "a.json",
+    23: "</parameter>",
+    24: "</function>",
+    25: "<function=web_search>",
+    26: "<parameter=limit>",
+    27: "5",
+    28: "<parameter=query>",
+    29: "seagate ironwolf",
+    30: "other query",
+    40: '{"name": "web_search", "arguments": {',
+    41: '"limit": 5',
+    42: ", ",
+    43: '"query": "seagate ironwolf"',
+    44: "}}",
+    8: "<|im_end|>",
+    9: "<|im_start|>",
+    10: "user",
+}
+
+
+class _ToolTok:
+    name_or_path = "unit/test-model"
+
+    def decode(self, ids):
+        return "".join(_TV.get(i, "x") for i in ids)
+
+
+_READ = [4, 1, 20, 1, 21, 1, 22, 1, 23, 1, 24, 1, 3]
+_LIMIT = [26, 1, 27, 1, 23]
+_QUERY = [28, 1, 29, 1, 23]
+_SEARCH = [4, 1, 25, 1]
+_CLOSE = [1, 24, 1, 3]
+# Field 2026-11-18 07:42 (Hermes): the model wrote limit first and joined the
+# calls with "\n\n"; the client sent query first, joined by "\n".
+_GEN = _READ + [2] + _SEARCH + _LIMIT + [1] + _QUERY + _CLOSE
+_SENT = _READ + [1] + _SEARCH + _QUERY + [1] + _LIMIT + _CLOSE
+
+
+def _reorder_kv(monkeypatch, generated=_GEN, tool_order=True):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_RECONCILE_GENERATED", "1")
+    if tool_order:
+        monkeypatch.setenv("VLLM_MLX_BATCHED_RECONCILE_TOOL_ORDER", "1")
+    else:
+        monkeypatch.delenv("VLLM_MLX_BATCHED_RECONCILE_TOOL_ORDER", raising=False)
+    kv = BatchedSystemKV(_FakeModel(), tokenizer=_ToolTok())
+    chain = _HEAD + generated
+    kv.store("turn1", chain, _donor_at(len(chain)), gen_start=len(_HEAD))
+    return kv
+
+
+def test_166_reordered_arguments_restore_the_whole_chain(monkeypatch):
+    kv = _reorder_kv(monkeypatch)
+    request = _queued("turn2", _HEAD + _SENT + _NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == _HEAD + _GEN + _NEXT
+    assert request.cached_tokens == len(_HEAD + _GEN)
+    st = kv.stats()
+    assert st["reconcile_splices"] == 1 and st["reconcile_reorders"] == 1
+
+
+def test_166_json_tool_calls_reordered_too(monkeypatch):
+    gen = [4, 1, 40, 41, 42, 43, 44, 1, 3]
+    sent = [4, 1, 40, 43, 42, 41, 44, 1, 3]
+    kv = _reorder_kv(monkeypatch, generated=gen)
+    request = _queued("turn2", _HEAD + sent + _NEXT)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == _HEAD + gen + _NEXT
+    assert kv.stats()["reconcile_reorders"] == 1
+
+
+@pytest.mark.parametrize("case", ["changed_value", "dropped_argument", "off"])
+def test_166_only_the_same_calls_in_another_order_are_rewritten(monkeypatch, case):
+    sent = _SENT
+    if case == "changed_value":
+        other = [28, 1, 30, 1, 23]
+        sent = _READ + [1] + _SEARCH + other + [1] + _LIMIT + _CLOSE
+    elif case == "dropped_argument":
+        sent = _READ + [1] + _SEARCH + _QUERY + _CLOSE
+    kv = _reorder_kv(monkeypatch, tool_order=case != "off")
+    prompt = _HEAD + sent + _NEXT
+    request = _queued("turn2", prompt)
+
+    bkv.fetch_for_request(kv, request)
+
+    assert request.prompt_token_ids == prompt
+    st = kv.stats()
+    assert st["reconcile_splices"] == 0 and st["reconcile_reorders"] == 0
