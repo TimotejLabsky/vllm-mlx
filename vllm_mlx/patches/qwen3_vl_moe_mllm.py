@@ -65,9 +65,9 @@ def patch_qwen3_vl_moe_attention() -> bool:
         queries = self.q_norm(
             queries.reshape(B, L, self.n_heads, self.head_dim)
         ).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, self.head_dim)).transpose(
-            0, 2, 1, 3
-        )
+        keys = self.k_norm(
+            keys.reshape(B, L, self.n_kv_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
             0, 2, 1, 3
         )
