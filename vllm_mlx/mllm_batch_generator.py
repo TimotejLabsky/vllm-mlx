@@ -695,6 +695,9 @@ class MLLMBatchGenerator:
 
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
+        from .patches.qwen3_vl_moe_mllm import patch_qwen3_vl_moe_attention
+
+        patch_qwen3_vl_moe_attention()  # (#168) no host sync per layer
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
