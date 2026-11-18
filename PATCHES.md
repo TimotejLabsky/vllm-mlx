@@ -4504,3 +4504,17 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 **Verification.**
 - `test_166_reordered_arguments_restore_the_whole_chain` (the field sequence: reorder plus the `\n\n`/`\n` separator), `test_166_json_tool_calls_reordered_too`, `test_166_only_the_same_calls_in_another_order_are_rewritten` (changed value, dropped argument, flag off).
 - Real server (`scripts/fork/e2e_reconcile_tool_order.py`, Studio, `Qwen3.5-4B-4bit`, spare port): turn 1 calls `web_search(query, limit)`, turn 2 sends it back with the arguments reversed. Control (#139 on, #166 off): split inside the call, turn 2 cached 744 of 789; armed: 1 reorder splice, cached 789 of 789.
+
+## 168. `patch: qwen3vl-moe-no-sync` — Qwen3-VL-MoE decode without a host sync per attention layer
+
+**Files:** `vllm_mlx/patches/qwen3_vl_moe_mllm.py` (new, fork-owned), `vllm_mlx/mllm_batch_generator.py` (applies it next to the Qwen3.5/Gemma4 patches), `tests/test_qwen3_vl_moe_mllm_patch.py`, `scripts/fork/e2e_qwen3vl_decode_sync.py`.
+
+**Found by** a sync census (2026-11-18: `mx.array.item`/`tolist` wrapped, counted by call site, on a real `cli serve` with each vision route's prod flags, one image+text request of 300 tokens). GLM-4.6V-Flash: 1.17 host syncs per decoded token (the generator's own per-step `tolist`). Qwen3-VL-30B-A3B: 49 per token, 48 of them from `mlx_vlm/models/qwen3_vl_moe/language.py` `Attention.__call__`: `kv_seq_len = kv_seq_len.max().item()`. Under BatchKVCache `cache.offset` is an `mx.array`, so every attention layer of every token blocked on the GPU and `MLLMBatchGenerator._next`'s pipelining was gone.
+
+**Fix.** The attention slices the mask after the cache update to the fetched keys' length (a host int), as mlx-vlm's dense `qwen3_vl` attention already does; everything else is upstream's method unchanged. On every cache the fork uses the mask covers exactly the fetched keys, so the slice is a no-op there either way. Applied only while the installed method still contains the syncing line; if upstream changes it, the patch logs and steps aside.
+
+**Verification.**
+- `test_168_patched_attention_matches_upstream_and_never_syncs`: a tiny real `qwen3_vl_moe` attention, left-padded 2-row BatchKVCache, prefill + 6 decode steps: output bit-identical to upstream's, zero `.item()` calls (upstream: one per call). `test_168_steps_aside_when_upstream_changes`.
+- Real server (`scripts/fork/e2e_qwen3vl_decode_sync.py`, Studio, `Qwen3-VL-30B-A3B-Instruct-8bit`, prod route flags, spare port; control = the installed build, armed = this tree): decode **34.2 -> 58.2 tok/s (+70%)** (3 runs each: 34.18/34.25/33.71 vs 58.24/58.01/58.16), T=0 text identical in all 6 runs, no traceback.
+
+**Not affected.** GLM-4.6V-Flash (already clean). The Qwen3.5 `--mllm` path has the same pattern in the fork's own `patches/qwen3_5_mllm.py` (`_cache_offset_to_int` per attention layer) plus two syncs in mlx-vlm's `Qwen3_5Model.__call__` B=1 branch; no prod route uses it, so it is left for when one does.
