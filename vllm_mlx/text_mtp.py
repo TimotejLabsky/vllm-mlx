@@ -52,6 +52,13 @@ logger = logging.getLogger(__name__)
 ENV_DRAFTER = "VLLM_MLX_TEXT_MTP_DRAFTER"
 ENV_BLOCK = "VLLM_MLX_TEXT_MTP_BLOCK"
 ENV_OVERLAP = "VLLM_MLX_TEXT_MTP_OVERLAP"
+# (#167) Speculative SAMPLING for requests that sample (T > 0): the draft is
+# drawn from the drafter's own filtered distribution q and accepted with
+# probability min(1, p/q), a rejection resampled from max(p - q, 0). Output is
+# distributed exactly as the request's sampler; acceptance is sum(min(p, q))
+# instead of p(argmax q). Greedy requests keep the exact-match rule.
+ENV_SPEC_SAMPLING = "VLLM_MLX_TEXT_MTP_SPEC_SAMPLING"
+SPEC_SAMPLING_MAX_TOP_K = 64
 DISABLE_AFTER_ERRORS = 8
 
 _REC = {"active": False}
@@ -146,6 +153,7 @@ class TextMTP:
         self.path = path
         self.block = _block_size()
         self.overlap = os.environ.get(ENV_OVERLAP, "1") != "0"
+        self.spec_sampling = os.environ.get(ENV_SPEC_SAMPLING, "0") == "1"
         self.drafter: Any = None
         self.lm: Any = None
         self.lock = threading.Lock()
@@ -158,6 +166,8 @@ class TextMTP:
             "rollbacks": 0,
             "sync_rollbacks": 0,
             "errors": 0,
+            "ss_rounds": 0,
+            "ss_accepted": 0,
         }
         # Where a round's wall time goes (seconds, cumulative): building and
         # submitting it, waiting for the GPU at completion, and everything
@@ -235,6 +245,11 @@ class TextMTP:
                 k: round(1000.0 * v / rounds, 2) if rounds else 0.0
                 for k, v in dict(self.seconds).items()
             },
+            "spec_sampling": self.spec_sampling,
+            "ss_rounds": c["ss_rounds"],
+            "ss_acceptance_rate": (
+                c["ss_accepted"] / c["ss_rounds"] if c["ss_rounds"] else 0.0
+            ),
             "bypass_counts": bypass,
             "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
             "disabled": self.disabled_reason is not None,
@@ -263,6 +278,8 @@ class _BatchState:
         "drafter_ready",
         "pending",
         "cache_ok",
+        "ss",
+        "q",
     )
 
     def __init__(self, mtp: TextMTP):
@@ -282,6 +299,12 @@ class _BatchState:
         # same request decodes alone - ``left_padding`` only ever decreases -
         # so it is asked once per request, not once per round.
         self.cache_ok = False
+        # (#167) This request's (temp, top_p, top_k) when it speculates by
+        # sampling, else None - fixed per request, because the draft a round
+        # verifies was drawn in the previous round. ``q`` is the sparse
+        # distribution (indices, log-probs) the newest draft was drawn from.
+        self.ss: Optional[Tuple[float, float, int]] = None
+        self.q: Optional[Tuple[mx.array, mx.array]] = None
 
     def forget(self) -> None:
         """Only from a clean state (after ``_sync``): drops, does not undo."""
@@ -292,6 +315,7 @@ class _BatchState:
         self.drafter_ready = False
         self.pending = None
         self.cache_ok = False
+        self.q = None
 
 
 class _Pending:
@@ -310,6 +334,7 @@ class _Pending:
         "targets",
         "limit",
         "processors",
+        "ss",
     )
 
 
@@ -536,6 +561,86 @@ def _greedy(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
 
 
+# -------------------------------------------------------------- (#167) ----
+def _ss_params(batch: Any, mtp: TextMTP) -> Optional[Tuple[float, float, int]]:
+    """(temp, top_p, top_k) when this request may speculate by sampling: the
+    switch is on, one draft per round, and its sampler is mlx-lm's
+    temperature/top-p/top-k chain (the scheduler tags it) with a top-k small
+    enough for the sparse filter and no min-p. None keeps exact matching."""
+    if not mtp.spec_sampling or mtp.block != 2:
+        return None
+    sampler = batch.samplers[0] if batch.samplers else None
+    params = getattr(sampler, "_vllm_mlx_sampling", None)
+    if params is None:
+        return None
+    temp, top_p, min_p, top_k = params
+    if not temp or temp <= 0 or min_p:
+        return None
+    if not top_k or not 0 < int(top_k) <= SPEC_SAMPLING_MAX_TOP_K:
+        return None
+    top_p = float(top_p) if top_p and 0 < top_p < 1 else 1.0
+    return float(temp), top_p, int(top_k)
+
+
+def _sparse_dist(
+    logits: mx.array, params: Tuple[float, float, int]
+) -> Tuple[mx.array, mx.array]:
+    """The distribution mlx-lm's ``make_sampler(temp, top_p, top_k)`` samples
+    from, over its at most ``top_k`` tokens: (indices, log-probs), dropped
+    tokens at -inf. Top-p on the full distribution then top-k keeps the
+    longest prefix of the descending order inside both, so the top-k
+    candidates with their full-vocabulary probabilities decide it - no
+    sort of the vocabulary."""
+    temp, top_p, top_k = params
+    lp = logits.reshape(-1).astype(mx.float32)
+    lp = lp - mx.logsumexp(lp)
+    idx = mx.argpartition(-lp, kth=top_k - 1)[:top_k]
+    vals = lp[idx]
+    order = mx.argsort(-vals)
+    idx, vals = idx[order], vals[order]
+    probs = mx.exp(vals)
+    keep = (mx.cumsum(probs) - probs) < top_p
+    keep = mx.logical_or(keep, mx.arange(top_k) == 0)
+    tempered = mx.where(keep, vals * (1.0 / temp), -float("inf"))
+    return idx, tempered - mx.logsumexp(tempered)
+
+
+def _q_sampler(state: _BatchState):
+    """The drafter's sampler under #167: draw from its filtered distribution
+    and remember that distribution for the verify."""
+
+    def sample(logits: mx.array) -> mx.array:
+        idx, lp = _sparse_dist(logits, state.ss)
+        state.q = (idx, lp)
+        return idx[mx.random.categorical(lp)].reshape(1, 1)
+
+    return sample
+
+
+def _ss_targets(logits: mx.array, draft: mx.array, state: _BatchState) -> mx.array:
+    """[accept, rejection token, bonus token, plain token] for one draft
+    (block 2): accept with probability min(1, p(d)/q(d)); on reject the
+    token comes from norm(max(p - q, 0)); ``plain`` is position 0 sampled
+    from p alone, for a round whose draft may not be accepted."""
+    pidx0, plp0 = _sparse_dist(logits[0], state.ss)
+    pidx1, plp1 = _sparse_dist(logits[1], state.ss)
+    qidx, qlp = state.q
+    p0, q = mx.exp(plp0), mx.exp(qlp)
+    d = draft.reshape(-1)[0]
+    pd = mx.sum(mx.where(pidx0 == d, p0, 0.0))
+    qd = mx.sum(mx.where(qidx == d, q, 0.0))
+    accept = mx.random.uniform() * qd < pd
+    q_at_p = mx.sum(mx.where(pidx0[:, None] == qidx[None, :], q[None, :], 0.0), axis=1)
+    resid = mx.maximum(p0 - q_at_p, 0.0)
+    rejected = pidx0[mx.random.categorical(mx.log(resid + 1e-30))]
+    bonus = pidx1[mx.random.categorical(plp1)]
+    plain = pidx0[mx.random.categorical(plp0)]
+    return mx.stack(
+        [accept.astype(mx.int32), rejected.astype(mx.int32),
+         bonus.astype(mx.int32), plain.astype(mx.int32)]
+    )  # fmt: skip
+
+
 def _head(lm: Any, hidden: mx.array) -> mx.array:
     if lm.args.tie_word_embeddings:
         return lm.model.embed_tokens.as_linear(hidden)
@@ -639,6 +744,7 @@ def _speculative_step_inner(batch: Any, state: _BatchState):
         _sync(batch)  # membership changed without a hook
         state.forget()
         state.uid = batch.uids[0]
+        state.ss = _ss_params(batch, state.mtp) if len(batch.uids) == 1 else None
 
     if not state.queue:
         if state.pending is not None:
@@ -692,9 +798,16 @@ def _launch(
                 {}, kv_offset=len(batch.tokens[0]) + (0 if block > 1 else 1)
             )
             state.drafter_ready = True
+        ss = state.ss is not None and block == 2
         if block > 1:
             drafts = drafter.draft_block(
-                b, state.hidden, None, block, _greedy, mx.int32, greedy=True
+                b,
+                state.hidden,
+                None,
+                block,
+                _q_sampler(state) if ss else _greedy,
+                mx.int32,
+                greedy=not ss,
             ).astype(mx.int32)
             verify_in = mx.concatenate(
                 [mx.array([[b]], dtype=mx.int32), drafts], axis=1
@@ -760,12 +873,17 @@ def _launch(
             logits = mx.concatenate(rows, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampler = (
-            batch.samplers[0] if batch.samplers else None
-        ) or batch.fallback_sampler
-        targets = mx.concatenate(
-            [sampler(logprobs[j : j + 1]) for j in range(logprobs.shape[0])], axis=0
-        )
+        if ss and state.q is not None and logits.shape[0] == 2:
+            targets = _ss_targets(logits, drafts, state)
+        else:
+            ss = False
+            sampler = (
+                batch.samplers[0] if batch.samplers else None
+            ) or batch.fallback_sampler
+            targets = mx.concatenate(
+                [sampler(logprobs[j : j + 1]) for j in range(logprobs.shape[0])],
+                axis=0,
+            )
         if mtp.overlap:
             mx.async_eval(targets, drafts)
         else:
@@ -792,6 +910,7 @@ def _launch(
     pending.targets = targets
     pending.limit = limit
     pending.processors = processors
+    pending.ss = ss
     state.pending = pending
     if enqueue:
         state.queue.append((b, pending.b_logprobs, False))
@@ -812,14 +931,33 @@ def _complete(batch: Any, state: _BatchState) -> None:
     if draft_list is None:
         draft_list = p.drafts[0].tolist() if block > 1 else []
 
-    accepted = 0
-    while accepted < p.limit and draft_list[accepted] == target_list[accepted]:
-        accepted += 1
-    new_tokens = draft_list[:accepted] + [int(target_list[accepted])]
+    if p.ss:  # (#167) [accept, rejected, bonus, plain]
+        accept, rejected, bonus, plain = (int(t) for t in target_list)
+        if p.limit < 1:
+            accepted, new_tokens = 0, [plain]
+        elif accept:
+            accepted, new_tokens = 1, [int(draft_list[0]), bonus]
+        else:
+            accepted, new_tokens = 0, [rejected]
+        if p.limit >= 1:
+            with mtp.lock:
+                mtp.counters["ss_rounds"] += 1
+                mtp.counters["ss_accepted"] += accepted
+    else:
+        accepted = 0
+        while accepted < p.limit and draft_list[accepted] == target_list[accepted]:
+            accepted += 1
+        new_tokens = draft_list[:accepted] + [int(target_list[accepted])]
     keep = accepted + 1
-    drafter.accept_verified_tokens(
-        p.h, p.drafts, accepted, new_tokens, _greedy, mx.int32, greedy=True
-    )
+    if state.ss is not None and block == 2:
+        drafter.accept_verified_tokens(
+            p.h, p.drafts, accepted, new_tokens, _q_sampler(state), mx.int32,
+            greedy=False,
+        )  # fmt: skip
+    else:
+        drafter.accept_verified_tokens(
+            p.h, p.drafts, accepted, new_tokens, _greedy, mx.int32, greedy=True
+        )
     # Nothing below can fail: the round is committed from here on.
     state.pending = None
     if keep < block:

@@ -2682,6 +2682,16 @@ class Scheduler:
                 min_p=request.sampling_params.min_p,
                 top_k=request.sampling_params.top_k or 0,
             )
+            if (request.sampling_params.temperature or 0) > 0:
+                # (#167) The text drafter reproduces this chain's
+                # distribution for speculative sampling. Only on a sampling
+                # closure: at temp 0 make_sampler returns a shared function.
+                sampler._vllm_mlx_sampling = (
+                    request.sampling_params.temperature,
+                    request.sampling_params.top_p,
+                    request.sampling_params.min_p,
+                    request.sampling_params.top_k or 0,
+                )
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
