@@ -2686,12 +2686,17 @@ class Scheduler:
                 # (#167) The text drafter reproduces this chain's
                 # distribution for speculative sampling. Only on a sampling
                 # closure: at temp 0 make_sampler returns a shared function.
-                sampler._vllm_mlx_sampling = (
-                    request.sampling_params.temperature,
-                    request.sampling_params.top_p,
-                    request.sampling_params.min_p,
-                    request.sampling_params.top_k or 0,
-                )
+                # A sampler that cannot carry the tag just never speculates
+                # by sampling.
+                try:
+                    sampler._vllm_mlx_sampling = (
+                        request.sampling_params.temperature,
+                        request.sampling_params.top_p,
+                        request.sampling_params.min_p,
+                        request.sampling_params.top_k or 0,
+                    )
+                except AttributeError:
+                    pass
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
