@@ -141,8 +141,10 @@ def _run(
     prompts=(PROMPT,),
     samplers=None,
     late=None,
+    drafter=None,
 ):
-    """``late=(n, prompt)``: insert a second request after ``n`` calls."""
+    """``late=(n, prompt)``: insert a second request after ``n`` calls.
+    ``drafter(model)``: a drafter to use instead of the oracle (any ``ref``)."""
     gen = BatchGenerator(
         model, max_tokens=max_tokens, stop_tokens=[[STOP]] if stop else None
     )
@@ -151,8 +153,15 @@ def _run(
         mtp = text_mtp.TextMTP("oracle")
         mtp.block = block
         mtp.lm = model.language_model
-        mtp.drafter = OracleDrafter(
-            ref, gen._generation_batch, len(prompts[0]), wrong_every, fail
+        mtp.drafter = (
+            drafter(model)
+            if drafter is not None
+            else OracleDrafter(
+                ref, gen._generation_batch, len(prompts[0]), wrong_every, fail
+            )
+        )
+        mtp.spec_sampling = drafter is not None and getattr(
+            mtp.drafter, "spec_sampling", False
         )
         text_mtp._install_class_patches()
         gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
@@ -626,3 +635,134 @@ def test_162_admission_is_zero_without_the_env_and_fails_open(tmp_path, monkeypa
     assert text_mtp.admission_extra_bytes(scheduler) == 2 * (2 * 3 * 5 * 4) * 3
     monkeypatch.delenv(text_mtp.ENV_DRAFTER)
     assert text_mtp.admission_extra_bytes(scheduler) == 0.0
+
+
+# ------------------------------------------- #167 speculative sampling ----
+from mlx_lm.sample_utils import apply_top_k, apply_top_p, make_sampler  # noqa: E402
+
+SS = (1.0, 0.9, 8)  # temp, top_p, top_k
+
+
+def _dense(logits, params=SS):
+    """make_sampler's distribution, the slow way (sort of the vocabulary)."""
+    temp, top_p, top_k = params
+    lp = logits.astype(mx.float32) - mx.logsumexp(logits.astype(mx.float32))
+    lp = apply_top_k(apply_top_p(lp[None], top_p), top_k)[0]
+    return mx.softmax(lp / temp)
+
+
+def test_167_sparse_filter_is_make_samplers_distribution():
+    for seed in range(20):
+        logits = mx.random.normal((VOCAB,), key=mx.random.key(seed)) * 3.0
+        for params in (SS, (0.7, 0.95, 20), (1.3, 1.0, 5), (1.0, 0.3, 64)):
+            idx, lp = text_mtp._sparse_dist(logits, params)
+            sparse = mx.zeros((VOCAB,)).at[idx].add(mx.exp(lp))
+            assert mx.abs(sparse - _dense(logits, params)).max().item() < 1e-5
+
+
+def test_167_emitted_token_is_distributed_as_the_sampler():
+    """Draft from q, accept with min(1, p/q), else the residual: whatever q
+    is, the token at the verified position must be distributed as p."""
+    state = text_mtp._BatchState(text_mtp.TextMTP("x"))
+    state.ss = SS
+    p_logits = mx.random.normal((2, VOCAB), key=mx.random.key(1)) * 2.0
+    q_logits = mx.random.normal((VOCAB,), key=mx.random.key(2)) * 2.0  # a poor q
+    draw = text_mtp._q_sampler(state)
+    counts, n = [0] * VOCAB, 6000
+    mx.random.seed(167)
+    accepted = 0
+    for _ in range(n):
+        d = draw(q_logits)
+        accept, rejected, _bonus, _plain = text_mtp._ss_targets(
+            p_logits, d, state
+        ).tolist()
+        token = int(d.item()) if accept else rejected
+        accepted += accept
+        counts[token] += 1
+    p = _dense(p_logits[0]).tolist()
+    tv = 0.5 * sum(abs(c / n - x) for c, x in zip(counts, p))
+    assert tv < 0.03, tv
+    q = _dense(q_logits).tolist()
+    expected = sum(min(a, b) for a, b in zip(p, q))  # sum(min(p, q))
+    assert abs(accepted / n - expected) < 0.03
+
+
+class SamplingDrafter:
+    """Drafts like the real head: logits from the hidden state (the target's
+    own head here, slightly off), through the sampler it is given."""
+
+    spec_sampling = True
+
+    def __init__(self, model):
+        self.lm = model.language_model
+        self.sampled = 0
+
+    def reset(self, lm):
+        pass
+
+    def set_shared_kv(self, shared, **kwargs):
+        pass
+
+    def draft_block(self, b, hidden, cache, block, sampler, dtype, greedy=False):
+        logits = text_mtp._head(self.lm, hidden) * 0.9
+        if greedy:
+            return mx.argmax(logits, axis=-1).astype(dtype)
+        self.sampled += 1
+        return sampler(logits).astype(dtype)
+
+    def accept_verified_tokens(self, *args, **kwargs):
+        pass
+
+    def draft_eval_state(self):
+        return [None]
+
+
+def _tagged_sampler(temp=1.0, top_p=0.9, top_k=8):
+    s = make_sampler(temp=temp, top_p=top_p, top_k=top_k)
+    s._vllm_mlx_sampling = (temp, top_p, 0.0, top_k)
+    return s
+
+
+def _replay(tokens):
+    it = iter(list(tokens) + [0])  # mlx-lm samples one step ahead
+    return lambda logprobs: mx.array([next(it)])
+
+
+def test_167_sampled_stream_leaves_the_cache_plain_decoding_would(model):
+    mx.random.seed(7)
+    tokens, caches, reasons, mtp = _run(
+        model, 61, ref=[], block=2, samplers=_tagged_sampler(),
+        drafter=SamplingDrafter,
+    )  # fmt: skip
+    stats = mtp.stats()
+    assert reasons[0] == "length" and len(tokens[0]) == 61
+    assert stats["errors"] == 0 and stats["disabled"] is False
+    assert stats["ss_rounds"] > 10 and 0 < stats["ss_acceptance_rate"] < 1
+    assert mtp.drafter.sampled > 10
+    # plain decoding forced to emit the same tokens leaves the same cache
+    plain_tokens, plain_caches, _, _ = _run(model, 61, samplers=_replay(tokens[0]))
+    assert plain_tokens[0] == tokens[0]
+    assert _max_diff(caches[0], plain_caches[0]) < TOL
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["off", "greedy", "min_p", "no_top_k", "big_top_k", "block3", "untagged"],
+)
+def test_167_only_tagged_sampling_requests_speculate_by_sampling(case):
+    mtp = text_mtp.TextMTP("x")
+    mtp.spec_sampling, mtp.block = case != "off", 3 if case == "block3" else 2
+    params = {
+        "greedy": (0.0, 0.9, 0.0, 8),
+        "min_p": (1.0, 0.9, 0.05, 8),
+        "no_top_k": (1.0, 0.9, 0.0, 0),
+        "big_top_k": (1.0, 0.9, 0.0, 100),
+    }.get(case, (1.0, 0.9, 0.0, 8))
+    sampler = make_sampler(temp=1.0)
+    if case != "untagged":
+        sampler._vllm_mlx_sampling = params
+    batch = type("B", (), {"samplers": [sampler]})()
+    assert text_mtp._ss_params(batch, mtp) is None
+    mtp.spec_sampling, mtp.block = True, 2
+    sampler._vllm_mlx_sampling = (1.0, 0.9, 0.0, 8)
+    assert text_mtp._ss_params(batch, mtp) == (1.0, 0.9, 8)
