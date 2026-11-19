@@ -1015,6 +1015,43 @@ def test_164_off_by_default_grown_chains_do_not_spill(monkeypatch, tmp_path):
         kv.close()
 
 
+# ---------------------------------- #169 small chains stay off the SSD tier
+
+
+_BIG = list(range(5000, 5600))
+
+
+def _spill_small_and_big(monkeypatch, tmp_path, min_tokens):
+    if min_tokens:
+        monkeypatch.setenv("VLLM_MLX_SSD_SPILL_MIN_TOKENS", str(min_tokens))
+    else:
+        monkeypatch.delenv("VLLM_MLX_SSD_SPILL_MIN_TOKENS", raising=False)
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=0)
+    kv.store("small", TOKENS[:400], _donor_at(400))
+    kv.store("big", _BIG, _donor_at(600))
+    assert kv.fetch(TOKENS[:400] + [7]) is not None  # RAM still has it
+    skipped = kv.stats()["spill_skipped_small"]
+    kv.close()  # drain the spill queue
+    kv2 = _grown_ssd_kv(monkeypatch, tmp_path, delta=0)
+    try:
+        small = kv2.check_ssd(TOKENS[:400] + [7])
+        big = kv2.check_ssd(_BIG + [7])
+    finally:
+        kv2.close()
+    return small, big, skipped
+
+
+def test_169_chains_under_the_minimum_stay_ram_only(monkeypatch, tmp_path):
+    small, big, skipped = _spill_small_and_big(monkeypatch, tmp_path, 450)
+    assert small is None and skipped == 1
+    assert big is not None and len(big["tokens"]) == 600
+
+
+def test_169_off_by_default_every_chain_spills(monkeypatch, tmp_path):
+    small, big, skipped = _spill_small_and_big(monkeypatch, tmp_path, 0)
+    assert small is not None and big is not None and skipped == 0
+
+
 def test_164_segmented_layer_round_trips_through_the_ssd_format():
     from vllm_mlx.system_kv import state_arrays
     from vllm_mlx.system_kv_ssd import flatten_snapshot, unflatten_snapshot

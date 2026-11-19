@@ -9,6 +9,7 @@ directly from tokenizer.json.
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -212,7 +213,33 @@ def load_model_with_fallback(
     model, tokenizer = _load_model_with_fallback(
         model_name, tokenizer_config, model_id=model_id
     )
-    return model, _install_custom_chat_template(model_name, tokenizer)
+    tokenizer = _install_custom_chat_template(model_name, tokenizer)
+    return model, _install_chat_template_file(tokenizer)
+
+
+def _install_chat_template_file(tokenizer):
+    """(fork #169) ``VLLM_MLX_CHAT_TEMPLATE_FILE=<path>``: this route's chat
+    template comes from a file kept with the deploy config, not from the
+    model snapshot. 2026-11-18 a re-download moved the HF ``refs/main`` to a
+    snapshot with the stock template and the 27B-8bit silently lost its
+    custom one. A missing or unreadable file fails startup: a route must not
+    run with a template other than the one it was configured with."""
+    path = os.environ.get("VLLM_MLX_CHAT_TEMPLATE_FILE", "").strip()
+    if not path or tokenizer is None:
+        return tokenizer
+    with open(path, encoding="utf-8") as f:
+        template = f.read()
+    target = getattr(tokenizer, "_tokenizer", tokenizer)
+    target.chat_template = template
+    import hashlib
+
+    logger.info(
+        "[chat_template] from %s (sha1 %s, %d chars)",
+        path,
+        hashlib.sha1(template.encode()).hexdigest()[:12],
+        len(template),
+    )
+    return tokenizer
 
 
 def _load_model_with_fallback(

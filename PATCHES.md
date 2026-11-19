@@ -4532,3 +4532,15 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - Real server (`scripts/fork/e2e_text_mtp_spec_sampling.py`, Studio, 27B-8bit + MTP-8bit, prod flags and sampling defaults, spare port, each prompt prefilled once then asked 3x as a cache hit, 400 tokens): greedy -> ss median decode review@20K 21.5 -> 22.7 (+6%), prose@20K 21.2 -> 22.2 (+5%), review@40K 20.7 -> 20.8 (+0%), prose@40K 19.8 -> 20.6 (+4%); geomean +3.7%. Acceptance 0.782 -> 0.818 (3,489 ss rounds), 0 drafter errors.
 
 **Not built.** An adaptive per-request gate (plain decode while drafting measurably loses): with speculative sampling the worst spike case was already +2% over plain, and the probe windows a gate needs would cost about that.
+
+## 169. `patch: ssd-spill-min-tokens` — small one-off chains stay off the SSD tier; a route's chat template can come from its deploy config
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`_spill`, stat), `vllm_mlx/utils/tokenizer.py` (`_install_chat_template_file`), `tests/test_batched_system_kv.py`, `tests/test_fork_invariants.py`, `scripts/fork/e2e_template_file_effort.py`.
+
+**Why (2026-11-19, 27B-8bit).** Every scheduled Hermes job started cold after a route reload (07:00-09:30: 0% cached, 41-69 s TTFT on 8.6-13.9K prompts; llama-swap restarted the route ~40 times in a day). The SSD tier held 37 entries, 31 of them the accounting classifier's ~2.1K-token bank-statement prompts: each ~600 MB on disk (hybrid checkpoints), unique content, never reused across a reload - together they filled the 20 GB tier and evicted every Hermes/opencode chain (147 spills since the previous deploy, up to 68K tokens, none left). When a Hermes chain did survive, a different job restored 8,303 of 9,465 tokens from it (the 11:30 brief).
+
+**Fix 1.** `VLLM_MLX_SSD_SPILL_MIN_TOKENS=<n>` (default 0 = spill everything): a chain shorter than n tokens stays RAM-only. Stat `spill_skipped_small`.
+
+**Fix 2.** `VLLM_MLX_CHAT_TEMPLATE_FILE=<path>`: the tokenizer's chat template is replaced by the file's at load (wrapped or plain tokenizer), logged with its sha1. A missing file fails startup. Reason: the 27B-8bit's custom template existed only as a hand-edited file inside an HF snapshot; 2026-11-18 a re-download moved `refs/main` to a snapshot with the stock template and the route silently ran it for 72 minutes. The template now lives in the infra repo (`mac-studio/templates/`).
+
+**Verification.** `test_169_chains_under_the_minimum_stay_ram_only` / `test_169_off_by_default_every_chain_spills` (a restart over the same SSD dir finds the 600-token chain and not the 400-token one; the RAM entry still hits); `test_169_chat_template_file_replaces_the_snapshots_template`, `test_169_unset_is_a_no_op_and_a_missing_file_fails_startup`. Full suite 5504 passed / 32 skipped. Real server (`scripts/fork/e2e_template_file_effort.py`, Studio, 27B-8bit, spare port): both template files loaded (`[chat_template] from ...`), `spill_skipped_small` counted the short requests, no traceback.
