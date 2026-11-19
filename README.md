@@ -7,7 +7,142 @@
 > For general use you almost certainly want
 > [upstream](https://github.com/waybarrios/vllm-mlx), not this fork.
 
-## How it compares (measured 2026-09-04)
+## Fork vs upstream, measured (2026-11-19)
+
+Same box (M1 Ultra, 64 GB), same mlx / mlx-lm / mlx-vlm, same models, prompts
+and sampling. **Fork** = `main` `b98dc212` with each llama-swap route's
+production command and env; **upstream** = stock
+[`3c228769`](https://github.com/waybarrios/vllm-mlx/commit/3c228769) (the commit
+this fork is rebased on) with the same command, minus the flags it does not
+have. One server at a time on a spare port, fresh SSD cache dir, streamed,
+client-side timing. Harness:
+[`scripts/fork/bench_fork_vs_upstream.py`](scripts/fork/bench_fork_vs_upstream.py);
+per-run numbers and method:
+[`docs/fork/fork-vs-upstream-2026-11-19.md`](docs/fork/fork-vs-upstream-2026-11-19.md).
+
+| route (model) | measurement | upstream | **fork** | change |
+|---|---|---|---|---|
+| **Qwen3.8-27B-8bit** (agent route: opencode, Hermes) | decode, short prompt | 15.1 tok/s | **24.4 tok/s** | **+61 %** |
+| | decode at ~12K context | 14.7 tok/s | **22.8 tok/s** | **+55 %** |
+| | first turn, 4.7K-token system + tools (cold) | 21.4 s | 21.9 s | same |
+| | tool-loop follow-up turn (5.9-10.8K), TTFT, median of 5 | 5.6 s | 6.1 s | +8 % (slower) |
+| | 6-turn tool session, wall | 108.1 s | **99.3 s** | **−8 %** |
+| | new user turn after the tool loop (12.1K), TTFT | 53.5 s | **35.1 s** | **−34 %** |
+| | next tool turn after a server restart, TTFT | 37.9 s | **19.7 s** | **−48 %**² |
+| **Qwen3.6-35B-A3B-4bit** (Home Assistant voice) | decode, short prompt | 54.7 tok/s | **87.8 tok/s** | **+60 %** |
+| | 4-turn tool session, wall | 18.2 s | **12.8 s** | **−30 %** |
+| | follow-up turn, TTFT | 0.94 s | 0.97 s | same |
+| **Qwen3-VL-30B-A3B-8bit** (vision: invoices, documents) | decode, image + text | 33.7 tok/s | **57.7 tok/s** | **+71 %** |
+| | follow-up turn about the same image, TTFT | 0.60 s | **0.35 s** | **−42 %** |
+
+² The restarted upstream server restored nothing and prefilled all 8.2K
+tokens. The fork restored the session's opening prompt (4,721 tokens) from SSD and
+prefilled the rest; a longer session also re-spills every 16K tokens of growth
+(#164), so it would restore more.
+
+Where the difference comes from, and where there is none:
+
+- **Decode.** Upstream has no `--text-only`, so it serves these
+  multimodal-format Qwen checkpoints through the mlx-vlm path; the fork serves
+  text through mlx-lm's `BatchedEngine` with its hybrid-safe cache. On top of
+  that the 27B-8bit decodes with an external MTP drafter head (#160/#161,
+  speculative sampling #167), and the Qwen3-VL route no longer makes a host↔GPU
+  sync in every attention layer of every token (#168: 48 syncs per token in
+  mlx-vlm's `qwen3_vl_moe`).
+- **Prefill is the same.** Cold first turns match within noise: the fork does
+  not make the GPU faster at prefill.
+- **Shallow follow-up turns are not faster.** Upstream's prefix cache now also
+  hits a simple tool-loop continuation on these hybrid models; on the 27B the
+  fork's first token is ~0.5 s later there (not yet investigated), won back
+  by faster decode over the session (−8 % wall). The fork's cache pulls ahead
+  where the prompt does not simply extend the previous one: measured above, a
+  new user turn after a tool loop and a route reload; not measured in this
+  run (each has its own real-server check in [`PATCHES.md`](PATCHES.md)), a
+  template that re-renders the model's own output differently (#139, #166),
+  conversations interleaved with other clients (#163, #165), and deep
+  sessions near the memory ceiling, where it sheds cache instead of crashing
+  (#48, #103-#108, #150).
+
+## What this fork is
+
+A **patch stack**, not a feature branch: 156 numbered `patch:` commits (plus
+their tests and docs) on top of upstream
+[`3c228769`](https://github.com/waybarrios/vllm-mlx/commit/3c228769), each
+documented in [`PATCHES.md`](PATCHES.md) with its rationale and measurements.
+`main` is periodically rebased onto `waybarrios/main`; generally useful fixes
+go upstream, and several have been merged there and retired from the stack.
+
+It is tuned for one box: one GPU memory pool, ~20 models swapped in and out by
+llama-swap, and long multi-turn agent sessions (opencode, Claude Code, a
+Hermes agent running scheduled jobs, Home Assistant voice) hitting the same
+prompt prefixes over and over. That shapes every patch: **decode fast, cache
+the prefix aggressively, never OOM the GPU, fail loudly instead of hanging.**
+
+## What's included
+
+**Faster decode**
+- **MTP drafter on the cached text path** (#160, #161, #167). The
+  Qwen3.8-27B-8bit decodes with an external MTP head that proposes the next
+  token; the target verifies it in the same forward pass, and a partial accept
+  restores the recurrent state recorded during that pass instead of re-running
+  it. At the route's T=1.0 sampling the draft is *sampled* from the head and
+  accepted with min(1, p/q), so output is distributed exactly as plain
+  sampling; at T=0 output and stored cache entries are byte-identical to plain
+  decoding. +20-37 % decode in controlled tests, +8-20 % on live agent traffic.
+- **Vision decode without per-layer host syncs** (#168). Qwen3-VL-30B decodes
+  34 → 58 tok/s, T=0 output identical.
+- **Text-only serving for multimodal-format checkpoints** (`--text-only`,
+  BatchedEngine for the whole text fleet since 2026-07-09): the Qwen3.5-3.8
+  checkpoints decode on mlx-lm's text path instead of mlx-vlm's (most of the
+  35B-A3B's +60 % above).
+
+**A prefix cache built for agents on hybrid models** (`system_kv.py`,
+`batched_system_kv.py`)
+- Works on hybrid attention + recurrent models (Qwen3.5/3.6/3.8, Qwen3-Next):
+  checkpoint/snapshot entries instead of hashable KV blocks, multi-slot LRU,
+  grow-on-hit so a warm chain extends instead of re-prefilling, partial
+  restore for divergent branches, and segmented stores (O(new tokens) per turn).
+- **SSD tier** so caches survive restarts and model swaps (restart 31.7 s →
+  1.9 s in the original measurement), now also for long sessions that grew
+  turn by turn (#164), with small one-off prompts kept off it so they cannot
+  evict agent sessions (#169).
+- **Repairs prompts that a client re-renders differently from what the model
+  wrote**: whitespace (#139), tool-call arguments in another order (#166), and
+  the record of what the model generated survives its cache entry being
+  evicted (#163).
+- **Agent turns go first**: after a long turn, the same conversation's next
+  turn is admitted before background jobs that queued meanwhile (#165).
+- Image follow-ups are served from the cache, keyed on the image's hash
+  (#142: GLM-4.6V 1.85 → 0.19 s TTFT).
+
+**Memory safety on a 64 GB box**
+- Peak-memory relief that sheds cache before the GPU ceiling, admission that
+  projects a co-batch's real memory peak, lazy restores, and a solo-prefill
+  guard that prices the drafter too (#48, #103-#108, #150, #162). Deep
+  concurrent agent chains that used to OOM now finish (5/5 deep follow-ups
+  served from cache, 123 s instead of 1,150 s).
+- Long generations on hybrid models no longer die at ~10.5K tokens (#125), and
+  prompts past a route's measured envelope get an honest
+  `400 prompt_too_long` instead of a crash.
+
+**Correct agent behaviour**
+- Per-request `reasoning_effort` mapped onto each model's own template
+  vocabulary, a thinking budget that binds, reasoning-parser fixes, tool-parser
+  fixes (gpt-oss harmony, qwen3_coder, GLM), structured output that fails
+  closed (llguidance), and a stop for degenerate repetition loops.
+- Engine-side aborts surface as retryable 503s instead of HTTP 200 with an
+  empty turn.
+
+**Operations**
+- A route's chat template can come from a file in the deploy config
+  (`VLLM_MLX_CHAT_TEMPLATE_FILE`, #169), so a model re-download cannot swap it.
+- `/v1/status` and Prometheus gauges for cache hits, evictions, memory
+  pressure, admission and drafter acceptance; a `GET /` for llama-swap probes.
+
+Everything new is off by default behind an env flag or CLI option, and the
+llama-swap config enables it per route.
+
+## How it compares to other engines (measured 2026-09-04)
 
 Cross-engine serving benchmark on the production box (M1 Ultra 64 GB), vLLM
 `benchmark_serving` (1024-in/256-out, T=0) plus load/warm-cache/prefill probes.
@@ -42,74 +177,32 @@ workload; on a natural prompt at T=0 it is **+13 %** over fork-batched
 gets its decode edge from vendored gated-delta Metal kernels (the mlx #4020
 class of win this fork waits to take via an mlx release rather than vendor).
 
-## What this fork is
-
-A **patch stack**, not a feature branch. `main` carries ~137 local patches on top
-of upstream [`ec8e493`](https://github.com/waybarrios/vllm-mlx/commit/ec8e493);
-each is a separate commit prefixed `patch:`, and the branch is periodically
-rebased onto `waybarrios/main` to pick up upstream changes. Fixes that are
-generally useful get cherry-picked from upstream PRs or prepared as upstreaming
-branches; several have since merged upstream and been retired from the stack.
-The rest are home-lab-specific and stay here.
-
-The deployment it is tuned for is one box, one GPU memory pool, many models
-swapped in and out on demand, and long multi-turn agent sessions (Claude Code,
-coding agents, chat bots) hitting the same prompt prefixes over and over. That
-shapes every patch: **cache the prefix aggressively, never OOM the GPU, fail
-loudly instead of hanging.**
-
-## What the patches actually add
-
-**180B-class models on a 64 GB box (`qwen4_exp`, PATCHES.md #97).** The fork
-vendors the Qwen3.8-Flash-Next architecture (missing or resident-only in the
-mlx-vlm builds at the pins) including its SSD-backed PLE mode: the arch's
-~29 GB hashed n-gram embedding table stays on disk (mmap, per-token row
-gathers), so the REAP-pruned `Flash-Next-REAP-288` (180B→288/512 experts,
-68 GB on disk) serves in ~39 GB resident at ~20 tok/s.
-`VLLM_MLX_QWEN4_PLE_MODE=auto|resident|mmap`.
-
-**Hybrid-safe prefix caching ("system-KV").** Upstream's prefix cache gets zero
-hits on hybrid attention+SSM models (Qwen3-Next, Qwen3.5/3.6/3.8 — most of the
-lineup here) because their `ArraysCache` state can't be hashed or sliced the way
-an attention KV cache can. The fork replaces it with a checkpoint/snapshot cache
-that works on both: multi-slot LRU across concurrent conversations, grow-on-HIT
-so a warm chain extends instead of re-prefilling, partial restore for divergent
-branches, a RAM budget on the resident slot set, and an SSD tier so caches
-survive restarts and model swaps. Lives in fork-owned modules —
-`vllm_mlx/system_kv.py`, `system_kv_ssd.py`, `batched_system_kv.py`.
-
-**BatchedEngine made usable for this fleet.** The batched (continuous-batching)
-path got the same hybrid-safe cache plus the pieces it was missing: `--text-only`
-support, stop-string enforcement, per-request sampling parameters, the DRY
-sampler, segmented snapshots (O(delta) stores instead of an O(context) copy per
-turn), an SSD cold tier, and dynamic concurrency where batch seats float on a
-measured KV-byte budget instead of a fixed count. **Since 2026-07-09 the entire
-text fleet runs BatchedEngine**; vision routes stay on the mlx-vlm path and
-embeddings on their own route.
-
-**Memory-pressure survival.** Deep-context prefill on a 27B model would ramp GPU
-memory into the hard ceiling and crash mid-request. The fork watches peak memory
-per step, sheds cache slots and clears the MLX buffer cache before the ceiling
-rather than after, and rejects prompts past a per-route measured token envelope
-with a non-retryable `400 prompt_too_long` instead of dying.
-
-**Correct reasoning and tool-call behaviour for agent clients.** Per-request
-`reasoning_effort` normalized against each model's own chat-template vocabulary;
-a thinking-token budget that actually binds; reasoning-parser correctness when
-thinking is disabled; a detector that ends degenerate repetition loops at the
-scheduler; and several tool-parser fixes. Agent replay shapes (an assistant turn
-carrying `tool_calls` but no reasoning) are a first-class test case here, because
-that is what broke in practice.
-
-**Reliability and operational fixes.** Admission control on the serialized route
-(503 rather than a silent lock wait), lazy MLX array realization on the load
-thread (the cross-thread stream crash that took out gpt-oss and Gemma text
-routes), a `GET /` route for llama-swap's preload probe, and extra `/v1/status`
-+ Prometheus gauges for cache hit rate, memory pressure, eviction timing, and
-admission.
-
 ## Recent changes
 
+> **2026-11-19 — agent sessions survive route reloads; the 27B's template is
+> version-controlled** (PATCHES.md #169): the 27B-8bit's SSD tier had filled
+> with an accounting classifier's one-off 2K-token prompts (~600 MB each) and
+> evicted every agent session, so scheduled jobs started cold after each
+> reload (41-69 s TTFT). Chains under 4K tokens now stay RAM-only and the tier
+> grew to 40 GB. The route's custom chat template loads from the deploy config
+> (`VLLM_MLX_CHAT_TEMPLATE_FILE`) after a model re-download had silently
+> replaced it; the copy moves the reasoning-effort line after the tool block
+> so low/medium/xhigh share the cached tools prefix.
+>
+> **2026-11-18 — Qwen3-VL decode +70 %, speculative sampling, tool-order
+> repair** (PATCHES.md #166-#168): mlx-vlm's `qwen3_vl_moe` attention made 48
+> host syncs per decoded token; removed (34.2 → 58.2 tok/s, T=0 identical).
+> The 27B's drafter now speculates by sampling at T > 0 (acceptance
+> 0.78 → 0.82, +3.7 % decode over exact matching, +2-12 % on live traffic).
+> A tool call sent back with its arguments reordered restores from cache.
+>
+> **2026-11-16/17 — MTP drafter on the cached text path, long-session fixes**
+> (PATCHES.md #159-#165): the 27B-8bit decodes with an external MTP head
+> (+20-37 % controlled, T=0 byte-identical); generated-span records survive
+> eviction (#163), grown sessions spill to SSD (#164), and an agent's next
+> turn goes before background work queued during its last one (#165). The
+> 27B-8bit also got the memory guards it lacked (it had OOMed 3x at 109K).
+>
 > **2026-10-14 — image follow-ups served from the prefix cache** (PATCHES.md
 > #142, vision phase B): image requests are keyed on the image's SHA-256
 > instead of its placeholder tokens, so a follow-up turn or re-ask about the
