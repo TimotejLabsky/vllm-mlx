@@ -4089,3 +4089,32 @@ def test_166_only_the_same_calls_in_another_order_are_rewritten(monkeypatch, cas
     assert request.prompt_token_ids == prompt
     st = kv.stats()
     assert st["reconcile_splices"] == 0 and st["reconcile_reorders"] == 0
+
+
+# ------------- #169 a route's chat template comes from its deploy config
+
+
+def test_169_chat_template_file_replaces_the_snapshots_template(monkeypatch, tmp_path):
+    from vllm_mlx.utils.tokenizer import _install_chat_template_file
+
+    path = tmp_path / "t.jinja"
+    path.write_text("{{ messages[0].content }}")
+    monkeypatch.setenv("VLLM_MLX_CHAT_TEMPLATE_FILE", str(path))
+    plain = SimpleNamespace(chat_template="stock")
+    wrapped = SimpleNamespace(_tokenizer=SimpleNamespace(chat_template="stock"))
+
+    assert _install_chat_template_file(plain).chat_template == path.read_text()
+    out = _install_chat_template_file(wrapped)
+    assert out._tokenizer.chat_template == path.read_text()
+
+
+def test_169_unset_is_a_no_op_and_a_missing_file_fails_startup(monkeypatch, tmp_path):
+    from vllm_mlx.utils.tokenizer import _install_chat_template_file
+
+    monkeypatch.delenv("VLLM_MLX_CHAT_TEMPLATE_FILE", raising=False)
+    tok = SimpleNamespace(chat_template="stock")
+    assert _install_chat_template_file(tok).chat_template == "stock"
+
+    monkeypatch.setenv("VLLM_MLX_CHAT_TEMPLATE_FILE", str(tmp_path / "missing.jinja"))
+    with pytest.raises(FileNotFoundError):
+        _install_chat_template_file(tok)

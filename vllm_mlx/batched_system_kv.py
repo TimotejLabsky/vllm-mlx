@@ -748,6 +748,13 @@ class BatchedSystemKV:
         # 0 = the old behaviour.
         self.spill_grown_delta = _env_int("VLLM_MLX_SSD_SPILL_GROWN_DELTA", 0)
         self.grown_spills = 0
+        # (#169) Chains shorter than this stay RAM-only. On the 27B-8bit a
+        # 2K-token entry is ~600 MB on disk (hybrid checkpoints), and the
+        # accounting classifier's one-off 2K prompts filled the 20 GB tier
+        # (31 of 37 entries, 2026-11-19), evicting every Hermes/opencode
+        # chain a reloaded route needs. 0 = spill everything (old behaviour).
+        self.spill_min_tokens = max(0, _env_int("VLLM_MLX_SSD_SPILL_MIN_TOKENS", 0))
+        self.spill_skipped_small = 0
         # (#165) Turn affinity. An agent sends its next turn 1-5 s after the
         # previous one finished (tool execution). A background request queued
         # meanwhile was admitted in that gap and the deep turn then waited
@@ -1208,6 +1215,9 @@ class BatchedSystemKV:
         reader understands; a grown entry's multi-segment layers (#164) are
         written segment by segment (format kind ``kvseg``)."""
         if self._ssd is None:
+            return
+        if len(tokens_list) < self.spill_min_tokens:
+            self.spill_skipped_small += 1  # (#169)
             return
         try:
             spill_snapshot = [
@@ -2169,6 +2179,7 @@ class BatchedSystemKV:
                 "reconcile_ssd_donors": self.reconcile_ssd_donors,
                 "gen_span_registry_size": len(self._gen_spans),
                 "grown_spills": self.grown_spills,
+                "spill_skipped_small": self.spill_skipped_small,
                 "turn_holds": self.turn_holds,
                 "turn_hold_hits": self.turn_hold_hits,
                 "turn_hold_expired": self.turn_hold_expired,
