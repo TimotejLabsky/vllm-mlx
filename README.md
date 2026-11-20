@@ -22,17 +22,17 @@ per-run numbers and method:
 
 | route (model) | measurement | upstream | **fork** | change |
 |---|---|---|---|---|
-| **Qwen3.8-27B-8bit** (agent route: opencode, Hermes) | decode, short prompt | 15.1 tok/s | **24.4 tok/s** | **+61 %** |
+| **Qwen3.8-27B-8bit** | decode, short prompt | 15.1 tok/s | **24.4 tok/s** | **+61 %** |
 | | decode at ~12K context | 14.7 tok/s | **22.8 tok/s** | **+55 %** |
 | | first turn, 4.7K-token system + tools (cold) | 21.4 s | 21.9 s | same |
 | | tool-loop follow-up turn (5.9-10.8K), TTFT, median of 5 | 5.6 s | 6.1 s | +8 % (slower) |
 | | 6-turn tool session, wall | 108.1 s | **99.3 s** | **−8 %** |
 | | new user turn after the tool loop (12.1K), TTFT | 53.5 s | **35.1 s** | **−34 %** |
 | | next tool turn after a server restart, TTFT | 37.9 s | **19.7 s** | **−48 %**² |
-| **Qwen3.6-35B-A3B-4bit** (Home Assistant voice) | decode, short prompt | 54.7 tok/s | **87.8 tok/s** | **+60 %** |
+| **Qwen3.6-35B-A3B-4bit** | decode, short prompt | 54.7 tok/s | **87.8 tok/s** | **+60 %** |
 | | 4-turn tool session, wall | 18.2 s | **12.8 s** | **−30 %** |
 | | follow-up turn, TTFT | 0.94 s | 0.97 s | same |
-| **Qwen3-VL-30B-A3B-8bit** (vision: invoices, documents) | decode, image + text | 33.7 tok/s | **57.7 tok/s** | **+71 %** |
+| **Qwen3-VL-30B-A3B-8bit** | decode, image + text | 33.7 tok/s | **57.7 tok/s** | **+71 %** |
 | | follow-up turn about the same image, TTFT | 0.60 s | **0.35 s** | **−42 %** |
 
 ² The restarted upstream server restored nothing and prefilled all 8.2K
@@ -73,8 +73,7 @@ documented in [`PATCHES.md`](PATCHES.md) with its rationale and measurements.
 go upstream, and several have been merged there and retired from the stack.
 
 It is tuned for one box: one GPU memory pool, ~20 models swapped in and out by
-llama-swap, and long multi-turn agent sessions (opencode, Claude Code, a
-Hermes agent running scheduled jobs, Home Assistant voice) hitting the same
+llama-swap, and long multi-turn agent sessions hitting the same
 prompt prefixes over and over. That shapes every patch: **decode fast, cache
 the prefix aggressively, never OOM the GPU, fail loudly instead of hanging.**
 
@@ -181,7 +180,7 @@ class of win this fork waits to take via an mlx release rather than vendor).
 
 > **2026-11-19 — agent sessions survive route reloads; the 27B's template is
 > version-controlled** (PATCHES.md #169): the 27B-8bit's SSD tier had filled
-> with an accounting classifier's one-off 2K-token prompts (~600 MB each) and
+> with a background job's one-off 2K-token prompts (~600 MB each) and
 > evicted every agent session, so scheduled jobs started cold after each
 > reload (41-69 s TTFT). Chains under 4K tokens now stay RAM-only and the tier
 > grew to 40 GB. The route's custom chat template loads from the deploy config
