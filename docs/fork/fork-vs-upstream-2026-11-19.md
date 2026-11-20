@@ -77,3 +77,22 @@ The restart scenario on this route used a new user message, not a tool continuat
 - **Not measured here:**
   - re-rendered generated spans (#139, #166) and interleaved clients (#163, #165), which have their own real-server checks in PATCHES.md;
   - memory-ceiling behaviour, also covered in PATCHES.md.
+
+## 2026-11-20 rerun: Qwen3.8-27B-8bit after the template fix and #170
+
+- **Fork:** `09051aff`, installed as deployed, with the live route's command and env.
+  - The chat template from the deploy config draws no think block for a turn whose reasoning was stripped.
+  - Re-save delta 8K, `VLLM_MLX_SSD_SUPERSEDE_SLACK=512`.
+- **Upstream:** `3c228769`, given the same template through a local model dir. It symlinks the snapshot's files and swaps `chat_template.jinja` (`bench --model`), because upstream cannot load a template file.
+- **Scenarios:** session (8 turns, 4.7K → 14.4K tokens), depth, toolrestart.
+
+| | upstream | fork |
+|---|---|---|
+| Session TTFT per turn (s) | 21.45, 5.61, 5.66, 5.56, 5.62, 5.95, 6.32, 6.54 | 23.37, 5.66, 5.80, 5.78, 6.11, 5.99, 6.50, 6.12 |
+| Session wall (s) | 157.1 | 131.6 |
+| Depth (new user turn, ~14.4K): TTFT (s) / decode (tok/s) | 6.01 / 14.4 | 6.65 / 22.6 |
+| Toolrestart: TTFT after restart (s) | 66.07 (prefilled 14,244, cached 0) | 8.40 (restored 13,100, prefilled 1,264) |
+
+- **The template fix helps both engines.** The depth row went 53.5 → 6.0 s on upstream and 35.1 → 6.7 s on the fork. With history rendered append-only, upstream's prefix cache hits it too.
+- **Restart.** The fork's re-save at production settings brought back 13,100 of 14,364 tokens. The session's spills each superseded the previous copy, so disk held one.
+- **Bug found by this run.** Every turn re-spilled (~2 GB each): #164 measured growth from strict-prefix copies only. Fixed in TimotejLabsky/vllm-mlx#97 (`_grown_spill_due` uses the lineage copy).

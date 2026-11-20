@@ -7,11 +7,12 @@
 > For general use you almost certainly want
 > [upstream](https://github.com/waybarrios/vllm-mlx), not this fork.
 
-## Fork vs upstream, measured (2026-11-19)
+## Fork vs upstream, measured (2026-11-19, 27B rerun 2026-11-20)
 
 Same box (M1 Ultra, 64 GB), same mlx / mlx-lm / mlx-vlm, same models, prompts
 and sampling. **Fork** = `main` `b98dc212` with each llama-swap route's
-production command and env; **upstream** = stock
+production command and env (27B rows except short-prompt decode:
+`09051aff`, rerun after the 2026-11-20 deploy); **upstream** = stock
 [`3c228769`](https://github.com/waybarrios/vllm-mlx/commit/3c228769) (the commit
 this fork is rebased on) with the same command, minus the flags it does not
 have. One server at a time on a spare port, fresh SSD cache dir, streamed,
@@ -23,28 +24,40 @@ per-run numbers and method:
 | route (model) | measurement | upstream | **fork** | change |
 |---|---|---|---|---|
 | **Qwen3.8-27B-8bit** | decode, short prompt | 15.1 tok/s | **24.4 tok/s** | **+61 %** |
-| | decode at ~12K context | 14.7 tok/s | **22.8 tok/s** | **+55 %** |
-| | first turn, 4.7K-token system + tools (cold) | 21.4 s | 21.9 s | same |
-| | tool-loop follow-up turn (5.9-10.8K), TTFT, median of 5 | 5.6 s | 6.1 s | same per token³ |
-| | 6-turn tool session, wall | 108.1 s | **99.3 s** | **−8 %** |
-| | new user turn after the tool loop (12.1K), TTFT | 53.5 s | **35.1 s** | **−34 %** |
-| | next tool turn after a server restart, TTFT | 37.9 s | **19.7 s** | **−48 %**² |
+| | decode at ~14K context | 14.4 tok/s | **22.6 tok/s** | **+57 %** |
+| | first turn, 4.7K-token system + tools (cold) | 21.4 s | 23.4 s | +9 % ¹ |
+| | tool-loop follow-up turn (5.9-14.4K), TTFT, median of 7 | 5.7 s | 6.0 s | same per token³ |
+| | 8-turn tool session, wall | 157.1 s | **131.6 s** | **−16 %** |
+| | new user turn after the tool loop (~14.4K), TTFT | 6.0 s | 6.7 s | same⁴ |
+| | next tool turn after a server restart (14.4K), TTFT | 66.1 s | **8.4 s** | **−87 %**² |
 | **Qwen3.6-35B-A3B-4bit** | decode, short prompt | 54.7 tok/s | **87.8 tok/s** | **+60 %** |
 | | 4-turn tool session, wall | 18.2 s | **12.8 s** | **−30 %** |
 | | follow-up turn, TTFT | 0.94 s | 0.97 s | same |
 | **Qwen3-VL-30B-A3B-8bit** | decode, image + text | 33.7 tok/s | **57.7 tok/s** | **+71 %** |
 | | follow-up turn about the same image, TTFT | 0.60 s | **0.35 s** | **−42 %** |
 
-² The restarted upstream server restored nothing and prefilled all 8.2K
-tokens. The fork restored the session's opening prompt (4,721 tokens) from SSD and
-prefilled the rest; a longer session also re-spills every 16K tokens of growth
-(#164), so it would restore more.
+¹ 2026-11-19's run had 21.4 s against 21.9 s: cold prefill is the same
+GPU work on both, so this is run-to-run noise plus a different first answer.
 
-³ The fork's turns had more to prefill (1,160-1,276 tokens against
+² The restarted upstream server restored nothing and prefilled all 14,244
+tokens. The fork restored 13,100 from its SSD tier and prefilled 1,264: a
+growing session is re-saved every 8K tokens and each new copy replaces the
+older ones (#164, #170). 2026-11-19, with a 16K re-save delta and no
+replacement, the same scenario restored only the opening 4,721 tokens
+(19.7 s against 37.9 s).
+
+³ Checked on the 2026-11-19 run (5.6 s against 6.1 s there): the fork's turns had more to prefill (1,160-1,276 tokens against
 upstream's 1,148-1,159): with sampling, its model answered in text on three
 turns, and the harness sent that text back with the next call. At equal size
 the gap is 1 % (1,160 tokens: 5.68 s against 5.62 s); the server log puts the
 fork's TTFT within 0.1 s of its prefill time.
+
+⁴ Both engines run the route's chat template from the deploy config, which
+since 2026-11-20 no longer draws an empty `<think></think>` for a turn whose
+reasoning the client stripped. Before, a new user message re-rendered the
+whole history: 2026-11-19 this row was **53.5 s upstream, 35.1 s fork**. The
+fix is in the template, so it helps both engines; it was found with this
+benchmark.
 
 Where the difference comes from, and where there is none:
 
@@ -56,12 +69,16 @@ Where the difference comes from, and where there is none:
   sync in every attention layer of every token (#168: 48 syncs per token in
   mlx-vlm's `qwen3_vl_moe`).
 - **Prefill is the same.** Cold first turns match within noise: the fork does
-  not make the GPU faster at prefill.
+  not make the GPU faster at prefill. Prefill on the 27B-8bit is bound by the
+  8-bit matmuls (8.8 s of every 10 s chunk); swapping in a dequantize + bf16
+  matmul gains ~9 % at best and changes T=0 output, so it is not built
+  (speed-lever ledger, #42).
 - **Shallow follow-up turns are not faster.** Upstream's prefix cache now also
   hits a simple tool-loop continuation on these hybrid models, and both
-  engines then prefill the new tokens at the same ~205 tok/s on the 27B³. The fork's cache pulls ahead
-  where the prompt does not simply extend the previous one: measured above, a
-  new user turn after a tool loop and a route reload; not measured in this
+  engines then prefill the new tokens at the same ~205 tok/s on the 27B³.
+  The fork wins the session on decode (−16 % wall over 8 turns). Its cache
+  pulls ahead where the prompt does not simply extend what is in memory:
+  measured above, a route reload; not measured in this
   run (each has its own real-server check in [`PATCHES.md`](PATCHES.md)), a
   template that re-renders the model's own output differently (#139, #166),
   conversations interleaved with other clients (#163, #165), and deep
@@ -183,6 +200,23 @@ class of win this fork waits to take via an mlx release rather than vendor).
 
 ## Recent changes
 
+> **2026-11-20 — a new message after a tool loop no longer re-reads the
+> whole history; reloaded sessions come back nearly whole** (PATCHES.md #170):
+> - **The template.** On the 27B-8bit a new user message after a tool loop
+>   waited 35 s to its first token (12K tokens). The route's chat template
+>   drew an empty `<think></think>` for each earlier turn whose reasoning the
+>   client had stripped, then dropped those blocks once a user message
+>   followed, so every earlier turn was re-rendered. It now draws none: 6.7 s,
+>   with no change in tool-call quality across a 4-task A/B.
+> - **The SSD tier.** A growing session is re-saved every 8K tokens instead of
+>   16K, and each new copy deletes the older ones (the same conversation
+>   only, never another job sharing its system prompt), so the tier keeps one
+>   copy per session. A restart in the middle of a 14K session now restores
+>   13.1K of it (8.4 s, against 66 s on upstream).
+> - **Wasted writes.** The re-save threshold had counted from the session's
+>   first prompt, so long sessions were re-saved on every turn (~2 GB each).
+>   It now counts from the session's last saved copy.
+>
 > **2026-11-19 — agent sessions survive route reloads; the 27B's template is
 > version-controlled** (PATCHES.md #169): the 27B-8bit's SSD tier had filled
 > with a background job's one-off 2K-token prompts (~600 MB each) and
