@@ -45,6 +45,8 @@ ap.add_argument("--scenarios", default="decode,session,depth,restart")
 ap.add_argument("--turns", type=int, default=6)
 ap.add_argument("--env", action="append", default=[], metavar="K=V",
                 help="override one of the route's env vars (repeatable)")  # fmt: skip
+ap.add_argument("--model", help="serve this model path instead of the route's (e.g. a "
+                "local dir with another chat_template.jinja, for upstream)")  # fmt: skip
 args = ap.parse_args()
 BASE = f"http://127.0.0.1:{args.port}"
 PY = "/Users/ai/vllm-mlx-env/bin/python"
@@ -95,6 +97,8 @@ SSD_DIR = tempfile.mkdtemp(prefix="bench-ssd-")
 
 def start(log_path):
     argv, env_extra = route_cmd()
+    if args.model:
+        argv[0] = args.model
     model = argv[0]
     if args.engine == "upstream":
         argv = drop_unsupported(argv)
