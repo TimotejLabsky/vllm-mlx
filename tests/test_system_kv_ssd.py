@@ -422,3 +422,104 @@ def test_upstream_index_schema_bump_keeps_existing_spills():
         store2.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _write_with_ckpts(store, n_tokens: int, ckpt_positions):
+    """Synchronous spill of an ``n_tokens`` chain with checkpoints at
+    ``ckpt_positions`` (meta only matters to #170; the tensors are tiny)."""
+    from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+    snap = _make_hybrid_snapshot(seq=8)
+    tensors, meta = flatten_snapshot(snap)
+    ckpt_meta = [{"pos": p, "layers": []} for p in ckpt_positions]
+    store._write_entry(
+        tuple(range(n_tokens)),
+        tensors,
+        meta,
+        ckpt_meta,
+        None,
+        None,
+        _snapshot_nbytes(snap),
+    )
+
+
+def test_supersede_deletes_covered_prefix_copies_170():
+    """#170: a longer spill of the same chain deletes the shorter copies its
+    ladder covers and leaves an unrelated chain alone."""
+    from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, supersede_slack=512))
+        _write_with_ckpts(store, 4000, [3990])
+        _write_with_ckpts(store, 8000, [3990, 7990])
+        other = tuple(range(1, 3000))  # a different chain (starts at 1)
+        snap = _make_hybrid_snapshot(seq=8)
+        t, m = flatten_snapshot(snap)
+        store._write_entry(other, t, m, [], None, None, _snapshot_nbytes(snap))
+        _write_with_ckpts(store, 12000, [7800, 11990])
+        rows = store._index.lookup_prefix(tuple(range(20000)))
+        assert [r["num_tokens"] for r in rows] == [12000]
+        assert store.lookup_prefix(other + (5,))["num_tokens"] == 2999
+        assert store.get_stats()["superseded"] == 2
+        # The deleted copies' dirs are gone; the survivors' remain.
+        assert len(os.listdir(os.path.join(d, "data"))) == 2
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_supersede_keeps_copy_without_nearby_checkpoint_170():
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, supersede_slack=512))
+        _write_with_ckpts(store, 4000, [3990])
+        _write_with_ckpts(store, 8000, [1000, 7990])  # nothing in [3488, 4000]
+        rows = store._index.lookup_prefix(tuple(range(9000)))
+        assert [r["num_tokens"] for r in rows] == [8000, 4000]
+        assert store.get_stats()["superseded"] == 0
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_supersede_off_by_default_170(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_SSD_SUPERSEDE_SLACK", raising=False)
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d))
+        assert store._config.supersede_slack == 0
+        _write_with_ckpts(store, 4000, [3990])
+        _write_with_ckpts(store, 8000, [3990, 7990])
+        rows = store._index.lookup_prefix(tuple(range(9000)))
+        assert [r["num_tokens"] for r in rows] == [8000, 4000]
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_supersede_named_key_and_gen_start_round_trip_170():
+    """A spill naming an older copy of its conversation deletes exactly that
+    key once written; gen_start survives the round trip."""
+    from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, supersede_slack=512))
+        snap = _make_hybrid_snapshot(seq=8)
+        t, m = flatten_snapshot(snap)
+        nb = _snapshot_nbytes(snap)
+        old = tuple(range(350)) + (9,) * 50
+        other = tuple(range(200)) + (4,) * 300
+        store._write_entry(old, t, m, [], None, None, nb, gen_start=350)
+        store._write_entry(other, t, m, [], None, None, nb)
+        new = tuple(range(345)) + (5,) * 200
+        store._write_entry(new, t, m, [], None, None, nb, gen_start=545, supersede=old)
+        assert store.lookup_prefix(old + (1,)) is None
+        assert store.lookup_prefix(other + (1,))["num_tokens"] == 500
+        hit = store.lookup_prefix(new + (1,))
+        assert store.read_entry(new, hit["file_path"])["gen_start"] == 545
+        assert store.get_stats()["superseded"] == 1
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

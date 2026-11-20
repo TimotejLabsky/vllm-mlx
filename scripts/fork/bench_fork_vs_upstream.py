@@ -43,6 +43,8 @@ ap.add_argument("--upstream", default="/tmp/upstream-vllm-mlx")
 ap.add_argument("--port", type=int, default=5996)
 ap.add_argument("--scenarios", default="decode,session,depth,restart")
 ap.add_argument("--turns", type=int, default=6)
+ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                help="override one of the route's env vars (repeatable)")  # fmt: skip
 args = ap.parse_args()
 BASE = f"http://127.0.0.1:{args.port}"
 PY = "/Users/ai/vllm-mlx-env/bin/python"
@@ -103,6 +105,8 @@ def start(log_path):
         env["PYTHONPATH"] = args.upstream
     else:
         env.pop("PYTHONPATH", None)
+    # Last, so --env PYTHONPATH=<rsync'd src> runs an uninstalled fork.
+    env.update(kv.partition("=")[::2] for kv in args.env)
     proc = subprocess.Popen([PY, "-m", "vllm_mlx.cli", "serve"] + argv, env=env,
                             stdout=open(log_path, "a"), stderr=subprocess.STDOUT,
                             cwd="/tmp")  # fmt: skip
@@ -260,9 +264,9 @@ def run():
             res["depth"] = {"ttft": r["ttft"], "rate": r["rate"]}
             print("depth", res["depth"], flush=True)
         if "toolrestart" in sc:
-            # The agent's NEXT tool turn after a reload (a new user message
-            # would make this template drop earlier <think> blocks - a split
-            # no cache can repair). Wait for the SSD writer's idle window.
+            # The agent's NEXT tool turn after a reload (before #170's
+            # template a new user message re-rendered every earlier turn, a
+            # split no cache can repair). Wait for the SSD writer's idle window.
             time.sleep(45)
             stop(proc)
             time.sleep(3)

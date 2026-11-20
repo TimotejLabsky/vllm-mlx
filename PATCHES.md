@@ -4544,3 +4544,36 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 **Fix 2.** `VLLM_MLX_CHAT_TEMPLATE_FILE=<path>`: the tokenizer's chat template is replaced by the file's at load (wrapped or plain tokenizer), logged with its sha1. A missing file fails startup. Reason: the 27B-8bit's custom template existed only as a hand-edited file inside an HF snapshot; 2026-11-18 a re-download moved `refs/main` to a snapshot with the stock template and the route silently ran it for 72 minutes. The template now lives in the infra repo (`mac-studio/templates/`).
 
 **Verification.** `test_169_chains_under_the_minimum_stay_ram_only` / `test_169_off_by_default_every_chain_spills` (a restart over the same SSD dir finds the 600-token chain and not the 400-token one; the RAM entry still hits); `test_169_chat_template_file_replaces_the_snapshots_template`, `test_169_unset_is_a_no_op_and_a_missing_file_fails_startup`. Full suite 5504 passed / 32 skipped. Real server (`scripts/fork/e2e_template_file_effort.py`, Studio, 27B-8bit, spare port): both template files loaded (`[chat_template] from ...`), `spill_skipped_small` counted the short requests, no traceback.
+
+## 170. `patch: ssd-supersede` — a growing session keeps one copy on the SSD tier, not one per spill
+
+**Files:** `vllm_mlx/system_kv_ssd.py` (`supersede_slack`, `_supersede_prefixes`, `_supersede_key`, `gen_start` in `meta.json`), `vllm_mlx/batched_system_kv.py` (`disk` lineage on entries, `_lineage_disk_locked`, `_supersede_pick`), `tests/test_system_kv_ssd.py`, `tests/test_batched_system_kv.py`, `scripts/fork/e2e_template_empty_think.py`, `scripts/fork/probe_dequant_prefill.py`, `scripts/fork/bench_fork_vs_upstream.py` (`--env`).
+
+**Why (2026-11-20, 27B-8bit).** After a reload, the fork-vs-upstream bench restored only a session's opening prompt (4,721 of 8.2K tokens): its later turns were under #164's 16K re-spill delta. Lowering the delta means more copies of the same session on disk, and nothing removed them. Every spill stayed in the tier until LRU reached it. At a 4K delta one 68K session would have left ~17 near-identical copies of itself, several GB each, pushing Hermes chains out of the 40 GB tier. Live write volume at 16K: 93-173 GB/day of spills, of which 28-77 GB were chains >= 20K tokens.
+
+**Fix.** `VLLM_MLX_SSD_SUPERSEDE_SLACK=<n>` (default 0 = off). When a spill lands:
+- **Strict-prefix copies** of it on disk are deleted, if the new entry has a checkpoint at most n tokens below their end. Hybrid models resume mid-chain only at a checkpoint, so whatever the old copy served, the new one serves for at most n extra prefill tokens.
+- **The previous copy of the same conversation** is deleted under the same checkpoint condition. Finished turns end in the model's own thinking, which the client sends back re-rendered, so those copies are siblings rather than prefixes of the next chain (real server: only 1 of 4 older copies was a strict prefix). The RAM tier tracks lineage instead:
+  - each entry carries `disk` = (key, prompt length) of the newest on-disk copy of its conversation, set when it spills or is promoted from SSD;
+  - a grown entry inherits it from its donor only when it contains that copy's whole prompt, minus the 16-token generation header the next turn re-renders;
+  - a different job restored from the same system prefix fails that test, so its spill never deletes the other job's chain.
+- The prompt length is persisted as `gen_start` in `meta.json` (an additive key), so the lineage survives a restart.
+- Stats: `superseded`, `superseded_bytes`.
+
+**Deploy (27B-8bit).** Slack 512 with #164's delta lowered 16K -> 8K: a reload costs at most ~8K tokens (~38 s) of re-prefill, not ~16K (~76 s), at about twice the deep-spill writes. Not 4K: with no supersede the copies would fill the tier, and even with it, writes would roughly quadruple.
+
+**Same day, infra repo (template, no fork code):** the 27B-8bit template renders a turn whose reasoning the client stripped (opencode, LiteLLM) with no think block wherever it sits. Under `preserve_thinking: false` it used to get an empty `<think></think>` inside the current tool loop and nothing once a user message followed. Each new user message therefore re-rendered every earlier turn: the bench's new user turn after a 6-turn loop re-prefilled 7,384 of 12,105 tokens. Turns that carry reasoning render as before (checked byte-identical).
+
+**Verification.**
+- **Unit tests:** `test_supersede_deletes_covered_prefix_copies_170`, `test_supersede_keeps_copy_without_nearby_checkpoint_170`, `test_supersede_off_by_default_170`, `test_supersede_named_key_and_gen_start_round_trip_170` (an unrelated chain sharing a prefix survives); `test_170_next_turn_inherits_the_disk_copy_of_its_conversation` (a different job sharing the system prefix does not inherit), `test_170_supersede_pick_needs_a_checkpoint_near_the_split`, `test_170_off_without_slack`. Full suite 5511 passed / 32 skipped.
+- **Template A/B, real server** (Studio, exact live route command and env, spare port, `e2e_template_empty_think.py`, 4 agent tasks, reasoning stripped like opencode):
+  - unparsed, duplicate or repeated tool calls: 0 / 0 / 0 for both templates;
+  - tasks with a final answer: old 3/4, new 4/4;
+  - new user turn TTFT: old 3.5 / 5.1 / 1.7 / 6.2 s, new 1.6 / 1.2 / 0.9 / 1.5 s.
+- **Bench, same route** (`bench_fork_vs_upstream.py --env VLLM_MLX_CHAT_TEMPLATE_FILE=...`):
+  - tool turns unchanged (5.5-6.2 s);
+  - new user turn at 12.1K: **33.6 s -> 6.7 s**;
+  - decode 23.1 -> 22.9 tok/s.
+- **Supersede, real server** (delta 1024, slack 512, 4-turn session, then a restart): first run, before the lineage rule: the session restored 8,285 of 9,542 tokens after the restart (19.7 s -> 10.5 s TTFT against the 16K-delta bench), but only the prompt-boundary copy was superseded.
+  - Rerun with the lineage rule: each of the 4 turns' spills deleted its predecessor ("superseded 4918-token copy by 6039-token spill (same conversation)", and so on), so the tier held one copy of the session throughout.
+  - After the restart, the promoted 8,444-token copy was superseded by the next spill, so the lineage survived the restart via `gen_start`. Restored 8,239 of 9,491 tokens, TTFT 11.7 s.

@@ -68,7 +68,11 @@ The restart scenario on this route used a new user message, not a tool continuat
   - The 27B-8bit adds the MTP drafter with speculative sampling (#160/#161/#167).
   - The Qwen3-VL route loses mlx-vlm's per-layer host sync (#168).
 - **Prefill is not faster.** Cold first turns are within noise.
-- **Cached tool-loop follow-ups are not faster.** Upstream's prefix cache now hits them too. On the 27B the fork is about 0.5 s later to first token there; the cause has not been investigated.
+- **Cached tool-loop follow-ups are not faster.** Upstream's prefix cache now hits them too.
+  - The fork's ~0.5 s later first token on the 27B is not engine overhead (checked 2026-11-20).
+  - Both engines prefill the new tokens at ~205 tok/s. At equal size the gap is 1 %: 1,160 tokens took 5.68 s on the fork, 1,159 took 5.62 s upstream.
+  - The fork's later turns were longer, 1,231-1,276 tokens against upstream's 1,148-1,159. Its sampled model answered in text on turns 3-5, and the harness sent that text back with its fallback call.
+  - In the fork's server log, TTFT is within 0.1 s of the schedule-to-prompt-boundary time, so nothing outside prefill adds latency.
 - **The cache gains show where the prompt is not a plain extension of the previous one:** a new user turn after tool turns (−34%) and a reload (−48%).
 - **Not measured here:**
   - re-rendered generated spans (#139, #166) and interleaved clients (#163, #165), which have their own real-server checks in PATCHES.md;
