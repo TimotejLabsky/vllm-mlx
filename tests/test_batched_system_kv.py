@@ -1132,3 +1132,21 @@ def test_170_off_without_slack(monkeypatch, tmp_path):
         assert kv._supersede_pick(new, e) is None
     finally:
         kv.close()
+
+
+def test_170_grown_spill_delta_counts_from_the_lineage_copy(monkeypatch, tmp_path):
+    """The previous turn's copy ends in the model's raw output, so it is not a
+    strict prefix of the next chain; the delta is measured from it anyway
+    (before: from the longest strict prefix, i.e. every turn re-spilled)."""
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=250)
+    try:
+        chain = list(TOKENS)
+        n = len(chain)
+        assert n > 400
+        prev = tuple(chain[: n - 100] + [-1] * 50)  # chain is 100 past it
+        assert kv._grown_spill_due(chain) is True  # nothing on disk
+        assert kv._grown_spill_due(chain, {"disk": (prev, n - 100)}) is False
+        far = tuple(chain[: n - 300] + [-1] * 50)  # 300 past: due
+        assert kv._grown_spill_due(chain, {"disk": (far, n - 300)}) is True
+    finally:
+        kv.close()

@@ -1150,7 +1150,7 @@ class BatchedSystemKV:
                 self.grown_stores += 1
         if not grown:
             self._spill(tokens_list, entry)
-        elif self._grown_spill_due(tokens_list):
+        elif self._grown_spill_due(tokens_list, entry):
             self.grown_spills += 1
             self._spill(tokens_list, entry)
         return True
@@ -1178,8 +1178,15 @@ class BatchedSystemKV:
             return None
         return donor["disk"]
 
-    def _grown_spill_due(self, tokens_list: list) -> bool:
-        """(#164) Is this grown chain far enough past the disk copy?"""
+    def _grown_spill_due(self, tokens_list: list, entry: Optional[dict] = None) -> bool:
+        """(#164) Is this grown chain far enough past the disk copy?
+
+        "The disk copy" is the longest on-disk strict prefix OR (#170) the
+        entry's own lineage copy, whichever shares more. A finished turn's
+        copy ends in the model's raw output, which the next turn re-renders,
+        so it is never a strict prefix of the next chain: measured only
+        against strict prefixes, every turn of a session more than the delta
+        past its first prompt re-spilled (2 GB a turn at 14K, 2026-11-20)."""
         if self._ssd is None or self.spill_grown_delta <= 0:
             return False
         try:
@@ -1188,6 +1195,9 @@ class BatchedSystemKV:
         except Exception:
             logger.debug("[batched_system_kv] grown-spill probe failed", exc_info=True)
             return False
+        disk = entry.get("disk") if entry is not None else None
+        if disk is not None:
+            on_disk = max(on_disk, common_prefix_len(tokens_list, list(disk[0])))
         return len(tokens_list) - on_disk >= self.spill_grown_delta
 
     def store_prompt_boundary(self, request_id: str, tokens: list, cache_list) -> bool:
