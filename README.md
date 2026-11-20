@@ -25,7 +25,7 @@ per-run numbers and method:
 | **Qwen3.8-27B-8bit** | decode, short prompt | 15.1 tok/s | **24.4 tok/s** | **+61 %** |
 | | decode at ~12K context | 14.7 tok/s | **22.8 tok/s** | **+55 %** |
 | | first turn, 4.7K-token system + tools (cold) | 21.4 s | 21.9 s | same |
-| | tool-loop follow-up turn (5.9-10.8K), TTFT, median of 5 | 5.6 s | 6.1 s | +8 % (slower) |
+| | tool-loop follow-up turn (5.9-10.8K), TTFT, median of 5 | 5.6 s | 6.1 s | same per token³ |
 | | 6-turn tool session, wall | 108.1 s | **99.3 s** | **−8 %** |
 | | new user turn after the tool loop (12.1K), TTFT | 53.5 s | **35.1 s** | **−34 %** |
 | | next tool turn after a server restart, TTFT | 37.9 s | **19.7 s** | **−48 %**² |
@@ -40,6 +40,12 @@ tokens. The fork restored the session's opening prompt (4,721 tokens) from SSD a
 prefilled the rest; a longer session also re-spills every 16K tokens of growth
 (#164), so it would restore more.
 
+³ The fork's turns had more to prefill (1,160-1,276 tokens against
+upstream's 1,148-1,159): with sampling, its model answered in text on three
+turns, and the harness sent that text back with the next call. At equal size
+the gap is 1 % (1,160 tokens: 5.68 s against 5.62 s); the server log puts the
+fork's TTFT within 0.1 s of its prefill time.
+
 Where the difference comes from, and where there is none:
 
 - **Decode.** Upstream has no `--text-only`, so it serves these
@@ -52,9 +58,8 @@ Where the difference comes from, and where there is none:
 - **Prefill is the same.** Cold first turns match within noise: the fork does
   not make the GPU faster at prefill.
 - **Shallow follow-up turns are not faster.** Upstream's prefix cache now also
-  hits a simple tool-loop continuation on these hybrid models; on the 27B the
-  fork's first token is ~0.5 s later there (not yet investigated), won back
-  by faster decode over the session (−8 % wall). The fork's cache pulls ahead
+  hits a simple tool-loop continuation on these hybrid models, and both
+  engines then prefill the new tokens at the same ~205 tok/s on the 27B³. The fork's cache pulls ahead
   where the prompt does not simply extend the previous one: measured above, a
   new user turn after a tool loop and a route reload; not measured in this
   run (each has its own real-server check in [`PATCHES.md`](PATCHES.md)), a

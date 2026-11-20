@@ -313,6 +313,9 @@ def _model_slug(tokenizer: Any) -> str:
 # (#128) histogram bucket upper bounds, in tokens
 _DIVERGENCE_BUCKETS = ("<256", "<1K", "<4K", "<16K", "<64K", ">=64K")
 _DIVERGENCE_BOUNDS = (256, 1024, 4096, 16384, 65536)
+# (#170) tokens at the end of a prompt the next turn may render differently
+# (the generation header), still counted as "the same conversation".
+_LINEAGE_HEADER_TOKENS = 16
 
 
 def _divergence_bucket(n: int) -> str:
@@ -996,7 +999,14 @@ class BatchedSystemKV:
         return kinds, snapshot, capture_snapshot_meta(cache_list), grown
 
     def _insert_entry_locked(
-        self, tokens_list, kinds, snapshot, metas, checkpoints, gen_start=None
+        self,
+        tokens_list,
+        kinds,
+        snapshot,
+        metas,
+        checkpoints,
+        gen_start=None,
+        disk=None,
     ):
         """Insert an entry, absorbing every existing entry whose tokens are a
         (proper or equal) PREFIX of the new chain: their ladders merge in
@@ -1005,6 +1015,9 @@ class BatchedSystemKV:
         case (found by the e2e concurrent scenario) and prompt-boundary
         entries being replaced by their finished chain."""
         gen_spans: set = set()  # (#139) carried along with absorbed chains
+        # (#170) the newest on-disk copy of this conversation: (key, prompt
+        # length or None). Given by the caller, else from an absorbed prefix.
+        inherited_disk = disk
         absorbed = [
             k
             for k, e in self._entries.items()
@@ -1018,6 +1031,8 @@ class BatchedSystemKV:
                 # Subsumed, not lost — the chain lives on in the new entry.
                 self._timing.forget(timing_key(popped["tokens"]))
                 gen_spans.update(popped.get("gen_spans", ()))
+                if inherited_disk is None and popped.get("disk") is not None:
+                    inherited_disk = popped["disk"]
                 for cp in popped["checkpoints"]:
                     merged[cp["pos"]] = cp
             for cp in checkpoints:
@@ -1044,6 +1059,8 @@ class BatchedSystemKV:
             "trim_bytes": trim_bytes,
             "fixed_bytes": snapshot_bytes - trim_bytes,
         }
+        if inherited_disk is not None:
+            entry["disk"] = inherited_disk
         if gen_start is not None and 0 <= gen_start <= len(tokens_list):
             entry["gen_start"] = int(gen_start)  # (#139) generated output begins
             if gen_start < len(tokens_list):
@@ -1118,6 +1135,7 @@ class BatchedSystemKV:
             return False
 
         with self._lock:
+            disk = self._lineage_disk_locked(request_id, tokens_list)
             checkpoints = self._pending.pop(request_id, [])
             self._base_pos.pop(request_id, None)
             # (#132) these leaked one entry per stored request before
@@ -1126,7 +1144,7 @@ class BatchedSystemKV:
             self._restore_source.pop(request_id, None)
             self._divergence.pop(request_id, None)
             entry = self._insert_entry_locked(
-                tokens_list, kinds, snapshot, metas, checkpoints, gen_start
+                tokens_list, kinds, snapshot, metas, checkpoints, gen_start, disk
             )
             if grown:
                 self.grown_stores += 1
@@ -1136,6 +1154,29 @@ class BatchedSystemKV:
             self.grown_spills += 1
             self._spill(tokens_list, entry)
         return True
+
+    def _lineage_disk_locked(self, request_id: str, tokens_list: list):
+        """(#170) The on-disk copy a new entry inherits from its donor.
+
+        Only when the new chain CONTAINS the donor copy's whole prompt - the
+        same conversation continued (the next turn re-sends the prompt, then
+        the re-rendered answer and new tool results). A different job that
+        only shares the system prefix restored from the same donor does not
+        inherit it, so its spill never deletes the other job's copy."""
+        donor_key = self._restore_source.get(request_id)
+        donor = self._entries.get(donor_key) if donor_key is not None else None
+        if donor is None or donor.get("disk") is None:
+            return None
+        key, prompt_len = donor["disk"]
+        if prompt_len is None:
+            return None
+        # The prompt ends with the generation header ("<|im_start|>assistant
+        # \n<think>\n"), which the next turn re-renders around the model's
+        # answer - so "contains the prompt" allows the last few tokens.
+        need = max(0, prompt_len - _LINEAGE_HEADER_TOKENS)
+        if common_prefix_len(tokens_list[:prompt_len], list(key[:prompt_len])) < need:
+            return None
+        return donor["disk"]
 
     def _grown_spill_due(self, tokens_list: list) -> bool:
         """(#164) Is this grown chain far enough past the disk copy?"""
@@ -1186,8 +1227,9 @@ class BatchedSystemKV:
             return False
         with self._lock:
             checkpoints = list(self._pending.get(request_id, []))
+            disk = self._lineage_disk_locked(request_id, tokens_list)
             entry = self._insert_entry_locked(
-                tokens_list, kinds, snapshot, metas, checkpoints
+                tokens_list, kinds, snapshot, metas, checkpoints, None, disk
             )
             self.boundary_stores += 1
             if grown:
@@ -1236,17 +1278,46 @@ class BatchedSystemKV:
             def _landed(entry=entry):
                 entry["spill_pending"] = False
 
+            key = tuple(tokens_list)
+            supersede = self._supersede_pick(key, entry)
             if not self._ssd.enqueue_spill(
-                tuple(tokens_list),
+                key,
                 spill_snapshot,
                 checkpoints=entry["checkpoints"],
                 meta=entry["metas"],
                 kinds=entry["kinds"],
                 on_done=_landed,
+                gen_start=entry.get("gen_start"),
+                supersede=supersede,
             ):
                 entry["spill_pending"] = False
+            else:
+                # (#170) the newest on-disk copy of this conversation is now
+                # this one; chains grown from it inherit the key.
+                entry["disk"] = (key, entry.get("gen_start"))
         except Exception:
             logger.debug("[batched_system_kv] spill enqueue failed", exc_info=True)
+
+    def _supersede_pick(self, key: tuple, entry: dict):
+        """(#170) The older on-disk copy this spill replaces, or None.
+
+        The copy must be of the same conversation (``_lineage_disk_locked``
+        checked that its prompt is contained) and this entry must be able to
+        resume within ``supersede_slack`` tokens of where the two chains part
+        - hybrid models resume mid-chain only at a checkpoint - so every
+        request the old copy could serve, the new one serves for at most
+        ``slack`` extra prefill tokens."""
+        disk = entry.get("disk")
+        slack = getattr(getattr(self._ssd, "_config", None), "supersede_slack", 0)
+        if disk is None or slack <= 0 or tuple(disk[0]) == key:
+            return None
+        old = disk[0]
+        lcp = common_prefix_len(list(key), list(old))
+        if lcp == len(old):
+            return None  # a strict prefix: the store's own rule covers it
+        if not any(lcp - slack <= cp["pos"] <= lcp for cp in entry["checkpoints"]):
+            return None
+        return tuple(old)
 
     # ------------------------------------------------------------- ssd tier
 
@@ -1348,12 +1419,16 @@ class BatchedSystemKV:
         if entry is None:
             return False
         with self._lock:
+            key = tuple(candidate["tokens"])
             self._insert_entry_locked(
-                list(candidate["tokens"]),
+                list(key),
                 entry["kinds"],
                 entry["snapshot"],
                 entry["meta"],
                 entry["checkpoints"],
+                # (#170) this entry IS on disk; a chain grown from it
+                # supersedes this copy when it spills.
+                disk=(key, entry.get("gen_start")),
             )
             self.ssd_promotes += 1
         return True

@@ -1067,3 +1067,68 @@ def test_164_segmented_layer_round_trips_through_the_ssd_format():
     pairs = zip(state_arrays(back[0]), state_arrays(seg))
     assert all(mx.array_equal(x, y) for x, y in pairs)
     assert len(state_arrays(seg)) == 4  # byte accounting sees the segments
+
+
+# --------------------------------------- #170 same-conversation supersede
+
+
+def _lineage_kv(monkeypatch, tmp_path, slack="512"):
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MLX_SSD_SUPERSEDE_SLACK", slack)
+    return BatchedSystemKV(_FakeModel(), tokenizer=NS(name_or_path="unit/test-model"))
+
+
+def _with_donor(kv, rid, disk):
+    kv._entries[99] = {"tokens": [], "disk": disk}
+    kv._restore_source[rid] = 99
+
+
+def test_170_next_turn_inherits_the_disk_copy_of_its_conversation(
+    monkeypatch, tmp_path
+):
+    """The previous turn's copy = its prompt (350) + generated answer. The next
+    turn contains that prompt up to the re-rendered generation header."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    try:
+        old = tuple(TOKENS[:350] + [9] * 50)
+        _with_donor(kv, "r1", (old, 350))
+        nxt = TOKENS[:345] + [5] * 200  # parts at 345: inside the header slack
+        assert kv._lineage_disk_locked("r1", nxt) == (old, 350)
+        # A different job that only shares the system prefix does not.
+        other = TOKENS[:200] + [4] * 300
+        assert kv._lineage_disk_locked("r1", other) is None
+        # Unknown prompt length (an entry spilled before #170): no inheritance.
+        _with_donor(kv, "r2", (old, None))
+        assert kv._lineage_disk_locked("r2", nxt) is None
+    finally:
+        kv.close()
+
+
+def test_170_supersede_pick_needs_a_checkpoint_near_the_split(monkeypatch, tmp_path):
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    try:
+        old = tuple(TOKENS[:350] + [9] * 50)
+        new = tuple(TOKENS[:345] + [5] * 200)
+        near = {"disk": (old, 350), "checkpoints": [{"pos": 300}, {"pos": 345}]}
+        assert kv._supersede_pick(new, near) == old
+        far = {"disk": (old, 350), "checkpoints": [{"pos": 540}]}
+        assert kv._supersede_pick(new, far) is None
+        # A strict prefix is left to the store's own rule.
+        pre = tuple(TOKENS[:300])
+        strict = {"disk": (pre, 290), "checkpoints": [{"pos": 299}]}
+        assert kv._supersede_pick(new, strict) is None
+    finally:
+        kv.close()
+
+
+def test_170_off_without_slack(monkeypatch, tmp_path):
+    kv = _lineage_kv(monkeypatch, tmp_path, slack="0")
+    try:
+        old = tuple(TOKENS[:350] + [9] * 50)
+        new = tuple(TOKENS[:345] + [5] * 200)
+        e = {"disk": (old, 350), "checkpoints": [{"pos": 345}]}
+        assert kv._supersede_pick(new, e) is None
+    finally:
+        kv.close()

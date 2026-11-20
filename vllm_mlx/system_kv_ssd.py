@@ -149,6 +149,9 @@ class SystemKVSSDStats:
     # (#140) checkpoints left out of queued spills by prune_spill_ladder
     ckpt_pruned: int = 0
     ckpt_pruned_bytes: int = 0
+    # (#170) shorter copies of a chain deleted when its longer copy landed
+    superseded: int = 0
+    superseded_bytes: int = 0
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -170,6 +173,8 @@ class SystemKVSSDStats:
             "busy_writes": self.busy_writes,
             "ckpt_pruned": self.ckpt_pruned,
             "ckpt_pruned_bytes": self.ckpt_pruned_bytes,
+            "superseded": self.superseded,
+            "superseded_bytes": self.superseded_bytes,
         }
 
 
@@ -180,6 +185,13 @@ def _default_ckpt_min_gap() -> int:
         )
     except ValueError:
         return 16
+
+
+def _default_supersede_slack() -> int:
+    try:
+        return max(0, int(os.environ.get("VLLM_MLX_SSD_SUPERSEDE_SLACK", "") or 0))
+    except ValueError:
+        return 0
 
 
 @dataclass
@@ -208,6 +220,13 @@ class SystemKVSSDConfig:
     # (#140) Spilled checkpoints closer than this to the previous kept one
     # are left out (see prune_spill_ladder). 0 keeps the whole ladder.
     ckpt_min_gap: int = field(default_factory=_default_ckpt_min_gap)
+    # (#170) When a spill lands, entries on disk whose tokens are a strict
+    # prefix of it are deleted - the older copies a growing session left
+    # behind (#164) - provided the new entry has a checkpoint at most this
+    # many tokens below the old copy's end, so anything that copy could
+    # serve the new one serves for <= slack tokens of extra prefill.
+    # 0 = keep every copy (the old behaviour, LRU removes them).
+    supersede_slack: int = field(default_factory=_default_supersede_slack)
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
@@ -637,6 +656,8 @@ class SystemKVSSDStore:
                 kinds,
                 nbytes,
                 on_done,
+                gen_start,
+                supersede,
             ) = item
             # The snapshot is leaving the queue (about to be written and then
             # dropped) — release its share of the pinned-byte budget.
@@ -657,6 +678,8 @@ class SystemKVSSDStore:
                         snap_meta,
                         kinds,
                         nbytes,
+                        gen_start=gen_start,
+                        supersede=supersede,
                     )
             except Exception:
                 logger.exception(
@@ -757,8 +780,15 @@ class SystemKVSSDStore:
         meta: list | None = None,
         kinds: list | None = None,
         on_done=None,
+        gen_start: int | None = None,
+        supersede: tuple[int, ...] | None = None,
     ) -> bool:
-        """``on_done`` (#108) is called exactly once when the queued spill
+        """``gen_start`` (#170) is persisted so a promoted entry still knows
+        where its prompt ends; ``supersede`` is an on-disk key the RAM tier
+        found to be an older copy of this same conversation, deleted once
+        this spill has landed.
+
+        ``on_done`` (#108) is called exactly once when the queued spill
         leaves the queue for good - written, failed, or dropped by
         ``drop_backlog`` - from whichever thread that happens on. It is NOT
         called when this method returns False (nothing was queued).
@@ -819,6 +849,8 @@ class SystemKVSSDStore:
                     kinds,
                     nbytes,
                     on_done,
+                    gen_start,
+                    supersede,
                 )
             )
             if pruned:
@@ -846,6 +878,8 @@ class SystemKVSSDStore:
         snap_meta: list | None,
         kinds: list | None,
         nbytes: int,
+        gen_start: int | None = None,
+        supersede: tuple[int, ...] | None = None,
     ) -> None:
         import mlx.core as mx
 
@@ -872,6 +906,8 @@ class SystemKVSSDStore:
                     "checkpoints": ckpt_meta,
                     "meta": snap_meta,
                     "kinds": kinds,
+                    # (#170) additive: where the generated output begins
+                    "gen_start": gen_start,
                 },
                 f,
             )
@@ -902,7 +938,66 @@ class SystemKVSSDStore:
             len(tokens),
             disk_bytes / 1e6,
         )
+        self._supersede_prefixes(tokens, ckpt_meta)
+        if supersede is not None and tuple(supersede) != tuple(tokens):
+            self._supersede_key(tuple(supersede), len(tokens))
         self._enforce_capacity()
+
+    def _supersede_key(self, key: tuple[int, ...], new_len: int) -> None:
+        """(#170) Delete one named older copy (the RAM tier's lineage pick)."""
+        try:
+            for row in self._index.lookup_prefix(key):
+                if row["num_tokens"] != len(key):
+                    continue
+                self._delete_entry(row["file_path"])
+                self._index.delete_entry(key)
+                with self._lock:
+                    self._stats.superseded += 1
+                    self._stats.superseded_bytes += row.get("memory_bytes") or 0
+                logger.info(
+                    "[system_kv_ssd] superseded %d-token copy by %d-token spill "
+                    "(same conversation)",
+                    len(key),
+                    new_len,
+                )
+        except Exception:
+            logger.debug("[system_kv_ssd] supersede failed", exc_info=True)
+
+    def _supersede_prefixes(self, tokens: tuple[int, ...], ckpt_meta: list) -> None:
+        """(#170) Delete the shorter on-disk copies of the chain just written.
+
+        A session that grows turn by turn is re-spilled every
+        ``VLLM_MLX_SSD_SPILL_GROWN_DELTA`` tokens (#164), and every earlier
+        copy stayed on disk until LRU reached it: one 68K session at a 4K
+        delta would hold ~17 near-identical copies of itself and push other
+        sessions out of the tier. A strict-prefix copy is redundant when the
+        new entry can resume within ``supersede_slack`` tokens of its end
+        (hybrid models resume mid-chain only at a checkpoint); otherwise it
+        is kept.
+        """
+        slack = self._config.supersede_slack
+        if slack <= 0:
+            return
+        try:
+            positions = [cm["pos"] for cm in ckpt_meta or []]
+            for row in self._index.lookup_prefix(tokens):
+                n = row["num_tokens"]
+                if n >= len(tokens):
+                    continue
+                if not any(n - slack <= p <= n for p in positions):
+                    continue
+                self._delete_entry(row["file_path"])
+                self._index.delete_entry(tuple(tokens[:n]))
+                with self._lock:
+                    self._stats.superseded += 1
+                    self._stats.superseded_bytes += row.get("memory_bytes") or 0
+                logger.info(
+                    "[system_kv_ssd] superseded %d-token copy by %d-token spill",
+                    n,
+                    len(tokens),
+                )
+        except Exception:
+            logger.debug("[system_kv_ssd] supersede failed", exc_info=True)
 
     def _enforce_capacity(self) -> None:
         cfg = self._config
@@ -1029,6 +1124,7 @@ class SystemKVSSDStore:
             "checkpoints": checkpoints,
             "meta": snap_meta,
             "kinds": snap_kinds,
+            "gen_start": meta.get("gen_start"),  # (#170) None on older entries
         }
 
     def _quarantine(self, tokens: tuple[int, ...], file_path: str) -> None:
