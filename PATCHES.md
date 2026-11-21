@@ -4578,3 +4578,21 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
   - Rerun with the lineage rule: each of the 4 turns' spills deleted its predecessor ("superseded 4918-token copy by 6039-token spill (same conversation)", and so on), so the tier held one copy of the session throughout.
   - After the restart, the promoted 8,444-token copy was superseded by the next spill, so the lineage survived the restart via `gen_start`. Restored 8,239 of 9,491 tokens, TTFT 11.7 s.
 - **Fix (2026-11-20, after deploy): the grown-spill delta counts from the lineage copy.** At production settings (8K delta), an 8-turn bench session spilled on EVERY turn (~2 GB each). #164 measured growth from the longest on-disk *strict prefix*, but a finished turn's copy ends in the model's raw output and is never a strict prefix of the next chain, so the check measured from the session's first prompt. Every turn of a session more than the delta past that prompt re-spilled, and this predates #170: under #164 at 16K, likely a large part of the 93-173 GB/day. With #170 deleting even the first-prompt copy, it measured from 0. `_grown_spill_due` now also takes the entry's lineage copy (`entry["disk"]`) and uses whichever shares more. Test: `test_170_grown_spill_delta_counts_from_the_lineage_copy`.
+
+## 171. `patch: ssd-usable-promote` — an SSD entry is promoted only if a restore from it lands somewhere; JSON parameter values reconcile in any key order
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`check_ssd`, `_canonical_value`, stat `ssd_unusable_skipped`), `tests/test_batched_system_kv.py`.
+
+**Why (2026-11-21, 27B-8bit overnight metrics after #170).**
+- **Wasted promotes.** `check_ssd` returned the first shared-prefix row whose *common prefix* reached `partial_min`, whatever its `usable` (where a restore would land, which snaps down to the checkpoint ladder). On lazy-restore routes a `usable == 0` candidate fell through to `ssd_pending` and was promoted: a multi-GB read plus a RAM slot that can push out a useful entry, for a restore that then started at 0. Over the route's log, 466 of 715 promotes were followed by a cold prefill: 212 GB read. Since #169 that is 1-2 a day; 2026-11-21 09:30 read a 13K entry that shared 4,000 tokens with no checkpoint below them.
+- **Nested JSON in tool calls.** #166 compared parameter values as raw text. A Hermes meta-tool's `calls` parameter (a JSON list of nested `{"arguments": {...}}`) came back with the nested keys in another order, re-prefilling 250-1,236 tokens a turn (02:02-02:03).
+
+**Fix.**
+- `check_ssd` scores the full-prefix row and every shared row by `usable` and keeps the best. It returns None when even the best lands under `partial_min`, counted in `ssd_unusable_skipped`.
+- A parameter value that parses as a JSON object or array compares with its keys sorted at every depth. Anything else compares as text, as before. Same calls and values only, under `VLLM_MLX_BATCHED_RECONCILE_TOOL_ORDER`.
+
+**Verification.**
+- **Unit tests:** `test_171_best_usable_candidate_wins_not_longest_common`, `test_171_unusable_candidate_is_not_promoted`, `test_171_json_parameter_values_compare_in_sorted_key_order` (a changed value still differs). Full suite 5515 passed / 32 skipped.
+- **Real data** (Studio, the 27B-8bit's live tier, index and meta copied): each of the 15 entries replayed as the request that wrote it, against the rest of the tier.
+  - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
+  - The other 12: identical choice and restore position.

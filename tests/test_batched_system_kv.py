@@ -1150,3 +1150,87 @@ def test_170_grown_spill_delta_counts_from_the_lineage_copy(monkeypatch, tmp_pat
         assert kv._grown_spill_due(chain, {"disk": (far, n - 300)}) is True
     finally:
         kv.close()
+
+
+# ------------------------------------- #171 promote only usable SSD candidates
+
+
+class _StubSSD:
+    """Index-level stand-in: rows and per-entry checkpoint positions."""
+
+    def __init__(self, prefix_row=None, shared=(), ckpts=None):
+        self.prefix_row, self.shared, self.ckpts = prefix_row, list(shared), ckpts or {}
+
+    def lookup_prefix(self, toks):
+        return self.prefix_row
+
+    def lookup_shared(self, toks):
+        return self.shared
+
+    def read_meta(self, fp):
+        return {"kinds": ["trim", "ckpt"],
+                "checkpoints": [{"pos": p} for p in self.ckpts.get(fp, [])]}  # fmt: skip
+
+
+def _shared(fp, n, common):
+    return {"file_path": fp, "tokens": tuple(range(n)), "common_len": common}
+
+
+def test_171_best_usable_candidate_wins_not_longest_common(monkeypatch, tmp_path):
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        # a: longer common prefix but its ladder stops at 300; b: lands at 3000.
+        kv._ssd = _StubSSD(
+            shared=[_shared("a", 9000, 8000), _shared("b", 5000, 4000)],
+            ckpts={"a": [300], "b": [2048, 3000]},
+        )
+        c = kv.check_ssd(list(range(10000)))
+        assert c["file_path"] == "b" and c["usable"] == 3000
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_171_unusable_candidate_is_not_promoted(monkeypatch, tmp_path):
+    """09:30 2026-11-21: a 13K entry shared 4000 tokens but had no checkpoint
+    a restore could use; it was promoted (1 GB read) and then nothing came of
+    it. Now check_ssd returns None and counts it."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        kv._ssd = _StubSSD(
+            shared=[_shared("a", 13114, 4000)], ckpts={"a": [8000, 12000]}
+        )
+        assert kv.check_ssd(list(range(11583))) is None
+        assert kv.ssd_unusable_skipped == 1
+        # A full-prefix hit is still taken.
+        kv._ssd = _StubSSD(
+            prefix_row={"num_tokens": 600, "file_path": "p"}, ckpts={"p": [512]}
+        )
+        c = kv.check_ssd(list(range(900)))
+        assert c is not None and c["usable"] == 600
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_171_json_parameter_values_compare_in_sorted_key_order():
+    """2026-11-21 02:02: the model wrote a ``calls`` parameter (a JSON list of
+    nested calls) and the client sent it back with the nested keys in another
+    order; #166 compared parameter values as raw text and re-prefilled."""
+    from vllm_mlx.batched_system_kv import _canonical_call
+
+    model = ('<function=tool_call>\n<parameter=calls>\n[{"arguments": {"datasourceUid": '
+             '"loki", "format": "compact", "limit": 40}, "name": "query_loki"}]\n'
+             "</parameter>\n</function>")  # fmt: skip
+    client = ('<function=tool_call>\n<parameter=calls>\n[{"name": "query_loki", "arguments": '
+              '{"limit": 40, "datasourceUid": "loki", "format": "compact"}}]\n'
+              "</parameter>\n</function>")  # fmt: skip
+    assert _canonical_call(model) == _canonical_call(client)
+    changed = client.replace("40", "41")
+    assert _canonical_call(model) != _canonical_call(changed)
+    # Values that are not JSON compare as text, as before.
+    a = "<function=f>\n<parameter=q>\n{not json\n</parameter>\n</function>"
+    b = "<function=f>\n<parameter=q>\n{not  json\n</parameter>\n</function>"
+    assert _canonical_call(a) == _canonical_call(b)

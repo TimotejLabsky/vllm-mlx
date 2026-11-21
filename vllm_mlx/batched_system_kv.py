@@ -363,6 +363,23 @@ _FUNCTION_RE = re.compile(r"\s*<function=([^>]*)>(.*)</function>\s*", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>]*)>(.*?)</parameter>", re.S)
 
 
+def _canonical_value(value: str) -> str:
+    """(#171) A parameter value up to whitespace; a JSON object or array with
+    its keys sorted at every depth. The client parses such a value and
+    re-serialises it in its own key order (2026-11-21: a ``calls`` list of
+    nested ``{"arguments": {...}}`` re-prefilled 250-1,236 tokens a turn);
+    the tool parser parses it back, so key order carries no meaning."""
+    text = value.strip()
+    if text[:1] in ("{", "["):
+        try:
+            return _ws_free(
+                json.dumps(json.loads(text), sort_keys=True, ensure_ascii=False)
+            )
+        except ValueError:
+            pass
+    return _ws_free(value)
+
+
 def _canonical_call(body: str) -> Optional[str]:
     """One tool call's body with its arguments in a fixed order, or None
     when it is not a well-formed call. Two forms: Qwen's XML-style
@@ -382,7 +399,7 @@ def _canonical_call(body: str) -> Optional[str]:
     params = _PARAM_RE.findall(m.group(2))
     if _ws_free(_PARAM_RE.sub("", m.group(2))):
         return None  # text between parameters: not just a reordering
-    params = sorted((_ws_free(k), _ws_free(v)) for k, v in params)
+    params = sorted((_ws_free(k), _canonical_value(v)) for k, v in params)
     return f"<function={_ws_free(m.group(1))}>" + "".join(
         f"<parameter={k}>{v}</parameter>" for k, v in params
     )
@@ -751,6 +768,8 @@ class BatchedSystemKV:
         # 0 = the old behaviour.
         self.spill_grown_delta = _env_int("VLLM_MLX_SSD_SPILL_GROWN_DELTA", 0)
         self.grown_spills = 0
+        # (#171) SSD candidates dropped: a restore from them would land < partial_min
+        self.ssd_unusable_skipped = 0
         # (#169) Chains shorter than this stay RAM-only. On the 27B-8bit a
         # 2K-token entry is ~600 MB on disk (hybrid checkpoints), and the
         # accounting classifier's one-off 2K prompts filled the 20 GB tier
@@ -1343,31 +1362,46 @@ class BatchedSystemKV:
         if self._ssd is None:
             return None
         toks = tuple(tokens)
+        cap = len(toks) - 1
+        # (#171) Score every candidate by where a restore would land and keep
+        # the best; none at all when even the best lands under partial_min.
+        # Before, the first shared row with a long enough COMMON prefix won,
+        # usable or not: on lazy routes a usable == 0 candidate fell through
+        # to ssd_pending and was promoted (multi-GB read + a RAM slot) for a
+        # restore that then started at 0 - 466 of 715 promotes on the
+        # 27B-8bit (2026-11-11..21).
+        best = None
         try:
             row = self._ssd.lookup_prefix(toks)
             if row is not None and row.get("num_tokens", 0) >= self.partial_min:
                 n = row["num_tokens"]
-                return {
+                best = {
                     "tokens": toks[:n],
                     "file_path": row["file_path"],
-                    "usable": self._ssd_usable(row["file_path"], n, n, len(toks) - 1),
+                    "usable": self._ssd_usable(row["file_path"], n, n, cap),
                 }
             for row in self._ssd.lookup_shared(toks):
-                if row.get("common_len", 0) >= self.partial_min:
-                    stored = tuple(row["tokens"])
-                    return {
+                if row.get("common_len", 0) < self.partial_min:
+                    continue
+                if best is not None and row["common_len"] <= best["usable"]:
+                    continue  # cannot land past the candidate already held
+                stored = tuple(row["tokens"])
+                usable = self._ssd_usable(
+                    row["file_path"], len(stored), row["common_len"], cap
+                )
+                if best is None or usable > best["usable"]:
+                    best = {
                         "tokens": stored,
                         "file_path": row["file_path"],
-                        "usable": self._ssd_usable(
-                            row["file_path"],
-                            len(stored),
-                            row["common_len"],
-                            len(toks) - 1,
-                        ),
+                        "usable": usable,
                     }
         except Exception:
             logger.debug("[batched_system_kv] check_ssd failed", exc_info=True)
-        return None
+            return None
+        if best is not None and best["usable"] < self.partial_min:
+            self.ssd_unusable_skipped += 1
+            return None
+        return best
 
     def _ssd_usable(self, file_path: str, donor_len: int, lcp: int, cap: int) -> int:
         """Where a restore from an SSD entry would land — the analog of
@@ -2264,6 +2298,7 @@ class BatchedSystemKV:
                 "reconcile_ssd_donors": self.reconcile_ssd_donors,
                 "gen_span_registry_size": len(self._gen_spans),
                 "grown_spills": self.grown_spills,
+                "ssd_unusable_skipped": self.ssd_unusable_skipped,
                 "spill_skipped_small": self.spill_skipped_small,
                 "turn_holds": self.turn_holds,
                 "turn_hold_hits": self.turn_hold_hits,
