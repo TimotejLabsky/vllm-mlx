@@ -4118,3 +4118,34 @@ def test_169_unset_is_a_no_op_and_a_missing_file_fails_startup(monkeypatch, tmp_
     monkeypatch.setenv("VLLM_MLX_CHAT_TEMPLATE_FILE", str(tmp_path / "missing.jinja"))
     with pytest.raises(FileNotFoundError):
         _install_chat_template_file(tok)
+
+
+# -------------- #179 the MoE decode kernels arm only behind their own flag
+
+
+def test_179_decode_kernels_cannot_arm_without_their_flag(monkeypatch):
+    """The kernels change T=0 output, so nothing but
+    VLLM_MLX_MOE_DECODE_KERNELS may arm them -- not #96's fusion flag, not
+    the engines' load hook -- and arming never patches the mlx-lm class."""
+    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+    from tests.test_moe_kernels_179 import _blocks, _build_model
+    from vllm_mlx import moe_kernels
+    from vllm_mlx.moe_fusion import maybe_fuse
+
+    assert moe_kernels.ENV == "VLLM_MLX_MOE_DECODE_KERNELS"
+    stock_call = Qwen3NextSparseMoeBlock.__call__
+    monkeypatch.delenv(moe_kernels.ENV, raising=False)
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    assert not moe_kernels.kernels_enabled()
+
+    model = _build_model()
+    assert maybe_fuse(model, "tiny") == 2  # #96 still fuses
+    assert all(type(b) is Qwen3NextSparseMoeBlock for b in _blocks(model))
+    assert moe_kernels.maybe_install(model) == 0
+
+    if moe_kernels.on_metal():  # the positive control
+        monkeypatch.setenv(moe_kernels.ENV, "1")
+        assert moe_kernels.maybe_install(model) == 2
+        assert all(b._vllm_mlx_moe_kernels for b in _blocks(model))
+    assert Qwen3NextSparseMoeBlock.__call__ is stock_call

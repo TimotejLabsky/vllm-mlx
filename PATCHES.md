@@ -4596,3 +4596,45 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - **Real data** (Studio, the 27B-8bit's live tier, index and meta copied): each of the 15 entries replayed as the request that wrote it, against the rest of the tier.
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
+
+## 179. `patch: moe-decode-kernels` — opt-in port of the mlx-lm MoE single-token kernels (#2053 + #2054), default OFF, on no route
+
+**Files:** `vllm_mlx/moe_kernels.py` (new), `vllm_mlx/moe_fusion.py` (`maybe_fuse` calls it after #96), `tests/test_moe_kernels_179.py` (new, 25), `tests/test_fork_invariants.py` (`test_179_*`).
+
+**Why (fork issue #111).** Two open mlx-lm PRs by pierreablin fuse the batch-1 MoE decode path:
+- #2054 (`04ecae9`, `softmax_topk`): the router softmax and top-k in one kernel.
+- #2053 (`8467a54`, `switch_glu`): one token's expert GLU, down projection and weighted sum in two kernels.
+
+Measured on the Studio in a standalone `generate_step` loop (not the server): Qwen3.6-35B-A3B-4bit-DWQ, 4,058-token prompt, 256 tokens at T=0, n = 10-12 per variant, ranges not overlapping. Both kernels together on top of #96: **+14.2 % decode** (90.57 → 103.45 tok/s). Both kernels without #96: +14.3 %. Prefill unchanged. Full table: issue #111 and draft PR #132 (bench script `scripts/fork/probe_moe_kernels_111.py`).
+
+**T=0 output changes when armed** (first difference at token 73 of 256 on the 35B; deterministic, same tokens on every run). The issue's kill gate is T=0 identity, so this ships OFF and the verdict stays "take them at the mlx-lm pin bump". This port exists so a route can try the win before then, deliberately.
+- #2054 picks the top-k from the fp32 logits. Stock runs `argpartition` over the bf16-rounded softmax, so two logits one bf16 step apart round to the same probability, and stock breaks that tie by position while the kernel takes the larger logit. That happened in 17 of 160 random single-token cases on the real 35B layers. `test_bf16_probability_tie_can_pick_a_different_expert_set` shows the mechanism.
+- #2053 rounds differently from `gather_qmm`: 1.3 % relative error worst case on the real layers, 1.1 % on the test model. That is bf16 accumulation order, not a bug.
+
+**What it does.**
+- `VLLM_MLX_MOE_DECODE_KERNELS=1` arms it (named after #96's `VLLM_MLX_MOE_GATEUP_FUSION`). Default OFF. With the flag off nothing is imported, nothing is touched, and output is byte-identical to before (tested on a real tiny Qwen3.5-MoE model, with and without #96 armed).
+- **Port.** The Metal source is upstream's (MIT, Apple Inc.), credited in the module. One edit: the gate/up kernel takes two more template ints, `ES` (rows per expert) and `GO` (gate row offset). Upstream's separate tensors are `ES=N, GO=0`, the same arithmetic as upstream. #96's fused `[up; gate]` tensor is `ES=2N, GO=N`. Checked once on the laptop against the upstream PR files at the 35B's shapes (2048→512, 256 experts, top-8, 4-bit g64) and three smaller ones: bit-identical, both layouts.
+- **Memory cost: no second weight copy.** With #96 armed the kernel reads #96's fused tensor; without it, the module's own gate/up tensors. Per armed forward there is one K×N activation (8×512 bf16 = 8 KB on the 35B) plus the JIT pipeline state of one compiled function per (activation, group size, bits, layout).
+- **Scope.** Only `Qwen3NextSparseMoeBlock` instances, the class the 35B-A3B runs (`qwen3_5`/`qwen3_5_moe` import it; Coder-Next is `qwen3_next` itself). Text path only. Every other MoE class (gpt-oss, gemma-4, GLM, qwen3_moe) is untouched.
+- **Guards, kept from upstream, plus one.** One token per forward (`x.size == x.shape[-1]`), not training, Metal GPU, no `sharding_group`. For the combine kernel, also #2053's `can_combine`: SwiGLU, affine 2/3/4/5/6/8-bit, group 32/64/128, all projections alike, scales in the token's dtype (bf16/fp16), quantization biases, no linear bias, no global scale, D and N multiples of 16. If the combine guards fail, routing still uses #2054 and the experts run stock. **Fork difference:** upstream #2054 also routes prefill and multi-token forwards. Here prefill, a co-batched decode (B > 1) and an MTP verify step all run the stock path, byte-identical (tested), so prefill KV and every system-KV/SSD snapshot are what the unarmed route would store.
+- **Per instance, not per class.** An armed block's `__class__` becomes a subclass of the stock class. `isinstance` still holds, and the mlx-lm class keeps its `__call__` (pinned in `test_179_*`).
+- **Armed but cannot bind** (the #125 / #175 hook pattern). This covers a missing class, a stock `__call__` that no longer contains the lines the armed forward mirrors, and a load-time self-test that fails on the model's own first block (either kernel raising, or the combine off by more than 5 %). Each logs ONE ERROR naming what is missing, and the model runs with no kernels. Load never raises. If the body changed because mlx-lm already routes through `softmax_topk`/`.combine(`, the message says the flag is redundant. `moe_kernels.status()` has `{armed, blocks, error}`; it is not on `/v1/status` yet (see reconciling below).
+
+**Verification (laptop only, no Studio access in this pass).**
+- 25 tests in `tests/test_moe_kernels_179.py`, all running the real Metal kernels on a real tiny quantized Qwen3.5-MoE text model:
+  - flag-off byte identity over prefill + 8 decode steps, stock and with #96;
+  - flag-on within tolerance and not equal: combine 3 % bound (1.1 % measured), whole block 3 % where the expert sets agree (1.5 % measured), first decode logits 5 % (2.1 % measured);
+  - fused layout bit-identical to separate;
+  - prefill / B=2 / B=3×T=4 byte-identical to stock;
+  - the tie mechanism, and routing weights within 1e-2 when the sets agree;
+  - four refusal paths: one ERROR each, model unchanged and still runs.
+- Plus `test_179_decode_kernels_cannot_arm_without_their_flag`.
+- Full suite 5541 passed / 32 skipped. Changed-lines black and ruff F821/F401 clean.
+- **Not measured through the server.** The +14 % is the standalone loop. Nothing has run on a real route, under BatchedEngine (where B > 1 steps fall back), or with the MTP drafter. **Not enabled on any route.**
+
+**Reconciling with #125 / #175 (`mlx_lm_compat`) when both land.**
+- `_TARGETS` and `_swiglu_class()` resolve by hard-coded module path. They should go through `mlx_lm_compat.resolve`: add `Qwen3NextSparseMoeBlock` (post-#2082 it stays in `mlx_lm.models.qwen3_next`) and `SwiGLU` (moves to `mlx_lm.layers.moe`).
+- `status()` should join #175's `moe_fusion` field in `/v1/status`.
+- #175 changes `fuse_moe_gate_up`, not `maybe_fuse`, so the textual conflict is small.
+
+**Retire** at the mlx-lm pin bump that merges #2053 and #2054. The needle check then refuses with the "redundant" hint, and the upstream path takes over (with its own new T=0 baseline).
