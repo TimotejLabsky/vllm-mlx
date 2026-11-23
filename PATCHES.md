@@ -4605,4 +4605,6 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 **Fix.** `BatchedSystemKV.clear()` drops every resident entry and returns `(entries, bytes)`; both scheduler clears call it. The SSD tier is untouched (same as the memory-aware cache's clear); in-flight checkpoint ladders belong to running requests and stay. The batched MLLM path already cleared its own cache (`test_mllm_scheduler_cache_clear.py`).
 
-**Verification.** `test_clear_drops_entries_and_bytes` (entry_count 2 -> 0, memory_mb > 0 -> 0, fetch misses) and `test_scheduler_prefix_clear_reaches_batched_system_kv` (fails on the old scheduler: 1 entry left). Mocked only; no real-server check yet.
+**Verification.** `test_clear_drops_entries_and_bytes` (entry_count 2 -> 0, memory_mb > 0 -> 0, fetch misses) and `test_scheduler_prefix_clear_reaches_batched_system_kv` (fails on the old scheduler: 1 entry left). Pinned in `tests/test_fork_invariants.py`: `test_172_scheduler_cache_clears_empty_the_batched_bag` (a real batched `Scheduler`, both clears; red on the old scheduler) and `test_172_clear_under_requests_that_hold_entries` (a lazy queued request matched before the clear falls back to a cold prefill; a restored in-flight request still stores its finished chain as a full copy). Mocked only; no real-server check yet.
+
+**Thread.** Both endpoints hop to the single generation worker (`BatchedEngine._clear_*_on_owner`), the thread that runs `scheduler.step`, so a clear lands between steps, never inside one.
