@@ -2179,6 +2179,13 @@ async def lifespan(app: FastAPI):
                     _sanitize_log_text(e, limit=500),
                 )
 
+        # Fork #112 probe: one short generation before ready (env-gated, off by default).
+        if _engine is not None and hasattr(_engine, "stream_chat"):
+            from vllm_mlx.load_warmup import load_warmup_tokens, run_load_warmup
+
+            if load_warmup_tokens() > 0:
+                await run_load_warmup(_engine, load_warmup_tokens())
+
         if _residency_manager is not None and _auto_unload_idle_seconds > 0:
             _lifecycle_task = asyncio.create_task(_lifecycle_loop())
 
