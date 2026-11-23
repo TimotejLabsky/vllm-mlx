@@ -1234,3 +1234,156 @@ def test_171_json_parameter_values_compare_in_sorted_key_order():
     a = "<function=f>\n<parameter=q>\n{not json\n</parameter>\n</function>"
     b = "<function=f>\n<parameter=q>\n{not  json\n</parameter>\n</function>"
     assert _canonical_call(a) == _canonical_call(b)
+
+
+# -------------------------------------------- #178 per-request match memo
+
+
+class _Counted:
+    """Counts the bag's ``common_prefix_len`` calls."""
+
+    def __init__(self, monkeypatch):
+        from vllm_mlx import batched_system_kv as bkv
+
+        self.n = 0
+        real = bkv.common_prefix_len
+
+        def counted(a, b):
+            self.n += 1
+            return real(a, b)
+
+        monkeypatch.setattr(bkv, "common_prefix_len", counted)
+
+
+DISJOINT_178 = list(range(5000, 5800))
+
+
+def _two_chain_kv():
+    kv = _make_cache()
+    kv.note_scheduled("a", 0)
+    kv.capture_segment("a", 448, _donor_at(448))
+    kv.store("a", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("b", DISJOINT_178, _donor_at(len(DISJOINT_178)))
+    return kv
+
+
+def test_178_memo_serves_repeated_scans_with_identical_answers(monkeypatch):
+    prompt = TOKENS[:600] + [1, 2, 3, 4]
+    plain = _two_chain_kv()
+    expected = (plain.peek(list(prompt), touch=False), plain.fetch(list(prompt))[2])
+
+    kv = _two_chain_kv()
+    calls = _Counted(monkeypatch)
+    kv.open_match_memo("r", prompt)
+    got = (kv.peek(prompt, touch=False), kv.peek(prompt), kv.fetch(prompt)[2])
+    kv.note_divergence(prompt, "r", got[0])
+    assert got == (expected[0], expected[0], expected[1]) == (448, 448, 448)
+    assert calls.n == 2  # one per entry, not one per entry per scan
+    assert kv.match_memo_hits == 6
+    # A copy of the prompt is not the memo's prompt object: computed afresh.
+    assert kv.peek(list(prompt), touch=False) == 448
+    assert calls.n == 4
+
+
+def test_178_memo_never_serves_a_stale_entry(monkeypatch):
+    """An entry grown, replaced, promoted or evicted while the memo is open
+    is a new (or a gone) key; a prompt mutated in place drops its memo."""
+    kv = _two_chain_kv()
+    prompt = TOKENS + [7, 8, 9]
+    kv.open_match_memo("r", prompt)
+    assert kv.peek(prompt, touch=False) == len(TOKENS)
+    # Grown: the chain now extends further into the prompt -> deeper hit.
+    kv.store("c", TOKENS + [7, 8], _donor_at(len(TOKENS) + 2))
+    assert kv.peek(prompt, touch=False) == len(TOKENS) + 2
+    # Evicted: every entry gone -> no match, not the memoised one.
+    while kv._drop_lru_entry():
+        pass
+    assert kv.peek(prompt, touch=False) == 0
+    # Re-stored under a NEW key -> matched again from scratch.
+    calls = _Counted(monkeypatch)
+    kv.store("d", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.peek(prompt, touch=False) == len(TOKENS)
+    assert calls.n == 1
+    # Mutated in place (same object): the fingerprint no longer matches.
+    prompt[-1] = 99
+    assert kv._memo_locked(prompt) is None
+
+
+def test_178_ssd_probe_shared_until_the_index_changes(monkeypatch, tmp_path):
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        stub = _StubSSD(shared=[_shared("b", 5000, 4000)], ckpts={"b": [3000]})
+        stub.index_version = 1
+        probes = []
+        orig = stub.lookup_shared
+        stub.lookup_shared = lambda toks: probes.append(1) or orig(toks)
+        kv._ssd = stub
+        prompt = list(range(10000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt)["usable"] == 3000
+        assert kv._ssd_reconcile_donor(prompt) == list(range(5000))
+        assert kv.check_ssd(prompt)["usable"] == 3000
+        assert len(probes) == 1
+        # A spill / supersede / eviction landed: the next ask re-probes.
+        stub.shared = [_shared("c", 9000, 8000)]
+        stub.ckpts["c"] = [7000]
+        stub.index_version = 2
+        assert kv.check_ssd(prompt)["usable"] == 7000
+        assert len(probes) == 2
+        # Without an index version (a tier without support): never memoised.
+        del stub.index_version
+        kv.check_ssd(prompt)
+        assert len(probes) == 3
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_178_ssd_index_version_moves_on_every_row_write(tmp_path):
+    from vllm_mlx.system_kv_ssd import _SystemKVIndex
+
+    idx = _SystemKVIndex(str(tmp_path))
+    v0 = idx.version
+    idx.insert_entry((1, 2, 3), "f", 10, 3)
+    v1 = idx.version
+    idx.touch((1, 2, 3))  # LRU only: lookups answer the same
+    assert idx.version == v1 > v0
+    idx.delete_entry((1, 2, 3))
+    assert idx.version > v1
+    idx.close()
+
+
+def test_178_memo_does_not_outlive_the_request(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from vllm_mlx.batched_system_kv import (
+        fetch_for_request,
+        materialize_pending_restore,
+    )
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    kv = _two_chain_kv()
+    req = NS(request_id="r", prompt_token_ids=TOKENS + [7], num_prompt_tokens=801)
+    fetch_for_request(kv, req)
+    assert req.cache_hit_type == "system_kv_pending"
+    assert kv._memo_locked(req.prompt_token_ids) is not None
+    materialize_pending_restore(NS(hybrid_kv=kv), req)
+    assert req.cache_hit_type == "system_kv"
+    assert kv._match_memo == {} and kv._match_memo_rid == {}
+    # Abort / reject before admission: discard_pending closes it.
+    req2 = NS(request_id="r2", prompt_token_ids=TOKENS + [8], num_prompt_tokens=801)
+    fetch_for_request(kv, req2)
+    kv.discard_pending("r2")
+    assert kv._match_memo == {}
+    # Bounded even if a close path were missed.
+    for i in range(kv._MATCH_MEMO_MAX + 10):
+        kv.open_match_memo(f"x{i}", [i] * 10)
+    assert len(kv._match_memo) == len(kv._match_memo_rid) == kv._MATCH_MEMO_MAX
+
+
+def test_178_kill_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MATCH_MEMO", "0")
+    kv = _two_chain_kv()
+    kv.open_match_memo("r", TOKENS + [1])
+    assert kv._match_memo == {}

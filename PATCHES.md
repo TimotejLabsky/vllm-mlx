@@ -4596,3 +4596,30 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - **Real data** (Studio, the 27B-8bit's live tier, index and meta copied): each of the 15 entries replayed as the request that wrote it, against the rest of the tier.
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
+
+## 178. `patch: match-memo` — one request's admission sequence scans the bag once, not once per question
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`open_match_memo` / `close_match_memo`, `_entry_lcp_locked`, `_ssd_probe`, `check_ssd` split into `_check_ssd_best`; callers `_best_match_locked`, `note_divergence`, `reconcile_generated`, `_ssd_reconcile_donor`; hooks `fetch_for_request` opens, `materialize_pending_restore` closes; stats `match_memo_hits`, `match_memo_ssd_hits`, `match_memo_open` (should read 0 when idle)), `vllm_mlx/system_kv_ssd.py` (`_SystemKVIndex.version`, `SystemKVSSDStore.index_version`), tests. Kill switch `VLLM_MLX_BATCHED_MATCH_MEMO=0` (default on).
+
+**Why (issue #109 audit).** A request's add_request -> solo verdict -> admission sequence asks the bag the same question up to ~7 times with the same prompt (reconcile, the SSD-vs-RAM peek, the lazy peek, the divergence log, the admission peek, fetch), each a `common_prefix_len` per entry (O(prompt), about 1 ms per 100K tokens), and probes the SSD index twice for each of `check_ssd` and the reconcile donor. All of it runs on the generation worker between decode steps, so it stalls the batch.
+
+**Fix.** A per-request memo, keyed on the request's prompt list *object* (held by strong reference, checked by identity plus (length, first, last) token):
+- RAM: `{entry key: (chain length, lcp)}`. Entry keys are a monotonic sequence never reused, and a chain is never mutated: grow, absorb, supersede and SSD promote insert a NEW key, eviction removes the key, so a memo slot can only ever answer for the chain it was computed on. The length is checked anyway.
+- SSD: the `lookup_prefix` + `lookup_shared` result (shared by `check_ssd` and the reconcile donor) and `check_ssd`'s scored candidate, each tagged with the index write version. `_SystemKVIndex` bumps it after every `insert_entry` / `delete_entry` commit (spill, supersede, capacity eviction, quarantine, reconcile); the version is read before probing, so a write that lands mid-probe invalidates.
+- Lifetime: opened by `fetch_for_request` (re-opened when #139 reconcile replaces the prompt), closed at the end of every `materialize_pending_restore`, by `discard_pending` (abort, reject, recovery) and by `store`; at most 64 open regardless. Answers are identical to the unmemoised path; the counters (`hits`, `misses`, `ssd_unusable_skipped`, ...) move exactly as before.
+
+**Measured (laptop M1 Pro, mocked bag, n=15 medians, same method as the #109 audit).** Real mlx-lm cache classes, 8 layers (6 KVCache + 2 ArraysCache), KV `(1, 2, N, 64)` bf16 shared by every entry. E chains of N tokens sharing a 20K system prefix, a checkpoint every 8K, a generated span over the last 5K, all spilled to a real SSD tier (writer drained). Prompt = chain 0's first P-1000 tokens + 1000 new ones (divergent from every entry). Flags: LAZY_RESTORE, RECONCILE_GENERATED, DIVERGENCE_LOG, SSD tier. Timed `fetch_for_request` + `solo_prefill_verdict` + `materialize_pending_restore` (the restore itself included in both).
+
+| bag | before | after | saved | `common_prefix_len` calls | SSD probes |
+|---|---|---|---|---|---|
+| 1 x 50K, prompt 45K | 9.9 ms | 6.3 ms | 3.6 ms | 8 -> 3 | 4 -> 2 |
+| 2 x 50K | 13.8 | 7.5 | 6.3 | 14 -> 4 | 4 -> 2 |
+| 4 x 50K | 22.7 | 10.0 | 12.7 | 26 -> 6 | 4 -> 2 |
+| 1 x 100K, prompt 90K | 20.2 | 12.4 | 7.8 | 8 -> 3 | 4 -> 2 |
+| 2 x 100K | 28.3 | 14.6 | 13.7 | 14 -> 4 | 4 -> 2 |
+| 4 x 100K | 44.3 | 19.7 | 24.6 | 26 -> 6 | 4 -> 2 |
+| 8 x 100K | 67.7 | 24.2 | 43.5 | 50 -> 10 | 4 -> 2 |
+
+Reproduce: `scripts/fork/bench_match_memo.py E N P [n]`, once with `PYTHONPATH` at the parent commit and once at this one. What remains is one scan per entry, one SSD probe pair, the `tuple`/`list` copies of the prompt and the restore build. Not measured: the Studio itself, and a production-size SSD index (the bench index holds only the E chains; a bigger index makes the halved probe cost worth more).
+
+**Verification.** Unit tests `test_178_memo_serves_repeated_scans_with_identical_answers`, `test_178_memo_never_serves_a_stale_entry` (grow, evict-all, re-store under a new key, in-place prompt mutation), `test_178_ssd_probe_shared_until_the_index_changes`, `test_178_ssd_index_version_moves_on_every_row_write`, `test_178_memo_does_not_outlive_the_request`, `test_178_kill_switch`; invariant `test_178_match_memo_preconditions_hold` (never-reused entry keys, admission closes the memo, index version moves). A mutation that serves memo slots by position instead of entry key fails two of them. Full mocked suite green. No real-server check yet (laptop-only pass).
