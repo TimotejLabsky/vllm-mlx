@@ -222,3 +222,29 @@ def test_175_signature_table_matches_the_installed_functions():
     for name, want in compat.SIGNATURES.items():
         have = tuple(inspect.signature(compat.resolve(name)).parameters)
         assert have[: len(want)] == want, name
+
+
+def test_175_a_packaged_module_that_breaks_on_import_is_a_miss_not_a_crash(
+    packaged, monkeypatch
+):
+    """A half-installed or mlx-mismatched new layout can raise something other
+    than ImportError while importing (e.g. an AttributeError on a missing
+    ``mx.fast`` kernel). The hooks' contract is fail-open with an ERROR, so the
+    resolver must turn that into MlxLmSymbolMissing naming the cause, and an
+    armed fusion must still return 0 instead of raising out of model load."""
+    from vllm_mlx import moe_fusion
+
+    broken = f"{FAKE}.layers.broken_175"
+    path = sys.path[0] + "/" + broken.replace(".", "/") + ".py"
+    with open(path, "w") as f:
+        f.write("raise AttributeError('mx.fast has no gather_kernel_175')\n")
+    for name in ("SwitchGLU", "_gather_sort", "_scatter_unsort"):
+        monkeypatch.setitem(
+            compat.CANDIDATES, name, [(compat.PACKAGED, broken, name)]
+        )
+    with pytest.raises(compat.MlxLmSymbolMissing, match="gather_kernel_175"):
+        compat.resolve("SwitchGLU")
+    monkeypatch.setattr(moe_fusion, "_status", dict(moe_fusion._status))
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    assert moe_fusion.maybe_fuse(object(), "toy") == 0
+    assert "gather_kernel_175" in moe_fusion.status()["error"]

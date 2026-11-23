@@ -144,8 +144,11 @@ def resolve_with_origin(name: str) -> Tuple[Any, str, str]:
         where = f"{module}.{attr}"
         try:
             mod = importlib.import_module(module)
-        except ImportError as e:
-            tried.append(f"{where} (import failed: {e})")
+        except Exception as e:  # noqa: BLE001
+            # Not only ImportError: a half-installed or mlx-mismatched layout
+            # can raise anything at import, and every caller's contract is
+            # fail-open with an ERROR, never a crash out of model load.
+            tried.append(f"{where} (import failed: {type(e).__name__}: {e})")
             continue
         obj = getattr(mod, attr, None)
         if obj is None:
