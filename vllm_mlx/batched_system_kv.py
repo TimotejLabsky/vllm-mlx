@@ -665,6 +665,10 @@ class BatchedSystemKV:
         # last uniform interval below it.
         self._divergence: dict[str, int] = {}
         self.divergence_cuts = 0
+        # (#177) ... and so does a MISS that shares >= partial_min tokens with
+        # an entry (no checkpoint below the split yet). 0 = #117 only.
+        self.miss_cut_on = _env_int("VLLM_MLX_BATCHED_MISS_CUT", 1) > 0
+        self.miss_cuts = 0
         self.projected_defers = 0
         self.projected_relief_passes = 0
         # Ground-truth backstop: defer co-batching while MLX active memory
@@ -1636,7 +1640,11 @@ class BatchedSystemKV:
             match = self._best_match_locked(tokens)
             if match is None:
                 self.misses += 1
+                if request_id is not None:
+                    self._note_miss_divergence_locked(tokens, request_id)
                 return None
+            if request_id is not None:
+                self._divergence.pop(request_id, None)  # (#177) a miss's cut
             best_key, best_lcp, pos, ck_states, ck_metas = match
             entry = self._entries[best_key]
             states, metas = self._build_restore_states(entry, ck_states, pos, ck_metas)
@@ -1701,6 +1709,27 @@ class BatchedSystemKV:
             ", divergent" if divergent else "", len(remaining),
         )
         return fresh, remaining, pos
+
+    def _note_miss_divergence_locked(self, tokens: list, request_id: str) -> None:
+        """(#177) A miss that still SHARES >= partial_min tokens with an entry
+        cuts its cold prefill there, as #117 does for a divergent hit.
+
+        A templated prompt (fixed instructions, then the variable item, then
+        more fixed text) parts ways with the previous call inside its one
+        user message: no template marker is there and the uniform interval
+        sits past it, so no entry ever had a checkpoint at the split, every
+        call restored nothing, and #117's cut - which needs a hit - never
+        fired. Hybrid models only: an all-attention entry slices to any
+        position, so for it a shared prefix that long is a hit, not a miss."""
+        if not self.miss_cut_on:
+            return
+        best = max(
+            (common_prefix_len(tokens, e["tokens"]) for e in self._entries.values()),
+            default=0,
+        )
+        if self.partial_min <= best < len(tokens):
+            self._divergence[request_id] = best
+            self.miss_cuts += 1
 
     def note_divergence(self, tokens: list, request_id: str, cached: int) -> None:
         """(#128) Record where ``tokens`` diverge from the closest RAM chain.
@@ -2266,6 +2295,7 @@ class BatchedSystemKV:
                 "ssd_promotes": self.ssd_promotes,
                 "ssd_preferred": self.ssd_preferred,
                 "divergence_cuts": self.divergence_cuts,
+                "miss_cuts": self.miss_cuts,
                 "grown_stores": self.grown_stores,
                 "admission_deferrals": self.admission_deferrals,
                 "pressure_evictions": self.pressure_evictions,
