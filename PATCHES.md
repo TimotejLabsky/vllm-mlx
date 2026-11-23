@@ -4669,3 +4669,25 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - `tests/test_moe_fusion.py` lost its `importorskip`, so it can no longer skip silently. `tests/test_qwen35_mllm_patch.py` stubs the resolver instead of faking `mlx_lm.models.base`.
 - Full suite 5539 passed / 32 skipped (baseline 5515 + 24 new), laptop, mlx-lm 0.32.2.
 - Not run against mlx-lm HEAD: the venv stays at the pin. The real check is #118's bump step (Studio cloned venv: suite, plus `moe_fusion.fused > 0` on the 35B-A3B and drafter `disabled: false` on the 27B-8bit).
+
+## 176. `patch: llguidance-ws-prefilter` — the strict JSON Schema processor stops decoding the whole suffix every step
+
+**Files:** `vllm_mlx/constrained/llguidance_schema_processor.py` (`_whitespace_prefilter`, `_whitespace_run_reached`), `tests/test_llguidance_whitespace_prefilter.py`.
+
+**Why (issue #126, side finding of #107).** Every step the processor decoded the full generated suffix and scanned it in Python only to ask whether it ends in 256 or more non-progress whitespace characters. That is O(n) per step on the decode path of every strict-schema request, O(n^2) per request.
+
+**Fix.** The processor walks back from the end of the suffix, adding an upper bound on the whitespace each token can contribute, and decodes only if the bound reaches 256. "Maybe" tokens (own decode empty, whitespace, or holding a replacement character: a partial multi-byte sequence that can complete into U+0085 or U+00A0 with its neighbour) are bounded by the longer of their decode and their piece. Any other token ends the walk: it decodes to a complete non-whitespace character followed by a fixed whitespace tail (`"}\n\n"` -> 2) that its neighbours cannot change, and that tail is added. Below 256, the answer is no without decoding. Tokens outside the vocab, or a tokenizer that cannot give piece lengths, always take the full decode. The walk is at most 256 tokens and usually one. The #89 stop protocol (`is_accepting`) is untouched.
+
+**Review fix (first cut was unsound).** The first cut asked only whether the last `ceil(256 / longest maybe piece)` tokens were all "maybe", ignoring the whitespace tail of the text token just before them: `"}" + 20 spaces` then a 250-space token is a 270-character run the window missed. Not reachable on the Qwen3 or Llama 3 vocabs (window 2, longest piece 128, longest tail 12 newlines), reachable on any vocab whose longest piece leaves less slack than its longest tail. Pinned by `test_176_whitespace_tail_of_a_text_token_counts` and a boundary sweep in the fuzz test.
+
+**Measured** (mocked suite host, real Qwen3 tokenizer, real processor, mean of the 19 steps before step n):
+
+| generated tokens | step before | step after |
+|---|---|---|
+| 100 | 0.36 ms | 0.35 ms |
+| 500 | 0.46 ms | 0.31 ms |
+| 2,000 | 1.03 ms | 0.45 ms |
+
+What remains growing is `tokens.tolist()` plus the consumed-prefix list compare (about 0.1 ms at 2,000), which the logits-processor interface forces.
+
+**Verification.** `test_176_*`: random suffixes against the full decode (3000 cases, over 100 long-run hits), a boundary sweep of runs that start inside a text token's tail, in-string whitespace, no decode on normal steps, bare tokenizer fallback, out-of-vocab fallback, and the cached Qwen3 and Llama 3 tokenizers with adversarial suffixes: partial UTF-8 halves of U+00A0 / U+0085 / U+3000, empty special tokens, the widest whitespace tokens, text tokens with newline tails (skipped if absent). Real-tokenizer per-check cost at 2,000 tokens: 0.002 ms against 0.2 ms for the full decode, compact and pretty-printed JSON.
