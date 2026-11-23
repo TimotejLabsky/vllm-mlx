@@ -396,6 +396,55 @@ def test_kernel_raising_at_load_never_crashes_load(monkeypatch, caplog):
     _assert_refused(caplog, _build_model(), "metal compile failed")
 
 
+def test_wrong_but_in_range_routing_fails_the_self_test(monkeypatch, caplog):
+    """Review: a routing kernel that returns valid expert ids but the WRONG
+    ones (here: the k smallest logits) must not pass the self-test. The
+    combine check reuses the kernel's inds, so only a stock comparison of
+    the routing itself catches this."""
+    real = moe_kernels.softmax_topk
+
+    def bottom_k(logits, *, top_k, normalize):
+        _, w = real(logits, top_k=top_k, normalize=normalize)
+        inds = mx.argpartition(logits, kth=top_k - 1, axis=-1)[..., :top_k]
+        return inds.astype(mx.uint32), w
+
+    monkeypatch.setenv(moe_kernels.ENV, "1")
+    monkeypatch.setattr(moe_kernels, "softmax_topk", bottom_k)
+    _assert_refused(caplog, _build_model(), "did not pick the top-k logits")
+
+
+def test_self_test_runs_once_per_expert_config(monkeypatch):
+    """Review: a mixed-precision model (layer 1's experts at 8 bits) needs a
+    second kernel specialisation, so it gets its own self-test."""
+    model = _build_model()
+    seen = []
+    real = moe_kernels._selftest
+
+    def spy(block):
+        seen.append(block.switch_mlp.down_proj.bits)
+        return real(block)
+
+    monkeypatch.setenv(moe_kernels.ENV, "1")
+    monkeypatch.setattr(moe_kernels, "_selftest", spy)
+    assert moe_kernels.maybe_install(model) == 2
+    assert seen == [4]  # both layers 4-bit: one test
+
+    mixed = _build_model()
+    glu = mixed.layers[1].mlp.switch_mlp
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        p = getattr(glu, name)
+        w = mx.dequantize(
+            p.weight, p.scales, p.biases, group_size=p.group_size, bits=p.bits
+        )
+        p.weight, p.scales, p.biases = mx.quantize(w, group_size=64, bits=8)
+        p.bits = 8
+    mx.eval(mixed.parameters())
+    seen.clear()
+    assert moe_kernels.maybe_install(mixed) == 2
+    assert sorted(seen) == [4, 8]
+    mx.eval(mixed(mx.array([[5]]), cache=mixed.make_cache()))
+
+
 def test_no_moe_block_is_not_an_error(monkeypatch, caplog):
     monkeypatch.setenv(moe_kernels.ENV, "1")
     with caplog.at_level(logging.ERROR, logger="vllm_mlx.moe_kernels"):

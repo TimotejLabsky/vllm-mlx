@@ -32,10 +32,13 @@ Scope (everything else runs the stock mlx-lm code, byte-for-byte):
   MoE block of ``qwen3_5``/``qwen3_5_moe`` text models, which import it), the
   class the #111 bench measured. Text path only (mlx-vlm classes untouched).
 - Only a forward of exactly ONE token (``x.size == x.shape[-1]``): batch-1
-  decode. Prefill, a co-batched decode (B > 1) and an MTP verify step take
-  the stock path, so prefill KV and every cached snapshot are the ones the
-  unarmed route computes. (Upstream #2054 also routes prefill; the fork does
-  not.)
+  decode. Prefill chunks, a co-batched decode (B > 1) and an MTP verify step
+  take the stock path. (Upstream #2054 also routes prefill; the fork does
+  not.) NOTE: mlx-lm holds the LAST prompt token back and runs it as the
+  first one-token step, so when the request is alone that token's KV/SSM
+  state, and every generated token's, is kernel-computed; cached snapshots
+  that include them (grown sessions, generated spans) differ in rounding
+  from an unarmed route's.
 - Not training, Metal GPU is the default device, no ``sharding_group``.
 - The combine kernel additionally needs #2053's own guards: SwiGLU
   activation, affine 2/3/4/5/6/8-bit, group size 32/64/128, all three
@@ -50,7 +53,9 @@ second model in the same process, keeps upstream's ``__call__``.
 
 Failure handling (the #125 hook pattern): armed but cannot bind -- the class
 is missing, its pinned ``__call__`` body is not the one mirrored here, or the
-kernels fail their load-time self-test on the model's own first block --
+kernels fail their load-time self-test (routing checked against the stock
+top-k, combine against ``gather_qmm``) on the model's own weights, once per
+distinct expert quantization config --
 logs ONE ERROR naming what is missing; the model then runs with no kernels.
 Model load never raises from here.
 
@@ -640,6 +645,26 @@ def _walk_modules(model):
                 stack.append(child)
 
 
+def _config_key(block):
+    """What selects a kernel specialisation for ``block``'s experts."""
+
+    def q(p):
+        scales = getattr(p, "scales", None)
+        return (
+            getattr(p, "bits", None),
+            getattr(p, "group_size", None),
+            getattr(p, "mode", None),
+            None if scales is None else scales.dtype,
+        )
+
+    projs = _projections(block.switch_mlp)
+    if projs is None:
+        return (type(block.switch_mlp).__name__,)
+    gp, up, dp, fused = projs
+    gate = getattr(block, "gate", None)
+    return (fused, q(gp), q(up), q(dp), getattr(gate, "bits", None))
+
+
 def _selftest(block) -> str | None:
     """Run both kernels once on ``block``'s real weights against the stock
     ops. Returns an error string, or None when they bind and agree."""
@@ -649,12 +674,33 @@ def _selftest(block) -> str | None:
         dtype = getattr(down, "scales", down.weight).dtype
         key = mx.random.key(179)
         x = (mx.random.normal((1, 1, dim), key=key) * 0.5).astype(dtype)
+        logits = block.gate(x)
         inds, scores = softmax_topk(
-            block.gate(x), top_k=block.top_k, normalize=block.norm_topk_prob
+            logits, top_k=block.top_k, normalize=block.norm_topk_prob
         )
         mx.eval(inds, scores)
         if not int(inds.max().item()) < n_exp:
             return "softmax_topk self-test returned an out-of-range expert"
+        # Routing against stock, so a wrong-but-in-range routing cannot pass
+        # (the combine check below reuses these inds and would not see it).
+        # The kernel takes the top-k LOGITS (ties by index): the chosen
+        # logits must be exactly the k largest, each expert once.
+        k = block.top_k
+        flat = [int(i) for i in inds.reshape(-1).tolist()]
+        if len(set(flat)) != k:
+            return "softmax_topk self-test picked an expert twice"
+        g32 = logits.astype(mx.float32)
+        chosen = mx.sort(mx.take_along_axis(g32, inds.astype(mx.int32), axis=-1))
+        if not mx.array_equal(chosen, mx.sort(g32, axis=-1)[..., -k:]).item():
+            return "softmax_topk self-test did not pick the top-k logits"
+        p = mx.take_along_axis(
+            mx.softmax(g32, axis=-1, precise=True), inds.astype(mx.int32), axis=-1
+        )
+        if block.norm_topk_prob:
+            p = p / p.sum(axis=-1, keepdims=True)
+        w_err = mx.abs(scores.astype(mx.float32) - p).max().item()
+        if not w_err <= 1e-2:  # bf16 rounding of a probability <= 1
+            return f"softmax_topk self-test weights off by {w_err:.3g}"
         if not can_combine(block.switch_mlp, x):
             return None  # routing kernel only; experts stay on gather_qmm
         ref = (block.switch_mlp(x, inds) * scores[..., None]).sum(axis=-2)
@@ -688,9 +734,18 @@ def install_decode_kernels(model) -> int:
             _status.update(blocks=0, error=None)
             logger.info("[moe-kernels] %s armed; no supported MoE block found", ENV)
             return 0
-        err = _selftest(blocks[0][0])
-        if err:
-            return _refuse(err)
+        # One self-test per distinct expert configuration, not only the first
+        # block: a mixed-precision quant can give later layers other bits /
+        # group sizes, i.e. another kernel specialisation.
+        tested = set()
+        for m, _ in blocks:
+            key = _config_key(m)
+            if key in tested:
+                continue
+            tested.add(key)
+            err = _selftest(m)
+            if err:
+                return _refuse(err)
         done = []
         try:
             for m, armed in blocks:
