@@ -4118,3 +4118,49 @@ def test_169_unset_is_a_no_op_and_a_missing_file_fails_startup(monkeypatch, tmp_
     monkeypatch.setenv("VLLM_MLX_CHAT_TEMPLATE_FILE", str(tmp_path / "missing.jinja"))
     with pytest.raises(FileNotFoundError):
         _install_chat_template_file(tok)
+
+
+# --------- #172 the DELETE /v1/cache* clears reach the batched system-KV bag
+
+
+def test_172_scheduler_cache_clears_empty_the_batched_bag(monkeypatch):
+    """The bag REPLACES the scheduler's other prefix caches, so a rebase that
+    takes upstream's clear_prefix_cache / clear_runtime_caches drops the only
+    branch that does anything on a batched route (upstream #874: 'cleared'
+    while freeing nothing)."""
+    for method in ("clear_prefix_cache", "clear_runtime_caches"):
+        scheduler = _make_scheduler(monkeypatch)
+        kv = scheduler.hybrid_kv
+        assert scheduler.memory_aware_cache is None
+        kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+        assert kv.stats()["entry_count"] == 1
+
+        result = getattr(scheduler, method)()
+
+        assert kv.stats()["entry_count"] == 0, method
+        assert kv.stats()["memory_mb"] == 0, method
+        if method == "clear_runtime_caches":
+            assert result["batched_system_kv"] is True
+
+
+def test_172_clear_under_requests_that_hold_entries(monkeypatch):
+    """A clear between a request's match and its use: a lazy queued request
+    falls back to a cold prefill, a restored running request still stores
+    its finished chain (as a full copy - its donor is gone)."""
+    kv = _lazy_kv(monkeypatch)
+    queued = _queued("lazy", GROWN)
+    bkv.fetch_for_request(kv, queued)
+    assert queued.cache_hit_type == "system_kv_pending"
+    assert kv.fetch(GROWN, request_id="running") is not None  # restored, in flight
+
+    kv.clear()
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), queued)
+    assert queued.cache_hit_type == "miss" and queued.cached_tokens == 0
+    assert queued.remaining_tokens == GROWN
+    assert kv.stats()["pinned_entries"] == 0
+
+    assert kv.store("running", GROWN, _donor_at(len(GROWN))) is True
+    assert kv.grown_stores == 0  # donor gone: full copy, no dangling segments
+    result = kv.fetch(GROWN + [5])
+    assert result is not None and result[2] == len(GROWN)

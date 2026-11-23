@@ -1234,3 +1234,43 @@ def test_171_json_parameter_values_compare_in_sorted_key_order():
     a = "<function=f>\n<parameter=q>\n{not json\n</parameter>\n</function>"
     b = "<function=f>\n<parameter=q>\n{not  json\n</parameter>\n</function>"
     assert _canonical_call(a) == _canonical_call(b)
+
+
+def test_clear_drops_entries_and_bytes():
+    """BatchedSystemKV.clear() empties the bag and reports what it freed."""
+    kv = _make_cache()
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", list(range(5000, 5600)), _donor_at(600, seed=3.0))
+    before = kv.stats()
+    assert before["entry_count"] == 2 and before["memory_mb"] > 0
+
+    n, freed = kv.clear()
+
+    after = kv.stats()
+    assert n == 2 and freed > 0
+    assert after["entry_count"] == 0 and after["memory_mb"] == 0
+    assert kv.fetch(TOKENS + [1]) is None
+
+
+def test_scheduler_prefix_clear_reaches_batched_system_kv():
+    """DELETE /v1/cache/prefix -> scheduler.clear_prefix_cache must free the
+    bag when it replaces the other prefix caches (upstream #874: 'cleared'
+    while doing nothing). Same for clear_runtime_caches (DELETE /v1/cache)."""
+    from vllm_mlx.scheduler import Scheduler
+
+    for method in ("clear_prefix_cache", "clear_runtime_caches"):
+        kv = _make_cache()
+        kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+        assert kv.stats()["entry_count"] == 1
+
+        sched = object.__new__(Scheduler)
+        sched.block_aware_cache = None
+        sched.memory_aware_cache = None
+        sched.prefix_cache = None
+        sched.hybrid_kv = kv
+
+        getattr(sched, method)()
+
+        stats = kv.stats()
+        assert stats["entry_count"] == 0, method
+        assert stats["memory_mb"] == 0, method
