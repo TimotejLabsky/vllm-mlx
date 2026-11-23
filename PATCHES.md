@@ -4640,3 +4640,32 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 **Verification.** Mocked: view-pins / detached-frees accounting (64 MiB control), and a join test that fails without the fix. A join-then-leave test: the row speculates alone again with wrong drafts after the drop, and its stream and cache equal plain decode's (no rollback reads a dropped recording). The detached row is a copy, bit-equal to the slice (T=0 output unchanged). `test_fork_invariants.py::test_174_*` pins both sites. Not measured on the real model.
 
 **Not covered.** The legacy `install_chunked_prefill_mllm` last chunk (`prompt_last_logits = logits[:, -1, :]`) keeps the same view through the next decode step; that path runs only with `--chunked-prefill-tokens`, which no route sets.
+
+## 175. `patch: mlxlm-2082-compat` — the fork's mlx-lm hooks resolve on both models layouts, and an armed hook that cannot bind says so
+
+**Files:** `vllm_mlx/mlx_lm_compat.py` (new, fork-owned), `vllm_mlx/moe_fusion.py`, `vllm_mlx/text_mtp.py`, `vllm_mlx/patches/qwen3_5_mllm.py`, `vllm_mlx/server.py` (`/v1/status` `moe_fusion`), `tests/test_mlx_lm_compat_175.py` (new), `tests/test_fork_invariants.py`, `tests/test_moe_fusion.py`, `tests/test_qwen35_mllm_patch.py`.
+
+**Why (issue #118, pin-bump pre-read).** mlx-lm #2082 (merged as `2d4df8d`, not in a release yet; the pin is 0.32.2) turns each `models/<arch>.py` into a package that exports only `Model`/`ModelArgs` and moves the shared helpers to `mlx_lm.layers.{moe,attention,recurrent}`, with no shims. Three live fork sites hard-coded the old paths behind an `except`:
+- **#96 MoE fusion** (4 routes arm it). `_switch_glu_class` returned `None` silently, but the class-NAME match still fused every `SwitchGLU`, and `FusedSwitchGLU.__call__` imported `_gather_sort` from the old module on every forward. Read, not run: on the new layout an armed MoE route would raise on its first decode.
+- **#160 text drafter** (27B-8bit). `_install_class_patches` reads `qwen3_5.GatedDeltaNet`, which the new package does not export. Read, not run: the AttributeError would come out of `maybe_install`, i.e. out of the batch-generator build.
+- **Qwen3.5 VLM attention patch.** `from mlx_lm.models.base import scaled_dot_product_attention` shared its `except ImportError` with the mlx-vlm import, so a moved helper looked like "no Qwen3.5 installed" (debug log, unpatched attention). No live qwen3_5 vision route.
+
+**What.**
+- `mlx_lm_compat.resolve(name)` looks each symbol up at the post-#2082 path first, then the 0.32.2 one: `SwitchGLU`, `_gather_sort`, `_scatter_unsort`, `gated_delta_update`, `normalize_qk`, `create_ssm_mask`, `create_attention_mask`, `scaled_dot_product_attention`, qwen3_5 `GatedDeltaNet`/`DecoderLayer`/`TextModelArgs`, `Qwen3NextDecoderLayer`. The paths come from the upstream tree at the merge commit. On 0.32.2 the new modules do not exist, so each lookup returns the very object the old import bound (a test asserts `is` for every one): **no behaviour change on the current pin.**
+- **The trap.** `mlx_lm.models.cache.create_attention_mask` exists on both layouts with the signature `(N, offset, return_array, window_size)`. It is never a candidate, and resolved functions have their leading parameter names checked against a table, so a wrong binding raises `MlxLmSymbolMissing` instead of silently changing a mask. A test runs the real cache function through the check and expects a rejection.
+- **Fusion**, when armed and a symbol is missing: one ERROR naming each missing symbol and every path tried. The model runs unfused (fail-open as before, never a crash), and `/v1/status` → `moe_fusion` = `{armed, fused, skipped, error}`. The sort helpers are bound when a module is fused, not imported per forward.
+- **Drafter**, when armed and a symbol is missing: #159's semantics. One ERROR, `disabled: true` + `disabled_reason: "mlx-lm layout: ..."` in the `mtp` stats, no class patched, decoding continues. Routes without the env are untouched.
+- **Qwen3.5 VLM patch**: a missing mlx-vlm module is still a debug line; a missing mlx-lm helper with mlx-vlm present is an ERROR.
+
+**Not done (needs the mlx-lm release).** The drafter's model-tree adaptation (B2 in #118's verdict). On the new layout the qwen3_5 tree is `Model.model.language_model`, not `Model.language_model.model`, and `tie_word_embeddings` sits under `args.text`. Until it is adapted, the drafter on a new mlx-lm resolves its classes but disables at load with the existing "exposes no hidden-state model" ERROR. Also not routed through the resolver yet: the built-in MTP patches (`qwen3_5_mtp.py`, `qwen3_next_mtp.py`, no route uses them), `text_model_from_vlm.py` and the gdn bench script.
+
+**Verification.**
+- `tests/test_mlx_lm_compat_175.py` (20). Installed layout: identity with the old imports and the signature table. Post-#2082 layout: a fake package tree in `tmp_path` mirroring upstream `2d4df8d`, the only faked paths in #175, with the stale `models/base.py`, `models/cache.py` and the `qwen3_5` package (exports only `Model`/`ModelArgs`) included so an old-first or cache-path resolver fails. Also covered: the trap, the "found nowhere" message, and a packaged module that raises a non-ImportError at import (a miss with the cause in the message, never a crash out of model load).
+- `tests/test_fork_invariants.py`, no importorskip and no faked paths:
+  - `test_175_moe_fusion_binds_on_installed_mlx_lm` fuses a real quantized `SwitchGLU` and checks exact equality on the decode and gather-sort paths.
+  - `test_175_text_mtp_hooks_bind_on_installed_mlx_lm` walks a real tiny qwen3_5 model and requires every recurrent layer to be the resolved class.
+  - `test_175_hooks_resolve_through_the_compat_module_only` checks that no old path is back at the three sites.
+  - `test_175_armed_fusion_*` and `test_175_armed_drafter_*` check the ERROR and status semantics.
+- `tests/test_moe_fusion.py` lost its `importorskip`, so it can no longer skip silently. `tests/test_qwen35_mllm_patch.py` stubs the resolver instead of faking `mlx_lm.models.base`.
+- Full suite 5539 passed / 32 skipped (baseline 5515 + 24 new), laptop, mlx-lm 0.32.2.
+- Not run against mlx-lm HEAD: the venv stays at the pin. The real check is #118's bump step (Studio cloned venv: suite, plus `moe_fusion.fused > 0` on the 35B-A3B and drafter `disabled: false` on the 27B-8bit).
