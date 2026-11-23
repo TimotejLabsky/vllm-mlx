@@ -74,6 +74,33 @@ class _SystemKVIndex(SSDIndex):
 
     _SCHEMA_VERSION = 1
 
+    # (#178) Write version: bumped AFTER every row insert/delete commits, so
+    # a caller that read it before probing can reuse that probe's result
+    # exactly while it is unchanged (BatchedSystemKV's per-request memo).
+    # touch / update_memory_bytes do not change what a lookup returns.
+    _version = 0
+    _version_lock = threading.Lock()
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def _bump_version(self) -> None:
+        with self._version_lock:
+            self._version += 1
+
+    def insert_entry(self, *args, **kwargs):
+        try:
+            return super().insert_entry(*args, **kwargs)
+        finally:
+            self._bump_version()
+
+    def delete_entry(self, *args, **kwargs):
+        try:
+            return super().delete_entry(*args, **kwargs)
+        finally:
+            self._bump_version()
+
     def lookup_shared_prefix(
         self, query_tokens: tuple[int, ...], limit: int = 4
     ) -> list[dict]:
@@ -1091,6 +1118,11 @@ class SystemKVSSDStore:
             shutil.rmtree(entry_dir, ignore_errors=True)
 
     # ---- promote ----------------------------------------------------------
+
+    @property
+    def index_version(self) -> int:
+        """(#178) Changes whenever a lookup could answer differently."""
+        return self._index.version
 
     def lookup_prefix(self, tokens: tuple[int, ...]) -> dict | None:
         """Longest stored entry whose tokens are a prefix of ``tokens``."""
