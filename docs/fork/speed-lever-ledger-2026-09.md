@@ -418,3 +418,24 @@ Full write-up in PATCHES.md #159/#160; data in `reports/mtp-drafter-2026-11-16/`
 - **Denser checkpoint ladder: NOT worth it.** A divergent restore snaps down to a checkpoint, and the recomputed gap cost 7-11K tokens a day over the last week (~35-55 s of prefill; 104 restores ever lost >= 1K, max 6.3K). Raising `VLLM_MLX_SYSTEM_KV_CHECKPOINTS` 8 -> 16 costs ~150 MB of recurrent state per checkpoint, ~1.2 GB more per entry, on a route already squeezed by memory relief.
 - **Shipped instead: #171**, which stops SSD promotes that cannot restore anything (466 of 715 historically) and reconciles nested JSON tool arguments.
 - **Not the engine's to fix:** daily repeats of one job share only ~4,000 tokens with yesterday's run (likely a date early in the prompt). Moving per-run values after the tool block in the Hermes job prompts would let each job restore its whole prefix.
+
+### 2026-11-23 — mlx-lm MoE single-token kernels (#2053/#2054/#2044) vs #96 (fork issue #111): gate KILL on T=0, +14 % decode, take at the pin bump that merges them
+
+`scripts/fork/probe_moe_kernels_111.py`. Qwen3.6-35B-A3B-4bit-DWQ, batch 1, standalone `generate_step` (not the server), PR kernel files loaded as an overlay (venv and mlx-lm 0.32.2 untouched), deployed `MLX_MAX_OPS_PER_BUFFER=1000` / `MLX_MAX_MB_PER_BUFFER=200`, 4,058-token prompt, 256 tokens at T=0. 7 variants interleaved over 6 rounds, one process per (round, variant), 2 timed runs each after a warm-up. Samples where a live route stepped were discarded (10 of 92). n = 10-12 per variant.
+
+| variant | decode tok/s, median (min-max) | prefill tok/s | vs #96 decode | T=0 vs stock |
+|---|---|---|---|---|
+| a stock | 89.17 (88.98-89.30) | 1540 | -1.5 % | — |
+| b #96 (deployed) | 90.57 (90.41-90.64) | 1496 | — | identical |
+| c1 #2053 combine | 93.85 (93.62-94.20) | 1537 | +3.6 % | diverges at token 77 |
+| c2 #2054 softmax_topk | 92.88 (92.23-93.11) | 1523 | +2.5 % | diverges at token 73 |
+| c #2053 + #2054 | 103.49 (102.24-103.72) | 1523 | **+14.3 %** | diverges at token 73 |
+| e #96 + #2054 | 94.45 (94.34-94.66) | 1505 | +4.3 % | diverges at token 73 |
+| d #96 + #2053 + #2054 | 103.45 (103.20-103.86) | 1508 | **+14.2 %** | diverges at token 73, same tokens as c |
+
+- **Decode is a real +14 %, far outside noise** (ranges do not overlap). The two kernels together give more than the sum of each alone (+3.6 % and +2.5 %). Prefill does not change: the kernels are single-token only.
+- **Gate fails on T=0.** Each kernel changes the output on its own, and every run of a variant produced the same tokens. #2054 picks the top-k from fp32 logits, while stock picks it from the bf16-rounded softmax with `argpartition`. In 17 of 160 random single-token cases on the real layers the selected expert set differed, because bf16 ties at the k-th place break differently. #2053's fused GLU and weighted sum is 1.3 % relative error from the `gather_qmm` path (bf16 rounding, no bug). This is the same failure as lever #10.
+- **#2044 was not timed: it never runs at these shapes.** At head `61accb9` it returns to the generic path for T < 2 and for T·k/E > 24 (a 2048-token prefill chunk is 64). Its win is multi-stream decode (B = 8-32), which is a separate question.
+- **#96 coexists with #2053.** In `d`, #2053's gate/up kernel is pointed at #96's fused `[up; gate]` tensor (gate at row offset N). It gives the same output as unfused #2053 (max abs diff 0) and needs no second weight copy. So a port does not require dropping #96.
+- **Side finding:** in this standalone loop #96 is only +1.5 % decode over stock with the #41 buffer env on, and −2.9 % on prefill. The recorded +12.8 % was a server measurement taken before #41. Re-check #96 on the server before relying on it.
+- **Verdict:** do not port into the fork; it would break the T=0 byte-identity gate on 7 MoE routes. Take these kernels at the mlx-lm pin bump that merges #2053 and #2054, and accept a new T=0 baseline there. A port would need: the two kernel files, a fork-side `combine` on `FusedSwitchGLU` using the fused-layout kernel above, routing patches per model class (each MoE model computes routing in its own `__call__`), an env gate, and a deliberate re-baseline of the T=0 tests.
