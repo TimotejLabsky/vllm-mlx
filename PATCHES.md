@@ -4596,3 +4596,15 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - **Real data** (Studio, the 27B-8bit's live tier, index and meta copied): each of the 15 entries replayed as the request that wrote it, against the rest of the tier.
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
+
+## 174. `patch: lazy-holds` — MLLM first-token logits and the MTP drafter's recorded states are not kept past their use
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`_detached_last_row`), `vllm_mlx/text_mtp.py` (`_drop_recording`), `tests/test_105_lazy_logits_hold.py`, `tests/test_text_mtp_160.py`.
+
+**Why (audit #105, from mlx-vlm #2806 / #2525).**
+- MLLM prefill (cache-hit-with-suffix and cold branches) took `logits[:, -1, :]`, a view that pins the whole `(B, T, vocab)` forward output, and kept `logits` bound through cache admission and the next row's prefill.
+- The text MTP drafter leaves each verify's per-position recurrent states on every recurrent layer until the next verify; a row that decodes bypassed beside another request's prefill kept them for its whole life.
+
+**Fix.** Take a detached last row and rebind `logits = None`; drop the recorded states in the `filter`/`extend` wrappers after `_sync`.
+
+**Verification.** Mocked: view-pins / detached-frees accounting (64 MiB control), and a join test that fails without the fix. Not measured on the real model.

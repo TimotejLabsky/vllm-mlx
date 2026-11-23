@@ -766,3 +766,37 @@ def test_167_only_tagged_sampling_requests_speculate_by_sampling(case):
     mtp.spec_sampling, mtp.block = True, 2
     sampler._vllm_mlx_sampling = (1.0, 0.9, 0.0, 8)
     assert text_mtp._ss_params(batch, mtp) == (1.0, 0.9, 8)
+
+
+# ------- #105 finished/bypassed speculative state is not left pinned
+def test_105_join_drops_the_last_rounds_recorded_states(model):
+    """A verify leaves ``_text_mtp_spec`` (per-position recurrent states) on
+    every recurrent layer. After a second request joins, the row decodes
+    bypassed and nothing can roll back into it: it must not stay pinned."""
+    solo = _run(model, 30)[0][0]
+    gen = BatchGenerator(model, max_tokens=30)
+    mtp = text_mtp.TextMTP("oracle")
+    mtp.block = 4
+    mtp.lm = model.language_model
+    mtp.drafter = OracleDrafter(solo, gen._generation_batch, len(PROMPT), 0)
+    text_mtp._install_class_patches()
+    gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
+    gen.insert([list(PROMPT)])
+    seen_spec = joined = False
+    for call in range(40):
+        if call == 5:
+            gen.insert([[11, 3, 77, 8]])
+        gen.next_generated()
+        recurrent = [
+            c
+            for c in gen._generation_batch.prompt_cache
+            if text_mtp._is_recurrent(c)
+        ]
+        specs = [getattr(c, "_text_mtp_spec", None) for c in recurrent]
+        if call < 5:
+            seen_spec = seen_spec or all(s is not None for s in specs)
+        elif len(gen._generation_batch.uids) > 1:
+            joined = True
+            assert recurrent and all(s is None for s in specs)
+    gen.close()
+    assert seen_spec and joined
