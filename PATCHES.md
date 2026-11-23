@@ -4609,6 +4609,24 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 **Thread.** Both endpoints hop to the single generation worker (`BatchedEngine._clear_*_on_owner`), the thread that runs `scheduler.step`, so a clear lands between steps, never inside one.
 
+## 173. `patch: ssd-free-space-floor` — the SSD KV tier refuses a spill that would leave its volume under a free-space floor
+
+**Files:** `vllm_mlx/system_kv_ssd.py` (`_disk_floor_ok`, `min_free_pct`, stat `spill_refused_low_disk`), `tests/test_system_kv_ssd.py`, `tests/test_fork_invariants.py`, `tests/conftest.py`.
+
+**Why (issue #106 follow-up).**
+- Every route's tier cap (`VLLM_MLX_SSD_SYSTEM_KV_GB`) is per store. The deployed caps sum to 360 GB worst case on a shared volume, and nothing checked free space; only operator discipline kept it safe. ENOSPC on that volume would hit every route and the OS.
+- Measured on the Studio (read-only, 2026-11-23): volume 926 GiB, 280 GiB free (30%); the whole tier holds 66.4 GiB across 15 store directories (largest: 27B-8bit 37 GiB, 35B 20 GiB).
+
+**Fix.**
+- `VLLM_MLX_SSD_MIN_FREE_PCT` (default 10, 0 disables). Before a spill is written, `shutil.disk_usage` of the tier's data dir; if free space minus the snapshot's size would be under that percent of the volume, the spill is refused, counted in `spill_refused_low_disk`, and a warning is logged at most once a minute. Nothing is raised into the request path.
+- The check runs twice per spill: in `enqueue_spill` (on the caller's thread, the same thread that already flattens the snapshot) and again in the writer thread before the write, for space that went between the two. One statvfs each, microseconds against a multi-hundred-MB write. An unreadable volume fails open: the write itself reports a real ENOSPC.
+- The enqueue-time refusal matters: `enqueue_spill` returning False is how the RAM tiers learn a chain is not on disk. Refused only in the writer, the batched tier had already recorded the key as the entry's `disk` lineage (#170), so the next spill superseded a file that never landed and left the real older copy on disk, and the SimpleEngine slot was marked `active_spilled` (evicted first as "cheap to re-promote"). Pinned by `test_173_a_refused_spill_leaves_no_disk_lineage`. A refusal in the writer (space ran out after the enqueue) still has that gap, as any failed write does.
+- Default 10 because the box is at 30% free today (floor = 93 GiB, 187 GiB of room before it bites) and 15% would have been 139 GiB, nearly the 146 GiB recorded free on 2026-09-17. Raise it per route to be stricter.
+- Refusal only stops new spills; it does not evict. Entries already on disk keep serving promotes.
+- `tests/conftest.py` turns the floor off by default so tests that write real entries do not depend on the dev disk's fullness (the dev laptop is under 10% free).
+
+**Verification.** `test_low_disk_floor_refuses_spill_and_counts_173`, `test_min_free_pct_env_default_173`, `test_173_a_refused_spill_leaves_no_disk_lineage` (batched tier), fork invariant `test_173_ssd_spill_has_a_global_free_space_floor`. Mocked `disk_usage` only; no real-server check yet.
+
 ## 174. `patch: lazy-holds` — MLLM first-token logits and the MTP drafter's recorded states are not kept past their use
 
 **Files:** `vllm_mlx/mllm_batch_generator.py` (`_detached_last_row`), `vllm_mlx/text_mtp.py` (`_drop_recording`), `tests/test_105_lazy_logits_hold.py`, `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`.

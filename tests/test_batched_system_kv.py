@@ -1274,3 +1274,37 @@ def test_scheduler_prefix_clear_reaches_batched_system_kv():
         stats = kv.stats()
         assert stats["entry_count"] == 0, method
         assert stats["memory_mb"] == 0, method
+
+
+# ----------------------------------------- #173 free-space floor refusals
+
+
+def test_173_a_refused_spill_leaves_no_disk_lineage(monkeypatch, tmp_path):
+    """Under the floor the chain must not be recorded as on disk: a phantom
+    ``disk`` key would make #170 supersede the phantom (leaking the real older
+    copy) and #164 skip grown spills it still owes once space frees up."""
+    import collections
+
+    from vllm_mlx import system_kv_ssd
+
+    DU = collections.namedtuple("DU", "total used free")
+    free = {"v": 5}
+    monkeypatch.setattr(
+        system_kv_ssd.shutil, "disk_usage", lambda p: DU(1000, 0, free["v"])
+    )
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "10")
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=0)
+    ssd = kv._ssd
+    try:
+        kv.store("t0", TOKENS[:400], _donor_at(400))
+        (entry,) = kv._entries.values()
+        assert entry.get("disk") is None
+        assert not entry.get("spill_pending")
+        st = ssd.get_stats()
+        assert st["spill_refused_low_disk"] == 1 and st["queued_bytes"] == 0
+        free["v"] = 10**15  # space freed: the next chain spills normally
+        kv.store("t1", _BIG, _donor_at(600))
+        assert any(e.get("disk") is not None for e in kv._entries.values())
+    finally:
+        kv.close()
+    assert ssd.get_stats()["spill_count"] == 1

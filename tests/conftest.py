@@ -113,3 +113,11 @@ def _restore_generation_stream_globals():
         module = sys.modules.get(name)
         if module is not None and hasattr(module, "generation_stream"):
             module.generation_stream = stream
+
+
+@pytest.fixture(autouse=True)
+def _ssd_free_space_floor_off(monkeypatch):
+    """(#173) The SSD tier's free-space floor reads the real volume; tests
+    that write real entries must not depend on how full the dev disk is.
+    Tests of the floor itself set the env or config explicitly."""
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "0")
