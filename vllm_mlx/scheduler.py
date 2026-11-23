@@ -3918,8 +3918,9 @@ class Scheduler:
         if self.hybrid_kv is not None:
             # The batched system-KV bag REPLACES the caches above, so without
             # this the clear (and DELETE /v1/cache*) was a silent no-op.
-            self.hybrid_kv.clear()
+            n, freed = self.hybrid_kv.clear()
             cleared["batched_system_kv"] = True
+            cleared["batched_system_kv_freed"] = {"entries": n, "bytes": freed}
         return cleared
 
     def reset(self) -> None:
@@ -3997,25 +3998,33 @@ class Scheduler:
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0
 
-    def clear_prefix_cache(self) -> None:
-        """Clear the in-memory prefix cache (keeps disk cache untouched)."""
+    def clear_prefix_cache(self) -> Dict[str, Any]:
+        """Clear the in-memory prefix cache (keeps disk cache untouched).
+        Returns which caches were cleared (fork #172: the endpoint reports
+        it instead of answering 'cleared' unconditionally)."""
+        cleared: Dict[str, Any] = {"memory_aware_cache": False, "prefix_cache": False}
         if self.memory_aware_cache is not None and hasattr(
             self.memory_aware_cache, "clear"
         ):
             self.memory_aware_cache.clear()
             logger.info("[clear_prefix_cache] memory-aware cache cleared")
-            return
+            cleared["memory_aware_cache"] = True
+            return cleared
         if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
             self.prefix_cache.clear()
             logger.info("[clear_prefix_cache] prefix cache cleared")
+            cleared["prefix_cache"] = True
         if self.hybrid_kv is not None:
             n, freed = self.hybrid_kv.clear()
+            cleared["batched_system_kv"] = True
+            cleared["batched_system_kv_freed"] = {"entries": n, "bytes": freed}
             logger.info(
                 "[clear_prefix_cache] batched system-KV cleared: "
                 "%d entries, %.1f MB",
                 n,
                 freed / (1024 * 1024),
             )
+        return cleared
 
     def ensure_ssd_tier(self) -> None:
         """Create and attach the configured SSD tier when it is absent."""

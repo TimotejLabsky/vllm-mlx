@@ -1847,21 +1847,36 @@ class BatchedEngine(BaseEngine):
             )
         return 0
 
-    def clear_prefix_cache(self) -> None:
+    def clear_prefix_cache(self) -> dict[str, Any] | None:
         """Clear the in-memory prefix cache. Used by bench-serve for clean
-        cold-start measurements between configurations."""
+        cold-start measurements between configurations (RAM only: an SSD
+        tier, when configured, is kept and repopulates the next request).
+
+        Returns what was cleared; an empty dict means nothing was reachable
+        (the server then answers ``not_supported``, not ``cleared``)."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None and hasattr(pc, "clear"):
                 pc.clear()
-                return
+                return {"prefix_cache": True}
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
-            self._run_on_generation_worker_sync(self._engine.clear_prefix_cache)
+            return self._run_on_generation_worker_sync(self._engine.clear_prefix_cache)
+        if self._engine is not None:
+            logger.warning(
+                "[clear_prefix_cache] %s has no clear_prefix_cache; nothing cleared",
+                type(self._engine).__name__,
+            )
+        return {}
 
-    async def _clear_prefix_cache_on_owner(self) -> None:
+    async def _clear_prefix_cache_on_owner(self) -> dict[str, Any] | None:
         """Clear the prefix cache on the thread that owns its MLX arrays."""
         if self._mllm_scheduler is not None:
-            self.clear_prefix_cache()
-            return
+            return self.clear_prefix_cache()
         if self._engine is not None and hasattr(self._engine, "clear_prefix_cache"):
-            await self._run_on_generation_worker(self._engine.clear_prefix_cache)
+            return await self._run_on_generation_worker(self._engine.clear_prefix_cache)
+        if self._engine is not None:
+            logger.warning(
+                "[clear_prefix_cache] %s has no clear_prefix_cache; nothing cleared",
+                type(self._engine).__name__,
+            )
+        return {}

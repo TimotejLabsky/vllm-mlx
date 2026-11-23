@@ -4164,3 +4164,111 @@ def test_172_clear_under_requests_that_hold_entries(monkeypatch):
     assert kv.grown_stores == 0  # donor gone: full copy, no dangling segments
     result = kv.fetch(GROWN + [5])
     assert result is not None and result[2] == len(GROWN)
+
+
+def _real_batched_engine_on_a_bag(monkeypatch):
+    """The objects a batched text route really serves the cache endpoints
+    through: BatchedEngine -> AsyncEngineCore -> EngineCore -> Scheduler ->
+    BatchedSystemKV. Only the model is mocked."""
+    import threading
+
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.engine_core import AsyncEngineCore, EngineConfig
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SYSTEM_KV", "1")
+    tokenizer = MagicMock()
+    tokenizer.encode = lambda x: list(range(len(x.split())))
+    tokenizer.eos_token_id = 0
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._mllm_scheduler = None
+    worker = engine._generation_worker()
+    engine._engine = AsyncEngineCore(
+        MagicMock(),
+        tokenizer,
+        EngineConfig(
+            scheduler_config=SchedulerConfig(max_num_seqs=4, enable_prefix_cache=True)
+        ),
+        generation_worker=worker,
+    )
+    kv = engine._engine.engine.scheduler.hybrid_kv
+    assert kv is not None
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT), seed=3.0))
+    assert kv.stats()["entry_count"] == 2 and kv.stats()["memory_mb"] > 0
+    owner = worker.submit(threading.get_ident).result(timeout=5)
+    clear_threads = []
+    real_clear = kv.clear
+
+    def recording_clear():
+        clear_threads.append(threading.get_ident())
+        return real_clear()
+
+    kv.clear = recording_clear
+    return engine, kv, owner, clear_threads
+
+
+@pytest.mark.parametrize("path", ["/v1/cache/prefix", "/v1/cache"])
+def test_172_http_cache_clears_reach_the_bag_through_the_real_wrappers(
+    monkeypatch, path
+):
+    """The real-server check failed while every scheduler-level test was
+    green: AsyncEngineCore had no clear_prefix_cache, so BatchedEngine's
+    hasattr skipped the clear and DELETE /v1/cache/prefix still answered
+    'cleared'. Go through the HTTP handler and the real engine wrappers, and
+    require the clear to run on the generation worker (the MLX owner)."""
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as server
+
+    engine, kv, owner, clear_threads = _real_batched_engine_on_a_bag(monkeypatch)
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_warm_prompts_path", None, raising=False)
+    try:
+        client = TestClient(server.app)
+        body = client.delete(path).json()
+        assert body["status"] == "cleared"
+        assert kv.stats()["entry_count"] == 0, path
+        assert kv.stats()["memory_mb"] == 0, path
+        assert clear_threads == [owner], path
+        report = body["freed"] if path == "/v1/cache/prefix" else body["engine_cache"]
+        assert report["batched_system_kv"] is True
+        assert report["batched_system_kv_freed"]["entries"] == 2
+        assert report["batched_system_kv_freed"]["bytes"] > 0
+
+        if path == "/v1/cache/prefix":
+            # Nothing left: the report says 0 freed, not a stale count.
+            again = client.delete(path).json()
+            assert again["freed"]["batched_system_kv_freed"] == {
+                "entries": 0,
+                "bytes": 0,
+            }
+    finally:
+        engine._engine.engine.close()
+        engine._generation_executor.shutdown(wait=True)
+        engine._generation_executor = None
+
+
+def test_172_prefix_clear_is_not_cleared_when_nothing_is_reachable(monkeypatch):
+    """A batched engine whose core cannot clear anything must not answer
+    'cleared' (the PR-head bug, minus the missing delegator)."""
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as server
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._mllm_scheduler = None
+    engine._engine = SimpleNamespace()  # no clear_prefix_cache at all
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_api_key", None)
+    try:
+        body = TestClient(server.app).delete("/v1/cache/prefix").json()
+    finally:
+        if engine._generation_executor is not None:
+            engine._generation_executor.shutdown(wait=True)
+    assert body["status"] == "not_supported"
+    assert body["rewarm_scheduled"] is False
