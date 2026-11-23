@@ -1387,3 +1387,92 @@ def test_178_kill_switch(monkeypatch):
     kv = _two_chain_kv()
     kv.open_match_memo("r", TOKENS + [1])
     assert kv._match_memo == {}
+
+
+def test_178_equal_length_prompts_and_shared_prompt_objects_stay_apart():
+    """Two open memos whose prompts have the same length and first token but
+    part ways with the cached chain at different depths, scanned interleaved,
+    plus a third request that shares the first one's prompt OBJECT (n>1
+    fan-out). Every answer equals the unmemoised bag's."""
+    p1 = TOKENS[:600] + [1, 2, 3, 4]
+    p2 = TOKENS[:500] + [9] * 104
+    assert len(p1) == len(p2) and p1[0] == p2[0] and p1[-1] != p2[-1]
+    plain = _two_chain_kv()
+    want1 = plain.peek(list(p1), touch=False)
+    want2 = plain.peek(list(p2), touch=False)
+
+    kv = _two_chain_kv()
+    kv.open_match_memo("r1", p1)
+    kv.open_match_memo("r2", p2)
+    for _ in range(3):
+        assert kv.peek(p1, touch=False) == want1
+        assert kv.peek(p2, touch=False) == want2
+    m1, m2 = kv._memo_locked(p1), kv._memo_locked(p2)
+    assert m1 is not m2
+    k_a = next(iter(kv._entries))
+    assert m1["lcp"][k_a][1] == 600 and m2["lcp"][k_a][1] == 500
+    kv.open_match_memo("r3", p1)  # takes over r1's memo slot
+    assert kv.peek(p1, touch=False) == want1
+    kv.close_match_memo("r1")  # r1 no longer owns it: a no-op
+    assert kv._memo_locked(p1) is not None
+    kv.close_match_memo("r3")
+    kv.close_match_memo("r2")
+    assert kv._match_memo == {} and kv._match_memo_rid == {}
+
+
+def test_178_a_write_during_the_probe_invalidates_it(monkeypatch, tmp_path):
+    """The index changes WHILE lookup_shared runs (the SSD writer commits
+    mid-probe). The result is tagged with the version read before the probe,
+    so the next ask re-probes and sees the new row."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        stub = _StubSSD(shared=[_shared("b", 5000, 4000)], ckpts={"b": [3000]})
+        stub.index_version = 1
+        probes = []
+
+        def racing(toks):
+            probes.append(1)
+            rows = list(stub.shared)
+            if len(probes) == 1:  # the writer lands mid-probe
+                stub.shared = [_shared("c", 9000, 8000)]
+                stub.ckpts["c"] = [7000]
+                stub.index_version = 2
+            return rows
+
+        stub.lookup_shared = racing
+        kv._ssd = stub
+        prompt = list(range(10000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt)["usable"] == 3000  # what the probe saw
+        assert kv.check_ssd(prompt)["usable"] == 7000  # re-probed, not stale
+        assert kv.check_ssd(prompt)["usable"] == 7000
+        assert len(probes) == 2  # stable again: served from the memo
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_178_real_tier_row_write_invalidates_check_ssd(monkeypatch, tmp_path):
+    """Real SystemKVSSDStore: an index row inserted (a spill commit) and then
+    deleted (supersede / eviction / quarantine) between asks of one open memo
+    moves check_ssd's and the reconcile donor's answers both ways."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    try:
+        assert kv._ssd is not None
+        prompt = list(range(1000, 3000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt) is None
+        assert kv.check_ssd(prompt) is None
+        key = tuple(prompt[:1500])
+        kv._ssd._index.insert_entry(
+            tokens_key=key, file_path="x", memory_bytes=1, num_tokens=len(key)
+        )
+        got = kv.check_ssd(prompt)
+        assert got is not None and got["usable"] == 1500
+        assert kv._ssd_reconcile_donor(prompt) == list(key)
+        kv._ssd._index.delete_entry(key)
+        assert kv.check_ssd(prompt) is None
+        assert kv._ssd_reconcile_donor(prompt) is None
+    finally:
+        kv.close()
