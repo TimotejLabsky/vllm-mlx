@@ -788,9 +788,7 @@ def test_105_join_drops_the_last_rounds_recorded_states(model):
             gen.insert([[11, 3, 77, 8]])
         gen.next_generated()
         recurrent = [
-            c
-            for c in gen._generation_batch.prompt_cache
-            if text_mtp._is_recurrent(c)
+            c for c in gen._generation_batch.prompt_cache if text_mtp._is_recurrent(c)
         ]
         specs = [getattr(c, "_text_mtp_spec", None) for c in recurrent]
         if call < 5:
@@ -800,3 +798,57 @@ def test_105_join_drops_the_last_rounds_recorded_states(model):
             assert recurrent and all(s is None for s in specs)
     gen.close()
     assert seen_spec and joined
+
+
+def _join_and_leave(model, ref=None):
+    """A short request joins at call 4 and finishes (extend, then filter);
+    the first request then decodes alone again."""
+    gen = BatchGenerator(model, max_tokens=40)
+    mtp = None
+    if ref is not None:
+        mtp = text_mtp.TextMTP("oracle")
+        mtp.block = 4
+        mtp.lm = model.language_model
+        mtp.drafter = OracleDrafter(ref, gen._generation_batch, len(PROMPT), 3)
+        text_mtp._install_class_patches()
+        gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
+    (first,) = gen.insert([list(PROMPT)])
+    tokens, cache, calls = [], None, 0
+    joined = left = recorded_after_leave = False
+    while cache is None:
+        if calls == 4:
+            gen.insert([[11, 3, 77, 8]], max_tokens=[3])
+        calls += 1
+        for r in gen.next_generated():
+            if r.uid == first:
+                tokens.append(r.token)
+                if r.finish_reason is not None:
+                    cache = r.prompt_cache
+        batch = gen._generation_batch
+        joined = joined or len(batch.uids) > 1
+        left = left or (joined and len(batch.uids) == 1)
+        recorded_after_leave = recorded_after_leave or (
+            left
+            and any(
+                getattr(c, "_text_mtp_spec", None) is not None
+                for c in batch.prompt_cache
+            )
+        )
+    gen.close()
+    return tokens, cache, (mtp, recorded_after_leave)
+
+
+def test_105_dropped_recording_never_feeds_a_later_rollback(model):
+    """After the join and the leave dropped the recorded states, the row
+    speculates alone again with wrong drafts: every rollback must read a
+    recording its own verify wrote, so the stream and the cache are plain
+    decode's."""
+    plain_tokens, plain_cache, _ = _join_and_leave(model)
+    solo = _run(model, 40)[0][0]
+    tokens, cache, (mtp, recorded_after_leave) = _join_and_leave(model, ref=solo)
+    assert recorded_after_leave  # it speculated again after the drop
+    assert tokens == plain_tokens
+    assert _max_diff(cache, plain_cache) < TOL
+    stats = mtp.stats()
+    assert stats["bypass_counts"]["concurrent_batch"] > 0
+    assert stats["accepted"] > 0 and stats["rejected"] > 0

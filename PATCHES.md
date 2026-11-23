@@ -4599,7 +4599,7 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 ## 174. `patch: lazy-holds` — MLLM first-token logits and the MTP drafter's recorded states are not kept past their use
 
-**Files:** `vllm_mlx/mllm_batch_generator.py` (`_detached_last_row`), `vllm_mlx/text_mtp.py` (`_drop_recording`), `tests/test_105_lazy_logits_hold.py`, `tests/test_text_mtp_160.py`.
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`_detached_last_row`), `vllm_mlx/text_mtp.py` (`_drop_recording`), `tests/test_105_lazy_logits_hold.py`, `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`.
 
 **Why (audit #105, from mlx-vlm #2806 / #2525).**
 - MLLM prefill (cache-hit-with-suffix and cold branches) took `logits[:, -1, :]`, a view that pins the whole `(B, T, vocab)` forward output, and kept `logits` bound through cache admission and the next row's prefill.
@@ -4607,4 +4607,6 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 
 **Fix.** Take a detached last row and rebind `logits = None`; drop the recorded states in the `filter`/`extend` wrappers after `_sync`.
 
-**Verification.** Mocked: view-pins / detached-frees accounting (64 MiB control), and a join test that fails without the fix. Not measured on the real model.
+**Verification.** Mocked: view-pins / detached-frees accounting (64 MiB control), and a join test that fails without the fix. A join-then-leave test: the row speculates alone again with wrong drafts after the drop, and its stream and cache equal plain decode's (no rollback reads a dropped recording). The detached row is a copy, bit-equal to the slice (T=0 output unchanged). `test_fork_invariants.py::test_174_*` pins both sites. Not measured on the real model.
+
+**Not covered.** The legacy `install_chunked_prefill_mllm` last chunk (`prompt_last_logits = logits[:, -1, :]`) keeps the same view through the next decode step; that path runs only with `--chunked-prefill-tokens`, which no route sets.
