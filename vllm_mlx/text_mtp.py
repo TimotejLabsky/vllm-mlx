@@ -358,21 +358,49 @@ def maybe_install(scheduler: Any, batch_gen: Any) -> None:
     if mtp is None or mtp.path != path:
         mtp = TextMTP(path)
         scheduler._text_mtp = mtp
+    gone = hook_symbols_missing()
+    if gone:
+        # (#175) mlx-lm moved what the drafter hooks (#2082); patching would
+        # raise out of the batch generator build. Same semantics as a failed
+        # load (#159): one ERROR, ``disabled`` in the stats, decoding
+        # continues without the drafter.
+        if mtp.disabled_reason is None:
+            mtp.disabled_reason = "mlx-lm layout: " + "; ".join(gone)
+            logger.error("[text-mtp] DISABLED: %s", mtp.disabled_reason)
+        batch_gen.get_mtp_stats = mtp.stats
+        return
     _install_class_patches()
     batch._text_mtp = _BatchState(mtp)
     batch_gen.get_mtp_stats = mtp.stats
     logger.info("[text-mtp] armed on the text path: %s block=%d", path, mtp.block)
 
 
-def _supports_recording(lm: Any) -> bool:
-    from mlx_lm.models import qwen3_5 as q35
+# (#175) The mlx-lm symbols the drafter binds, resolved on both the 0.32.2
+# layout and the post-#2082 one (``mlx_lm_compat``).
+HOOK_SYMBOLS = ("qwen3_5.GatedDeltaNet", "gated_delta_update", "normalize_qk")
 
+
+def hook_symbols_missing() -> List[str]:
+    """Errors for the hooked mlx-lm symbols that do not resolve."""
+    from .mlx_lm_compat import missing
+
+    return missing(HOOK_SYMBOLS)
+
+
+def _gdn_class() -> Any:
+    from .mlx_lm_compat import resolve
+
+    return resolve("qwen3_5.GatedDeltaNet")
+
+
+def _supports_recording(lm: Any) -> bool:
+    gdn_cls = _gdn_class()
     layers = getattr(getattr(lm, "model", None), "layers", None) or []
     recurrent = [
         layer.linear_attn for layer in layers if getattr(layer, "is_linear", False)
     ]
     return bool(recurrent) and all(
-        type(m) is q35.GatedDeltaNet and m.sharding_group is None for m in recurrent
+        type(m) is gdn_cls and m.sharding_group is None for m in recurrent
     )
 
 
@@ -384,13 +412,13 @@ def _install_class_patches() -> None:
         if _patched:
             return
         from mlx_lm.generate import GenerationBatch
-        from mlx_lm.models import qwen3_5 as q35
 
+        gdn_cls = _gdn_class()
         _orig["step"] = GenerationBatch._step
         _orig["extract_cache"] = GenerationBatch.extract_cache
         _orig["filter"] = GenerationBatch.filter
         _orig["extend"] = GenerationBatch.extend
-        _orig["gdn_call"] = q35.GatedDeltaNet.__call__
+        _orig["gdn_call"] = gdn_cls.__call__
 
         def _step(self):
             state = getattr(self, "_text_mtp", None)
@@ -422,7 +450,7 @@ def _install_class_patches() -> None:
         GenerationBatch.extract_cache = extract_cache
         GenerationBatch.filter = filter
         GenerationBatch.extend = extend
-        q35.GatedDeltaNet.__call__ = _recording_gdn_call
+        gdn_cls.__call__ = _recording_gdn_call
         _patched = True
 
 
@@ -437,9 +465,10 @@ def _recording_gdn_call(self, inputs, mask=None, cache=None):
     against the original by ``test_160_recording_forward_matches_mlx_lm``."""
     if not _REC["active"] or cache is None:
         return _orig["gdn_call"](self, inputs, mask, cache)
-    from mlx_lm.models import gated_delta as gd
-    from mlx_lm.models import qwen3_5 as q35
+    from .mlx_lm_compat import resolve
 
+    normalize_qk = resolve("normalize_qk")
+    gated_delta_update = resolve("gated_delta_update")
     B, S, _ = inputs.shape
     qkv = self.in_proj_qkv(inputs)
     z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
@@ -464,11 +493,11 @@ def _recording_gdn_call(self, inputs, mask=None, cache=None):
             [self.head_k_dim, self.head_k_dim, self.head_v_dim],
         )
     ]
-    q, k = q35.normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
+    q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
     state = cache[1]
     outs, states = [], []
     for t in range(S):
-        out_t, state = gd.gated_delta_update(
+        out_t, state = gated_delta_update(
             q[:, t : t + 1],
             k[:, t : t + 1],
             v[:, t : t + 1],

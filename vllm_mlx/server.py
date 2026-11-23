@@ -4971,6 +4971,14 @@ async def health():
     return payload
 
 
+def _moe_fusion_status() -> dict[str, object]:
+    """(#175) patch #96's fusion: armed, how many modules it fused, and the
+    error when mlx-lm lacks the classes it hooks."""
+    from .moe_fusion import status
+
+    return status()
+
+
 def _embedding_status() -> dict[str, object] | None:
     """Effective embedding config, for status/config reporting."""
     if _embedding_engine is None:
@@ -5075,6 +5083,8 @@ async def status():
             or stats.get("system_kv_cache"),
         ),
         "mtp": stats.get("mtp") or {"enabled": False},
+        # (#175) armed MoE fusion that bound nothing shows an error here
+        "moe_fusion": _moe_fusion_status(),
         # Pixel/preprocessing cache (MLLM branch only) — the layer that
         # absorbs re-sent images while the KV prefix cache excludes media
         # (#56 phase A).
