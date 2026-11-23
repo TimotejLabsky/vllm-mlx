@@ -92,23 +92,27 @@ def _decoded_token_is_whitespace(tokenizer: Any, token_id: int) -> bool:
 
 def _whitespace_prefilter(
     tokenizer: Any, vocab_size: int
-) -> tuple[frozenset[int], int] | None:
-    """Tokens that could end a 256-character whitespace run, and how many.
+) -> tuple[dict[int, int], dict[int, int]] | None:
+    """Per-token bounds on how much trailing whitespace a token can add.
 
-    A trailing run of ``_MAX_NONPROGRESS_WHITESPACE_CHARS`` whitespace
-    characters in the decoded suffix needs at least ``run`` consecutive
-    trailing tokens from ``maybe``: tokens whose own decode is empty (special
-    tokens, a stripped leading space), whitespace, or holds a replacement
-    character (a partial multi-byte sequence that can complete into U+0085
-    or U+00A0 with its neighbour). Any other token puts a non-whitespace
-    character at the end of the text. Returns None, meaning "always decode",
-    when the tokenizer cannot give token lengths.
+    Returns ``(maybe, tail)``. ``maybe`` maps each token whose own decode is
+    empty (special tokens, a stripped leading space), whitespace, or holds a
+    replacement character (a partial multi-byte sequence that can complete
+    into U+0085 or U+00A0 with its neighbour) to an upper bound on the
+    characters it can contribute in context: the longer of its decode and
+    its piece, at least 1. Every other token decodes to a complete
+    non-whitespace character followed by a fixed whitespace tail that its
+    neighbours cannot change; ``tail`` holds that tail's length where it is
+    non-zero (``"}\\n\\n"`` -> 2). A trailing run therefore ends at the first
+    such token walking back from the end, and is at most the sum of the
+    bounds walked. Returns None, meaning "always decode", when the tokenizer
+    cannot give token lengths.
     """
     convert = getattr(tokenizer, "convert_ids_to_tokens", None)
     if convert is None:
         return None
-    maybe: set[int] = set()
-    longest = 1
+    maybe: dict[int, int] = {}
+    tail: dict[int, int] = {}
     try:
         for token_id in range(vocab_size):
             try:
@@ -120,14 +124,15 @@ def _whitespace_prefilter(
             except TypeError:
                 text = tokenizer.decode([token_id])
             if text and not text.isspace() and "\ufffd" not in text:
+                trailing = len(text) - len(text.rstrip())
+                if trailing:
+                    tail[token_id] = trailing
                 continue
             piece = convert(token_id)
-            maybe.add(token_id)
-            longest = max(longest, len(text), len(piece) if piece else 0)
+            maybe[token_id] = max(1, len(text), len(piece) if piece else 0)
     except Exception:
         return None
-    run = -(-_MAX_NONPROGRESS_WHITESPACE_CHARS // longest)
-    return frozenset(maybe), max(1, run)
+    return maybe, tail
 
 
 def _trailing_json_whitespace(text: str) -> int:
@@ -235,18 +240,30 @@ class LLGuidanceJSONSchemaLogitsProcessor:
         """Whether the decoded suffix ends in a non-progress whitespace run.
 
         Same answer as decoding the whole suffix every step, but the decode
-        only runs when the last few tokens could form such a run (see
-        ``_whitespace_prefilter``), so a normal step costs O(1), not O(n).
+        only runs when the trailing tokens could form such a run (see
+        ``_whitespace_prefilter``), so a normal step costs O(1), not O(n):
+        the walk back stops at the first non-whitespace token or once the
+        bound reaches the limit, at most 256 tokens.
         """
         prefilter = self._ws_prefilter
         if prefilter is not None:
-            maybe, run = prefilter
-            if len(suffix) < run:
-                return False
+            maybe, tail = prefilter
             vocab_size = self._vocab_size
-            for token in suffix[-run:]:
-                if token not in maybe and 0 <= token < vocab_size:
-                    return False
+            limit = _MAX_NONPROGRESS_WHITESPACE_CHARS
+            bound = 0
+            for token in reversed(suffix):
+                if not 0 <= token < vocab_size:
+                    break  # unknown token: decode
+                width = maybe.get(token)
+                if width is None:
+                    if bound + tail.get(token, 0) < limit:
+                        return False
+                    break
+                bound += width
+                if bound >= limit:
+                    break
+            else:
+                return False  # the whole suffix bounds below the limit
         decoded = self._tokenizer.decode(
             suffix,
             skip_special_tokens=True,
