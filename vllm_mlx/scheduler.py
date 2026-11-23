@@ -3915,6 +3915,11 @@ class Scheduler:
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
             cleared["prefix_cache"] = True
+        if self.hybrid_kv is not None:
+            # The batched system-KV bag REPLACES the caches above, so without
+            # this the clear (and DELETE /v1/cache*) was a silent no-op.
+            self.hybrid_kv.clear()
+            cleared["batched_system_kv"] = True
         return cleared
 
     def reset(self) -> None:
@@ -4003,6 +4008,14 @@ class Scheduler:
         if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
             self.prefix_cache.clear()
             logger.info("[clear_prefix_cache] prefix cache cleared")
+        if self.hybrid_kv is not None:
+            n, freed = self.hybrid_kv.clear()
+            logger.info(
+                "[clear_prefix_cache] batched system-KV cleared: "
+                "%d entries, %.1f MB",
+                n,
+                freed / (1024 * 1024),
+            )
 
     def ensure_ssd_tier(self) -> None:
         """Create and attach the configured SSD tier when it is absent."""
