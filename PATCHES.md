@@ -4596,3 +4596,23 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 - **Real data** (Studio, the 27B-8bit's live tier, index and meta copied): each of the 15 entries replayed as the request that wrote it, against the rest of the tier.
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
+
+## 176. `patch: llguidance-ws-prefilter` — the strict JSON Schema processor stops decoding the whole suffix every step
+
+**Files:** `vllm_mlx/constrained/llguidance_schema_processor.py` (`_whitespace_prefilter`, `_whitespace_run_reached`), `tests/test_llguidance_whitespace_prefilter.py`.
+
+**Why (issue #126, side finding of #107).** Every step the processor decoded the full generated suffix and scanned it in Python only to ask whether it ends in 256 or more non-progress whitespace characters. That is O(n) per step on the decode path of every strict-schema request, O(n^2) per request.
+
+**Fix.** The decode runs only when the last `run` tokens could form such a run. `run` is 256 divided by the longest piece among "maybe" tokens: tokens whose own decode is empty, whitespace, or holds a replacement character (a partial multi-byte sequence that can complete into U+0085 or U+00A0 with its neighbour). Any other trailing token puts a non-whitespace character at the end of the text, so the answer is no without decoding. Tokens outside the vocab, or a tokenizer that cannot give piece lengths, always take the full decode. The answer is the old one, byte for byte, by construction. The #89 stop protocol (`is_accepting`) is untouched.
+
+**Measured** (mocked suite host, real Qwen3 tokenizer, real processor, mean of the 19 steps before step n):
+
+| generated tokens | step before | step after |
+|---|---|---|
+| 100 | 0.36 ms | 0.35 ms |
+| 500 | 0.46 ms | 0.31 ms |
+| 2,000 | 1.03 ms | 0.45 ms |
+
+What remains growing is `tokens.tolist()` plus the consumed-prefix list compare (about 0.1 ms at 2,000), which the logits-processor interface forces.
+
+**Verification.** `test_176_*`: random suffixes against the full decode (3000 cases, over 100 long-run hits), in-string whitespace, no decode on normal steps, bare tokenizer fallback, out-of-vocab fallback, and the cached Qwen3 tokenizer (skipped if absent).
