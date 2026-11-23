@@ -239,9 +239,7 @@ def test_175_a_packaged_module_that_breaks_on_import_is_a_miss_not_a_crash(
     with open(path, "w") as f:
         f.write("raise AttributeError('mx.fast has no gather_kernel_175')\n")
     for name in ("SwitchGLU", "_gather_sort", "_scatter_unsort"):
-        monkeypatch.setitem(
-            compat.CANDIDATES, name, [(compat.PACKAGED, broken, name)]
-        )
+        monkeypatch.setitem(compat.CANDIDATES, name, [(compat.PACKAGED, broken, name)])
     with pytest.raises(compat.MlxLmSymbolMissing, match="gather_kernel_175"):
         compat.resolve("SwitchGLU")
     monkeypatch.setattr(moe_fusion, "_status", dict(moe_fusion._status))
