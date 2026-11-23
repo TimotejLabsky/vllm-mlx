@@ -4691,3 +4691,25 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 What remains growing is `tokens.tolist()` plus the consumed-prefix list compare (about 0.1 ms at 2,000), which the logits-processor interface forces.
 
 **Verification.** `test_176_*`: random suffixes against the full decode (3000 cases, over 100 long-run hits), a boundary sweep of runs that start inside a text token's tail, in-string whitespace, no decode on normal steps, bare tokenizer fallback, out-of-vocab fallback, and the cached Qwen3 and Llama 3 tokenizers with adversarial suffixes: partial UTF-8 halves of U+00A0 / U+0085 / U+3000, empty special tokens, the widest whitespace tokens, text tokens with newline tails (skipped if absent). Real-tokenizer per-check cost at 2,000 tokens: 0.002 ms against 0.2 ms for the full decode, compact and pretty-printed JSON.
+
+## 177. `patch: templated-prompt-reuse` — a templated prompt's miss checkpoints the shared prefix; the SSD tier's entry cap is a knob
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`_note_miss_divergence_locked`, `fetch`, stat `miss_cuts`), `vllm_mlx/system_kv_ssd.py` (`_default_max_entries`), `tests/test_fork_invariants.py`, `tests/test_system_kv_ssd.py`.
+
+**Why (fork issue #127, route logs 2026-11-14..23, read-only).** Two daily classifier batches, served from different routes, missed the cache for two different reasons.
+- **Dense 14B (email classifier): the tier's fixed 64-entry cap.** The job re-sends the same ~90 short prompts (~520 tokens) every day, in the same order. The route unloads between runs (`ttl`), so only the SSD tier carries them over. Through 11-13 the batch was 21 prompts: every one hit from SSD (1-token prefill). From 11-14 it was ~90: each day's 90 spills cycled through a 64-entry LRU, and every entry was evicted just before it was needed again. Result: 0 hits a day (898 requests), with 5.2 GB used of a 20 GB tier. Cold median 3.17 s vs 1.85 s on a hit (n=898 / 976), so ~1.3 s per request, **~2 min/day**. `SystemKVSSDConfig.max_entries` had no env knob.
+- **Hybrid 27B-8bit (bank-transaction classifier): no checkpoint where the prompts part ways.** ~55 serial ~2.1K-token prompts a day, ~14 s apart. Each has fixed instructions, then the transaction, then ~1.6K tokens of rules, all in ONE user message. Consecutive calls share ~481-519 tokens. The only checkpoints are the uniform interval (2048) and the end of the prompt: no template marker sits at the split, and #126's anchor needs one. So restore position was 0 for 358 of 541 divergence events. #117's cut at the divergence never fired, because it is recorded only on a hit. Recoverable: ~490 tokens at ~215 tok/s ≈ 2.3 s per call, **~2 min/day**.
+
+**Fix.**
+- `fetch` on a miss with a request id: if the longest raw LCP against any entry is >= `partial_min` and inside the prompt, it is recorded as the request's divergence. `add_divergence_cut` then cuts the cold prefill there, exactly like #117's hit-path cut. The checkpoint lands at the split (flagged as a boundary), and the next call restores there. The positions converge down to the true template end: a later hit snaps to the lowest such checkpoint and inherits it. A hit clears a stale miss cut (lazy routes re-match at admission). On an all-attention model a shared prefix that long is always a hit, so this only fires on hybrids. Stat `miss_cuts`; `VLLM_MLX_BATCHED_MISS_CUT=0` turns it off (default on, like #117).
+- `VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES=<n>` (default 64, unchanged). The GB cap still applies.
+
+**Cost.** Miss cut: one extra recurrent checkpoint per affected entry, ~150 MB on the 27B (ledger), RAM only there because these chains are under #169's spill minimum. 14B: no RAM. On disk, ~90 entries x ~85 MB ≈ 7.7 GB inside the existing 20 GB cap. Proposed 14B route env: `VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES=256` (the 20 GB cap binds first at ~235 such entries).
+
+**Not addressed.** A news-summary job on the 27B-8bit shares only 157 tokens (< `partial_min` 256). That is 18-75 calls a day at ~0.7 s each, under a minute a day. Bigger levers sit in the clients, not here:
+- both classifiers re-send the same items every day;
+- both put the variable item before the fixed instructions. The 14B prompts share ~25 tokens; with the rules first they would share ~360 of ~520, and the 27B ones ~2,000 of ~2,100.
+
+**Verification.**
+- **Unit tests:** `test_177_a_templated_miss_cuts_the_prefill_where_it_parts_ways` (the next templated call restores at the split), `test_177_no_miss_cut_under_the_floor_or_when_off`, `test_177_a_later_hit_drops_the_cut_a_miss_recorded`, `test_177_entry_cap_comes_from_the_env`. Full suite 5519 passed / 32 skipped.
+- **Real server: NOT yet run** (the issue was read-only on the Studio). Before deploy: replay two templated prompts on a spare-port 27B and check the second logs `restore at ~500`.

@@ -418,3 +418,9 @@ Full write-up in PATCHES.md #159/#160; data in `reports/mtp-drafter-2026-11-16/`
 - **Denser checkpoint ladder: NOT worth it.** A divergent restore snaps down to a checkpoint, and the recomputed gap cost 7-11K tokens a day over the last week (~35-55 s of prefill; 104 restores ever lost >= 1K, max 6.3K). Raising `VLLM_MLX_SYSTEM_KV_CHECKPOINTS` 8 -> 16 costs ~150 MB of recurrent state per checkpoint, ~1.2 GB more per entry, on a route already squeezed by memory relief.
 - **Shipped instead: #171**, which stops SSD promotes that cannot restore anything (466 of 715 historically) and reconciles nested JSON tool arguments.
 - **Not the engine's to fix:** daily repeats of one job share only ~4,000 tokens with yesterday's run (likely a date early in the prompt). Moving per-run values after the tool block in the Hermes job prompts would let each job restore its whole prefix.
+
+### 2026-11-23 — templated classifier prompts (fork issue #127): #177 BUILT, not deployed
+
+- **14B email classifier: 0 hits a day since 11-14** because the SSD tier's fixed 64-entry cap is smaller than the job's daily ~90 repeated prompts (LRU cycles). ~1.3 s per request, ~2 min/day. Fix: an entry-cap knob plus route config.
+- **27B-8bit transaction classifier: restore 0 on ~55 calls a day** that share ~490 tokens. The prompts part ways inside one user message, where there is no checkpoint, and #117's cut needed a hit. ~2 min/day. Fix: cut on a miss too.
+- **Earlier first checkpoint / lower `partial_min`: NOT the lever.** The 157-token news template is under a minute a day. The real levers are in the clients: daily re-classification of the same items, and the variable item placed before the fixed instructions.

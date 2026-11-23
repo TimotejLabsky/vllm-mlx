@@ -190,6 +190,19 @@ def _default_ckpt_min_gap() -> int:
         return 16
 
 
+def _default_max_entries() -> int:
+    """(#177) Entry-count cap of the tier, beside the GB cap. 64 was fixed:
+    a classifier that re-sends the same ~90 short prompts every day (~85 MB
+    each, 5 GB of a 20 GB tier) cycled through it and LRU dropped each one
+    just before it came round again - 0 hits a day."""
+    try:
+        return max(
+            1, int(os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "") or 64)
+        )
+    except ValueError:
+        return 64
+
+
 def _default_supersede_slack() -> int:
     try:
         return max(0, int(os.environ.get("VLLM_MLX_SSD_SUPERSEDE_SLACK", "") or 0))
@@ -210,7 +223,7 @@ def _default_min_free_pct() -> float:
 class SystemKVSSDConfig:
     cache_dir: str
     max_size_gb: float = 50.0
-    max_entries: int = 64
+    max_entries: int = field(default_factory=_default_max_entries)
     spill_queue_size: int = 16
     # Cap on the bytes of snapshots queued-but-not-yet-written. The queue
     # holds references to flattened (still-resident) mx arrays, so a backlog

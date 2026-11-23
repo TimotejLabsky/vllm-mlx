@@ -4374,3 +4374,66 @@ def test_175_armed_drafter_on_a_layout_without_its_classes_disables_loudly(
     assert any(r.levelno == logging.ERROR for r in caplog.records)
     assert not hasattr(gen._generation_batch, "_text_mtp")
     assert GenerationBatch._step is step_before
+
+
+# ------------- #177 a templated prompt's miss cuts its prefill at the shared prefix
+
+_FIX = list(range(1000, 1500))  # fixed instructions, before the item
+
+
+def _templated(seed):
+    """Instructions, then the item, then more fixed text (rules, JSON schema)."""
+    return _FIX + list(range(seed, seed + 80)) + list(range(5000, 6500))
+
+
+def test_177_a_templated_miss_cuts_the_prefill_where_it_parts_ways():
+    """The previous call's entry has no checkpoint at or below the split (a
+    single user message: no marker there; the uniform interval is past it).
+    The miss must still checkpoint the split, so the NEXT call restores it."""
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    second = _templated(61000)
+    assert kv.fetch(second, request_id="second") is None
+    assert kv._divergence["second"] == len(_FIX)
+    assert kv.stats()["miss_cuts"] == 1
+
+    generator = MagicMock()
+    request = _queued("second", second)
+    request.prompt = None  # no template family -> no message boundaries
+    bkv.insert_segmented(kv, generator, request, second, {})
+    ([segments],), _kw = generator.insert_segments.call_args
+    assert len(segments[0]) == len(_FIX)  # a segment ends at the split
+    assert len(_FIX) in kv._boundary_pos["second"]  # survives thinning
+    kv.capture_segment("second", len(_FIX), _donor_at(len(_FIX)))
+    kv.store("second", second, _donor_at(len(second)))
+
+    _cache, _remaining, pos = kv.fetch(_templated(62000), request_id="third")
+    assert pos == len(_FIX)
+    assert "third" not in kv._divergence  # a hit at the split: nothing to cut
+
+
+def test_177_no_miss_cut_under_the_floor_or_when_off(monkeypatch):
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _FIX[:200] + list(range(60000, 61600)), ckpts=())
+    assert kv.fetch(_FIX[:200] + list(range(70000, 71600)), "short") is None
+    assert "short" not in kv._divergence  # shares < partial_min: unrelated
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MISS_CUT", "0")
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    assert kv.fetch(_templated(61000), request_id="second") is None
+    assert "second" not in kv._divergence and kv.stats()["miss_cuts"] == 0
+
+
+def test_177_a_later_hit_drops_the_cut_a_miss_recorded():
+    """Lazy routes match again at admission: a cut recorded by the enqueue
+    miss must not outlive a hit that restores past it."""
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    second = _templated(61000)
+    assert kv.fetch(second, request_id="second") is None
+    assert "second" in kv._divergence
+    landed = len(second) - 100  # an entry that landed while it waited
+    _store_chain(kv, "leader", second + [9], ckpts=(landed,))
+    _cache, _remaining, pos = kv.fetch(second, request_id="second")
+    assert pos == landed and "second" not in kv._divergence
