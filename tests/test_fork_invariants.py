@@ -4142,3 +4142,41 @@ def test_173_ssd_spill_has_a_global_free_space_floor(monkeypatch, tmp_path):
     # not on disk (else it records a phantom `disk` lineage key).
     assert store.enqueue_spill((1, 2, 3), []) is False
     assert store.get_stats()["spill_refused_low_disk"] == 2
+
+
+# -------- #178 the match memo keys on entry keys that are never reused
+
+
+def test_178_match_memo_preconditions_hold(tmp_path):
+    """The memo is correct only because (1) a stored chain always lands under
+    a NEW, never-reused key - grow, absorb and re-store included - and its
+    token list is never mutated, (2) admission closes it, and (3) the SSD
+    index version moves on every row write. A rebase that re-keys the bag by
+    content or reuses keys makes the memo serve another chain's LCP."""
+    from vllm_mlx.system_kv_ssd import _SystemKVIndex
+
+    kv = BatchedSystemKV(_FakeModel())
+    seen = set()
+    for chain in (TOKENS, TOKENS + [1, 2], TOKENS, DISJOINT):
+        kv.store("r", chain, _donor_at(len(chain)))
+        key = next(reversed(kv._entries))
+        assert key not in seen and kv._entries[key]["tokens"] == chain
+        seen.add(key)
+
+    prompt = TOKENS + [5]
+    req = SimpleNamespace(
+        request_id="q", prompt_token_ids=prompt, num_prompt_tokens=801
+    )
+    bkv.fetch_for_request(kv, req)
+    assert kv._memo_locked(prompt) is not None
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), req)
+    assert kv._match_memo == {}
+
+    idx = _SystemKVIndex(str(tmp_path))
+    v = idx.version
+    idx.insert_entry((1, 2, 3), "f", 1, 3)
+    assert idx.version != v
+    v = idx.version
+    idx.delete_entry((1, 2, 3))
+    assert idx.version != v
+    idx.close()
