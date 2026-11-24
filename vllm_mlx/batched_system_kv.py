@@ -2166,6 +2166,23 @@ class BatchedSystemKV:
             self.pressure_evictions += 1
         return True
 
+    def clear(self) -> tuple:
+        """Drop every resident snapshot entry (operator cache clear,
+        ``DELETE /v1/cache/prefix``). Returns ``(entries, bytes)`` freed.
+
+        Pinned/spill-pending entries go too: an operator clear is explicit,
+        and a queued request that peeked one simply re-matches (or misses)
+        at admission. In-flight checkpoint ladders belong to running
+        requests and are left alone. The SSD tier is untouched, like the
+        memory-aware cache's clear."""
+        with self._lock:
+            n = len(self._entries)
+            freed = sum(e["bytes"] for e in self._entries.values())
+            for e in self._entries.values():
+                self._timing.forget(timing_key(e["tokens"]))
+            self._entries.clear()
+        return n, freed
+
     def relieve_pressure(self) -> int:
         """Evict resident snapshot entries when the PEAK memory since the
         last check crossed the watermark.
