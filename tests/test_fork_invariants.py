@@ -4205,3 +4205,164 @@ def test_174_mtp_filter_and_extend_drop_the_recording():
 
     src = inspect.getsource(text_mtp._install_class_patches)
     assert src.count("_drop_recording(self.prompt_cache)") == 2
+
+
+# ------- #175 mlx-lm models-directory move (#2082): hooks bind or say so
+
+
+def test_175_moe_fusion_binds_on_installed_mlx_lm(monkeypatch):
+    """Patch #96 must find SwitchGLU and its sort helpers on THIS mlx-lm and
+    fuse a real module through both forward paths. No importorskip: on a
+    layout the resolver does not know, this goes red instead of skipping."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from vllm_mlx import moe_fusion
+    from vllm_mlx.mlx_lm_compat import resolve
+
+    assert moe_fusion._hook_symbols_missing() == []
+    switch_glu = resolve("SwitchGLU")
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.switch_mlp = switch_glu(128, 64, 8, bias=False)
+
+    toy = Toy()
+    nn.quantize(toy, group_size=64, bits=4)
+    mx.eval(toy.parameters())
+    stock = toy.switch_mlp
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    assert moe_fusion.maybe_fuse(toy, "toy") == 1
+    assert isinstance(toy.switch_mlp, moe_fusion.FusedSwitchGLU)
+    st = moe_fusion.status()
+    assert st["armed"] and st["fused"] == 1 and st["error"] is None
+    for shape in ((1, 1, 2), (1, 40, 2)):  # decode, and the gather-sort path
+        x = mx.random.normal(shape[:2] + (128,)).astype(mx.float16)
+        idx = mx.random.randint(0, 8, shape)
+        assert mx.array_equal(stock(x, idx), toy.switch_mlp(x, idx))
+
+
+def test_175_text_mtp_hooks_bind_on_installed_mlx_lm():
+    """Patch #160 records the state of mlx-lm's qwen3_5 GatedDeltaNet. The
+    class it resolves must be the class a real qwen3_5 model instantiates
+    (found by walking the model, so either module tree passes), and the
+    recurrence helpers must resolve with the signatures the copy calls."""
+    from mlx_lm.models import qwen3_5
+
+    from vllm_mlx import text_mtp
+    from vllm_mlx.mlx_lm_compat import resolve
+
+    assert text_mtp.hook_symbols_missing() == []
+    args = qwen3_5.ModelArgs.from_dict(
+        {
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 32,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "full_attention_interval": 2,
+        }
+    )
+    model = qwen3_5.Model(args)
+    gdn = [m for _, m in model.named_modules() if hasattr(m, "in_proj_qkv")]
+    assert gdn, "tiny qwen3_5 has no recurrent layer"
+    cls = resolve("qwen3_5.GatedDeltaNet")
+    assert all(type(m) is cls for m in gdn)
+    assert callable(resolve("gated_delta_update"))
+    assert callable(resolve("normalize_qk"))
+
+
+def test_175_hooks_resolve_through_the_compat_module_only():
+    """A rebase must not bring back a hard-coded pre-#2082 path at the three
+    live sites (each one swallowed the ImportError)."""
+    import inspect
+
+    from vllm_mlx import moe_fusion, text_mtp
+    from vllm_mlx.patches import qwen3_5_mllm
+
+    for mod in (moe_fusion, text_mtp, qwen3_5_mllm):
+        src = inspect.getsource(mod)
+        for old in (
+            "mlx_lm.models.switch_layers",
+            "mlx_lm.models.gated_delta",
+            "mlx_lm.models.base",
+            "from mlx_lm.models import qwen3_5",
+        ):
+            assert old not in src, f"{mod.__name__} hard-codes {old}"
+
+
+def test_175_armed_fusion_on_a_layout_without_its_classes_is_an_error(
+    monkeypatch, caplog
+):
+    """Fail-open stays (the model runs unfused, nothing crashes), but an
+    armed route says so: one ERROR naming the symbol, and the status."""
+    import logging
+
+    from vllm_mlx import mlx_lm_compat, moe_fusion
+
+    monkeypatch.setattr(mlx_lm_compat, "_resolved", {})
+    monkeypatch.setitem(
+        mlx_lm_compat.CANDIDATES,
+        "_gather_sort",
+        [(mlx_lm_compat.PACKAGED, "_no_such_pkg_175.layers.moe", "_gather_sort")],
+    )
+    monkeypatch.setattr(moe_fusion, "_status", dict(moe_fusion._status), raising=True)
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    with caplog.at_level(logging.ERROR, logger="vllm_mlx.moe_fusion"):
+        assert moe_fusion.maybe_fuse(SimpleNamespace(), "toy") == 0
+    assert any(
+        r.levelno == logging.ERROR and "_gather_sort" in r.getMessage()
+        for r in caplog.records
+    )
+    assert "_gather_sort" in moe_fusion.status()["error"]
+
+
+def test_175_armed_drafter_on_a_layout_without_its_classes_disables_loudly(
+    monkeypatch, caplog
+):
+    """#159 semantics: ERROR + ``disabled``/``disabled_reason`` in the stats,
+    decoding continues. Before #175 the class patching raised out of the
+    batch-generator build on the new layout."""
+    import logging
+
+    from mlx_lm.generate import GenerationBatch
+
+    from vllm_mlx import mlx_lm_compat, text_mtp
+
+    monkeypatch.setattr(mlx_lm_compat, "_resolved", {})
+    monkeypatch.setitem(
+        mlx_lm_compat.CANDIDATES,
+        "qwen3_5.GatedDeltaNet",
+        [
+            (
+                mlx_lm_compat.PACKAGED,
+                "_no_such_pkg_175.models.qwen3_5.layers",
+                "GatedDeltaNet",
+            )
+        ],
+    )
+    monkeypatch.setenv(text_mtp.ENV_DRAFTER, "some/drafter")
+    step_before = GenerationBatch._step
+
+    class Batch:
+        def _step(self):
+            pass
+
+    gen = SimpleNamespace(_generation_batch=Batch())
+    scheduler = SimpleNamespace()
+    with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_mtp"):
+        text_mtp.maybe_install(scheduler, gen)
+    stats = gen.get_mtp_stats()
+    assert stats["disabled"] is True
+    assert "qwen3_5.GatedDeltaNet" in stats["disabled_reason"]
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    assert not hasattr(gen._generation_batch, "_text_mtp")
+    assert GenerationBatch._step is step_before
