@@ -4597,6 +4597,105 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
 
+## 172. `fix: batched-kv-clear` — `DELETE /v1/cache/prefix` (and `/v1/cache`) free the batched system-KV bag
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`clear`), `vllm_mlx/scheduler.py` (`clear_prefix_cache`, `clear_runtime_caches`), `vllm_mlx/engine_core.py` (`AsyncEngineCore.clear_prefix_cache`, `EngineCore.clear_prefix_cache` return), `vllm_mlx/engine/batched.py` (`clear_prefix_cache`, `_clear_prefix_cache_on_owner`), `vllm_mlx/server.py` (`DELETE /v1/cache/prefix` handler), `tests/test_batched_system_kv.py`, `tests/test_fork_invariants.py`.
+
+**Why (issue #108, upstream waybarrios/vllm-mlx#874).** `DELETE /v1/cache/prefix` answered `cleared` on every batched text route while freeing nothing. Two broken links, both on the call chain server handler -> `BatchedEngine._clear_prefix_cache_on_owner` -> `AsyncEngineCore` -> `EngineCore` -> `Scheduler` -> `BatchedSystemKV`:
+1. **The engine wrapper (the one the real-server check found).** `BatchedEngine._engine` is an `AsyncEngineCore`, which had `clear_runtime_caches` but no `clear_prefix_cache`. `_clear_prefix_cache_on_owner` guards with `hasattr`, so it silently did nothing and the handler still set `cleared = True`. `DELETE /v1/cache` worked because its delegator exists.
+2. **The scheduler.** With the bag on, `memory_aware_cache`, `prefix_cache` and `block_aware_cache` are all None (the bag replaces them), so both scheduler clears were no-ops even when reached.
+
+The first cut of this patch fixed only link 2 and was tested only at the scheduler, so the real-server check failed (stats after the clear: 1 entry, 315.5 MB, unchanged).
+
+**Fix.** `BatchedSystemKV.clear()` drops every resident entry and returns `(entries, bytes)`; both scheduler clears call it and report `batched_system_kv: true` plus `batched_system_kv_freed: {entries, bytes}`. `AsyncEngineCore.clear_prefix_cache` delegates to `EngineCore`, and the result travels back through `BatchedEngine` (still hopping to the generation worker). The handler adds that report as `freed` (additive; `status`/`rewarm_scheduled` unchanged) and answers `cleared` only if some cache was actually cleared; an engine that cannot reach one now gets `not_supported` and a warning log instead of a silent `cleared` (an engine returning None, i.e. one that does not report, is still trusted). The SSD tier is untouched (same as the memory-aware cache's clear), so on an SSD route the next request can promote from disk: not a true cold start. In-flight checkpoint ladders belong to running requests and stay. SimpleEngine has no `clear_prefix_cache` (`not_supported`, unchanged); the batched MLLM path clears its own prefix cache and now reports `{prefix_cache: true}`, or `not_supported` when it has none.
+
+**Verification.** `test_clear_drops_entries_and_bytes` (entry_count 2 -> 0, memory_mb > 0 -> 0, fetch misses) and `test_scheduler_prefix_clear_reaches_batched_system_kv`. Pinned in `tests/test_fork_invariants.py`: `test_172_scheduler_cache_clears_empty_the_batched_bag`, `test_172_clear_under_requests_that_hold_entries`, and the through-path test that would have caught link 1: `test_172_http_cache_clears_reach_the_bag_through_the_real_wrappers` (FastAPI `TestClient` -> real `BatchedEngine` -> real `AsyncEngineCore`/`EngineCore`/`Scheduler`/bag, mocked model only; both endpoints; entries and bytes drop, the clear runs on the generation worker thread, the response reports what was freed). On the first-cut head it fails exactly like the real server: `/v1/cache/prefix` answers `cleared` with 2 entries left. `test_172_prefix_clear_is_not_cleared_when_nothing_is_reachable` pins the honest status.
+
+**Thread.** Both endpoints hop to the single generation worker (`BatchedEngine._clear_*_on_owner`), the thread that runs `scheduler.step`, so a clear lands between steps, never inside one.
+
+## 173. `patch: ssd-free-space-floor` — the SSD KV tier refuses a spill that would leave its volume under a free-space floor
+
+**Files:** `vllm_mlx/system_kv_ssd.py` (`_disk_floor_ok`, `min_free_pct`, stat `spill_refused_low_disk`), `tests/test_system_kv_ssd.py`, `tests/test_fork_invariants.py`, `tests/conftest.py`.
+
+**Why (issue #106 follow-up).**
+- Every route's tier cap (`VLLM_MLX_SSD_SYSTEM_KV_GB`) is per store. The deployed caps sum to 360 GB worst case on a shared volume, and nothing checked free space; only operator discipline kept it safe. ENOSPC on that volume would hit every route and the OS.
+- Measured on the Studio (read-only, 2026-11-23): volume 926 GiB, 280 GiB free (30%); the whole tier holds 66.4 GiB across 15 store directories (largest: 27B-8bit 37 GiB, 35B 20 GiB).
+
+**Fix.**
+- `VLLM_MLX_SSD_MIN_FREE_PCT` (default 10, 0 disables). Before a spill is written, `shutil.disk_usage` of the tier's data dir; if free space minus the snapshot's size would be under that percent of the volume, the spill is refused, counted in `spill_refused_low_disk`, and a warning is logged at most once a minute. Nothing is raised into the request path.
+- The check runs twice per spill: in `enqueue_spill` (on the caller's thread, the same thread that already flattens the snapshot) and again in the writer thread before the write, for space that went between the two. One statvfs each, microseconds against a multi-hundred-MB write. An unreadable volume fails open: the write itself reports a real ENOSPC.
+- The enqueue-time refusal matters: `enqueue_spill` returning False is how the RAM tiers learn a chain is not on disk. Refused only in the writer, the batched tier had already recorded the key as the entry's `disk` lineage (#170), so the next spill superseded a file that never landed and left the real older copy on disk, and the SimpleEngine slot was marked `active_spilled` (evicted first as "cheap to re-promote"). Pinned by `test_173_a_refused_spill_leaves_no_disk_lineage`. A refusal in the writer (space ran out after the enqueue) still has that gap, as any failed write does.
+- Default 10 because the box is at 30% free today (floor = 93 GiB, 187 GiB of room before it bites) and 15% would have been 139 GiB, nearly the 146 GiB recorded free on 2026-09-17. Raise it per route to be stricter.
+- Refusal only stops new spills; it does not evict. Entries already on disk keep serving promotes.
+- `tests/conftest.py` turns the floor off by default so tests that write real entries do not depend on the dev disk's fullness (the dev laptop is under 10% free).
+
+**Verification.** `test_low_disk_floor_refuses_spill_and_counts_173`, `test_min_free_pct_env_default_173`, `test_173_a_refused_spill_leaves_no_disk_lineage` (batched tier), fork invariant `test_173_ssd_spill_has_a_global_free_space_floor`. Mocked `disk_usage` only; no real-server check yet.
+
+## 174. `patch: lazy-holds` — MLLM first-token logits and the MTP drafter's recorded states are not kept past their use
+
+**Files:** `vllm_mlx/mllm_batch_generator.py` (`_detached_last_row`), `vllm_mlx/text_mtp.py` (`_drop_recording`), `tests/test_105_lazy_logits_hold.py`, `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`.
+
+**Why (audit #105, from mlx-vlm #2806 / #2525).**
+- MLLM prefill (cache-hit-with-suffix and cold branches) took `logits[:, -1, :]`, a view that pins the whole `(B, T, vocab)` forward output, and kept `logits` bound through cache admission and the next row's prefill.
+- The text MTP drafter leaves each verify's per-position recurrent states on every recurrent layer until the next verify; a row that decodes bypassed beside another request's prefill kept them for its whole life.
+
+**Fix.** Take a detached last row and rebind `logits = None`; drop the recorded states in the `filter`/`extend` wrappers after `_sync`.
+
+**Verification.** Mocked: view-pins / detached-frees accounting (64 MiB control), and a join test that fails without the fix. A join-then-leave test: the row speculates alone again with wrong drafts after the drop, and its stream and cache equal plain decode's (no rollback reads a dropped recording). The detached row is a copy, bit-equal to the slice (T=0 output unchanged). `test_fork_invariants.py::test_174_*` pins both sites. Not measured on the real model.
+
+**Not covered.** The legacy `install_chunked_prefill_mllm` last chunk (`prompt_last_logits = logits[:, -1, :]`) keeps the same view through the next decode step; that path runs only with `--chunked-prefill-tokens`, which no route sets.
+
+## 175. `patch: mlxlm-2082-compat` — the fork's mlx-lm hooks resolve on both models layouts, and an armed hook that cannot bind says so
+
+**Files:** `vllm_mlx/mlx_lm_compat.py` (new, fork-owned), `vllm_mlx/moe_fusion.py`, `vllm_mlx/text_mtp.py`, `vllm_mlx/patches/qwen3_5_mllm.py`, `vllm_mlx/server.py` (`/v1/status` `moe_fusion`), `tests/test_mlx_lm_compat_175.py` (new), `tests/test_fork_invariants.py`, `tests/test_moe_fusion.py`, `tests/test_qwen35_mllm_patch.py`.
+
+**Why (issue #118, pin-bump pre-read).** mlx-lm #2082 (merged as `2d4df8d`, not in a release yet; the pin is 0.32.2) turns each `models/<arch>.py` into a package that exports only `Model`/`ModelArgs` and moves the shared helpers to `mlx_lm.layers.{moe,attention,recurrent}`, with no shims. Three live fork sites hard-coded the old paths behind an `except`:
+- **#96 MoE fusion** (4 routes arm it). `_switch_glu_class` returned `None` silently, but the class-NAME match still fused every `SwitchGLU`, and `FusedSwitchGLU.__call__` imported `_gather_sort` from the old module on every forward. Read, not run: on the new layout an armed MoE route would raise on its first decode.
+- **#160 text drafter** (27B-8bit). `_install_class_patches` reads `qwen3_5.GatedDeltaNet`, which the new package does not export. Read, not run: the AttributeError would come out of `maybe_install`, i.e. out of the batch-generator build.
+- **Qwen3.5 VLM attention patch.** `from mlx_lm.models.base import scaled_dot_product_attention` shared its `except ImportError` with the mlx-vlm import, so a moved helper looked like "no Qwen3.5 installed" (debug log, unpatched attention). No live qwen3_5 vision route.
+
+**What.**
+- `mlx_lm_compat.resolve(name)` looks each symbol up at the post-#2082 path first, then the 0.32.2 one: `SwitchGLU`, `_gather_sort`, `_scatter_unsort`, `gated_delta_update`, `normalize_qk`, `create_ssm_mask`, `create_attention_mask`, `scaled_dot_product_attention`, qwen3_5 `GatedDeltaNet`/`DecoderLayer`/`TextModelArgs`, `Qwen3NextDecoderLayer`. The paths come from the upstream tree at the merge commit. On 0.32.2 the new modules do not exist, so each lookup returns the very object the old import bound (a test asserts `is` for every one): **no behaviour change on the current pin.**
+- **The trap.** `mlx_lm.models.cache.create_attention_mask` exists on both layouts with the signature `(N, offset, return_array, window_size)`. It is never a candidate, and resolved functions have their leading parameter names checked against a table, so a wrong binding raises `MlxLmSymbolMissing` instead of silently changing a mask. A test runs the real cache function through the check and expects a rejection.
+- **Fusion**, when armed and a symbol is missing: one ERROR naming each missing symbol and every path tried. The model runs unfused (fail-open as before, never a crash), and `/v1/status` → `moe_fusion` = `{armed, fused, skipped, error}`. The sort helpers are bound when a module is fused, not imported per forward.
+- **Drafter**, when armed and a symbol is missing: #159's semantics. One ERROR, `disabled: true` + `disabled_reason: "mlx-lm layout: ..."` in the `mtp` stats, no class patched, decoding continues. Routes without the env are untouched.
+- **Qwen3.5 VLM patch**: a missing mlx-vlm module is still a debug line; a missing mlx-lm helper with mlx-vlm present is an ERROR.
+
+**Not done (needs the mlx-lm release).** The drafter's model-tree adaptation (B2 in #118's verdict). On the new layout the qwen3_5 tree is `Model.model.language_model`, not `Model.language_model.model`, and `tie_word_embeddings` sits under `args.text`. Until it is adapted, the drafter on a new mlx-lm resolves its classes but disables at load with the existing "exposes no hidden-state model" ERROR. Also not routed through the resolver yet: the built-in MTP patches (`qwen3_5_mtp.py`, `qwen3_next_mtp.py`, no route uses them), `text_model_from_vlm.py` and the gdn bench script.
+
+**Verification.**
+- `tests/test_mlx_lm_compat_175.py` (20). Installed layout: identity with the old imports and the signature table. Post-#2082 layout: a fake package tree in `tmp_path` mirroring upstream `2d4df8d`, the only faked paths in #175, with the stale `models/base.py`, `models/cache.py` and the `qwen3_5` package (exports only `Model`/`ModelArgs`) included so an old-first or cache-path resolver fails. Also covered: the trap, the "found nowhere" message, and a packaged module that raises a non-ImportError at import (a miss with the cause in the message, never a crash out of model load).
+- `tests/test_fork_invariants.py`, no importorskip and no faked paths:
+  - `test_175_moe_fusion_binds_on_installed_mlx_lm` fuses a real quantized `SwitchGLU` and checks exact equality on the decode and gather-sort paths.
+  - `test_175_text_mtp_hooks_bind_on_installed_mlx_lm` walks a real tiny qwen3_5 model and requires every recurrent layer to be the resolved class.
+  - `test_175_hooks_resolve_through_the_compat_module_only` checks that no old path is back at the three sites.
+  - `test_175_armed_fusion_*` and `test_175_armed_drafter_*` check the ERROR and status semantics.
+- `tests/test_moe_fusion.py` lost its `importorskip`, so it can no longer skip silently. `tests/test_qwen35_mllm_patch.py` stubs the resolver instead of faking `mlx_lm.models.base`.
+- Full suite 5539 passed / 32 skipped (baseline 5515 + 24 new), laptop, mlx-lm 0.32.2.
+- Not run against mlx-lm HEAD: the venv stays at the pin. The real check is #118's bump step (Studio cloned venv: suite, plus `moe_fusion.fused > 0` on the 35B-A3B and drafter `disabled: false` on the 27B-8bit).
+
+## 176. `patch: llguidance-ws-prefilter` — the strict JSON Schema processor stops decoding the whole suffix every step
+
+**Files:** `vllm_mlx/constrained/llguidance_schema_processor.py` (`_whitespace_prefilter`, `_whitespace_run_reached`), `tests/test_llguidance_whitespace_prefilter.py`.
+
+**Why (issue #126, side finding of #107).** Every step the processor decoded the full generated suffix and scanned it in Python only to ask whether it ends in 256 or more non-progress whitespace characters. That is O(n) per step on the decode path of every strict-schema request, O(n^2) per request.
+
+**Fix.** The processor walks back from the end of the suffix, adding an upper bound on the whitespace each token can contribute, and decodes only if the bound reaches 256. "Maybe" tokens (own decode empty, whitespace, or holding a replacement character: a partial multi-byte sequence that can complete into U+0085 or U+00A0 with its neighbour) are bounded by the longer of their decode and their piece. Any other token ends the walk: it decodes to a complete non-whitespace character followed by a fixed whitespace tail (`"}\n\n"` -> 2) that its neighbours cannot change, and that tail is added. Below 256, the answer is no without decoding. Tokens outside the vocab, or a tokenizer that cannot give piece lengths, always take the full decode. The walk is at most 256 tokens and usually one. The #89 stop protocol (`is_accepting`) is untouched.
+
+**Review fix (first cut was unsound).** The first cut asked only whether the last `ceil(256 / longest maybe piece)` tokens were all "maybe", ignoring the whitespace tail of the text token just before them: `"}" + 20 spaces` then a 250-space token is a 270-character run the window missed. Not reachable on the Qwen3 or Llama 3 vocabs (window 2, longest piece 128, longest tail 12 newlines), reachable on any vocab whose longest piece leaves less slack than its longest tail. Pinned by `test_176_whitespace_tail_of_a_text_token_counts` and a boundary sweep in the fuzz test.
+
+**Measured** (mocked suite host, real Qwen3 tokenizer, real processor, mean of the 19 steps before step n):
+
+| generated tokens | step before | step after |
+|---|---|---|
+| 100 | 0.36 ms | 0.35 ms |
+| 500 | 0.46 ms | 0.31 ms |
+| 2,000 | 1.03 ms | 0.45 ms |
+
+What remains growing is `tokens.tolist()` plus the consumed-prefix list compare (about 0.1 ms at 2,000), which the logits-processor interface forces.
+
+**Verification.** `test_176_*`: random suffixes against the full decode (3000 cases, over 100 long-run hits), a boundary sweep of runs that start inside a text token's tail, in-string whitespace, no decode on normal steps, bare tokenizer fallback, out-of-vocab fallback, and the cached Qwen3 and Llama 3 tokenizers with adversarial suffixes: partial UTF-8 halves of U+00A0 / U+0085 / U+3000, empty special tokens, the widest whitespace tokens, text tokens with newline tails (skipped if absent). Real-tokenizer per-check cost at 2,000 tokens: 0.002 ms against 0.2 ms for the full decode, compact and pretty-printed JSON.
+
 ## 177. `patch: templated-prompt-reuse` — a templated prompt's miss checkpoints the shared prefix; the SSD tier's entry cap is a knob
 
 **Files:** `vllm_mlx/batched_system_kv.py` (`_note_miss_divergence_locked`, `fetch`, stat `miss_cuts`), `vllm_mlx/system_kv_ssd.py` (`_default_max_entries`), `tests/test_fork_invariants.py`, `tests/test_system_kv_ssd.py`.
@@ -4618,3 +4717,30 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
 **Verification.**
 - **Unit tests:** `test_177_a_templated_miss_cuts_the_prefill_where_it_parts_ways` (the next templated call restores at the split), `test_177_no_miss_cut_under_the_floor_or_when_off`, `test_177_a_later_hit_drops_the_cut_a_miss_recorded`, `test_177_entry_cap_comes_from_the_env`. Full suite 5519 passed / 32 skipped.
 - **Real server: NOT yet run** (the issue was read-only on the Studio). Before deploy: replay two templated prompts on a spare-port 27B and check the second logs `restore at ~500`.
+
+## 178. `patch: match-memo` — one request's admission sequence scans the bag once, not once per question
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`open_match_memo` / `close_match_memo`, `_entry_lcp_locked`, `_ssd_probe`, `check_ssd` split into `_check_ssd_best`; callers `_best_match_locked`, `note_divergence`, `reconcile_generated`, `_ssd_reconcile_donor`; hooks `fetch_for_request` opens, `materialize_pending_restore` closes; stats `match_memo_hits`, `match_memo_ssd_hits`, `match_memo_open` (should read 0 when idle)), `vllm_mlx/system_kv_ssd.py` (`_SystemKVIndex.version`, `SystemKVSSDStore.index_version`), tests. Kill switch `VLLM_MLX_BATCHED_MATCH_MEMO=0` (default on).
+
+**Why (issue #109 audit).** A request's add_request -> solo verdict -> admission sequence asks the bag the same question up to ~7 times with the same prompt (reconcile, the SSD-vs-RAM peek, the lazy peek, the divergence log, the admission peek, fetch), each a `common_prefix_len` per entry (O(prompt), about 1 ms per 100K tokens), and probes the SSD index twice for each of `check_ssd` and the reconcile donor. All of it runs on the generation worker between decode steps, so it stalls the batch.
+
+**Fix.** A per-request memo, keyed on the request's prompt list *object* (held by strong reference, checked by identity plus (length, first, last) token):
+- RAM: `{entry key: (chain length, lcp)}`. Entry keys are a monotonic sequence never reused, and a chain is never mutated: grow, absorb, supersede and SSD promote insert a NEW key, eviction removes the key, so a memo slot can only ever answer for the chain it was computed on. The length is checked anyway.
+- SSD: the `lookup_prefix` + `lookup_shared` result (shared by `check_ssd` and the reconcile donor) and `check_ssd`'s scored candidate, each tagged with the index write version. `_SystemKVIndex` bumps it after every `insert_entry` / `delete_entry` commit (spill, supersede, capacity eviction, quarantine, reconcile); the version is read before probing, so a write that lands mid-probe invalidates.
+- Lifetime: opened by `fetch_for_request` (re-opened when #139 reconcile replaces the prompt), closed at the end of every `materialize_pending_restore`, by `discard_pending` (abort, reject, recovery) and by `store`; at most 64 open regardless. Answers are identical to the unmemoised path; the counters (`hits`, `misses`, `ssd_unusable_skipped`, ...) move exactly as before.
+
+**Measured (laptop M1 Pro, mocked bag, n=15 medians, same method as the #109 audit).** Real mlx-lm cache classes, 8 layers (6 KVCache + 2 ArraysCache), KV `(1, 2, N, 64)` bf16 shared by every entry. E chains of N tokens sharing a 20K system prefix, a checkpoint every 8K, a generated span over the last 5K, all spilled to a real SSD tier (writer drained). Prompt = chain 0's first P-1000 tokens + 1000 new ones (divergent from every entry). Flags: LAZY_RESTORE, RECONCILE_GENERATED, DIVERGENCE_LOG, SSD tier. Timed `fetch_for_request` + `solo_prefill_verdict` + `materialize_pending_restore` (the restore itself included in both).
+
+| bag | before | after | saved | `common_prefix_len` calls | SSD probes |
+|---|---|---|---|---|---|
+| 1 x 50K, prompt 45K | 9.9 ms | 6.3 ms | 3.6 ms | 8 -> 3 | 4 -> 2 |
+| 2 x 50K | 13.8 | 7.5 | 6.3 | 14 -> 4 | 4 -> 2 |
+| 4 x 50K | 22.7 | 10.0 | 12.7 | 26 -> 6 | 4 -> 2 |
+| 1 x 100K, prompt 90K | 20.2 | 12.4 | 7.8 | 8 -> 3 | 4 -> 2 |
+| 2 x 100K | 28.3 | 14.6 | 13.7 | 14 -> 4 | 4 -> 2 |
+| 4 x 100K | 44.3 | 19.7 | 24.6 | 26 -> 6 | 4 -> 2 |
+| 8 x 100K | 67.7 | 24.2 | 43.5 | 50 -> 10 | 4 -> 2 |
+
+Reproduce: `scripts/fork/bench_match_memo.py E N P [n]`, once with `PYTHONPATH` at the parent commit and once at this one. What remains is one scan per entry, one SSD probe pair, the `tuple`/`list` copies of the prompt and the restore build. Not measured: the Studio itself, and a production-size SSD index (the bench index holds only the E chains; a bigger index makes the halved probe cost worth more).
+
+**Verification.** Unit tests `test_178_memo_serves_repeated_scans_with_identical_answers`, `test_178_memo_never_serves_a_stale_entry` (grow, evict-all, re-store under a new key, in-place prompt mutation), `test_178_ssd_probe_shared_until_the_index_changes`, `test_178_ssd_index_version_moves_on_every_row_write`, `test_178_memo_does_not_outlive_the_request`, `test_178_kill_switch`; invariant `test_178_match_memo_preconditions_hold` (never-reused entry keys, admission closes the memo, index version moves). A mutation that serves memo slots by position instead of entry key fails two of them. Full mocked suite green. No real-server check yet (laptop-only pass).

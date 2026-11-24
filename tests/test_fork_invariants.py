@@ -4120,6 +4120,408 @@ def test_169_unset_is_a_no_op_and_a_missing_file_fails_startup(monkeypatch, tmp_
         _install_chat_template_file(tok)
 
 
+# --------- #172 the DELETE /v1/cache* clears reach the batched system-KV bag
+
+
+def test_172_scheduler_cache_clears_empty_the_batched_bag(monkeypatch):
+    """The bag REPLACES the scheduler's other prefix caches, so a rebase that
+    takes upstream's clear_prefix_cache / clear_runtime_caches drops the only
+    branch that does anything on a batched route (upstream #874: 'cleared'
+    while freeing nothing)."""
+    for method in ("clear_prefix_cache", "clear_runtime_caches"):
+        scheduler = _make_scheduler(monkeypatch)
+        kv = scheduler.hybrid_kv
+        assert scheduler.memory_aware_cache is None
+        kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+        assert kv.stats()["entry_count"] == 1
+
+        result = getattr(scheduler, method)()
+
+        assert kv.stats()["entry_count"] == 0, method
+        assert kv.stats()["memory_mb"] == 0, method
+        if method == "clear_runtime_caches":
+            assert result["batched_system_kv"] is True
+
+
+def test_172_clear_under_requests_that_hold_entries(monkeypatch):
+    """A clear between a request's match and its use: a lazy queued request
+    falls back to a cold prefill, a restored running request still stores
+    its finished chain (as a full copy - its donor is gone)."""
+    kv = _lazy_kv(monkeypatch)
+    queued = _queued("lazy", GROWN)
+    bkv.fetch_for_request(kv, queued)
+    assert queued.cache_hit_type == "system_kv_pending"
+    assert kv.fetch(GROWN, request_id="running") is not None  # restored, in flight
+
+    kv.clear()
+
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), queued)
+    assert queued.cache_hit_type == "miss" and queued.cached_tokens == 0
+    assert queued.remaining_tokens == GROWN
+    assert kv.stats()["pinned_entries"] == 0
+
+    assert kv.store("running", GROWN, _donor_at(len(GROWN))) is True
+    assert kv.grown_stores == 0  # donor gone: full copy, no dangling segments
+    result = kv.fetch(GROWN + [5])
+    assert result is not None and result[2] == len(GROWN)
+
+
+def _real_batched_engine_on_a_bag(monkeypatch):
+    """The objects a batched text route really serves the cache endpoints
+    through: BatchedEngine -> AsyncEngineCore -> EngineCore -> Scheduler ->
+    BatchedSystemKV. Only the model is mocked."""
+    import threading
+
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.engine_core import AsyncEngineCore, EngineConfig
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_SYSTEM_KV", "1")
+    tokenizer = MagicMock()
+    tokenizer.encode = lambda x: list(range(len(x.split())))
+    tokenizer.eos_token_id = 0
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._mllm_scheduler = None
+    worker = engine._generation_worker()
+    engine._engine = AsyncEngineCore(
+        MagicMock(),
+        tokenizer,
+        EngineConfig(
+            scheduler_config=SchedulerConfig(max_num_seqs=4, enable_prefix_cache=True)
+        ),
+        generation_worker=worker,
+    )
+    kv = engine._engine.engine.scheduler.hybrid_kv
+    assert kv is not None
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", DISJOINT, _donor_at(len(DISJOINT), seed=3.0))
+    assert kv.stats()["entry_count"] == 2 and kv.stats()["memory_mb"] > 0
+    owner = worker.submit(threading.get_ident).result(timeout=5)
+    clear_threads = []
+    real_clear = kv.clear
+
+    def recording_clear():
+        clear_threads.append(threading.get_ident())
+        return real_clear()
+
+    kv.clear = recording_clear
+    return engine, kv, owner, clear_threads
+
+
+@pytest.mark.parametrize("path", ["/v1/cache/prefix", "/v1/cache"])
+def test_172_http_cache_clears_reach_the_bag_through_the_real_wrappers(
+    monkeypatch, path
+):
+    """The real-server check failed while every scheduler-level test was
+    green: AsyncEngineCore had no clear_prefix_cache, so BatchedEngine's
+    hasattr skipped the clear and DELETE /v1/cache/prefix still answered
+    'cleared'. Go through the HTTP handler and the real engine wrappers, and
+    require the clear to run on the generation worker (the MLX owner)."""
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as server
+
+    engine, kv, owner, clear_threads = _real_batched_engine_on_a_bag(monkeypatch)
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_warm_prompts_path", None, raising=False)
+    try:
+        client = TestClient(server.app)
+        body = client.delete(path).json()
+        assert body["status"] == "cleared"
+        assert kv.stats()["entry_count"] == 0, path
+        assert kv.stats()["memory_mb"] == 0, path
+        assert clear_threads == [owner], path
+        report = body["freed"] if path == "/v1/cache/prefix" else body["engine_cache"]
+        assert report["batched_system_kv"] is True
+        assert report["batched_system_kv_freed"]["entries"] == 2
+        assert report["batched_system_kv_freed"]["bytes"] > 0
+
+        if path == "/v1/cache/prefix":
+            # Nothing left: the report says 0 freed, not a stale count.
+            again = client.delete(path).json()
+            assert again["freed"]["batched_system_kv_freed"] == {
+                "entries": 0,
+                "bytes": 0,
+            }
+    finally:
+        engine._engine.engine.close()
+        engine._generation_executor.shutdown(wait=True)
+        engine._generation_executor = None
+
+
+def test_172_prefix_clear_is_not_cleared_when_nothing_is_reachable(monkeypatch):
+    """A batched engine whose core cannot clear anything must not answer
+    'cleared' (the PR-head bug, minus the missing delegator)."""
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as server
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._mllm_scheduler = None
+    engine._engine = SimpleNamespace()  # no clear_prefix_cache at all
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(server, "_api_key", None)
+    try:
+        body = TestClient(server.app).delete("/v1/cache/prefix").json()
+    finally:
+        if engine._generation_executor is not None:
+            engine._generation_executor.shutdown(wait=True)
+    assert body["status"] == "not_supported"
+    assert body["rewarm_scheduled"] is False
+
+
+# ------------- #173 the SSD tier never fills the volume it shares
+
+
+def test_173_ssd_spill_has_a_global_free_space_floor(monkeypatch, tmp_path):
+    """Per-route caps sum past the disk; the writer must still refuse a spill
+    that would leave the volume under VLLM_MLX_SSD_MIN_FREE_PCT, count it, and
+    not raise. A rebase that drops the check from _write_entry fails here."""
+    import collections
+
+    from vllm_mlx import system_kv_ssd as m
+
+    DU = collections.namedtuple("DU", "total used free")
+    monkeypatch.setattr(m.shutil, "disk_usage", lambda p: DU(1000, 995, 5))
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "10")
+    store = m.SystemKVSSDStore(m.SystemKVSSDConfig(cache_dir=str(tmp_path)))
+    store._write_entry((1, 2, 3), {}, [], [], None, None, 1)
+    st = store.get_stats()
+    assert st["spill_refused_low_disk"] == 1 and st["spill_count"] == 0
+    # Refused at enqueue too: False is how the RAM tier learns the chain is
+    # not on disk (else it records a phantom `disk` lineage key).
+    assert store.enqueue_spill((1, 2, 3), []) is False
+    assert store.get_stats()["spill_refused_low_disk"] == 2
+
+
+# -------- #178 the match memo keys on entry keys that are never reused
+
+
+def test_178_match_memo_preconditions_hold(tmp_path):
+    """The memo is correct only because (1) a stored chain always lands under
+    a NEW, never-reused key - grow, absorb and re-store included - and its
+    token list is never mutated, (2) admission closes it, and (3) the SSD
+    index version moves on every row write. A rebase that re-keys the bag by
+    content or reuses keys makes the memo serve another chain's LCP."""
+    from vllm_mlx.system_kv_ssd import _SystemKVIndex
+
+    kv = BatchedSystemKV(_FakeModel())
+    seen = set()
+    for chain in (TOKENS, TOKENS + [1, 2], TOKENS, DISJOINT):
+        kv.store("r", chain, _donor_at(len(chain)))
+        key = next(reversed(kv._entries))
+        assert key not in seen and kv._entries[key]["tokens"] == chain
+        seen.add(key)
+
+    prompt = TOKENS + [5]
+    req = SimpleNamespace(
+        request_id="q", prompt_token_ids=prompt, num_prompt_tokens=801
+    )
+    bkv.fetch_for_request(kv, req)
+    assert kv._memo_locked(prompt) is not None
+    bkv.materialize_pending_restore(SimpleNamespace(hybrid_kv=kv), req)
+    assert kv._match_memo == {}
+
+    idx = _SystemKVIndex(str(tmp_path))
+    v = idx.version
+    idx.insert_entry((1, 2, 3), "f", 1, 3)
+    assert idx.version != v
+    v = idx.version
+    idx.delete_entry((1, 2, 3))
+    assert idx.version != v
+    idx.close()
+
+
+# ------------- #174 first-token logits and MTP recordings are not held
+
+
+def test_174_mllm_first_token_sites_detach_the_row_and_drop_the_logits():
+    """``logits[:, -1, :]`` is a view that pins the whole (B, T, vocab)
+    forward output; a rebase restoring upstream's slice brings the hold back."""
+    import inspect
+
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+    src = inspect.getsource(MLLMBatchGenerator._process_prompts)
+    assert src.count("last_logits = _detached_last_row(logits)") == 2
+    # only the exact-hit rerun (a 1-token forward) still slices directly
+    assert src.count("last_logits = logits[:, -1, :]") == 1
+
+
+def test_174_mtp_filter_and_extend_drop_the_recording():
+    import inspect
+
+    from vllm_mlx import text_mtp
+
+    src = inspect.getsource(text_mtp._install_class_patches)
+    assert src.count("_drop_recording(self.prompt_cache)") == 2
+
+
+# ------- #175 mlx-lm models-directory move (#2082): hooks bind or say so
+
+
+def test_175_moe_fusion_binds_on_installed_mlx_lm(monkeypatch):
+    """Patch #96 must find SwitchGLU and its sort helpers on THIS mlx-lm and
+    fuse a real module through both forward paths. No importorskip: on a
+    layout the resolver does not know, this goes red instead of skipping."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from vllm_mlx import moe_fusion
+    from vllm_mlx.mlx_lm_compat import resolve
+
+    assert moe_fusion._hook_symbols_missing() == []
+    switch_glu = resolve("SwitchGLU")
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.switch_mlp = switch_glu(128, 64, 8, bias=False)
+
+    toy = Toy()
+    nn.quantize(toy, group_size=64, bits=4)
+    mx.eval(toy.parameters())
+    stock = toy.switch_mlp
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    assert moe_fusion.maybe_fuse(toy, "toy") == 1
+    assert isinstance(toy.switch_mlp, moe_fusion.FusedSwitchGLU)
+    st = moe_fusion.status()
+    assert st["armed"] and st["fused"] == 1 and st["error"] is None
+    for shape in ((1, 1, 2), (1, 40, 2)):  # decode, and the gather-sort path
+        x = mx.random.normal(shape[:2] + (128,)).astype(mx.float16)
+        idx = mx.random.randint(0, 8, shape)
+        assert mx.array_equal(stock(x, idx), toy.switch_mlp(x, idx))
+
+
+def test_175_text_mtp_hooks_bind_on_installed_mlx_lm():
+    """Patch #160 records the state of mlx-lm's qwen3_5 GatedDeltaNet. The
+    class it resolves must be the class a real qwen3_5 model instantiates
+    (found by walking the model, so either module tree passes), and the
+    recurrence helpers must resolve with the signatures the copy calls."""
+    from mlx_lm.models import qwen3_5
+
+    from vllm_mlx import text_mtp
+    from vllm_mlx.mlx_lm_compat import resolve
+
+    assert text_mtp.hook_symbols_missing() == []
+    args = qwen3_5.ModelArgs.from_dict(
+        {
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 32,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "full_attention_interval": 2,
+        }
+    )
+    model = qwen3_5.Model(args)
+    gdn = [m for _, m in model.named_modules() if hasattr(m, "in_proj_qkv")]
+    assert gdn, "tiny qwen3_5 has no recurrent layer"
+    cls = resolve("qwen3_5.GatedDeltaNet")
+    assert all(type(m) is cls for m in gdn)
+    assert callable(resolve("gated_delta_update"))
+    assert callable(resolve("normalize_qk"))
+
+
+def test_175_hooks_resolve_through_the_compat_module_only():
+    """A rebase must not bring back a hard-coded pre-#2082 path at the three
+    live sites (each one swallowed the ImportError)."""
+    import inspect
+
+    from vllm_mlx import moe_fusion, text_mtp
+    from vllm_mlx.patches import qwen3_5_mllm
+
+    for mod in (moe_fusion, text_mtp, qwen3_5_mllm):
+        src = inspect.getsource(mod)
+        for old in (
+            "mlx_lm.models.switch_layers",
+            "mlx_lm.models.gated_delta",
+            "mlx_lm.models.base",
+            "from mlx_lm.models import qwen3_5",
+        ):
+            assert old not in src, f"{mod.__name__} hard-codes {old}"
+
+
+def test_175_armed_fusion_on_a_layout_without_its_classes_is_an_error(
+    monkeypatch, caplog
+):
+    """Fail-open stays (the model runs unfused, nothing crashes), but an
+    armed route says so: one ERROR naming the symbol, and the status."""
+    import logging
+
+    from vllm_mlx import mlx_lm_compat, moe_fusion
+
+    monkeypatch.setattr(mlx_lm_compat, "_resolved", {})
+    monkeypatch.setitem(
+        mlx_lm_compat.CANDIDATES,
+        "_gather_sort",
+        [(mlx_lm_compat.PACKAGED, "_no_such_pkg_175.layers.moe", "_gather_sort")],
+    )
+    monkeypatch.setattr(moe_fusion, "_status", dict(moe_fusion._status), raising=True)
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    with caplog.at_level(logging.ERROR, logger="vllm_mlx.moe_fusion"):
+        assert moe_fusion.maybe_fuse(SimpleNamespace(), "toy") == 0
+    assert any(
+        r.levelno == logging.ERROR and "_gather_sort" in r.getMessage()
+        for r in caplog.records
+    )
+    assert "_gather_sort" in moe_fusion.status()["error"]
+
+
+def test_175_armed_drafter_on_a_layout_without_its_classes_disables_loudly(
+    monkeypatch, caplog
+):
+    """#159 semantics: ERROR + ``disabled``/``disabled_reason`` in the stats,
+    decoding continues. Before #175 the class patching raised out of the
+    batch-generator build on the new layout."""
+    import logging
+
+    from mlx_lm.generate import GenerationBatch
+
+    from vllm_mlx import mlx_lm_compat, text_mtp
+
+    monkeypatch.setattr(mlx_lm_compat, "_resolved", {})
+    monkeypatch.setitem(
+        mlx_lm_compat.CANDIDATES,
+        "qwen3_5.GatedDeltaNet",
+        [
+            (
+                mlx_lm_compat.PACKAGED,
+                "_no_such_pkg_175.models.qwen3_5.layers",
+                "GatedDeltaNet",
+            )
+        ],
+    )
+    monkeypatch.setenv(text_mtp.ENV_DRAFTER, "some/drafter")
+    step_before = GenerationBatch._step
+
+    class Batch:
+        def _step(self):
+            pass
+
+    gen = SimpleNamespace(_generation_batch=Batch())
+    scheduler = SimpleNamespace()
+    with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_mtp"):
+        text_mtp.maybe_install(scheduler, gen)
+    stats = gen.get_mtp_stats()
+    assert stats["disabled"] is True
+    assert "qwen3_5.GatedDeltaNet" in stats["disabled_reason"]
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    assert not hasattr(gen._generation_batch, "_text_mtp")
+    assert GenerationBatch._step is step_before
+
+
 # ------------- #177 a templated prompt's miss cuts its prefill at the shared prefix
 
 _FIX = list(range(1000, 1500))  # fixed instructions, before the item

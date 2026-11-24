@@ -478,6 +478,16 @@ class BatchedSystemKV:
         # request_id -> entry key of the chain this request continues
         # (grow-on-HIT donor linkage, fork patch #37)
         self._restore_source: dict[str, int] = {}
+        # (#178) Per-request prefix-match memo: id(prompt list) -> {"prompt",
+        # "rid", "fp", "lcp": {entry key: (chain len, lcp)}, "ssd": (index
+        # version, probe result), "ssd_best": (index version, candidate)}.
+        # Opened by the add_request hook, closed when admission finishes (or
+        # by discard_pending / store); see open_match_memo.
+        self._match_memo: OrderedDict[int, dict] = OrderedDict()
+        self._match_memo_rid: dict[str, int] = {}
+        self.match_memo_on = _env_int("VLLM_MLX_BATCHED_MATCH_MEMO", 1) > 0
+        self.match_memo_hits = 0
+        self.match_memo_ssd_hits = 0
 
         self.slots = max(1, _env_int("VLLM_MLX_SYSTEM_KV_SLOTS", 4))
         self.ram_mb = _env_int("VLLM_MLX_SYSTEM_KV_RAM_MB", 0)
@@ -962,6 +972,128 @@ class BatchedSystemKV:
             self._restore_source.pop(request_id, None)
             self._peeked.pop(request_id, None)
             self._divergence.pop(request_id, None)
+            self._close_match_memo_locked(request_id)
+
+    # ------------------------------------------------------ match memo (#178)
+    #
+    # One request's add_request -> solo verdict -> admission sequence scans
+    # the bag up to ~7 times with the SAME prompt (reconcile, the SSD-vs-RAM
+    # peek, the lazy peek, the divergence log, the admission peek, fetch),
+    # and probes the SSD index twice per tier question - each scan one
+    # ``common_prefix_len`` per entry, O(prompt) apiece, on the generation
+    # worker between decode steps (#109: 57 calls + 4 index probes, ~85 ms
+    # at 8 x 100K). The memo serves the repeats.
+    #
+    # Why it cannot go stale:
+    # - LCP(prompt, entry) is a pure function of two token chains. Entries
+    #   are keyed by a monotonic sequence number that is never reused, and
+    #   an entry's chain is never mutated or reassigned: a grow, supersede,
+    #   absorb or SSD promote inserts a NEW key, an eviction removes the key
+    #   (so its memo slot is never consulted again). The chain length is
+    #   checked as a guard anyway.
+    # - The prompt side is the request's prompt list OBJECT, held by strong
+    #   reference (so its id cannot be reused) and checked by identity plus
+    #   (length, first, last) at every lookup. A reconcile splice replaces
+    #   the list, which is a different object - it re-opens the memo.
+    # - SSD index results are tagged with the index's write version (bumped
+    #   after every insert/delete commit) and reused only while it holds.
+    # - Lifetime: closed at the end of materialize_pending_restore (every
+    #   admission), by discard_pending (abort / reject / recovery) and by
+    #   store; bounded at _MATCH_MEMO_MAX open memos regardless.
+
+    _MATCH_MEMO_MAX = 64
+
+    @staticmethod
+    def _prompt_fp(prompt) -> tuple:
+        n = len(prompt)
+        return (n, prompt[0], prompt[-1]) if n else (0, None, None)
+
+    def open_match_memo(self, request_id: str, prompt) -> None:
+        """Start (or restart, for a new prompt object) ``request_id``'s memo."""
+        with self._lock:
+            self._close_match_memo_locked(request_id)
+            if not self.match_memo_on or not isinstance(prompt, list):
+                return
+            key = id(prompt)
+            old = self._match_memo.pop(key, None)
+            if old is not None:
+                self._match_memo_rid.pop(old["rid"], None)
+            self._match_memo[key] = {
+                "prompt": prompt,
+                "rid": request_id,
+                "fp": self._prompt_fp(prompt),
+                "lcp": {},
+                "ssd": None,
+                "ssd_best": None,
+            }
+            self._match_memo_rid[request_id] = key
+            while len(self._match_memo) > self._MATCH_MEMO_MAX:
+                _k, dropped = self._match_memo.popitem(last=False)
+                self._match_memo_rid.pop(dropped["rid"], None)
+
+    def close_match_memo(self, request_id: str) -> None:
+        with self._lock:
+            self._close_match_memo_locked(request_id)
+
+    def _close_match_memo_locked(self, request_id: str) -> None:
+        key = self._match_memo_rid.pop(request_id, None)
+        if key is not None:
+            memo = self._match_memo.get(key)
+            if memo is not None and memo["rid"] == request_id:
+                del self._match_memo[key]
+
+    def _memo_locked(self, src) -> Optional[dict]:
+        """The open memo for this exact prompt object, or None."""
+        if src is None or not self._match_memo:
+            return None
+        memo = self._match_memo.get(id(src))
+        if memo is None or memo["prompt"] is not src:
+            return None
+        if self._prompt_fp(src) != memo["fp"]:
+            return None  # mutated in place: never trust it again
+        return memo
+
+    def _entry_lcp_locked(self, memo, tokens: list, key, entry: dict) -> int:
+        chain = entry["tokens"]
+        if memo is not None:
+            hit = memo["lcp"].get(key)
+            if hit is not None and hit[0] == len(chain):
+                self.match_memo_hits += 1
+                return hit[1]
+        lcp = common_prefix_len(tokens, chain)
+        if memo is not None:
+            memo["lcp"][key] = (len(chain), lcp)
+        return lcp
+
+    def _ssd_version(self):
+        return getattr(self._ssd, "index_version", None)
+
+    def _ssd_memo_get(self, src, slot: str):
+        """(memo, version, cached value or None) for an SSD memo slot. The
+        version is read BEFORE the caller probes, so a write that lands
+        mid-probe leaves the stored tag behind the index."""
+        version = self._ssd_version()
+        with self._lock:
+            memo = self._memo_locked(src)
+        if memo is None or version is None:
+            return None, None, None
+        cached = memo[slot]
+        if cached is not None and cached[0] == version:
+            self.match_memo_ssd_hits += 1
+            return memo, version, cached
+        return memo, version, None
+
+    def _ssd_probe(self, src, toks: tuple):
+        """``(lookup_prefix row, lookup_shared rows)`` for ``toks``, shared by
+        every caller in one request's sequence while the index is unchanged."""
+        memo, version, cached = self._ssd_memo_get(src, "ssd")
+        if cached is not None:
+            return cached[1]
+        result = (self._ssd.lookup_prefix(toks), list(self._ssd.lookup_shared(toks)))
+        if memo is not None:
+            with self._lock:
+                memo["ssd"] = (version, result)
+        return result
 
     # ---------------------------------------------------------------- store
 
@@ -1166,6 +1298,7 @@ class BatchedSystemKV:
             self._anchor_pos.pop(request_id, None)
             self._restore_source.pop(request_id, None)
             self._divergence.pop(request_id, None)
+            self._close_match_memo_locked(request_id)
             entry = self._insert_entry_locked(
                 tokens_list, kinds, snapshot, metas, checkpoints, gen_start, disk
             )
@@ -1365,6 +1498,25 @@ class BatchedSystemKV:
         it would land on, for comparing against the RAM tier."""
         if self._ssd is None:
             return None
+        # (#178) the same prompt asked again while the index is unchanged
+        memo, version, cached = self._ssd_memo_get(tokens, "ssd_best")
+        if cached is not None:
+            best = cached[1]
+        else:
+            best = self._check_ssd_best(tokens)
+            if best is False:
+                return None  # probe failed: nothing to memoise
+            if memo is not None:
+                with self._lock:
+                    memo["ssd_best"] = (version, best)
+        if best is not None and best["usable"] < self.partial_min:
+            self.ssd_unusable_skipped += 1
+            return None
+        return dict(best) if best is not None else None
+
+    def _check_ssd_best(self, tokens):
+        """check_ssd's scoring pass: the best candidate before the
+        partial_min floor, None for none, False when the probe failed."""
         toks = tuple(tokens)
         cap = len(toks) - 1
         # (#171) Score every candidate by where a restore would land and keep
@@ -1376,7 +1528,7 @@ class BatchedSystemKV:
         # 27B-8bit (2026-11-11..21).
         best = None
         try:
-            row = self._ssd.lookup_prefix(toks)
+            row, shared_rows = self._ssd_probe(tokens, toks)
             if row is not None and row.get("num_tokens", 0) >= self.partial_min:
                 n = row["num_tokens"]
                 best = {
@@ -1384,7 +1536,7 @@ class BatchedSystemKV:
                     "file_path": row["file_path"],
                     "usable": self._ssd_usable(row["file_path"], n, n, cap),
                 }
-            for row in self._ssd.lookup_shared(toks):
+            for row in shared_rows:
                 if row.get("common_len", 0) < self.partial_min:
                     continue
                 if best is not None and row["common_len"] <= best["usable"]:
@@ -1401,10 +1553,7 @@ class BatchedSystemKV:
                     }
         except Exception:
             logger.debug("[batched_system_kv] check_ssd failed", exc_info=True)
-            return None
-        if best is not None and best["usable"] < self.partial_min:
-            self.ssd_unusable_skipped += 1
-            return None
+            return False
         return best
 
     def _ssd_usable(self, file_path: str, donor_len: int, lcp: int, cap: int) -> int:
@@ -1593,17 +1742,20 @@ class BatchedSystemKV:
                 return None, None
         return out, metas
 
-    def _best_match_locked(self, tokens: list):
+    def _best_match_locked(self, tokens: list, src=None):
         """The entry with the best RESTORABLE position for ``tokens`` (caller
         holds the lock): ``(key, lcp, pos, ck_states, ck_metas)`` or None.
 
         Ranked by restore position, then LCP — not raw LCP (#117): on a
         hybrid model a long LCP can snap down to a checkpoint far below it,
-        while a shorter match on another entry restores deeper."""
+        while a shorter match on another entry restores deeper.
+
+        ``src`` = the caller's original prompt object, for the #178 memo."""
         cap = len(tokens) - 1
         best = None
+        memo = self._memo_locked(src)
         for key, entry in self._entries.items():
-            lcp = common_prefix_len(tokens, entry["tokens"])
+            lcp = self._entry_lcp_locked(memo, tokens, key, entry)
             if lcp < self.partial_min:
                 continue
             plan = {
@@ -1635,9 +1787,9 @@ class BatchedSystemKV:
         Without this, an exact re-send that prefills only the kickoff token
         would store a duplicate chain whose ladder has no usable positions.
         """
-        tokens = list(tokens)
+        src, tokens = tokens, list(tokens)
         with self._lock:
-            match = self._best_match_locked(tokens)
+            match = self._best_match_locked(tokens, src)
             if match is None:
                 self.misses += 1
                 if request_id is not None:
@@ -1739,11 +1891,12 @@ class BatchedSystemKV:
         ``reprefill`` = tokens this request will actually prefill (``depth``
         plus what checkpoint snapping lost). Only true divergences count — a
         prompt that extends a whole chain is the normal next turn."""
-        tokens = list(tokens)
+        src, tokens = tokens, list(tokens)
         with self._lock:
             best_lcp, donor = 0, None
-            for entry in self._entries.values():
-                lcp = common_prefix_len(tokens, entry["tokens"])
+            memo = self._memo_locked(src)
+            for key, entry in self._entries.items():
+                lcp = self._entry_lcp_locked(memo, tokens, key, entry)
                 if lcp > best_lcp:
                     best_lcp, donor = lcp, entry["tokens"]
         if donor is None or best_lcp >= min(len(tokens), len(donor)):
@@ -1795,12 +1948,13 @@ class BatchedSystemKV:
         the whole chain instead of re-prefilling from the last checkpoint."""
         if not self.reconcile_generated_on or self._tokenizer is None:
             return None
-        tokens = list(tokens)
+        src, tokens = tokens, list(tokens)
         with self._lock:
             best_lcp, donor, gen_spans = 0, None, ()
-            for entry in self._entries.values():
+            memo = self._memo_locked(src)
+            for key, entry in self._entries.items():
                 chain = entry["tokens"]
-                lcp = common_prefix_len(tokens, chain)
+                lcp = self._entry_lcp_locked(memo, tokens, key, entry)
                 # Ties: a stale shorter chain would stop the splice early.
                 if lcp > best_lcp or (
                     lcp == best_lcp and donor is not None and len(chain) > len(donor)
@@ -1813,7 +1967,7 @@ class BatchedSystemKV:
         if self._ssd is not None and (
             donor is None or best_lcp < min(len(tokens), len(donor))
         ):
-            ssd_donor = self._ssd_reconcile_donor(tokens)
+            ssd_donor = self._ssd_reconcile_donor(src)
             if ssd_donor is not None:
                 ssd_lcp = common_prefix_len(tokens, ssd_donor)
                 if ssd_lcp > best_lcp:
@@ -1900,12 +2054,12 @@ class BatchedSystemKV:
         try:
             toks = tuple(tokens)
             best_len, best = 0, None
-            row = self._ssd.lookup_prefix(toks)
+            row, shared_rows = self._ssd_probe(tokens, toks)
             if row is not None:
                 best_len, best = row["num_tokens"], list(toks[: row["num_tokens"]])
             # A divergent chain can share more than any full-prefix entry: it
             # is the one that holds the turn the prompt re-renders.
-            for shared in self._ssd.lookup_shared(toks):
+            for shared in shared_rows:
                 if shared.get("common_len", 0) > best_len:
                     best_len, best = shared["common_len"], list(shared["tokens"])
             return best
@@ -1927,9 +2081,9 @@ class BatchedSystemKV:
         LRU-touches the matched entry, so the chain a queued request is about
         to extend outlives an idle one while it waits (``touch=False`` for a
         pure probe)."""
-        tokens = list(tokens)
+        src, tokens = tokens, list(tokens)
         with self._lock:
-            match = self._best_match_locked(tokens)
+            match = self._best_match_locked(tokens, src)
             if match is None:
                 return 0
             best_key, _lcp, pos, _states, _metas = match
@@ -2040,6 +2194,23 @@ class BatchedSystemKV:
             self.evictions += 1
             self.pressure_evictions += 1
         return True
+
+    def clear(self) -> tuple:
+        """Drop every resident snapshot entry (operator cache clear,
+        ``DELETE /v1/cache/prefix``). Returns ``(entries, bytes)`` freed.
+
+        Pinned/spill-pending entries go too: an operator clear is explicit,
+        and a queued request that peeked one simply re-matches (or misses)
+        at admission. In-flight checkpoint ladders belong to running
+        requests and are left alone. The SSD tier is untouched, like the
+        memory-aware cache's clear."""
+        with self._lock:
+            n = len(self._entries)
+            freed = sum(e["bytes"] for e in self._entries.values())
+            for e in self._entries.values():
+                self._timing.forget(timing_key(e["tokens"]))
+            self._entries.clear()
+        return n, freed
 
     def relieve_pressure(self) -> int:
         """Evict resident snapshot entries when the PEAK memory since the
@@ -2329,6 +2500,10 @@ class BatchedSystemKV:
                 "gen_span_registry_size": len(self._gen_spans),
                 "grown_spills": self.grown_spills,
                 "ssd_unusable_skipped": self.ssd_unusable_skipped,
+                # (#178) scans / SSD probes served by the per-request memo
+                "match_memo_hits": self.match_memo_hits,
+                "match_memo_ssd_hits": self.match_memo_ssd_hits,
+                "match_memo_open": len(self._match_memo),
                 "spill_skipped_small": self.spill_skipped_small,
                 "turn_holds": self.turn_holds,
                 "turn_hold_hits": self.turn_hold_hits,
@@ -2403,13 +2578,19 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     ``VLLM_MLX_DIVERGENCE_LOG=1``, the #128 divergence record. (#139) First,
     a prompt that re-renders a cached turn's output with other whitespace
     gets the model's own tokens back, so every consumer below (match, lazy
-    restore, the finish store) sees one consistent prompt."""
+    restore, the finish store) sees one consistent prompt.
+
+    (#178) Opens the request's match memo: every bag scan and SSD index
+    probe from here to the end of admission reuses the first one's answer
+    (closed by ``materialize_pending_restore`` / ``discard_pending``)."""
+    _open_memo(hybrid_kv, request)
     if getattr(hybrid_kv, "reconcile_generated_on", False) is True:
         try:
             spliced = hybrid_kv.reconcile_generated(request.prompt_token_ids)
             if spliced is not None:
                 request.prompt_token_ids = spliced
                 request.num_prompt_tokens = len(spliced)
+                _open_memo(hybrid_kv, request)  # a new prompt object
         except Exception:
             logger.debug("[batched_system_kv] reconcile failed", exc_info=True)
     _fetch_for_request(hybrid_kv, request)
@@ -2424,6 +2605,15 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
             )
         except Exception:
             logger.debug("[batched_system_kv] divergence log failed", exc_info=True)
+
+
+def _open_memo(hybrid_kv, request) -> None:
+    opener = getattr(hybrid_kv, "open_match_memo", None)
+    if callable(opener) and isinstance(getattr(hybrid_kv, "_match_memo", None), dict):
+        try:
+            opener(request.request_id, request.prompt_token_ids)
+        except Exception:
+            logger.debug("[batched_system_kv] match memo open failed", exc_info=True)
 
 
 def _fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
@@ -2548,7 +2738,19 @@ def materialize_pending_restore(scheduler, request) -> None:
 
     The entry may have been evicted while the request waited (it was
     LRU-touched at enqueue, so this is rare): ``fetch`` then returns a
-    shallower hit or nothing, and the request simply prefills more."""
+    shallower hit or nothing, and the request simply prefills more.
+
+    (#178) The last step of every admission: closes the request's match
+    memo whatever the outcome."""
+    try:
+        _materialize_pending_restore(scheduler, request)
+    finally:
+        hybrid_kv = scheduler.hybrid_kv
+        if isinstance(getattr(hybrid_kv, "_match_memo", None), dict):
+            hybrid_kv.close_match_memo(request.request_id)
+
+
+def _materialize_pending_restore(scheduler, request) -> None:
     if getattr(request, "cache_hit_type", None) == "miss":
         _rematch_at_admission(scheduler.hybrid_kv, request)
         return

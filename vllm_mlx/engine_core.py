@@ -792,10 +792,12 @@ class EngineCore:
         """Clear scheduler-managed runtime caches."""
         return self.scheduler.clear_runtime_caches()
 
-    def clear_prefix_cache(self) -> None:
-        """Clear the prefix cache (delegates to scheduler)."""
+    def clear_prefix_cache(self) -> Dict[str, Any] | None:
+        """Clear the prefix cache (delegates to scheduler); returns what
+        the scheduler reports it freed."""
         if hasattr(self.scheduler, "clear_prefix_cache"):
-            self.scheduler.clear_prefix_cache()
+            return self.scheduler.clear_prefix_cache()
+        return None
 
     def _release_model(self) -> None:
         """Release model ownership."""
@@ -952,3 +954,9 @@ class AsyncEngineCore:
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
         return self.engine.clear_runtime_caches()
+
+    def clear_prefix_cache(self) -> Dict[str, Any] | None:
+        """Clear the prefix cache. BatchedEngine reaches the scheduler only
+        through this wrapper: without it DELETE /v1/cache/prefix was a
+        silent no-op on every batched text route (fork #172)."""
+        return self.engine.clear_prefix_cache()
