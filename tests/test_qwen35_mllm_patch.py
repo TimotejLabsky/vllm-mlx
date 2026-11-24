@@ -97,11 +97,16 @@ def _install_fake_qwen35_modules(monkeypatch):
         fake_apply_multimodal_rotary_pos_emb,
     )
 
-    fake_lm_base_mod = types.ModuleType("mlx_lm.models.base")
-    setattr(fake_lm_base_mod, "scaled_dot_product_attention", fake_sdpa)
-
     monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.language", fake_qwen35_mod)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.base", fake_lm_base_mod)
+    # (#175) the patch resolves sdpa through mlx_lm_compat, on whichever
+    # mlx-lm layout is installed; stub the resolution, not a module path.
+    from vllm_mlx import mlx_lm_compat
+
+    monkeypatch.setitem(
+        mlx_lm_compat._resolved,
+        "scaled_dot_product_attention",
+        (fake_sdpa, "test", "fake"),
+    )
 
     return DummyAttention, DummyCache, call_log
 

@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
-import pytest
 
-switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
-from mlx_lm.models.switch_layers import SwitchGLU  # noqa: E402
-
-from vllm_mlx.moe_fusion import (  # noqa: E402
+from vllm_mlx.mlx_lm_compat import resolve
+from vllm_mlx.moe_fusion import (
     FusedSwitchGLU,
     fuse_moe_gate_up,
     maybe_fuse,
 )
+
+# (#175) No importorskip: this file used to skip silently when mlx-lm moved
+# switch_layers (#2082), exactly when the fusion it tests stopped binding.
+SwitchGLU = resolve("SwitchGLU")
 
 DIM, HID, EXPERTS, TOPK = 128, 64, 8, 2
 
