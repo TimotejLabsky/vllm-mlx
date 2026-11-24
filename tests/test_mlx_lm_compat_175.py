@@ -30,6 +30,10 @@ FAKE = "_mlxlm_2082_fake"
 _TREE = {
     "__init__.py": "",
     "layers/__init__.py": "",
+    "layers/common.py": """
+        class SwiGLU:
+            pass
+    """,
     "layers/moe.py": """
         class SwitchGLU:
             pass
@@ -91,6 +95,8 @@ _TREE = {
     "models/qwen3_next/layers.py": """
         class Qwen3NextDecoderLayer:
             pass
+        class Qwen3NextSparseMoeBlock:
+            pass
     """,
 }
 
@@ -127,6 +133,8 @@ _PACKAGED_HOME = {
     "qwen3_5.DecoderLayer": "models.qwen3_5.layers",
     "qwen3_5.TextModelArgs": "models.qwen3_5.config",
     "qwen3_next.Qwen3NextDecoderLayer": "models.qwen3_next.layers",
+    "SwiGLU": "layers.common",
+    "qwen3_next.Qwen3NextSparseMoeBlock": "models.qwen3_next.layers",
 }
 
 
@@ -215,6 +223,11 @@ def test_175_installed_legacy_layout_binds_what_the_old_imports_bound():
     assert (
         compat.resolve("qwen3_next.Qwen3NextDecoderLayer")
         is qwen3_next.Qwen3NextDecoderLayer
+    )
+    assert compat.resolve("SwiGLU") is switch_layers.SwiGLU
+    assert (
+        compat.resolve("qwen3_next.Qwen3NextSparseMoeBlock")
+        is qwen3_next.Qwen3NextSparseMoeBlock
     )
 
 

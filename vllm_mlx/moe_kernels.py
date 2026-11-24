@@ -57,7 +57,10 @@ kernels fail their load-time self-test (routing checked against the stock
 top-k, combine against ``gather_qmm``) on the model's own weights, once per
 distinct expert quantization config --
 logs ONE ERROR naming what is missing; the model then runs with no kernels.
-Model load never raises from here.
+Model load never raises from here. The mlx-lm symbols (the block class and
+``SwiGLU``) resolve through ``mlx_lm_compat`` (#175), so both the 0.32.2
+layout and the post-#2082 one bind; ``/v1/status`` reports the outcome as
+``moe_kernels`` = ``{armed, blocks, skipped, error}``.
 
 Memory: no weight copy (separate layout reads the module's own tensors,
 fused layout reads #96's). Per armed forward, one K x N activation (top-8 x
@@ -87,7 +90,11 @@ _ACT_SWIGLU = 0
 # well under 1 % on the tiny test model. A broken kernel is off by O(1).
 SELFTEST_REL_TOL = 5e-2
 
-_status = {"armed": False, "blocks": 0, "error": None}
+# What the last armed install did, for /v1/status ``moe_kernels`` (the shape
+# of #175's ``moe_fusion`` block): ``armed`` = the flag is set, ``blocks`` =
+# MoE blocks running the kernels, ``skipped`` = supported blocks found but
+# left stock because the kernels could not bind, ``error`` = why.
+_status = {"armed": False, "blocks": 0, "skipped": 0, "error": None}
 
 
 def kernels_enabled() -> bool:
@@ -395,11 +402,11 @@ def softmax_topk(logits: mx.array, *, top_k: int, normalize: bool):
 
 
 def _swiglu_class():
-    try:
-        from mlx_lm.models.switch_layers import SwiGLU
+    from .mlx_lm_compat import MlxLmSymbolMissing, resolve
 
-        return SwiGLU
-    except Exception:
+    try:
+        return resolve("SwiGLU")
+    except MlxLmSymbolMissing:
         return None
 
 
@@ -540,9 +547,9 @@ _QWEN3_NEXT_NEEDLES = (
     "shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y",
 )
 
-_TARGETS = (
-    ("mlx_lm.models.qwen3_next", "Qwen3NextSparseMoeBlock", _QWEN3_NEXT_NEEDLES),
-)
+# (mlx_lm_compat name, needles): the class resolves on both mlx-lm layouts
+# (#175; post-#2082 it lives in ``models/qwen3_next/layers.py``).
+_TARGETS = (("qwen3_next.Qwen3NextSparseMoeBlock", _QWEN3_NEXT_NEEDLES),)
 
 
 def _eligible(block, x) -> bool:
@@ -588,18 +595,16 @@ def _make_armed_class(stock_cls):
 
 def _resolve_targets():
     """[(stock_cls, armed_cls)] and a list of errors naming what is missing."""
-    import importlib
+    from .mlx_lm_compat import missing, resolve_with_origin
 
-    found, errors = [], []
-    if _swiglu_class() is None:
-        errors.append("mlx_lm.models.switch_layers.SwiGLU not found")
-    for mod_name, cls_name, needles in _TARGETS:
-        where = f"{mod_name}.{cls_name}"
-        try:
-            cls = getattr(importlib.import_module(mod_name), cls_name)
-        except Exception as e:
-            errors.append(f"{where} not found ({type(e).__name__})")
-            continue
+    # (#175 pattern) every symbol through the resolver; what binds nowhere is
+    # named with every path tried.
+    errors = missing(("SwiGLU",) + tuple(name for name, _ in _TARGETS))
+    if errors:
+        return [], errors
+    found = []
+    for name, needles in _TARGETS:
+        cls, _layout, where = resolve_with_origin(name)
         try:
             src = inspect.getsource(cls.__call__)
         except Exception as e:
@@ -731,7 +736,7 @@ def install_decode_kernels(model) -> int:
             if type(m) is stock
         ]
         if not blocks:
-            _status.update(blocks=0, error=None)
+            _status.update(blocks=0, skipped=0, error=None)
             logger.info("[moe-kernels] %s armed; no supported MoE block found", ENV)
             return 0
         # One self-test per distinct expert configuration, not only the first
@@ -745,20 +750,22 @@ def install_decode_kernels(model) -> int:
             tested.add(key)
             err = _selftest(m)
             if err:
-                return _refuse(err)
+                return _refuse(err, skipped=len(blocks))
         done = []
         try:
             for m, armed in blocks:
                 stock = type(m)
                 m.__class__ = armed
                 done.append((m, stock))
-        except Exception:
+        except Exception as e:
             for m, stock in done:  # all or nothing
                 m.__class__ = stock
-            raise
+            return _refuse(
+                f"install raised {type(e).__name__}: {e}", skipped=len(blocks)
+            )
     except Exception as e:
         return _refuse(f"install raised {type(e).__name__}: {e}")
-    _status.update(blocks=len(blocks), error=None)
+    _status.update(blocks=len(blocks), skipped=0, error=None)
     logger.warning(
         "[moe-kernels] %s armed: %d MoE block(s) run the single-token decode "
         "kernels (mlx-lm #2053/#2054 port). T=0 output differs from the "
@@ -769,8 +776,8 @@ def install_decode_kernels(model) -> int:
     return len(blocks)
 
 
-def _refuse(error: str) -> int:
-    _status.update(blocks=0, error=error)
+def _refuse(error: str, skipped: int = 0) -> int:
+    _status.update(blocks=0, skipped=skipped, error=error)
     logger.error(
         "[moe-kernels] %s is armed but the kernels cannot bind; the model "
         "runs WITHOUT them (stock MoE path). Missing: %s",

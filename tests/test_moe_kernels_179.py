@@ -106,6 +106,11 @@ def _greedy(model):
 def _clean_env(monkeypatch):
     monkeypatch.delenv(moe_kernels.ENV, raising=False)
     monkeypatch.delenv("VLLM_MLX_MOE_GATEUP_FUSION", raising=False)
+    monkeypatch.setattr(
+        moe_kernels,
+        "_status",
+        {"armed": False, "blocks": 0, "skipped": 0, "error": None},
+    )
 
 
 def _x(shape=(1, 1, DIM), seed=0):
@@ -360,23 +365,41 @@ def _assert_refused(caplog, model, needle):
     mx.eval(model(mx.array([PROMPT])))
 
 
+def _hide_from_the_resolver(monkeypatch, name, module):
+    """(#175 pattern) the symbol resolves nowhere: only ``module`` is tried."""
+    from vllm_mlx import mlx_lm_compat
+
+    monkeypatch.setattr(mlx_lm_compat, "_resolved", {})
+    attr = name.rsplit(".", 1)[-1]
+    monkeypatch.setitem(
+        mlx_lm_compat.CANDIDATES, name, [(mlx_lm_compat.PACKAGED, module, attr)]
+    )
+
+
 def test_missing_class_is_an_error_naming_it(monkeypatch, caplog):
     monkeypatch.setenv(moe_kernels.ENV, "1")
-    monkeypatch.setattr(
-        moe_kernels,
-        "_TARGETS",
-        (("mlx_lm.models.qwen3_next_gone", "Qwen3NextSparseMoeBlock", ()),),
+    _hide_from_the_resolver(
+        monkeypatch, "qwen3_next.Qwen3NextSparseMoeBlock", "_no_such_pkg_179.layers"
     )
     _assert_refused(
-        caplog, _build_model(), "mlx_lm.models.qwen3_next_gone.Qwen3NextSparseMoeBlock"
+        caplog, _build_model(), "_no_such_pkg_179.layers.Qwen3NextSparseMoeBlock"
     )
+    assert "qwen3_next.Qwen3NextSparseMoeBlock not found" in (
+        moe_kernels.status()["error"]
+    )
+
+
+def test_missing_swiglu_is_an_error_naming_it(monkeypatch, caplog):
+    monkeypatch.setenv(moe_kernels.ENV, "1")
+    _hide_from_the_resolver(monkeypatch, "SwiGLU", "_no_such_pkg_179.layers.common")
+    _assert_refused(caplog, _build_model(), "_no_such_pkg_179.layers.common.SwiGLU")
 
 
 def test_changed_stock_body_is_an_error_naming_the_line(monkeypatch, caplog):
     monkeypatch.setenv(moe_kernels.ENV, "1")
-    mod, cls, needles = moe_kernels._TARGETS[0]
+    name, needles = moe_kernels._TARGETS[0]
     monkeypatch.setattr(
-        moe_kernels, "_TARGETS", ((mod, cls, needles + ("y = self.new_router(x)",)),)
+        moe_kernels, "_TARGETS", ((name, needles + ("y = self.new_router(x)",)),)
     )
     _assert_refused(caplog, _build_model(), "y = self.new_router(x)")
 
@@ -450,3 +473,55 @@ def test_no_moe_block_is_not_an_error(monkeypatch, caplog):
     with caplog.at_level(logging.ERROR, logger="vllm_mlx.moe_kernels"):
         assert moe_kernels.maybe_install(nn.Linear(4, 4)) == 0
     assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+# ------------------------------------------------- /v1/status moe_kernels
+
+
+def test_status_block_reports_flag_armed_skipped_and_error(monkeypatch):
+    """The A/B reads this: flag set, how many blocks run the kernels, how
+    many supported blocks were left stock, and why."""
+    assert moe_kernels.status() == {
+        "armed": False,
+        "blocks": 0,
+        "skipped": 0,
+        "error": None,
+    }
+    monkeypatch.setenv(moe_kernels.ENV, "1")
+    assert moe_kernels.maybe_install(_build_model()) == 2
+    assert moe_kernels.status() == {
+        "armed": True,
+        "blocks": 2,
+        "skipped": 0,
+        "error": None,
+    }
+    monkeypatch.setattr(moe_kernels, "SELFTEST_REL_TOL", -1.0)
+    assert moe_kernels.maybe_install(_build_model()) == 0
+    st = moe_kernels.status()
+    assert (st["armed"], st["blocks"], st["skipped"]) == (True, 0, 2)
+    assert "self-test relative error" in st["error"]
+
+
+def test_v1_status_carries_the_moe_kernels_block(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from fastapi.testclient import TestClient
+
+    import vllm_mlx.server as srv
+
+    engine = MagicMock()
+    engine.get_stats.return_value = {"running": True}
+    monkeypatch.setattr(srv, "_engine", engine)
+    monkeypatch.setattr(srv, "_model_manager", None)
+    monkeypatch.setenv(moe_kernels.ENV, "1")
+    monkeypatch.setitem(moe_kernels._status, "blocks", 40)
+    resp = TestClient(srv.app).get("/v1/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["moe_kernels"] == {
+        "armed": True,
+        "blocks": 40,
+        "skipped": 0,
+        "error": None,
+    }
+    assert set(body["moe_fusion"]) == {"armed", "fused", "skipped", "error"}

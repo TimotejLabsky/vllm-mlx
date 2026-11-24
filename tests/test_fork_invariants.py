@@ -4743,3 +4743,24 @@ def test_179_decode_kernels_cannot_arm_without_their_flag(monkeypatch):
         assert moe_kernels.maybe_install(model) == 2
         assert all(b._vllm_mlx_moe_kernels for b in _blocks(model))
     assert Qwen3NextSparseMoeBlock.__call__ is stock_call
+
+
+def test_179_kernels_resolve_through_the_compat_module_and_bind():
+    """(#175 reconcile) the kernels' mlx-lm symbols come from mlx_lm_compat,
+    never a hard-coded path, and on the installed mlx-lm they bind with no
+    error, so an armed route cannot silently run stock after an mlx-lm
+    upgrade that only moved the classes."""
+    import inspect
+
+    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+    from vllm_mlx import moe_kernels
+
+    src = inspect.getsource(moe_kernels)
+    for old in ("mlx_lm.models.switch_layers", "mlx_lm.models.qwen3_next"):
+        assert old not in src, f"moe_kernels hard-codes {old}"
+    targets, errors = moe_kernels._resolve_targets()
+    assert errors == []
+    assert [stock for stock, _ in targets] == [Qwen3NextSparseMoeBlock]
+    assert moe_kernels._swiglu_class() is not None
+    assert set(moe_kernels.status()) == {"armed", "blocks", "skipped", "error"}
