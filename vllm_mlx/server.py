@@ -4971,6 +4971,14 @@ async def health():
     return payload
 
 
+def _moe_fusion_status() -> dict[str, object]:
+    """(#175) patch #96's fusion: armed, how many modules it fused, and the
+    error when mlx-lm lacks the classes it hooks."""
+    from .moe_fusion import status
+
+    return status()
+
+
 def _embedding_status() -> dict[str, object] | None:
     """Effective embedding config, for status/config reporting."""
     if _embedding_engine is None:
@@ -5075,6 +5083,8 @@ async def status():
             or stats.get("system_kv_cache"),
         ),
         "mtp": stats.get("mtp") or {"enabled": False},
+        # (#175) armed MoE fusion that bound nothing shows an error here
+        "moe_fusion": _moe_fusion_status(),
         # Pixel/preprocessing cache (MLLM branch only) — the layer that
         # absorbs re-sent images while the KV prefix cache excludes media
         # (#56 phase A).
@@ -5169,16 +5179,22 @@ async def clear_prefix_cache():
     if _engine is None:
         return {"status": "no_engine"}
     cleared = False
+    clear_result = None
     if hasattr(_engine, "clear_prefix_cache"):
         try:
             owned_clear = getattr(_engine, "_clear_prefix_cache_on_owner", None)
             if owned_clear is not None:
-                await owned_clear()
+                clear_result = await owned_clear()
             else:
                 clear_result = _engine.clear_prefix_cache()
                 if inspect.isawaitable(clear_result):
-                    await clear_result
-            cleared = True
+                    clear_result = await clear_result
+            # Fork #172: an engine that reports what it cleared answers
+            # "cleared" only if something was; None = legacy engine, trusted.
+            if isinstance(clear_result, dict):
+                cleared = any(v is True for v in clear_result.values())
+            else:
+                cleared = True
         except Exception as e:
             logger.warning(
                 "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
@@ -5214,7 +5230,10 @@ async def clear_prefix_cache():
         rewarm_scheduled = True
 
     status = "cleared" if cleared else "not_supported"
-    return {"status": status, "rewarm_scheduled": rewarm_scheduled}
+    response = {"status": status, "rewarm_scheduled": rewarm_scheduled}
+    if isinstance(clear_result, dict):
+        response["freed"] = clear_result
+    return response
 
 
 @app.post(

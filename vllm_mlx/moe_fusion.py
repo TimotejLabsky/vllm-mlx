@@ -24,9 +24,12 @@ Scope and safety:
   skipped, counted, and the model runs unfused (fail-open to the stock
   path, never to a broken one).
 - Text models only (the MLLM path loads through mlx-vlm's own classes).
-- The mlx-lm import is guarded and matched by class NAME as well, so a
-  future mlx-lm restructuring degrades to a no-op, not an ImportError
-  (pin-ceiling discipline, see PATCHES.md #78/#81).
+- The mlx-lm symbols resolve through ``mlx_lm_compat`` (both the 0.32.2
+  layout and the post-#2082 ``mlx_lm.layers.moe`` one). If the env is armed
+  and they resolve nowhere, the model runs unfused and that is an ERROR
+  naming what is missing plus ``status()["error"]`` (#175) -- it used to be
+  silent, and the name-match below would then have fused modules whose
+  forward could not import its sort helpers.
 """
 
 from __future__ import annotations
@@ -39,6 +42,14 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+# (#175) What the last armed fusion did, for /v1/status: an armed route that
+# fused nothing because mlx-lm moved its classes must be visible.
+_status = {"armed": False, "fused": 0, "skipped": 0, "error": None}
+
+
+def status() -> dict:
+    return dict(_status, armed=fusion_enabled())
+
 
 def fusion_enabled() -> bool:
     return os.environ.get("VLLM_MLX_MOE_GATEUP_FUSION", "").lower() in (
@@ -49,12 +60,16 @@ def fusion_enabled() -> bool:
 
 
 def _switch_glu_class():
-    try:
-        from mlx_lm.models.switch_layers import SwitchGLU
+    from .mlx_lm_compat import resolve
 
-        return SwitchGLU
-    except Exception:
-        return None
+    return resolve("SwitchGLU")
+
+
+def _hook_symbols_missing() -> list:
+    """Errors for the mlx-lm symbols a fused forward needs (empty: all bind)."""
+    from .mlx_lm_compat import missing
+
+    return missing(("SwitchGLU", "_gather_sort", "_scatter_unsort"))
 
 
 def _is_quantized_switch_linear(m) -> bool:
@@ -107,20 +122,23 @@ class FusedSwitchGLU:
         if "bias" in up:
             fused.bias = mx.concatenate([up["bias"], gate["bias"]], axis=1)
         mx.eval(fused.weight, fused.scales)
+        from .mlx_lm_compat import resolve
+
+        # Bound once here, so a layout that lacks them never fuses.
+        self._gather_sort = resolve("_gather_sort")
+        self._scatter_unsort = resolve("_scatter_unsort")
         self.gate_up_proj = fused
         self.down_proj = glu.down_proj
         self.activation = glu.activation
         self.training = False
 
     def __call__(self, x, indices) -> mx.array:
-        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
-
         x = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            x, idx, inv_order = self._gather_sort(x, indices)
         gu = self.gate_up_proj(x, idx, sorted_indices=do_sort)
         x_up, x_gate = mx.split(gu, 2, axis=-1)
         x = self.down_proj(
@@ -129,7 +147,7 @@ class FusedSwitchGLU:
             sorted_indices=do_sort,
         )
         if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
+            x = self._scatter_unsort(x, inv_order, indices.shape)
         return x.squeeze(-2)
 
 
@@ -153,6 +171,16 @@ def _try_fuse(glu):
 def fuse_moe_gate_up(model) -> int:
     """Replace every fusable ``SwitchGLU`` under ``model``. Returns the
     number fused. Never raises — any failure leaves the model unfused."""
+    gone = _hook_symbols_missing()
+    if gone:
+        _status.update(fused=0, skipped=0, error="; ".join(gone))
+        logger.error(
+            "[moe-fusion] VLLM_MLX_MOE_GATEUP_FUSION is armed but this mlx-lm "
+            "lacks what the fused forward needs; the model runs UNFUSED "
+            "(patch #96 decode win lost). Missing: %s",
+            _status["error"],
+        )
+        return 0
     glu_cls = _switch_glu_class()
     fused = 0
     skipped = 0
@@ -190,7 +218,9 @@ def fuse_moe_gate_up(model) -> int:
                     stack.append(child)
     except Exception:
         logger.warning("[moe-fusion] walk failed; model left unfused", exc_info=True)
+        _status.update(fused=fused, skipped=skipped, error="walk failed")
         return fused
+    _status.update(fused=fused, skipped=skipped, error=None)
     if fused or skipped:
         logger.info(
             "[moe-fusion] fused %d SwitchGLU module(s), skipped %d "

@@ -74,6 +74,33 @@ class _SystemKVIndex(SSDIndex):
 
     _SCHEMA_VERSION = 1
 
+    # (#178) Write version: bumped AFTER every row insert/delete commits, so
+    # a caller that read it before probing can reuse that probe's result
+    # exactly while it is unchanged (BatchedSystemKV's per-request memo).
+    # touch / update_memory_bytes do not change what a lookup returns.
+    _version = 0
+    _version_lock = threading.Lock()
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def _bump_version(self) -> None:
+        with self._version_lock:
+            self._version += 1
+
+    def insert_entry(self, *args, **kwargs):
+        try:
+            return super().insert_entry(*args, **kwargs)
+        finally:
+            self._bump_version()
+
+    def delete_entry(self, *args, **kwargs):
+        try:
+            return super().delete_entry(*args, **kwargs)
+        finally:
+            self._bump_version()
+
     def lookup_shared_prefix(
         self, query_tokens: tuple[int, ...], limit: int = 4
     ) -> list[dict]:
@@ -152,6 +179,8 @@ class SystemKVSSDStats:
     # (#170) shorter copies of a chain deleted when its longer copy landed
     superseded: int = 0
     superseded_bytes: int = 0
+    # (#173) spills refused because the volume was under the free-space floor
+    spill_refused_low_disk: int = 0
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -175,6 +204,7 @@ class SystemKVSSDStats:
             "ckpt_pruned_bytes": self.ckpt_pruned_bytes,
             "superseded": self.superseded,
             "superseded_bytes": self.superseded_bytes,
+            "spill_refused_low_disk": self.spill_refused_low_disk,
         }
 
 
@@ -187,6 +217,19 @@ def _default_ckpt_min_gap() -> int:
         return 16
 
 
+def _default_max_entries() -> int:
+    """(#177) Entry-count cap of the tier, beside the GB cap. 64 was fixed:
+    a classifier that re-sends the same ~90 short prompts every day (~85 MB
+    each, 5 GB of a 20 GB tier) cycled through it and LRU dropped each one
+    just before it came round again - 0 hits a day."""
+    try:
+        return max(
+            1, int(os.environ.get("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "") or 64)
+        )
+    except ValueError:
+        return 64
+
+
 def _default_supersede_slack() -> int:
     try:
         return max(0, int(os.environ.get("VLLM_MLX_SSD_SUPERSEDE_SLACK", "") or 0))
@@ -194,11 +237,20 @@ def _default_supersede_slack() -> int:
         return 0
 
 
+def _default_min_free_pct() -> float:
+    """(#173) Free-space floor, percent of the volume. 0 disables the check."""
+    try:
+        v = float(os.environ.get("VLLM_MLX_SSD_MIN_FREE_PCT", "") or 10.0)
+    except ValueError:
+        return 10.0
+    return min(100.0, max(0.0, v))
+
+
 @dataclass
 class SystemKVSSDConfig:
     cache_dir: str
     max_size_gb: float = 50.0
-    max_entries: int = 64
+    max_entries: int = field(default_factory=_default_max_entries)
     spill_queue_size: int = 16
     # Cap on the bytes of snapshots queued-but-not-yet-written. The queue
     # holds references to flattened (still-resident) mx arrays, so a backlog
@@ -227,6 +279,10 @@ class SystemKVSSDConfig:
     # serve the new one serves for <= slack tokens of extra prefill.
     # 0 = keep every copy (the old behaviour, LRU removes them).
     supersede_slack: int = field(default_factory=_default_supersede_slack)
+    # (#173) Refuse a spill that would leave the tier's volume with less than
+    # this percent free. The per-store caps are independent per route, so
+    # their sum can exceed the disk; this is the one bound that is global.
+    min_free_pct: float = field(default_factory=_default_min_free_pct)
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
@@ -499,6 +555,7 @@ class SystemKVSSDStore:
         self._backlog_gen = 0
         self._held_bytes = 0  # nbytes of the spill the writer is holding
         self._wake = threading.Event()
+        self._low_disk_logged = 0.0  # monotonic time of the last warning
 
     # ---- writer lifecycle -------------------------------------------------
 
@@ -816,6 +873,12 @@ class SystemKVSSDStore:
             [list(m) if m else None for m in meta] if meta else None
         )
         nbytes = _snapshot_nbytes(snapshot)
+        # (#173) Refuse up front too: a False return is what tells the RAM
+        # tier the chain is NOT on disk (no spill_pending pin, no `disk`
+        # lineage key naming a file that never lands, not evicted as
+        # "cheap to re-promote"). The writer re-checks for the race.
+        if not self._disk_floor_ok(nbytes):
+            return False
         # Byte-cap the backlog: drop if this spill would push the pinned bytes
         # over the cap AND something is already queued (an empty queue always
         # admits one spill, even an oversized one, so huge prefixes persist).
@@ -869,6 +932,36 @@ class SystemKVSSDStore:
             )
             return False
 
+    def _disk_floor_ok(self, nbytes: int) -> bool:
+        """(#173) False when writing ``nbytes`` would leave the volume under
+        the free-space floor. Runs on the writer thread (one statvfs per
+        spill, never on the event loop) and never raises: an unreadable
+        volume fails open, since the write itself reports a real ENOSPC."""
+        pct = self._config.min_free_pct
+        if pct <= 0:
+            return True
+        try:
+            du = shutil.disk_usage(self._data_dir)
+        except Exception:
+            return True
+        if du.total <= 0 or (du.free - nbytes) >= du.total * pct / 100.0:
+            return True
+        with self._lock:
+            self._stats.spill_refused_low_disk += 1
+            refused = self._stats.spill_refused_low_disk
+        now = time.monotonic()
+        if now - self._low_disk_logged >= 60.0:
+            self._low_disk_logged = now
+            logger.warning(
+                "[system_kv_ssd] spill refused: %.1f GB free of %.1f GB, "
+                "floor %.1f%% (%d refused so far)",
+                du.free / _BYTES_PER_GB,
+                du.total / _BYTES_PER_GB,
+                pct,
+                refused,
+            )
+        return False
+
     def _write_entry(
         self,
         tokens: tuple[int, ...],
@@ -883,6 +976,8 @@ class SystemKVSSDStore:
     ) -> None:
         import mlx.core as mx
 
+        if not self._disk_floor_ok(nbytes):
+            return
         entry_hash = _tokens_hash(tokens)
         entry_dir = os.path.join(self._data_dir, entry_hash)
         tmp_dir = entry_dir + ".tmp"
@@ -1023,6 +1118,11 @@ class SystemKVSSDStore:
             shutil.rmtree(entry_dir, ignore_errors=True)
 
     # ---- promote ----------------------------------------------------------
+
+    @property
+    def index_version(self) -> int:
+        """(#178) Changes whenever a lookup could answer differently."""
+        return self._index.version
 
     def lookup_prefix(self, tokens: tuple[int, ...]) -> dict | None:
         """Longest stored entry whose tokens are a prefix of ``tokens``."""

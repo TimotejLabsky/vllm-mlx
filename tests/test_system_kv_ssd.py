@@ -523,3 +523,89 @@ def test_supersede_named_key_and_gen_start_round_trip_170():
         store.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_low_disk_floor_refuses_spill_and_counts_173(monkeypatch):
+    """#173: under the free-space floor a spill is refused, counted, and
+    never raises; above it (or with the floor off) it lands."""
+    import collections
+
+    from vllm_mlx import system_kv_ssd
+    from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+    DU = collections.namedtuple("DU", "total used free")
+    gb = 10**9
+    free = {"v": 50 * gb}
+    monkeypatch.setattr(
+        system_kv_ssd.shutil, "disk_usage", lambda p: DU(1000 * gb, 0, free["v"])
+    )
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, min_free_pct=10))
+        snap = _make_hybrid_snapshot(seq=8)
+        t, m = flatten_snapshot(snap)
+        nb = _snapshot_nbytes(snap)
+        store._write_entry(tuple(range(100)), t, m, [], None, None, nb)
+        st = store.get_stats()
+        assert st["spill_count"] == 0 and st["spill_refused_low_disk"] == 1
+        assert os.listdir(os.path.join(d, "data")) == []
+        free["v"] = 400 * gb  # 40% free: above the floor
+        store._write_entry(tuple(range(100)), t, m, [], None, None, nb)
+        assert store.get_stats()["spill_count"] == 1
+        # the floor is on the volume AFTER the write: 100.5 GB free, 100 GB floor
+        free["v"] = 100 * gb + nb // 2
+        store._write_entry(tuple(range(200)), t, m, [], None, None, nb)
+        assert store.get_stats()["spill_refused_low_disk"] == 2
+        store._config.min_free_pct = 0  # off
+        store._write_entry(tuple(range(200)), t, m, [], None, None, nb)
+        assert store.get_stats()["spill_count"] == 2
+        # an unreadable volume fails open
+        store._config.min_free_pct = 10
+
+        def boom(p):
+            raise OSError("gone")
+
+        monkeypatch.setattr(system_kv_ssd.shutil, "disk_usage", boom)
+        assert store._disk_floor_ok(nb) is True
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_min_free_pct_env_default_173(monkeypatch):
+    monkeypatch.delenv("VLLM_MLX_SSD_MIN_FREE_PCT", raising=False)
+    assert SystemKVSSDConfig(cache_dir="x").min_free_pct == 10.0
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "15")
+    assert SystemKVSSDConfig(cache_dir="x").min_free_pct == 15.0
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "junk")
+    assert SystemKVSSDConfig(cache_dir="x").min_free_pct == 10.0
+
+
+def test_177_entry_cap_comes_from_the_env(monkeypatch):
+    """#177: the tier's entry cap was a fixed 64. A daily batch of more
+    distinct prompts than that cycled through LRU and never hit."""
+    monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", raising=False)
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 64
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "nonsense")
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 64
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "256")
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 256
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "3")
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, max_size_gb=999.0))
+        from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+        for base in (0, 1000, 2000, 3000):
+            snap = _make_hybrid_snapshot(seq=32)
+            toks = tuple(range(base, base + 40))
+            tensors, meta = flatten_snapshot(snap)
+            store._write_entry(
+                toks, tensors, meta, [], None, None, _snapshot_nbytes(snap)
+            )
+        assert store._index.get_entry_count() == 3
+        assert store._index.lookup_prefix(tuple(range(0, 40))) == []  # LRU went
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

@@ -1234,3 +1234,319 @@ def test_171_json_parameter_values_compare_in_sorted_key_order():
     a = "<function=f>\n<parameter=q>\n{not json\n</parameter>\n</function>"
     b = "<function=f>\n<parameter=q>\n{not  json\n</parameter>\n</function>"
     assert _canonical_call(a) == _canonical_call(b)
+
+
+def test_clear_drops_entries_and_bytes():
+    """BatchedSystemKV.clear() empties the bag and reports what it freed."""
+    kv = _make_cache()
+    kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("r2", list(range(5000, 5600)), _donor_at(600, seed=3.0))
+    before = kv.stats()
+    assert before["entry_count"] == 2 and before["memory_mb"] > 0
+
+    n, freed = kv.clear()
+
+    after = kv.stats()
+    assert n == 2 and freed > 0
+    assert after["entry_count"] == 0 and after["memory_mb"] == 0
+    assert kv.fetch(TOKENS + [1]) is None
+
+
+def test_scheduler_prefix_clear_reaches_batched_system_kv():
+    """DELETE /v1/cache/prefix -> scheduler.clear_prefix_cache must free the
+    bag when it replaces the other prefix caches (upstream #874: 'cleared'
+    while doing nothing). Same for clear_runtime_caches (DELETE /v1/cache)."""
+    from vllm_mlx.scheduler import Scheduler
+
+    for method in ("clear_prefix_cache", "clear_runtime_caches"):
+        kv = _make_cache()
+        kv.store("r1", TOKENS, _donor_at(len(TOKENS)))
+        assert kv.stats()["entry_count"] == 1
+
+        sched = object.__new__(Scheduler)
+        sched.block_aware_cache = None
+        sched.memory_aware_cache = None
+        sched.prefix_cache = None
+        sched.hybrid_kv = kv
+
+        getattr(sched, method)()
+
+        stats = kv.stats()
+        assert stats["entry_count"] == 0, method
+        assert stats["memory_mb"] == 0, method
+
+
+# ----------------------------------------- #173 free-space floor refusals
+
+
+def test_173_a_refused_spill_leaves_no_disk_lineage(monkeypatch, tmp_path):
+    """Under the floor the chain must not be recorded as on disk: a phantom
+    ``disk`` key would make #170 supersede the phantom (leaking the real older
+    copy) and #164 skip grown spills it still owes once space frees up."""
+    import collections
+
+    from vllm_mlx import system_kv_ssd
+
+    DU = collections.namedtuple("DU", "total used free")
+    free = {"v": 5}
+    monkeypatch.setattr(
+        system_kv_ssd.shutil, "disk_usage", lambda p: DU(1000, 0, free["v"])
+    )
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "10")
+    kv = _grown_ssd_kv(monkeypatch, tmp_path, delta=0)
+    ssd = kv._ssd
+    try:
+        kv.store("t0", TOKENS[:400], _donor_at(400))
+        (entry,) = kv._entries.values()
+        assert entry.get("disk") is None
+        assert not entry.get("spill_pending")
+        st = ssd.get_stats()
+        assert st["spill_refused_low_disk"] == 1 and st["queued_bytes"] == 0
+        free["v"] = 10**15  # space freed: the next chain spills normally
+        kv.store("t1", _BIG, _donor_at(600))
+        assert any(e.get("disk") is not None for e in kv._entries.values())
+    finally:
+        kv.close()
+    assert ssd.get_stats()["spill_count"] == 1
+
+
+# -------------------------------------------- #178 per-request match memo
+
+
+class _Counted:
+    """Counts the bag's ``common_prefix_len`` calls."""
+
+    def __init__(self, monkeypatch):
+        from vllm_mlx import batched_system_kv as bkv
+
+        self.n = 0
+        real = bkv.common_prefix_len
+
+        def counted(a, b):
+            self.n += 1
+            return real(a, b)
+
+        monkeypatch.setattr(bkv, "common_prefix_len", counted)
+
+
+DISJOINT_178 = list(range(5000, 5800))
+
+
+def _two_chain_kv():
+    kv = _make_cache()
+    kv.note_scheduled("a", 0)
+    kv.capture_segment("a", 448, _donor_at(448))
+    kv.store("a", TOKENS, _donor_at(len(TOKENS)))
+    kv.store("b", DISJOINT_178, _donor_at(len(DISJOINT_178)))
+    return kv
+
+
+def test_178_memo_serves_repeated_scans_with_identical_answers(monkeypatch):
+    prompt = TOKENS[:600] + [1, 2, 3, 4]
+    plain = _two_chain_kv()
+    expected = (plain.peek(list(prompt), touch=False), plain.fetch(list(prompt))[2])
+
+    kv = _two_chain_kv()
+    calls = _Counted(monkeypatch)
+    kv.open_match_memo("r", prompt)
+    got = (kv.peek(prompt, touch=False), kv.peek(prompt), kv.fetch(prompt)[2])
+    kv.note_divergence(prompt, "r", got[0])
+    assert got == (expected[0], expected[0], expected[1]) == (448, 448, 448)
+    assert calls.n == 2  # one per entry, not one per entry per scan
+    assert kv.match_memo_hits == 6
+    # A copy of the prompt is not the memo's prompt object: computed afresh.
+    assert kv.peek(list(prompt), touch=False) == 448
+    assert calls.n == 4
+
+
+def test_178_memo_never_serves_a_stale_entry(monkeypatch):
+    """An entry grown, replaced, promoted or evicted while the memo is open
+    is a new (or a gone) key; a prompt mutated in place drops its memo."""
+    kv = _two_chain_kv()
+    prompt = TOKENS + [7, 8, 9]
+    kv.open_match_memo("r", prompt)
+    assert kv.peek(prompt, touch=False) == len(TOKENS)
+    # Grown: the chain now extends further into the prompt -> deeper hit.
+    kv.store("c", TOKENS + [7, 8], _donor_at(len(TOKENS) + 2))
+    assert kv.peek(prompt, touch=False) == len(TOKENS) + 2
+    # Evicted: every entry gone -> no match, not the memoised one.
+    while kv._drop_lru_entry():
+        pass
+    assert kv.peek(prompt, touch=False) == 0
+    # Re-stored under a NEW key -> matched again from scratch.
+    calls = _Counted(monkeypatch)
+    kv.store("d", TOKENS, _donor_at(len(TOKENS)))
+    assert kv.peek(prompt, touch=False) == len(TOKENS)
+    assert calls.n == 1
+    # Mutated in place (same object): the fingerprint no longer matches.
+    prompt[-1] = 99
+    assert kv._memo_locked(prompt) is None
+
+
+def test_178_ssd_probe_shared_until_the_index_changes(monkeypatch, tmp_path):
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        stub = _StubSSD(shared=[_shared("b", 5000, 4000)], ckpts={"b": [3000]})
+        stub.index_version = 1
+        probes = []
+        orig = stub.lookup_shared
+        stub.lookup_shared = lambda toks: probes.append(1) or orig(toks)
+        kv._ssd = stub
+        prompt = list(range(10000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt)["usable"] == 3000
+        assert kv._ssd_reconcile_donor(prompt) == list(range(5000))
+        assert kv.check_ssd(prompt)["usable"] == 3000
+        assert len(probes) == 1
+        # A spill / supersede / eviction landed: the next ask re-probes.
+        stub.shared = [_shared("c", 9000, 8000)]
+        stub.ckpts["c"] = [7000]
+        stub.index_version = 2
+        assert kv.check_ssd(prompt)["usable"] == 7000
+        assert len(probes) == 2
+        # Without an index version (a tier without support): never memoised.
+        del stub.index_version
+        kv.check_ssd(prompt)
+        assert len(probes) == 3
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_178_ssd_index_version_moves_on_every_row_write(tmp_path):
+    from vllm_mlx.system_kv_ssd import _SystemKVIndex
+
+    idx = _SystemKVIndex(str(tmp_path))
+    v0 = idx.version
+    idx.insert_entry((1, 2, 3), "f", 10, 3)
+    v1 = idx.version
+    idx.touch((1, 2, 3))  # LRU only: lookups answer the same
+    assert idx.version == v1 > v0
+    idx.delete_entry((1, 2, 3))
+    assert idx.version > v1
+    idx.close()
+
+
+def test_178_memo_does_not_outlive_the_request(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from vllm_mlx.batched_system_kv import (
+        fetch_for_request,
+        materialize_pending_restore,
+    )
+
+    monkeypatch.setenv("VLLM_MLX_BATCHED_LAZY_RESTORE", "1")
+    kv = _two_chain_kv()
+    req = NS(request_id="r", prompt_token_ids=TOKENS + [7], num_prompt_tokens=801)
+    fetch_for_request(kv, req)
+    assert req.cache_hit_type == "system_kv_pending"
+    assert kv._memo_locked(req.prompt_token_ids) is not None
+    materialize_pending_restore(NS(hybrid_kv=kv), req)
+    assert req.cache_hit_type == "system_kv"
+    assert kv._match_memo == {} and kv._match_memo_rid == {}
+    # Abort / reject before admission: discard_pending closes it.
+    req2 = NS(request_id="r2", prompt_token_ids=TOKENS + [8], num_prompt_tokens=801)
+    fetch_for_request(kv, req2)
+    kv.discard_pending("r2")
+    assert kv._match_memo == {}
+    # Bounded even if a close path were missed.
+    for i in range(kv._MATCH_MEMO_MAX + 10):
+        kv.open_match_memo(f"x{i}", [i] * 10)
+    assert len(kv._match_memo) == len(kv._match_memo_rid) == kv._MATCH_MEMO_MAX
+
+
+def test_178_kill_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MATCH_MEMO", "0")
+    kv = _two_chain_kv()
+    kv.open_match_memo("r", TOKENS + [1])
+    assert kv._match_memo == {}
+
+
+def test_178_equal_length_prompts_and_shared_prompt_objects_stay_apart():
+    """Two open memos whose prompts have the same length and first token but
+    part ways with the cached chain at different depths, scanned interleaved,
+    plus a third request that shares the first one's prompt OBJECT (n>1
+    fan-out). Every answer equals the unmemoised bag's."""
+    p1 = TOKENS[:600] + [1, 2, 3, 4]
+    p2 = TOKENS[:500] + [9] * 104
+    assert len(p1) == len(p2) and p1[0] == p2[0] and p1[-1] != p2[-1]
+    plain = _two_chain_kv()
+    want1 = plain.peek(list(p1), touch=False)
+    want2 = plain.peek(list(p2), touch=False)
+
+    kv = _two_chain_kv()
+    kv.open_match_memo("r1", p1)
+    kv.open_match_memo("r2", p2)
+    for _ in range(3):
+        assert kv.peek(p1, touch=False) == want1
+        assert kv.peek(p2, touch=False) == want2
+    m1, m2 = kv._memo_locked(p1), kv._memo_locked(p2)
+    assert m1 is not m2
+    k_a = next(iter(kv._entries))
+    assert m1["lcp"][k_a][1] == 600 and m2["lcp"][k_a][1] == 500
+    kv.open_match_memo("r3", p1)  # takes over r1's memo slot
+    assert kv.peek(p1, touch=False) == want1
+    kv.close_match_memo("r1")  # r1 no longer owns it: a no-op
+    assert kv._memo_locked(p1) is not None
+    kv.close_match_memo("r3")
+    kv.close_match_memo("r2")
+    assert kv._match_memo == {} and kv._match_memo_rid == {}
+
+
+def test_178_a_write_during_the_probe_invalidates_it(monkeypatch, tmp_path):
+    """The index changes WHILE lookup_shared runs (the SSD writer commits
+    mid-probe). The result is tagged with the version read before the probe,
+    so the next ask re-probes and sees the new row."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    real = kv._ssd
+    try:
+        stub = _StubSSD(shared=[_shared("b", 5000, 4000)], ckpts={"b": [3000]})
+        stub.index_version = 1
+        probes = []
+
+        def racing(toks):
+            probes.append(1)
+            rows = list(stub.shared)
+            if len(probes) == 1:  # the writer lands mid-probe
+                stub.shared = [_shared("c", 9000, 8000)]
+                stub.ckpts["c"] = [7000]
+                stub.index_version = 2
+            return rows
+
+        stub.lookup_shared = racing
+        kv._ssd = stub
+        prompt = list(range(10000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt)["usable"] == 3000  # what the probe saw
+        assert kv.check_ssd(prompt)["usable"] == 7000  # re-probed, not stale
+        assert kv.check_ssd(prompt)["usable"] == 7000
+        assert len(probes) == 2  # stable again: served from the memo
+    finally:
+        kv._ssd = real
+        kv.close()
+
+
+def test_178_real_tier_row_write_invalidates_check_ssd(monkeypatch, tmp_path):
+    """Real SystemKVSSDStore: an index row inserted (a spill commit) and then
+    deleted (supersede / eviction / quarantine) between asks of one open memo
+    moves check_ssd's and the reconcile donor's answers both ways."""
+    kv = _lineage_kv(monkeypatch, tmp_path)
+    try:
+        assert kv._ssd is not None
+        prompt = list(range(1000, 3000))
+        kv.open_match_memo("r", prompt)
+        assert kv.check_ssd(prompt) is None
+        assert kv.check_ssd(prompt) is None
+        key = tuple(prompt[:1500])
+        kv._ssd._index.insert_entry(
+            tokens_key=key, file_path="x", memory_bytes=1, num_tokens=len(key)
+        )
+        got = kv.check_ssd(prompt)
+        assert got is not None and got["usable"] == 1500
+        assert kv._ssd_reconcile_donor(prompt) == list(key)
+        kv._ssd._index.delete_entry(key)
+        assert kv.check_ssd(prompt) is None
+        assert kv._ssd_reconcile_donor(prompt) is None
+    finally:
+        kv.close()

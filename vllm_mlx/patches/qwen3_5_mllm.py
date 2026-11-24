@@ -155,9 +155,22 @@ def patch_qwen35_attention_for_batching() -> bool:
     """
     try:
         qwen35_language = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-        from mlx_lm.models.base import scaled_dot_product_attention
     except ImportError:
         logger.debug("[Qwen3.5 patch] mlx-vlm Qwen3.5 module not available")
+        return False
+    # (#175) mlx-lm #2082 moves this to mlx_lm.layers.attention. Missing it
+    # is not "no Qwen3.5 here": the VLM module IS installed, and a Qwen3.5
+    # VLM batched on the unpatched attention breaks on BatchKVCache offsets.
+    from ..mlx_lm_compat import MlxLmSymbolMissing, resolve
+
+    try:
+        scaled_dot_product_attention = resolve("scaled_dot_product_attention")
+    except MlxLmSymbolMissing as e:
+        logger.error(
+            "[Qwen3.5 patch] NOT applied: Qwen3.5 VLM attention stays "
+            "unpatched for BatchKVCache. %s",
+            e,
+        )
         return False
 
     Qwen3_5Attention = qwen35_language.Qwen3_5Attention
