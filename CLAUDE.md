@@ -47,10 +47,20 @@ feature branch — read this before changing anything.
 ## Conventions
 
 - Each patch is a separate commit on `main` prefixed `patch:` (also used:
-  `docs:`, `tests:`, `restore:`, `fix(scope):`, `refactor:`). Amend a patch via
-  `git commit --fixup <sha>` + `git rebase -i --autosquash`, then
-  `git push --force-with-lease`.
-- Rebase onto `upstream/main` periodically. When upstream rewrites
+  `docs:`, `tests:`, `restore:`, `fix(scope):`, `refactor:`).
+- **`main` is protected** (since 2026-11-24): changes land only through a pull
+  request, the required checks (`lint`, `test-matrix (3.11)`,
+  `test-matrix (3.13)`, `test-apple-silicon (3.11)`) must be green, history is
+  linear, and force-pushes and deletion are blocked. Squash-merge a patch PR so
+  it lands as one `patch:` commit (review fix-ups go on the PR branch as new
+  commits — never rewrite a pushed PR branch). Amend a patch that is already on
+  `main` with a follow-up PR (`fix(scope):` naming the patch number), not by
+  rewriting `main`.
+- Rebase onto `upstream/main` periodically. A rebase rewrites `main`, so it is
+  the one operation that needs a force-push: the owner lifts
+  `allow_force_pushes` on the branch protection for that push
+  (`--force-with-lease`) and restores it straight after. This is a deliberate
+  owner step — an agent never changes branch protection on its own. When upstream rewrites
   `engine/simple.py` in ways our patches supersede, reject upstream's version
   wholesale and restore wanted upstream deltas in a dedicated `restore:` commit
   (precedent: #541, #579 — see the rebase notes at the top of PATCHES.md).
