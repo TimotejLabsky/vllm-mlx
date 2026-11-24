@@ -152,6 +152,8 @@ class SystemKVSSDStats:
     # (#170) shorter copies of a chain deleted when its longer copy landed
     superseded: int = 0
     superseded_bytes: int = 0
+    # (#173) spills refused because the volume was under the free-space floor
+    spill_refused_low_disk: int = 0
 
     def to_dict(self) -> dict:
         avg_ms = (
@@ -175,6 +177,7 @@ class SystemKVSSDStats:
             "ckpt_pruned_bytes": self.ckpt_pruned_bytes,
             "superseded": self.superseded,
             "superseded_bytes": self.superseded_bytes,
+            "spill_refused_low_disk": self.spill_refused_low_disk,
         }
 
 
@@ -192,6 +195,15 @@ def _default_supersede_slack() -> int:
         return max(0, int(os.environ.get("VLLM_MLX_SSD_SUPERSEDE_SLACK", "") or 0))
     except ValueError:
         return 0
+
+
+def _default_min_free_pct() -> float:
+    """(#173) Free-space floor, percent of the volume. 0 disables the check."""
+    try:
+        v = float(os.environ.get("VLLM_MLX_SSD_MIN_FREE_PCT", "") or 10.0)
+    except ValueError:
+        return 10.0
+    return min(100.0, max(0.0, v))
 
 
 @dataclass
@@ -227,6 +239,10 @@ class SystemKVSSDConfig:
     # serve the new one serves for <= slack tokens of extra prefill.
     # 0 = keep every copy (the old behaviour, LRU removes them).
     supersede_slack: int = field(default_factory=_default_supersede_slack)
+    # (#173) Refuse a spill that would leave the tier's volume with less than
+    # this percent free. The per-store caps are independent per route, so
+    # their sum can exceed the disk; this is the one bound that is global.
+    min_free_pct: float = field(default_factory=_default_min_free_pct)
     dir_permissions: int = 0o700
     file_permissions: int = 0o600
     # Stale ``*.tmp`` dirs older than this (seconds) are interrupted writes —
@@ -499,6 +515,7 @@ class SystemKVSSDStore:
         self._backlog_gen = 0
         self._held_bytes = 0  # nbytes of the spill the writer is holding
         self._wake = threading.Event()
+        self._low_disk_logged = 0.0  # monotonic time of the last warning
 
     # ---- writer lifecycle -------------------------------------------------
 
@@ -816,6 +833,12 @@ class SystemKVSSDStore:
             [list(m) if m else None for m in meta] if meta else None
         )
         nbytes = _snapshot_nbytes(snapshot)
+        # (#173) Refuse up front too: a False return is what tells the RAM
+        # tier the chain is NOT on disk (no spill_pending pin, no `disk`
+        # lineage key naming a file that never lands, not evicted as
+        # "cheap to re-promote"). The writer re-checks for the race.
+        if not self._disk_floor_ok(nbytes):
+            return False
         # Byte-cap the backlog: drop if this spill would push the pinned bytes
         # over the cap AND something is already queued (an empty queue always
         # admits one spill, even an oversized one, so huge prefixes persist).
@@ -869,6 +892,36 @@ class SystemKVSSDStore:
             )
             return False
 
+    def _disk_floor_ok(self, nbytes: int) -> bool:
+        """(#173) False when writing ``nbytes`` would leave the volume under
+        the free-space floor. Runs on the writer thread (one statvfs per
+        spill, never on the event loop) and never raises: an unreadable
+        volume fails open, since the write itself reports a real ENOSPC."""
+        pct = self._config.min_free_pct
+        if pct <= 0:
+            return True
+        try:
+            du = shutil.disk_usage(self._data_dir)
+        except Exception:
+            return True
+        if du.total <= 0 or (du.free - nbytes) >= du.total * pct / 100.0:
+            return True
+        with self._lock:
+            self._stats.spill_refused_low_disk += 1
+            refused = self._stats.spill_refused_low_disk
+        now = time.monotonic()
+        if now - self._low_disk_logged >= 60.0:
+            self._low_disk_logged = now
+            logger.warning(
+                "[system_kv_ssd] spill refused: %.1f GB free of %.1f GB, "
+                "floor %.1f%% (%d refused so far)",
+                du.free / _BYTES_PER_GB,
+                du.total / _BYTES_PER_GB,
+                pct,
+                refused,
+            )
+        return False
+
     def _write_entry(
         self,
         tokens: tuple[int, ...],
@@ -883,6 +936,8 @@ class SystemKVSSDStore:
     ) -> None:
         import mlx.core as mx
 
+        if not self._disk_floor_ok(nbytes):
+            return
         entry_hash = _tokens_hash(tokens)
         entry_dir = os.path.join(self._data_dir, entry_hash)
         tmp_dir = entry_dir + ".tmp"

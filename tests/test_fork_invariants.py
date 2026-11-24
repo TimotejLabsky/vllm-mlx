@@ -4118,3 +4118,27 @@ def test_169_unset_is_a_no_op_and_a_missing_file_fails_startup(monkeypatch, tmp_
     monkeypatch.setenv("VLLM_MLX_CHAT_TEMPLATE_FILE", str(tmp_path / "missing.jinja"))
     with pytest.raises(FileNotFoundError):
         _install_chat_template_file(tok)
+
+
+# ------------- #173 the SSD tier never fills the volume it shares
+
+
+def test_173_ssd_spill_has_a_global_free_space_floor(monkeypatch, tmp_path):
+    """Per-route caps sum past the disk; the writer must still refuse a spill
+    that would leave the volume under VLLM_MLX_SSD_MIN_FREE_PCT, count it, and
+    not raise. A rebase that drops the check from _write_entry fails here."""
+    import collections
+
+    from vllm_mlx import system_kv_ssd as m
+
+    DU = collections.namedtuple("DU", "total used free")
+    monkeypatch.setattr(m.shutil, "disk_usage", lambda p: DU(1000, 995, 5))
+    monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "10")
+    store = m.SystemKVSSDStore(m.SystemKVSSDConfig(cache_dir=str(tmp_path)))
+    store._write_entry((1, 2, 3), {}, [], [], None, None, 1)
+    st = store.get_stats()
+    assert st["spill_refused_low_disk"] == 1 and st["spill_count"] == 0
+    # Refused at enqueue too: False is how the RAM tier learns the chain is
+    # not on disk (else it records a phantom `disk` lineage key).
+    assert store.enqueue_spill((1, 2, 3), []) is False
+    assert store.get_stats()["spill_refused_low_disk"] == 2
