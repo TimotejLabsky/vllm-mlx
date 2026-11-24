@@ -4597,6 +4597,22 @@ Together ~0.9 GB for the first request after a route load and ~0.45 GB for every
   - 3 cases where the old logic promoted for nothing, including the 09:30 incident: the new logic skips them.
   - The other 12: identical choice and restore position.
 
+## 172. `fix: batched-kv-clear` — `DELETE /v1/cache/prefix` (and `/v1/cache`) free the batched system-KV bag
+
+**Files:** `vllm_mlx/batched_system_kv.py` (`clear`), `vllm_mlx/scheduler.py` (`clear_prefix_cache`, `clear_runtime_caches`), `vllm_mlx/engine_core.py` (`AsyncEngineCore.clear_prefix_cache`, `EngineCore.clear_prefix_cache` return), `vllm_mlx/engine/batched.py` (`clear_prefix_cache`, `_clear_prefix_cache_on_owner`), `vllm_mlx/server.py` (`DELETE /v1/cache/prefix` handler), `tests/test_batched_system_kv.py`, `tests/test_fork_invariants.py`.
+
+**Why (issue #108, upstream waybarrios/vllm-mlx#874).** `DELETE /v1/cache/prefix` answered `cleared` on every batched text route while freeing nothing. Two broken links, both on the call chain server handler -> `BatchedEngine._clear_prefix_cache_on_owner` -> `AsyncEngineCore` -> `EngineCore` -> `Scheduler` -> `BatchedSystemKV`:
+1. **The engine wrapper (the one the real-server check found).** `BatchedEngine._engine` is an `AsyncEngineCore`, which had `clear_runtime_caches` but no `clear_prefix_cache`. `_clear_prefix_cache_on_owner` guards with `hasattr`, so it silently did nothing and the handler still set `cleared = True`. `DELETE /v1/cache` worked because its delegator exists.
+2. **The scheduler.** With the bag on, `memory_aware_cache`, `prefix_cache` and `block_aware_cache` are all None (the bag replaces them), so both scheduler clears were no-ops even when reached.
+
+The first cut of this patch fixed only link 2 and was tested only at the scheduler, so the real-server check failed (stats after the clear: 1 entry, 315.5 MB, unchanged).
+
+**Fix.** `BatchedSystemKV.clear()` drops every resident entry and returns `(entries, bytes)`; both scheduler clears call it and report `batched_system_kv: true` plus `batched_system_kv_freed: {entries, bytes}`. `AsyncEngineCore.clear_prefix_cache` delegates to `EngineCore`, and the result travels back through `BatchedEngine` (still hopping to the generation worker). The handler adds that report as `freed` (additive; `status`/`rewarm_scheduled` unchanged) and answers `cleared` only if some cache was actually cleared; an engine that cannot reach one now gets `not_supported` and a warning log instead of a silent `cleared` (an engine returning None, i.e. one that does not report, is still trusted). The SSD tier is untouched (same as the memory-aware cache's clear), so on an SSD route the next request can promote from disk: not a true cold start. In-flight checkpoint ladders belong to running requests and stay. SimpleEngine has no `clear_prefix_cache` (`not_supported`, unchanged); the batched MLLM path clears its own prefix cache and now reports `{prefix_cache: true}`, or `not_supported` when it has none.
+
+**Verification.** `test_clear_drops_entries_and_bytes` (entry_count 2 -> 0, memory_mb > 0 -> 0, fetch misses) and `test_scheduler_prefix_clear_reaches_batched_system_kv`. Pinned in `tests/test_fork_invariants.py`: `test_172_scheduler_cache_clears_empty_the_batched_bag`, `test_172_clear_under_requests_that_hold_entries`, and the through-path test that would have caught link 1: `test_172_http_cache_clears_reach_the_bag_through_the_real_wrappers` (FastAPI `TestClient` -> real `BatchedEngine` -> real `AsyncEngineCore`/`EngineCore`/`Scheduler`/bag, mocked model only; both endpoints; entries and bytes drop, the clear runs on the generation worker thread, the response reports what was freed). On the first-cut head it fails exactly like the real server: `/v1/cache/prefix` answers `cleared` with 2 entries left. `test_172_prefix_clear_is_not_cleared_when_nothing_is_reachable` pins the honest status.
+
+**Thread.** Both endpoints hop to the single generation worker (`BatchedEngine._clear_*_on_owner`), the thread that runs `scheduler.step`, so a clear lands between steps, never inside one.
+
 ## 173. `patch: ssd-free-space-floor` — the SSD KV tier refuses a spill that would leave its volume under a free-space floor
 
 **Files:** `vllm_mlx/system_kv_ssd.py` (`_disk_floor_ok`, `min_free_pct`, stat `spill_refused_low_disk`), `tests/test_system_kv_ssd.py`, `tests/test_fork_invariants.py`, `tests/conftest.py`.
