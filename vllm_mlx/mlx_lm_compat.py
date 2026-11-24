@@ -20,6 +20,9 @@ qwen3_5 GatedDeltaNet,      mlx_lm.models.qwen3_5           mlx_lm.models.qwen3_
 DecoderLayer
 qwen3_5 TextModelArgs       mlx_lm.models.qwen3_5           mlx_lm.models.qwen3_5.config
 Qwen3NextDecoderLayer       mlx_lm.models.qwen3_next        mlx_lm.models.qwen3_next.layers
+SwiGLU (#179)               mlx_lm.models.switch_layers     mlx_lm.layers.common
+Qwen3NextSparseMoeBlock     mlx_lm.models.qwen3_next        mlx_lm.models.qwen3_next.layers
+(#179)
 ==========================  ==============================  ==================================
 
 There are no back-compat shims upstream, so a hard-coded old path is an
@@ -74,6 +77,14 @@ _both("qwen3_5.DecoderLayer", "mlx_lm.models.qwen3_5.layers", "mlx_lm.models.qwe
 _both("qwen3_5.TextModelArgs", "mlx_lm.models.qwen3_5.config", "mlx_lm.models.qwen3_5")
 _both(
     "qwen3_next.Qwen3NextDecoderLayer",
+    "mlx_lm.models.qwen3_next.layers",
+    "mlx_lm.models.qwen3_next",
+)
+# (#179) the decode kernels' targets. SwiGLU's post-#2082 home is
+# layers.common (layers.moe only re-imports it).
+_both("SwiGLU", "mlx_lm.layers.common", "mlx_lm.models.switch_layers")
+_both(
+    "qwen3_next.Qwen3NextSparseMoeBlock",
     "mlx_lm.models.qwen3_next.layers",
     "mlx_lm.models.qwen3_next",
 )

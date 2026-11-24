@@ -4979,6 +4979,14 @@ def _moe_fusion_status() -> dict[str, object]:
     return status()
 
 
+def _moe_kernels_status() -> dict[str, object]:
+    """(#179) the opt-in MoE decode kernels: flag set, blocks armed, blocks
+    left stock, and the error when they could not bind."""
+    from .moe_kernels import status
+
+    return status()
+
+
 def _embedding_status() -> dict[str, object] | None:
     """Effective embedding config, for status/config reporting."""
     if _embedding_engine is None:
@@ -5085,6 +5093,8 @@ async def status():
         "mtp": stats.get("mtp") or {"enabled": False},
         # (#175) armed MoE fusion that bound nothing shows an error here
         "moe_fusion": _moe_fusion_status(),
+        # (#179) armed decode kernels that could not bind show an error here
+        "moe_kernels": _moe_kernels_status(),
         # Pixel/preprocessing cache (MLLM branch only) — the layer that
         # absorbs re-sent images while the KV prefix cache excludes media
         # (#56 phase A).

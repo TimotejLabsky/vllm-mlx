@@ -232,10 +232,15 @@ def fuse_moe_gate_up(model) -> int:
 
 
 def maybe_fuse(model, model_name: str = "") -> int:
-    """Entry point for the engines: fuse iff the env gate is armed."""
-    if not fusion_enabled():
-        return 0
-    n = fuse_moe_gate_up(model)
-    if n:
-        logger.info("[moe-fusion] %s: %d expert MLP(s) fused", model_name, n)
+    """Entry point for the engines: fuse iff the env gate is armed, then
+    arm the opt-in decode kernels (#179, ``VLLM_MLX_MOE_DECODE_KERNELS``;
+    a no-op unless set). Kernels go second so they read the fused tensor."""
+    n = 0
+    if fusion_enabled():
+        n = fuse_moe_gate_up(model)
+        if n:
+            logger.info("[moe-fusion] %s: %d expert MLP(s) fused", model_name, n)
+    from .moe_kernels import maybe_install
+
+    maybe_install(model, model_name)
     return n

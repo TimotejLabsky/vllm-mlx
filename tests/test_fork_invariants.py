@@ -4712,3 +4712,55 @@ def test_177_a_shared_system_prompt_flood_does_not_cut_per_request(monkeypatch):
     kv = BatchedSystemKV(_FakeModel())
     assert _flood(kv) == [0] * 40  # unarmed: as on main, nothing restores
     assert kv.miss_cuts == 0
+
+
+# -------------- #179 the MoE decode kernels arm only behind their own flag
+
+
+def test_179_decode_kernels_cannot_arm_without_their_flag(monkeypatch):
+    """The kernels change T=0 output, so nothing but
+    VLLM_MLX_MOE_DECODE_KERNELS may arm them -- not #96's fusion flag, not
+    the engines' load hook -- and arming never patches the mlx-lm class."""
+    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+    from tests.test_moe_kernels_179 import _blocks, _build_model
+    from vllm_mlx import moe_kernels
+    from vllm_mlx.moe_fusion import maybe_fuse
+
+    assert moe_kernels.ENV == "VLLM_MLX_MOE_DECODE_KERNELS"
+    stock_call = Qwen3NextSparseMoeBlock.__call__
+    monkeypatch.delenv(moe_kernels.ENV, raising=False)
+    monkeypatch.setenv("VLLM_MLX_MOE_GATEUP_FUSION", "1")
+    assert not moe_kernels.kernels_enabled()
+
+    model = _build_model()
+    assert maybe_fuse(model, "tiny") == 2  # #96 still fuses
+    assert all(type(b) is Qwen3NextSparseMoeBlock for b in _blocks(model))
+    assert moe_kernels.maybe_install(model) == 0
+
+    if moe_kernels.on_metal():  # the positive control
+        monkeypatch.setenv(moe_kernels.ENV, "1")
+        assert moe_kernels.maybe_install(model) == 2
+        assert all(b._vllm_mlx_moe_kernels for b in _blocks(model))
+    assert Qwen3NextSparseMoeBlock.__call__ is stock_call
+
+
+def test_179_kernels_resolve_through_the_compat_module_and_bind():
+    """(#175 reconcile) the kernels' mlx-lm symbols come from mlx_lm_compat,
+    never a hard-coded path, and on the installed mlx-lm they bind with no
+    error, so an armed route cannot silently run stock after an mlx-lm
+    upgrade that only moved the classes."""
+    import inspect
+
+    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+    from vllm_mlx import moe_kernels
+
+    src = inspect.getsource(moe_kernels)
+    for old in ("mlx_lm.models.switch_layers", "mlx_lm.models.qwen3_next"):
+        assert old not in src, f"moe_kernels hard-codes {old}"
+    targets, errors = moe_kernels._resolve_targets()
+    assert errors == []
+    assert [stock for stock, _ in targets] == [Qwen3NextSparseMoeBlock]
+    assert moe_kernels._swiglu_class() is not None
+    assert set(moe_kernels.status()) == {"armed", "blocks", "skipped", "error"}
