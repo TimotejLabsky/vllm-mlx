@@ -11,7 +11,7 @@ import numpy as np
 from .json_schema_processor import ConstrainedDecodingError
 
 _MAX_NONPROGRESS_WHITESPACE_CHARS = 256
-_tokenizer_cache: dict[int, tuple[Any, Any, frozenset[int]]] = {}
+_tokenizer_cache: dict[int, tuple[Any, Any, frozenset[int], Any]] = {}
 
 
 def is_available() -> bool:
@@ -61,7 +61,12 @@ def _ll_tokenizer(tokenizer: Any):
             for token_id in range(ll_tokenizer.vocab_size)
             if _decoded_token_is_whitespace(candidate, token_id)
         )
-        result = (candidate, ll_tokenizer, whitespace_tokens)
+        result = (
+            candidate,
+            ll_tokenizer,
+            whitespace_tokens,
+            _whitespace_prefilter(candidate, ll_tokenizer.vocab_size),
+        )
         _tokenizer_cache[id(candidate)] = result
         return result
     detail = "; ".join(errors)
@@ -83,6 +88,51 @@ def _decoded_token_is_whitespace(tokenizer: Any, token_id: int) -> bool:
     except Exception:
         return False
     return bool(text) and text.isspace()
+
+
+def _whitespace_prefilter(
+    tokenizer: Any, vocab_size: int
+) -> tuple[dict[int, int], dict[int, int]] | None:
+    """Per-token bounds on how much trailing whitespace a token can add.
+
+    Returns ``(maybe, tail)``. ``maybe`` maps each token whose own decode is
+    empty (special tokens, a stripped leading space), whitespace, or holds a
+    replacement character (a partial multi-byte sequence that can complete
+    into U+0085 or U+00A0 with its neighbour) to an upper bound on the
+    characters it can contribute in context: the longer of its decode and
+    its piece, at least 1. Every other token decodes to a complete
+    non-whitespace character followed by a fixed whitespace tail that its
+    neighbours cannot change; ``tail`` holds that tail's length where it is
+    non-zero (``"}\\n\\n"`` -> 2). A trailing run therefore ends at the first
+    such token walking back from the end, and is at most the sum of the
+    bounds walked. Returns None, meaning "always decode", when the tokenizer
+    cannot give token lengths.
+    """
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if convert is None:
+        return None
+    maybe: dict[int, int] = {}
+    tail: dict[int, int] = {}
+    try:
+        for token_id in range(vocab_size):
+            try:
+                text = tokenizer.decode(
+                    [token_id],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                text = tokenizer.decode([token_id])
+            if text and not text.isspace() and "\ufffd" not in text:
+                trailing = len(text) - len(text.rstrip())
+                if trailing:
+                    tail[token_id] = trailing
+                continue
+            piece = convert(token_id)
+            maybe[token_id] = max(1, len(text), len(piece) if piece else 0)
+    except Exception:
+        return None
+    return maybe, tail
 
 
 def _trailing_json_whitespace(text: str) -> int:
@@ -122,7 +172,10 @@ class LLGuidanceJSONSchemaLogitsProcessor:
 
         import llguidance
 
-        self._tokenizer, ll_tokenizer, whitespace_tokens = _ll_tokenizer(tokenizer)
+        self._tokenizer, ll_tokenizer, whitespace_tokens, prefilter = _ll_tokenizer(
+            tokenizer
+        )
+        self._ws_prefilter = prefilter
         self._vocab_size = ll_tokenizer.vocab_size
         self._whitespace_tokens = whitespace_tokens
         eos_tokens = ll_tokenizer.eos_tokens
@@ -183,6 +236,41 @@ class LLGuidanceJSONSchemaLogitsProcessor:
             )
         self._consumed_suffix = list(suffix)
 
+    def _whitespace_run_reached(self, suffix: list[int]) -> bool:
+        """Whether the decoded suffix ends in a non-progress whitespace run.
+
+        Same answer as decoding the whole suffix every step, but the decode
+        only runs when the trailing tokens could form such a run (see
+        ``_whitespace_prefilter``), so a normal step costs O(1), not O(n):
+        the walk back stops at the first non-whitespace token or once the
+        bound reaches the limit, at most 256 tokens.
+        """
+        prefilter = self._ws_prefilter
+        if prefilter is not None:
+            maybe, tail = prefilter
+            vocab_size = self._vocab_size
+            limit = _MAX_NONPROGRESS_WHITESPACE_CHARS
+            bound = 0
+            for token in reversed(suffix):
+                if not 0 <= token < vocab_size:
+                    break  # unknown token: decode
+                width = maybe.get(token)
+                if width is None:
+                    if bound + tail.get(token, 0) < limit:
+                        return False
+                    break
+                bound += width
+                if bound >= limit:
+                    break
+            else:
+                return False  # the whole suffix bounds below the limit
+        decoded = self._tokenizer.decode(
+            suffix,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        return _trailing_json_whitespace(decoded) >= _MAX_NONPROGRESS_WHITESPACE_CHARS
+
     def _matcher_is_accepting(self) -> bool:
         try:
             return bool(self._matcher.is_accepting())
@@ -223,12 +311,7 @@ class LLGuidanceJSONSchemaLogitsProcessor:
         try:
             mask = llguidance.mlx.allocate_token_bitmask(1, self._vocab_size)
             llguidance.mlx.fill_next_token_bitmask(self._matcher, mask)
-            decoded = self._tokenizer.decode(
-                suffix,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            if _trailing_json_whitespace(decoded) >= _MAX_NONPROGRESS_WHITESPACE_CHARS:
+            if self._whitespace_run_reached(suffix):
                 for token_id in self._whitespace_tokens:
                     _clear_mask_token(mask, token_id)
             masked: mx.array = llguidance.mlx.apply_token_bitmask(logits, mask)
