@@ -101,6 +101,16 @@ def _request_uses_stochastic_sampling(request: Any) -> bool:
     return temperature not in (0, 0.0)
 
 
+def _detached_last_row(logits: mx.array) -> mx.array:
+    """The last position's logits as their own buffer (#105).
+
+    ``logits[:, -1, :]`` is a view: while it lives it pins the whole
+    ``(B, T, vocab)`` forward output (~1 GB per 2K-token chunk on a 248K
+    vocab). Callers rebind ``logits = None`` after taking this row.
+    """
+    return mx.contiguous(logits[:, -1, :])
+
+
 def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
     """Match mlx-lm's request sampler in log-probability space.
 
@@ -2322,7 +2332,8 @@ class MLLMBatchGenerator:
                         if hasattr(logits, "logits"):
                             logits = logits.logits
 
-                        last_logits = logits[:, -1, :]
+                        last_logits = _detached_last_row(logits)
+                        logits = None  # (#105) not held across the next row's prefill
 
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
@@ -2416,7 +2427,10 @@ class MLLMBatchGenerator:
                                 self._capture_dense_rope_delta(req)
 
                         # Extract last token logits
-                        last_logits = logits[:, -1, :]
+                        last_logits = _detached_last_row(logits)
+                        # (#105) The full forward output must not stay referenced through
+                        # cache admission below or the next row's prefill.
+                        logits = None
 
                         # Keep the cold request's first-token path identical
                         # whether or not a prompt snapshot will be published.

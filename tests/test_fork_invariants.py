@@ -4180,3 +4180,28 @@ def test_178_match_memo_preconditions_hold(tmp_path):
     idx.delete_entry((1, 2, 3))
     assert idx.version != v
     idx.close()
+
+
+# ------------- #174 first-token logits and MTP recordings are not held
+
+
+def test_174_mllm_first_token_sites_detach_the_row_and_drop_the_logits():
+    """``logits[:, -1, :]`` is a view that pins the whole (B, T, vocab)
+    forward output; a rebase restoring upstream's slice brings the hold back."""
+    import inspect
+
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+    src = inspect.getsource(MLLMBatchGenerator._process_prompts)
+    assert src.count("last_logits = _detached_last_row(logits)") == 2
+    # only the exact-hit rerun (a 1-token forward) still slices directly
+    assert src.count("last_logits = logits[:, -1, :]") == 1
+
+
+def test_174_mtp_filter_and_extend_drop_the_recording():
+    import inspect
+
+    from vllm_mlx import text_mtp
+
+    src = inspect.getsource(text_mtp._install_class_patches)
+    assert src.count("_drop_recording(self.prompt_cache)") == 2
