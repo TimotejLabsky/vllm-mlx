@@ -4520,3 +4520,195 @@ def test_175_armed_drafter_on_a_layout_without_its_classes_disables_loudly(
     assert any(r.levelno == logging.ERROR for r in caplog.records)
     assert not hasattr(gen._generation_batch, "_text_mtp")
     assert GenerationBatch._step is step_before
+
+
+# ------------- #177 a templated prompt's miss cuts its prefill at the shared prefix
+#
+# OFF by default, opt-in per route (VLLM_MLX_BATCHED_MISS_CUT=1). Every test
+# that exercises the cut arms it; the unarmed ones pin "exactly main".
+
+_FIX = list(range(1000, 1500))  # fixed instructions, before the item
+
+
+def _templated(seed):
+    """Instructions, then the item, then more fixed text (rules, JSON schema)."""
+    return _FIX + list(range(seed, seed + 80)) + list(range(5000, 6500))
+
+
+def _armed(monkeypatch, value="1"):
+    monkeypatch.setenv("VLLM_MLX_BATCHED_MISS_CUT", value)
+    return BatchedSystemKV(_FakeModel())
+
+
+def _cold_segments(kv, rid, tokens, cached=0):
+    """Run the insert hook for one request; return its segment lengths."""
+    generator = MagicMock()
+    request = _queued(rid, tokens[cached:])
+    request.cached_tokens = cached
+    request.prompt = None  # no template family -> no message boundaries
+    bkv.insert_segmented(kv, generator, request, tokens[cached:], {})
+    ([segments],), _kw = generator.insert_segments.call_args
+    return [len(seg) for seg in segments]
+
+
+def test_177_miss_cut_is_off_by_default(monkeypatch):
+    """Armed, the split prefill changed a 9B hybrid's T=0 output: the cut is
+    opt-in per route. Unset / 0 / anything not truthy leaves it unarmed."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MISS_CUT", raising=False)
+    assert BatchedSystemKV(_FakeModel()).miss_cut_on is False
+    for off in ("0", "", "no", "false", "off", "2"):
+        assert _armed(monkeypatch, off).miss_cut_on is False, off
+    for on in ("1", "true", "yes", "TRUE", " Yes "):
+        assert _armed(monkeypatch, on).miss_cut_on is True, on
+
+
+def test_177_unarmed_a_shared_prefix_miss_is_exactly_main(monkeypatch):
+    """Unarmed, a miss that shares the template prefix records nothing, the
+    cold prefill is one segment (no stop at the split), the stored entry has
+    no checkpoint, and the next templated call misses again: main's path."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MISS_CUT", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    second = _templated(61000)
+    assert kv.fetch(second, request_id="second") is None
+    assert "second" not in kv._divergence
+    assert kv.stats()["miss_cuts"] == 0
+    interval = kv.ckpt_interval  # the only stop: the uniform interval
+    assert _cold_segments(kv, "second", second) == [interval, len(second) - interval]
+    assert kv.divergence_cuts == 0
+    assert len(_FIX) not in kv._boundary_pos.get("second", ())
+    kv.capture_segment("second", interval, _donor_at(interval))
+    kv.store("second", second, _donor_at(len(second)))
+    ladders = [[cp["pos"] for cp in e["checkpoints"]] for e in kv._entries.values()]
+    assert ladders == [[], [interval]]  # no extra checkpoint at the split
+    assert kv.fetch(_templated(62000), request_id="third") is None
+    assert not kv._divergence
+
+
+def test_177_unarmed_a_hit_leaves_divergence_to_117(monkeypatch):
+    """Armed, a hit pops the request's recorded cut first; unarmed, fetch
+    must touch ``_divergence`` only the way #117 does (as on main)."""
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MISS_CUT", raising=False)
+    kv = BatchedSystemKV(_FakeModel())
+    _store_chain(kv, "first", _templated(60000), ckpts=(256,))
+    kv._divergence["again"] = 999  # e.g. a cut from an earlier fetch
+    exact = _templated(60000)[:300]  # extends nothing past the checkpoint
+    _cache, _remaining, pos = kv.fetch(exact, request_id="again")
+    assert pos == 256
+    assert kv._divergence["again"] == 999  # not divergent: #117 leaves it
+
+
+def test_177_a_templated_miss_cuts_the_prefill_where_it_parts_ways(monkeypatch):
+    """The previous call's entry has no checkpoint at or below the split (a
+    single user message: no marker there; the uniform interval is past it).
+    Armed, the miss must still checkpoint the split, so the NEXT call
+    restores it."""
+    kv = _armed(monkeypatch)
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    second = _templated(61000)
+    assert kv.fetch(second, request_id="second") is None
+    assert kv._divergence["second"] == len(_FIX)
+    assert kv.stats()["miss_cuts"] == 1
+
+    assert _cold_segments(kv, "second", second)[0] == len(_FIX)  # ends at split
+    assert len(_FIX) in kv._boundary_pos["second"]  # survives thinning
+    kv.capture_segment("second", len(_FIX), _donor_at(len(_FIX)))
+    kv.store("second", second, _donor_at(len(second)))
+
+    _cache, _remaining, pos = kv.fetch(_templated(62000), request_id="third")
+    assert pos == len(_FIX)
+    assert "third" not in kv._divergence  # a hit at the split: nothing to cut
+
+
+def test_177_no_miss_cut_under_the_floor_or_when_off(monkeypatch):
+    kv = _armed(monkeypatch)
+    _store_chain(kv, "first", _FIX[:200] + list(range(60000, 61600)), ckpts=())
+    assert kv.fetch(_FIX[:200] + list(range(70000, 71600)), "short") is None
+    assert "short" not in kv._divergence  # shares < partial_min: unrelated
+
+    kv = _armed(monkeypatch, "0")
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    assert kv.fetch(_templated(61000), request_id="second") is None
+    assert "second" not in kv._divergence and kv.stats()["miss_cuts"] == 0
+
+
+def test_177_a_later_hit_drops_the_cut_a_miss_recorded(monkeypatch):
+    """Lazy routes match again at admission: a cut recorded by the enqueue
+    miss must not outlive a hit that restores past it."""
+    kv = _armed(monkeypatch)
+    _store_chain(kv, "first", _templated(60000), ckpts=())
+    second = _templated(61000)
+    assert kv.fetch(second, request_id="second") is None
+    assert "second" in kv._divergence
+    landed = len(second) - 100  # an entry that landed while it waited
+    _store_chain(kv, "leader", second + [9], ckpts=(landed,))
+    _cache, _remaining, pos = kv.fetch(second, request_id="second")
+    assert pos == landed and "second" not in kv._divergence
+
+
+def test_177_armed_miss_scan_reads_the_178_memo(monkeypatch):
+    """#178 promises one bag scan per admission sequence: the armed miss
+    path's LCP pass must come from the memo _best_match_locked just filled,
+    and still see every entry (the cut uses the max over the whole bag)."""
+    kv = _armed(monkeypatch)
+    _store_chain(kv, "a", _templated(60000), ckpts=())
+    _store_chain(kv, "b", _FIX[:300] + list(range(70000, 71000)), ckpts=())
+    second = _templated(61000)
+    kv.open_match_memo("second", second)
+    calls = []
+    real = bkv.common_prefix_len
+    monkeypatch.setattr(
+        bkv, "common_prefix_len", lambda a, b: calls.append(1) or real(a, b)
+    )
+    assert kv.fetch(second, request_id="second") is None
+    assert len(calls) == 2  # one per entry, not two
+    assert kv._divergence["second"] == len(_FIX)
+    kv.close_match_memo("second")
+
+
+def _flood(kv, n=40, shared=600):
+    """``n`` marker-less prompts under one ``shared``-token prefix, each with
+    a 0-40-token coincidental shared head after it, served one at a time:
+    fetch -> insert hook -> capture at each segment stop -> store."""
+    import random
+
+    rng = random.Random(7)  # fixed: 6 cuts, 33/40 restores >= 600 when armed
+    prefix = list(range(1000, 1000 + shared))
+    head = list(range(90000, 90040))
+    restores = []
+    for i in range(n):
+        own = list(range(100000 + i * 1000, 100200 + i * 1000))
+        tokens = prefix + head[: rng.randint(0, 40)] + own
+        rid = f"r{i}"
+        hit = kv.fetch(tokens, request_id=rid)
+        cached = hit[2] if hit else 0
+        restores.append(cached)
+        done = cached
+        for length in _cold_segments(kv, rid, tokens, cached)[:-1]:
+            done += length
+            kv.capture_segment(rid, done - cached, _donor_at(done))
+        kv.store(rid, tokens, _donor_at(len(tokens)))
+    return restores
+
+
+def test_177_a_shared_system_prompt_flood_does_not_cut_per_request(monkeypatch):
+    """Reviewer's scenario: armed, 40 unrelated prompts with no message
+    markers share exactly one ~600-token prefix, through a 4-slot bag. The
+    cut fires once per new LCP low (re-minted only after its lowest holder
+    is evicted), most requests restore at the shared prefix or deeper, and
+    hits inherit the cut's checkpoint by reference: not one checkpoint (or
+    copy) per request."""
+    monkeypatch.setenv("VLLM_MLX_SYSTEM_KV_SLOTS", "4")
+    kv = _armed(monkeypatch)
+    restores = _flood(kv)
+    assert restores[0] == 0
+    assert 1 <= kv.miss_cuts <= 8, kv.miss_cuts  # not ~40
+    assert sum(pos >= 600 for pos in restores) >= 30, restores
+    states = {id(cp["states"]) for e in kv._entries.values() for cp in e["checkpoints"]}
+    assert len(states) == 1, len(states)  # one checkpoint copy in the bag
+    assert not kv._divergence and not kv._pending
+
+    monkeypatch.delenv("VLLM_MLX_BATCHED_MISS_CUT")
+    kv = BatchedSystemKV(_FakeModel())
+    assert _flood(kv) == [0] * 40  # unarmed: as on main, nothing restores
+    assert kv.miss_cuts == 0

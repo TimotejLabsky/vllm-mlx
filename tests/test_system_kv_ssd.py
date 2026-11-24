@@ -579,3 +579,33 @@ def test_min_free_pct_env_default_173(monkeypatch):
     assert SystemKVSSDConfig(cache_dir="x").min_free_pct == 15.0
     monkeypatch.setenv("VLLM_MLX_SSD_MIN_FREE_PCT", "junk")
     assert SystemKVSSDConfig(cache_dir="x").min_free_pct == 10.0
+
+
+def test_177_entry_cap_comes_from_the_env(monkeypatch):
+    """#177: the tier's entry cap was a fixed 64. A daily batch of more
+    distinct prompts than that cycled through LRU and never hit."""
+    monkeypatch.delenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", raising=False)
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 64
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "nonsense")
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 64
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "256")
+    assert SystemKVSSDConfig(cache_dir="unused").max_entries == 256
+
+    monkeypatch.setenv("VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES", "3")
+    d = tempfile.mkdtemp(prefix="skv-ssd-")
+    try:
+        store = SystemKVSSDStore(SystemKVSSDConfig(cache_dir=d, max_size_gb=999.0))
+        from vllm_mlx.system_kv_ssd import _snapshot_nbytes
+
+        for base in (0, 1000, 2000, 3000):
+            snap = _make_hybrid_snapshot(seq=32)
+            toks = tuple(range(base, base + 40))
+            tensors, meta = flatten_snapshot(snap)
+            store._write_entry(
+                toks, tensors, meta, [], None, None, _snapshot_nbytes(snap)
+            )
+        assert store._index.get_entry_count() == 3
+        assert store._index.lookup_prefix(tuple(range(0, 40))) == []  # LRU went
+        store.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
