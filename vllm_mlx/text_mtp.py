@@ -408,6 +408,7 @@ def _install_class_patches() -> None:
             state = getattr(self, "_text_mtp", None)
             if state is not None:
                 state.forget()
+                _drop_recording(self.prompt_cache)
             return result
 
         def extend(self, batch):
@@ -416,6 +417,7 @@ def _install_class_patches() -> None:
             state = getattr(self, "_text_mtp", None)
             if state is not None:
                 state.forget()
+                _drop_recording(self.prompt_cache)
             return result
 
         GenerationBatch._step = _step
@@ -491,6 +493,17 @@ def _recording_gdn_call(self, inputs, mask=None, cache=None):
 
 def _is_recurrent(c: Any) -> bool:
     return not c.is_trimmable()
+
+
+def _drop_recording(cache: List[Any]) -> None:
+    """(#105) Free the last verify's per-position recurrent states and conv
+    window. Only from a clean state (after ``_sync``): nothing can roll back
+    into them, and the next verify writes its own. Left in place they stay
+    pinned on every recurrent layer for as long as the row lives, including
+    every step it runs bypassed beside another request's prefill."""
+    for c in cache:
+        if getattr(c, "_text_mtp_spec", None) is not None:
+            c._text_mtp_spec = None
 
 
 def _rollback(cache: List[Any], held: int, keep: int) -> None:
