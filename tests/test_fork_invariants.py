@@ -4892,3 +4892,38 @@ def test_179_kernels_resolve_through_the_compat_module_and_bind():
     assert [stock for stock, _ in targets] == [Qwen3NextSparseMoeBlock]
     assert moe_kernels._swiglu_class() is not None
     assert set(moe_kernels.status()) == {"armed", "blocks", "skipped", "error"}
+
+
+def test_181_vision_unified_is_inert_until_installed():
+    """#181 patches mlx-lm's BatchKVCache class and wraps RoPE modules, so
+    nothing may do it at import: a route without ``--vision-unified`` must
+    run stock mlx-lm. (The #181 tests restore the class after installing.)"""
+    import importlib
+
+    from mlx_lm.models.cache import BatchKVCache
+
+    import vllm_mlx.vision_unified as vu
+
+    importlib.reload(vu)
+    assert not getattr(BatchKVCache.merge, "__vllm_mlx_181__", False)
+    assert not getattr(BatchKVCache.extract, "__vllm_mlx_181__", False)
+    model = _tiny_qwen3_5()
+    for layer in model.language_model.layers:
+        if not layer.is_linear:
+            assert type(layer.self_attn.rope).__name__ == "RoPE"
+
+
+def test_181_rope_dispatch_without_positions_is_bit_identical():
+    """With the #181 dispatch installed and no media positions set, every
+    text forward is the stock nn.RoPE call: logits bit-equal."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_mlx import vision_unified as vu
+
+    model = _tiny_qwen3_5().language_model
+    tokens = mx.array([[1, 5, 9, 2, 7, 3]])
+    before = model(tokens, cache=make_prompt_cache(model))
+    assert vu.install_mrope(model, [2, 1, 1]) > 0
+    after = model(tokens, cache=make_prompt_cache(model))
+    assert mx.array_equal(before, after)
