@@ -47,6 +47,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import vision_unified as _vu
+
 logger = logging.getLogger(__name__)
 
 ENV_DRAFTER = "VLLM_MLX_TEXT_MTP_DRAFTER"
@@ -281,7 +283,7 @@ class TextMTP:
 
     def count_bypass(self, key: str) -> None:
         with self.lock:
-            self.bypass[key] += 1
+            self.bypass[key] = self.bypass.get(key, 0) + 1
 
 
 class _BatchState:
@@ -714,6 +716,8 @@ def _bypass_reason(batch: Any, state: _BatchState) -> Optional[str]:
         return "disabled"
     if len(batch.uids) != 1:
         return "concurrent_batch"
+    if _vu.batch_has_media_row(batch.prompt_cache):
+        return "media_row"  # (#181) never drafts for an image request
     processors = (batch.logits_processors or [None])[0] or ()
     for p in processors:
         if not (

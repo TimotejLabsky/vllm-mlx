@@ -126,6 +126,31 @@ def serve_command(args):
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
+    if getattr(args, "vision_unified", False):
+        # (#181) refuse every combination the unified route cannot honour,
+        # before any download; load_model re-checks the same rules.
+        from .vision_unified_engine import (
+            VisionUnifiedError,
+            check_vision_unified_config,
+        )
+
+        try:
+            check_vision_unified_config(
+                use_batching=args.continuous_batching,
+                force_text_only=getattr(args, "text_only", False),
+                force_mllm=getattr(args, "mllm", False),
+                auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+                lazy_load_model=args.lazy_load_model,
+                mllm_draft_model=mllm_draft_model,
+                enable_mtp=getattr(args, "enable_mtp", False),
+                compile=getattr(args, "compile", False),
+                models_config=models_config,
+                max_kv_size=int(max_kv_size or 0),
+                chunked_prefill_tokens=getattr(args, "chunked_prefill_tokens", 0),
+            )
+        except VisionUnifiedError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
     # Configure server security settings
     server._api_key = args.api_key
@@ -283,6 +308,22 @@ def serve_command(args):
                 f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
                 f"(source={mllm_route.source})"
             )
+            if getattr(args, "vision_unified", False):
+                # (#181) the checkpoint itself must be one the route serves
+                from .vision_unified_engine import (
+                    VisionUnifiedError,
+                    checkpoint_support,
+                    read_checkpoint_config,
+                )
+
+                try:
+                    model_type, _ = checkpoint_support(
+                        read_checkpoint_config(resolved_model_path or model_arg)
+                    )
+                except VisionUnifiedError as e:
+                    print(f"Error: {e}")
+                    sys.exit(1)
+                logger.info(f"Model route: vision-unified (model_type={model_type})")
         if args.lazy_load_model:
             print(f"Registering model for lazy load: {model_arg}")
             print("Model will load on the first request.")
@@ -475,6 +516,7 @@ def serve_command(args):
             force_mllm=(
                 False
                 if getattr(args, "text_only", False)
+                or getattr(args, "vision_unified", False)  # (#181)
                 else (
                     mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
                 )
@@ -501,6 +543,7 @@ def serve_command(args):
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
             compile=getattr(args, "compile", False),
+            vision_unified=getattr(args, "vision_unified", False),
         )
 
     # Start server
@@ -1607,6 +1650,18 @@ Examples:
             "processor metadata that breaks AutoProcessor while the language "
             "weights are sound; mlx_lm's strict=False fallback discards "
             "vision_tower.* tensors and serves it as text-only."
+        ),
+    )
+    serve_parser.add_argument(
+        "--vision-unified",
+        action="store_true",
+        help=(
+            "(fork #181) One engine for text AND images on a Qwen3.5-family "
+            "checkpoint with a vision tower: loaded once through mlx-vlm, "
+            "text and image requests share the --text-only batched scheduler "
+            "(text requests run exactly as on --text-only). Requires "
+            "--continuous-batching; excludes --text-only and --mllm. "
+            "Default off."
         ),
     )
     serve_parser.add_argument(

@@ -31,11 +31,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -255,3 +258,198 @@ def media_prefill(
                 input_embeddings=input_embeddings[:, start:end],
             )
         mx.eval([c.state for c in cache])
+
+
+# ---------------------------------------------------------------------------
+# Media inputs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MediaInputs:
+    """One request's processed images, host-side (numpy) so nothing lazy
+    crosses threads. Carried on ``Request.images`` as a one-item list."""
+
+    input_ids: list
+    pixel_values: np.ndarray
+    image_grid_thw: np.ndarray
+    image_digests: tuple = ()
+    n_images: int = 0
+    image_tokens: int = 0
+    preprocess_s: float = 0.0
+    stats: dict = field(default_factory=dict)
+
+
+def media_of(request: Any) -> Optional[MediaInputs]:
+    """The :class:`MediaInputs` of a media request on a --vision-unified
+    route, else None. A plain attribute read for every text request."""
+    images = getattr(request, "images", None)
+    if images and isinstance(images[0], MediaInputs):
+        return images[0]
+    return None
+
+
+def _np(value: Any) -> np.ndarray:
+    import mlx.core as mx
+
+    if isinstance(value, mx.array):
+        return np.array(value)
+    return np.asarray(value)
+
+
+# ---------------------------------------------------------------------------
+# Per-scheduler media hooks (run on the generation worker)
+# ---------------------------------------------------------------------------
+
+
+class MediaRows:
+    """Attached to the text ``Scheduler`` as ``_vision_unified``. Owns the
+    mlx-vlm model whose vision tower and ``get_input_embeddings`` encode a
+    media request at schedule time."""
+
+    def __init__(self, vlm_model: Any, mrope_section: list):
+        self.vlm = vlm_model
+        cfg = getattr(vlm_model, "config", None)
+        self.image_token_id = getattr(cfg, "image_token_id", None) or getattr(
+            cfg, "image_token_index", None
+        )
+        self.video_token_id = getattr(cfg, "video_token_id", None)
+        self.vision_end_id = getattr(cfg, "vision_end_token_id", None)
+        self.mrope_section = mrope_section
+        self._lock = threading.Lock()
+        self.counters = {
+            "media_requests": 0,
+            "media_images": 0,
+            "media_image_tokens": 0,
+            "media_prefill_tokens": 0,
+            "media_encode_prefill_s": 0.0,
+            "media_errors": 0,
+        }
+
+    def stats(self) -> dict:
+        with self._lock:
+            out = dict(self.counters)
+        out["media_encode_prefill_s"] = round(out["media_encode_prefill_s"], 3)
+        return out
+
+    def count(self, **deltas) -> None:
+        with self._lock:
+            for k, v in deltas.items():
+                self.counters[k] = self.counters.get(k, 0) + v
+
+    def media_cut(self, ids: list) -> int:
+        """Tokens prefilled out of band: through the end of the LAST image
+        (its vision_end marker when present), never the final token."""
+        last = -1
+        for i in range(len(ids) - 1, -1, -1):
+            if ids[i] == self.image_token_id or ids[i] == self.video_token_id:
+                last = i
+                break
+        if last < 0:
+            raise ValueError("media request has no image tokens")
+        cut = last + 1
+        if (
+            self.vision_end_id is not None
+            and cut < len(ids)
+            and ids[cut] == (self.vision_end_id)
+        ):
+            cut += 1
+        return min(cut, len(ids) - 1)
+
+    def prefill(self, scheduler: Any, request: Any) -> tuple:
+        """Encode + prefill one media request. Returns ``(tokens_to_process,
+        cache)`` for ``BatchGenerator.insert``."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        media = media_of(request)
+        tic = time.perf_counter()
+        ids_list = list(media.input_ids)
+        ids = mx.array([ids_list])
+        feats = self.vlm.get_input_embeddings(
+            ids,
+            mx.array(media.pixel_values),
+            image_grid_thw=mx.array(media.image_grid_thw),
+        )
+        emb, pos, deltas = feats.inputs_embeds, feats.position_ids, feats.rope_deltas
+        if pos is None or pos.ndim != 3:
+            raise ValueError("vision model returned no 3-axis positions")
+        delta = int(deltas.reshape(-1)[0].item())
+        cut = self.media_cut(ids_list)
+        cache = make_prompt_cache(scheduler.model)
+        step = int(getattr(scheduler.config, "prefill_step_size", 2048) or 2048)
+        media_prefill(
+            scheduler.model,
+            ids[:, :cut],
+            emb[:, :cut],
+            pos[:, :, :cut],
+            cache,
+            step=step,
+        )
+        set_rope_delta(cache, delta)
+        del feats, emb, pos
+        elapsed = time.perf_counter() - tic
+        self.count(
+            media_requests=1,
+            media_images=media.n_images,
+            media_image_tokens=media.image_tokens,
+            media_prefill_tokens=cut,
+            media_encode_prefill_s=elapsed,
+        )
+        media.stats.update(delta=delta, cut=cut, encode_prefill_s=round(elapsed, 3))
+        logger.info(
+            "[vision_unified] request=%s images=%d image_tokens=%d "
+            "prefilled=%d/%d delta=%d encode+prefill=%.2fs",
+            request.request_id[:12],
+            media.n_images,
+            media.image_tokens,
+            cut,
+            len(ids_list),
+            delta,
+            elapsed,
+        )
+        return ids_list[cut:], cache
+
+
+def mark_uncached(request: Any) -> None:
+    """(stage 2) A media request reads no cache: a cold miss."""
+    request.cache_hit_type = "miss"
+    request.prompt_cache = None
+    request.cached_tokens = 0
+    request.remaining_tokens = request.prompt_token_ids
+
+
+def prefill_media_row(scheduler: Any, request: Any) -> tuple:
+    rows = getattr(scheduler, "_vision_unified", None)
+    if rows is None:
+        raise RuntimeError("media request on a scheduler without --vision-unified")
+    return rows.prefill(scheduler, request)
+
+
+def count_media_error(scheduler: Any) -> None:
+    rows = getattr(scheduler, "_vision_unified", None)
+    if rows is not None:
+        rows.count(media_errors=1)
+
+
+def release_media_request(scheduler: Any, request_id: str, request: Any) -> None:
+    """_cleanup_finished for a media request: nothing is stored (stage 2);
+    drop any pending checkpoint ladder and the extraction reference."""
+    hybrid_kv = getattr(scheduler, "hybrid_kv", None)
+    if hybrid_kv is not None:
+        hybrid_kv.discard_pending(request_id)
+    request._extracted_cache = None
+
+
+def batch_has_media_row(cache: Any) -> bool:
+    """True when any row of a batch cache carries a RoPE delta (a media row
+    after its prefill). Answers False unless the #181 patch is installed."""
+    if not _BATCH_PATCHED or not cache:
+        return False
+    for layer in cache:
+        offset = getattr(layer, "offset", None)
+        left = getattr(layer, "left_padding", None)
+        idx = getattr(layer, "_idx", None)
+        if isinstance(offset, mx.array) and left is not None and idx is not None:
+            return bool(mx.any(offset != (idx - left)).item())
+    return False

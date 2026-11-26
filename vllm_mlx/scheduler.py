@@ -29,6 +29,7 @@ from .batch_compat import (
     _sanitize_batch_generator_logits_processors,
 )
 from . import batched_system_kv as _batched_kv
+from . import vision_unified as _vu
 from . import recurrent_state_eval as _recurrent_eval
 from .cache_state_compat import (
     from_legacy_state,
@@ -2256,7 +2257,9 @@ class Scheduler:
                 )
 
         # Check prefix cache for cached KV state
-        if self.hybrid_kv is not None:
+        if _vu.media_of(request) is not None:
+            _vu.mark_uncached(request)  # (#181) media on --vision-unified
+        elif self.hybrid_kv is not None:
             _batched_kv.fetch_for_request(self.hybrid_kv, request)
         elif self.block_aware_cache is not None:
             # Use paged cache
@@ -2671,6 +2674,25 @@ class Scheduler:
                 )
             lp = combined_lp
 
+            # (#181) a media request on a --vision-unified route: encode its
+            # images and prefill through the last one out of band; the rest
+            # is inserted like a prefix-cache hit.
+            media = _vu.media_of(request)
+            if media is not None:
+                try:
+                    tokens_to_process, cache_to_use = _vu.prefill_media_row(
+                        self, request
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[vision_unified] request={request.request_id[:12]} "
+                        f"media prefill failed: {e}",
+                        exc_info=True,
+                    )
+                    _vu.count_media_error(self)
+                    self._reject_at_schedule(request, "media_error")
+                    continue
+
             # Per-request sampler (fork patch #33): the generator-level
             # fallback sampler carries only the FIRST request's
             # (temperature, top_p, min_p) — top_k was dropped entirely and
@@ -2722,7 +2744,7 @@ class Scheduler:
             }
 
             def _do_insert(toks):
-                if self.hybrid_kv is not None:
+                if self.hybrid_kv is not None and media is None:
                     return _batched_kv.insert_segmented(
                         self.hybrid_kv, self.batch_generator, request,
                         toks, insert_kwargs,
@@ -2733,7 +2755,7 @@ class Scheduler:
             try:
                 uids = _do_insert(tokens_to_process)
             except Exception as e:
-                if cache_to_use is not None:
+                if cache_to_use is not None and media is None:
                     logger.warning(
                         f"[cache_insert_error] request={request.request_id[:12]} "
                         f"cache insert failed ({e}), retrying without cache"
@@ -3126,7 +3148,7 @@ class Scheduler:
             # window wraps (RotatingKVCache.is_trimmable() is offset<max_size),
             # while its PoolingCache cannot split a pooled window. That data is
             # gone, so no trim can recover it.
-            if request.num_output_tokens == 0:
+            if request.num_output_tokens == 0 and _vu.media_of(request) is None:
                 self._store_prompt_only_cache(request, response)
 
             # Append token to request
@@ -3262,7 +3284,8 @@ class Scheduler:
                 self._cleanup_detokenizer(request_id)
 
                 # Extract cache for future reuse (critical for agentic multi-turn)
-                if hasattr(response, "prompt_cache"):
+                # (#181) media rows are not cached
+                if hasattr(response, "prompt_cache") and _vu.media_of(request) is None:
                     try:
                         # prompt_cache may be callable or direct attribute
                         if callable(response.prompt_cache):
@@ -3313,7 +3336,9 @@ class Scheduler:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
-            if request is not None and request.prompt_token_ids:
+            if request is not None and _vu.media_of(request) is not None:
+                _vu.release_media_request(self, request_id, request)  # (#181)
+            elif request is not None and request.prompt_token_ids:
                 if self.hybrid_kv is not None:
                     _batched_kv.store_finished(self.hybrid_kv, request_id, request)
 

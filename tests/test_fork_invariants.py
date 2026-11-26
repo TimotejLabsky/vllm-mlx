@@ -4927,3 +4927,44 @@ def test_181_rope_dispatch_without_positions_is_bit_identical():
     assert vu.install_mrope(model, [2, 1, 1]) > 0
     after = model(tokens, cache=make_prompt_cache(model))
     assert mx.array_equal(before, after)
+
+
+def test_181_text_requests_take_no_media_branch():
+    """Every #181 seam in the scheduler keys on ``media_of(request)``; it
+    must be None for anything but the unified engine's MediaInputs, so a
+    text request (and every request on a flag-off route) takes the
+    unchanged path."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_mlx import vision_unified as vu
+    from vllm_mlx.request import Request, SamplingParams
+
+    for images in (None, [], ["data:image/png;base64,AAAA"], [{"url": "x"}]):
+        r = Request(
+            request_id="r",
+            prompt=[1, 2],
+            sampling_params=SamplingParams(max_tokens=1),
+            images=images,
+        )
+        assert vu.media_of(r) is None
+    m = vu.MediaInputs(
+        input_ids=[1], pixel_values=np.zeros(1), image_grid_thw=np.zeros(3)
+    )
+    assert vu.media_of(SimpleNamespace(images=[m])) is m
+
+
+def test_181_off_route_server_seams_equal_engine_is_mllm():
+    """Flag off, the two server seams are the old ``engine.is_mllm`` reads."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.vision_unified_engine import engine_serves_media, request_is_mllm
+
+    img = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}
+    ]
+    for flag in (False, True):
+        eng = SimpleNamespace(is_mllm=flag)
+        assert request_is_mllm(eng, img) is flag
+        assert engine_serves_media(eng) is flag
