@@ -36,6 +36,8 @@ inside mlx's Metal kernels:
 | upstream #606 `train(False)` cherry-pick | ~6× prefill (2026-06) |
 | mlx-lm pin lift to `f4f3b57` (fp32 co-batch promotion fix) | removed whole-batch fp32 KV promotion when cold+warm co-batch |
 | memory-pressure relief (#48, #53) | not a speedup — removes the crash ceiling that throttled long-context use |
+| launchd `ProcessType=Interactive` on the llama-swap daemon (infra change, applied 2026-11-24) | decode at a ~4K prompt 93.14 → 99.65 tok/s (+7 %, 35B-A3B only; priority 20 → 31); ~0.3 % at 60K, prefill unchanged. See the 2026-11-24 (later) section below |
+| #179 opt-in MoE single-token decode kernels (`VLLM_MLX_MOE_DECODE_KERNELS=1`, armed on the 35B-A3B route) | +13.8 % decode on fresh processes at ~4K (87.43 → 99.47 tok/s, n=6); changes T=0 output, so opt-in. See the 2026-11-24 (later) section below |
 
 ## Refuted levers (do NOT re-propose without new evidence)
 
@@ -55,6 +57,8 @@ inside mlx's Metal kernels:
 | 12 | oMLX 0.7.3 in-place batch KV update (#4916) | N/A: oMLX's own table shows 0 change with MTP off at 1–8 streams, and we run MTP off. Measured on our box the fork already uses less: peak RSS 5.8 vs 7.4 GB | 2026-11-01 PR read + head-to-head |
 | 13 | oMLX 0.7.3 shared system-prompt snapshot (#4994) | No gap: the fork already reuses it. 7.4K system prompt, 5 concurrent: warm TTFT 0.45 vs 1.00 s, sequential 0.16 vs 0.23 s, cached 7424 vs 7427 | 2026-11-01 head-to-head |
 | 14 | Load-time warm-up generation (fork issue #112; oMLX "cold shader cache" claim; env-gated prototype built and measured, then dropped, not shipped) | REAL GAP, NO NET WIN on spawn-triggered requests. First request after spawn pays ~1.1 s (9B hybrid dense, TTFT 1.50 vs 0.42 s, n=5) to ~2.0 s (35B-A3B MoE, 2.28 vs 0.30 s, n=5) of one-time cost plus first-request decode 83 vs 92 tok/s; a 1-token warm-up removes it from the first request but adds the same cost (+1.3 s 9B, +1.5-2.3 s MoE) to ready time. Spawn+first-request total 5.77→5.96 s (9B), 10.66→11.0 s (MoE). Only useful if a spawn is triggered with no waiting client (idle preload) — none exists on this box. Prototype lives on PR #131's branch `probe/112-load-warmup` | 2026-11-23 spare-port A/B |
+| 15 | Gated-delta recurrent-state low-rank store (mlx-lm #2101, fork issue #115) | KILLED. SVD of the 128x128 per-head states in 5 live SSD entries (27B-8bit at 9K / 23K / 55K / 84K tokens, 35B-A3B at 11K): rank for 99.9 % energy median 17-21 of 128 (worst head 105-106), i.e. 2.2-2.4x on recurrent bytes with adaptive per-matrix rank (4.6x on the 35B), 1.7-1.9x at 99.99 % (the more defensible fidelity bar), below 1x with any fixed rank. Recurrent state is only 16 % of an 84K 27B entry (61 % at 9K), so the whole-entry saving is 9-36 %. Lossy, and needs variable-size tensors the safetensors layout does not have. If SSD bytes on recurrent state ever matter, plain bf16 storage of the float32 state is the simpler 2x. Energy is a proxy; resume fidelity (T=0) was not tested | 2026-11-24 offline CPU read of live SSD entries |
+| 16 | 5-bit mixed oQ5 build of the 35B-A3B (`deepsweet/Qwen3.6-35B-A3B-MLX-oQ5`, fork issue #113) | KILLED. Loads on the pinned mlx-lm and arms #96 fusion + #179 kernels (40 blocks), but vs the route's 4-bit DWQ (spare port, fresh process per run, 5 interleaved rounds, T=0, 300 tokens, same build and env): decode at 4K 99.77 → 91.46 tok/s (**-8.3 %**, ranges do not overlap), at 32K 76.14 → 74.37 (-2.3 %); prefill -5.6 % / -5.1 %; Metal active +3.78 GB. Quality stage NOT run (memory guard + clean window ended); a 20-prompt smoke cannot show a gain of the size its KLD implies (0.0235 vs oQ4 0.047, vendor data, DWQ not in their table), so the 4K decode loss alone triggers the kill. 35B-A3B only | 2026-11-24 spare-port A/B |
 
 ### Methodology lessons (paid for, don't re-learn)
 
@@ -68,6 +72,22 @@ inside mlx's Metal kernels:
   live, #97 amplified to zero. Always confirm with the end-to-end A/B.
 - **A/B throughput claims from tiny models don't scale down-column** — an
   overhead that is 11.6% at 2370 tok/s is 0.5% at 78 tok/s (lever 9).
+- **Polling a model's status through llama-swap `/upstream/<model>/...` resets
+  that model's idle TTL** (2026-11-24). Use llama-swap `/running` plus the route
+  log tails to check for pollution.
+- **Live-route decode numbers from before the `ProcessType` change (2026-11-24,
+  ~14:45 CET) are ~7 % low at short contexts** (priority 20 instead of 31) and
+  are not comparable with later ones. Spare-port processes started from an SSH
+  session ran at priority 31, so a launchd-spawned route and a spare-port A/B
+  disagreed until this was found.
+- **Size a trial model against everything that can load on demand.** Trial
+  models co-resident with on-demand live routes (embedding, the 27B-8bit cron
+  route) drove the box to critical memory pressure twice on 2026-11-24 (swap
+  ~7 to ~19 GB in one case; the guard killed the spare each time). Count the
+  embedding route and the cron route in the fit check.
+- **LiteLLM has a local response cache** (`cache: true`): an identical request
+  through it replays from memory in ~27 ms and never reaches the engine. Any
+  bench through LiteLLM must send `cache: {"no-cache": true}` and unique prompts.
 
 ### 2026-09-04 — cross-engine benchmark round (see engine-benchmarks-2026-09.md)
 
@@ -464,3 +484,45 @@ Full write-up in PATCHES.md #159/#160; data in `reports/mtp-drafter-2026-11-16/`
 - **Shipped: match-memo (#109 → #178).** One request's admission sequence scans the bag once instead of once per question: saves 4-25 ms per deep request at 1-4 deep chains (8 x 100K: 67.7 → 24.2 ms; LCP calls 50 → 10). Laptop M1 Pro, n=15 medians; low priority, kill switch `VLLM_MLX_BATCHED_MATCH_MEMO=0`.
 - **Shipped: llguidance whitespace prefilter (#126 → #176).** The per-step whole-suffix decode now runs only when a 256-char whitespace run is possible: 0.46 / 1.03 → 0.31 / 0.45 ms per step at 500 / 2,000 tokens (laptop, real Qwen3 tokenizer). ~0.6 ms/step at 2K tokens, no deploy urgency.
 - **Opt-in: templated-prompt reuse (#127 → #177).** Miss-cut checkpoints plus a SSD entry-cap knob (`VLLM_MLX_SSD_SYSTEM_KV_MAX_ENTRIES`); worth ~2 min/day on the 27B classifier. See the 2026-11-23 section above. Real-server behaviour unchecked.
+
+### 2026-11-24 (later) — bench verdicts: launch context, MoE kernels in production, per-hop TTFT, model trials
+
+Numbers are from the verdict comments on fork issues #111, #113, #114, #115 and infra issues #1151 and #1156 (private repo; numbers and mechanism only).
+
+- **launchd `ProcessType` (infra issue #1151): CONFIRMED, APPLIED 2026-11-24.** A launchd job with no `ProcessType` runs at scheduling priority 20 (spawn type daemon, jetsam priority 40); an SSH-started process is 31. llama-swap sets nothing on its children, so every route inherits 20. Qwen3.6-35B-A3B-4bit, deployed build, MoE kernels armed, T=0, 300 tokens, spare port, ~4K prompt, n=4 per variant:
+
+| How the server is started | Priority | Decode tok/s, median (min-max) |
+|---|---|---|
+| From SSH (control) | 31 | 99.61 (99.49-99.70) |
+| launchd, `ProcessType=Interactive` | 31 | 99.65 (99.54-99.77) |
+| `nice -n 10` | 31 | 99.52 (99.38-99.71) |
+| launchd, no `ProcessType` (previous setup) | 20 | 93.14 (92.36-93.72) |
+| launchd, `ProcessType=Standard` | 20 | 93.27 (92.15-94.00) |
+| `taskpolicy -c utility` | 20 | 92.41 (91.87-93.27) |
+| `taskpolicy -c background` | 4 | 15.15 (15.02-15.32) |
+
+  - The cost is host-side work between GPU steps: ~7 % at a 4K context, ~0.3 % at 60K (cold ~60K request, n=2: TTFT 68.4-68.7 s in all three of control / no `ProcessType` / `Interactive`; decode 63.34 / 63.25 / 63.42 tok/s). Prefill is unaffected. It helps short-context traffic (voice, classifiers), not deep agent sessions. `Standard` does nothing; `Background` (and `Adaptive` when backgrounded) is catastrophic, never use.
+  - Applied to the llama-swap daemon plist with a daemon reload; routes now run at priority 31. Live 35B route, same prompts and harness: direct 93.5 (n=3) → 100.7-100.9 (n=2, one further run 98.8); via llama-swap 92.0 (n=3) → 100.8-100.9 (n=3). **Caveat: the "after" requests were prefix-cache hits and the "before" ones were cold** (decode is measured after the first token in both, but the conditions are not strictly identical).
+  - **Measured on the 35B-A3B only.** The mechanism is model-independent; the gain on the 27B, 14B or vision routes is an expectation, not a measurement.
+  - Gotcha recorded in the infra plist: do not chain `launchctl bootstrap` after `bootout` with `&&` (bootout can return non-zero while still stopping the service; the bootstrap then never runs and the daemon stays down).
+
+- **MoE decode kernels (#179, fork issue #111) under production conditions.** The 2026-11-23 standalone verdict (+14 %, T=0 changes, do not port by default) stands; #179 later shipped as an opt-in (`VLLM_MLX_MOE_DECODE_KERNELS=1`, default OFF, `Qwen3NextSparseMoeBlock` single-token forwards only) and is armed on the 35B-A3B route. Earlier server A/B on PR #133 (spare port): 87.6 → 99.5 tok/s, **+13.6 % at 4K, +10.9 % at 32K, T=0 output changes, 1 of 20 prompts byte-identical.** Re-check on the deployed build `37428071` (same ~4K prompts, T=0, 300 tokens, live 35B + voice resident, 35B-A3B only):
+
+| Condition | n | Decode tok/s, median (min-max) |
+|---|---|---|
+| Fresh spare-port process, kernels off | 6 | 87.43 (86.98-87.67) |
+| Fresh spare-port process, kernels on | 6 | 99.47 (99.36-99.68) |
+| ...on, behind the route-log wrapper | 6 | 99.60 (99.46-99.84) |
+| ...on, from source instead of the installed package | 6 | 99.47 (98.49-99.78) |
+| Live armed route, direct (before the `ProcessType` change) | 3 | 93.5 (93.1-93.7) |
+| Live armed route, via llama-swap (before the `ProcessType` change) | 3 | 92.0 (91.8-92.2) |
+
+  - The kernel gain reproduces on fresh processes: **+13.8 %** (87.43 → 99.47); warm repeats in one process 87.6 vs 99.4 (4 runs each). The live route read ~6 % below a fresh armed process on the same build; the launch context (priority 20) was the leading hypothesis in the #111 comment and the `ProcessType` result above is consistent with it (live route 100.7-100.9 afterwards). The live route with kernels off was never measured, so the live-route gain from the kernels is inferred.
+
+- **Per-hop TTFT (infra issue #1156): diagnosis only, nothing changed; the "a hop adds tens of ms" gate was not met.** Route Qwen3.6-35B-A3B-4bit resident, same tiny prompt per hop, T=0, streaming, `max_tokens=1`, cached prefix, n=20 per hop in 4 alternating blocks. Engine direct 104.7 ms median (p90 105.4); llama-swap +0.2 (localhost) / +0.9 (LAN); HAProxy +5.1 (`option http-server-close` opens a fresh backend connection per request, the likely cause); LiteLLM `-fast` route, cache bypassed, 138.3 ms (+27, per-block medians 130-158) and `/llamaswap` passthrough 178.8 (+68 vs HAProxy), p90 reaching 170-225 ms (the pod has a 500m CPU limit); ingress to llama-swap +14.6 vs a laptop LAN baseline of 110.2; ingress to LiteLLM +45.6. Full chain ~155 ms vs ~105 ms at the engine. **No SSE buffering at any hop:** 50 chunks per 50-token response everywhere, median inter-chunk gap 9.4-9.5 ms at every hop (p90 9.9 ms at the engine, 10.3-11.5 ms behind LiteLLM/Traefik), 0-1 % of gaps under 1 ms. Not measured: in-cluster ingress hops (ingress was timed from a laptop, so it includes Wi-Fi/LAN variance), concurrent load, whether the LiteLLM cost scales with context length. **Methodology note:** LiteLLM's response cache (see the lessons above) replays an identical request without touching the engine.
+
+- **Model trials (fork issue #114): INCONCLUSIVE for Muse Glimmer 30B, Flint NOT RUN.**
+  - **Muse-Glimmer-30B-4bit** (dense, already an opt-in route since 2026-10-16 with fork #147 parsers; no MTP/draft weights exist): spare port beside the resident Home Assistant set, T=0. Time to ready 8.4 / 9.2 s (two starts); Metal active 15.7 GB, peak 17.9 GB at 4K; decode at 4K 29.5 tok/s (29.4-29.6, n=4); prefill at 4K 209 tok/s (177-209, n=4; the 177 was the first run after a restart); 4,055 of 4,076 prompt tokens cached on every follow-up (n=3; ~1.5 s vs 19.5 s cold first-turn TTFT). About 3x slower at decode than the 35B-A3B (92.3 tok/s at 4K on the live route that day, before the `ProcessType` change). Function: single tool call (stream and non-stream) and strict json_schema pass; parallel calls 1 of 2 (one call per turn by design). Fixed set at T=0, n=16 tasks (a screen for gross failure, not a quality verdict): assistant prompts with tools 9/10 + 1 partial, coding 6/6 unit-tested. **Stopped by the memory guard** when a live client request loaded the embedding route (~4 GB) on top of the Home Assistant set and the spare (swap 146 MB → ~2.2 GB, pressure briefly critical); 32K runs, the image request and same-session incumbent runs not done. Not a candidate to replace the Home Assistant route.
+  - **Flint 40B-A2.5B: NOT RUN.** The GGUF declares `general.architecture = flint` and the llama.cpp build on the box (commit `d812350`, 2026-10-05) has no such architecture. Unchecked alternative: mlx-vlm 0.7.12 ships a `flint` module (mlx-lm 0.32.2 does not), so an MLX build may load through the fork's MLLM path with no llama.cpp.
+
+- **Not added:** the all-true GDN mask (#116, +1.2 % NULL) already has its line in the 2026-11-24 survey section above.

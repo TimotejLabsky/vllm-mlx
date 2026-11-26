@@ -27,7 +27,7 @@ feature branch — read this before changing anything.
     recency-only eviction. Verdict is instrument-first, don't build yet.
   - [`speed-lever-ledger-2026-09.md`](docs/fork/speed-lever-ledger-2026-09.md)
     — **read before proposing any performance work**: every speed lever
-    measured on this box (10 refuted, 5 shipped), the methodology lessons,
+    measured on this box (16 refuted, 7 shipped), the methodology lessons,
     and the watch list (mlx #4020 gated-delta kernels = the pending big win,
     taken via mlx release, never vendored). Update it with every new verdict.
   - [`improvement-plan-2026-09-16.md`](docs/fork/improvement-plan-2026-09-16.md)
