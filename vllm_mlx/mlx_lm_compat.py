@@ -203,3 +203,74 @@ def layout() -> str:
 
 def _reset_for_tests() -> None:
     _resolved.clear()
+
+
+# --------------------------------------------------------------------------
+# (#180) the qwen3_5 model TREE, not just its symbols, changed in #2082
+# --------------------------------------------------------------------------
+#
+#   0.32.2 ("legacy")                      post-#2082 ("packaged")
+#   Model                                  Model
+#     .language_model  TextModel             .args.text      TextModelArgs
+#       .args          TextModelArgs         .lm_head        (untied only)
+#       .lm_head       (untied only)         .model          Qwen3_5Model (not
+#       .model         Qwen3_5TextModel                      callable, no embed)
+#         .embed_tokens .layers .norm          .language_model Qwen3_5TextModel
+#                                                .embed_tokens .layers .norm
+#
+# ``Qwen3_5TextModel`` itself (``__call__(inputs, cache)`` -> normed hidden)
+# is unchanged. Code that needs "the text model" asks :func:`text_tree` for
+# an object with the legacy ``TextModel`` surface - ``.model`` (the inner
+# text model), ``.args`` (text args) and ``.lm_head`` - on either layout.
+
+
+class TextTreeView:
+    """The legacy ``TextModel`` surface over a packaged qwen3_5 ``Model``:
+    ``.model``, ``.args``, ``.lm_head`` (None when tied). Deliberately has no
+    ``language_model`` and no ``embed_tokens`` of its own, so mlx-vlm's
+    ``AutoregressiveMTPDraftModel.bind`` finds ``.model.embed_tokens`` and
+    this ``lm_head`` - the same objects it binds on the legacy tree."""
+
+    __slots__ = ("model", "args", "lm_head", "outer")
+    layout = PACKAGED
+
+    def __init__(self, outer: Any, inner: Any, args: Any, lm_head: Any):
+        self.outer = outer
+        self.model = inner
+        self.args = args
+        self.lm_head = lm_head
+
+
+def text_tree(model: Any) -> Tuple[Optional[Any], str]:
+    """``(text_model, how)`` for a loaded mlx-lm model: the object with the
+    legacy ``TextModel`` surface (``.model`` = inner text model, ``.args`` =
+    text args, ``.lm_head`` or tied), and which tree matched.
+
+    * ``legacy``: ``model.language_model`` - the very object 0.32.2 code
+      used (``getattr(model, "language_model", model)``).
+    * ``packaged``: a :class:`TextTreeView` over ``model.model.language_model``
+      and ``model.args.text``.
+    * ``flat``: ``model`` itself, the old fallback (a text model whose
+      ``.model`` is the inner model, e.g. qwen3_next).
+
+    Only the shape is matched; callers validate what they need (the drafter
+    still checks ``callable(text_model.model)``). ``text_model`` is None,
+    with ``how`` naming what is missing, only for a packaged tree without
+    ``args.text``. Never raises."""
+    try:
+        lm = getattr(model, "language_model", None)
+        if lm is not None:
+            return lm, LEGACY
+        inner = getattr(getattr(model, "model", None), "language_model", None)
+        if inner is not None:
+            args = getattr(getattr(model, "args", None), "text", None)
+            if args is None:
+                return None, (
+                    f"{type(model).__name__} has .model.language_model "
+                    "(post-#2082 tree) but no .args.text"
+                )
+            view = TextTreeView(model, inner, args, getattr(model, "lm_head", None))
+            return view, PACKAGED
+        return model, "flat"
+    except Exception as e:  # noqa: BLE001
+        return None, f"walking {type(model).__name__} raised {type(e).__name__}: {e}"
