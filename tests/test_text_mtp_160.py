@@ -19,6 +19,7 @@ from mlx_lm.models import qwen3_5 as q35
 
 from vllm_mlx import text_mtp
 from vllm_mlx.constrained.thinking_processor import ThinkingAwareLogitsProcessor
+from vllm_mlx.mlx_lm_compat import text_tree
 
 VOCAB = 96
 THINK_START, THINK_END, STOP = 1, 2, 3
@@ -61,6 +62,13 @@ def _build_model():
     m.train(False)
     mx.eval(m.parameters())
     return m
+
+
+def _lm(model):
+    """The drafter's view of the target on either mlx-lm qwen3_5 tree (#180)."""
+    lm, how = text_tree(model)
+    assert lm is not None and callable(lm.model), how
+    return lm
 
 
 @pytest.fixture(scope="module")
@@ -152,7 +160,7 @@ def _run(
     if ref is not None:
         mtp = text_mtp.TextMTP("oracle")
         mtp.block = block
-        mtp.lm = model.language_model
+        mtp.lm = _lm(model)
         mtp.drafter = (
             drafter(model)
             if drafter is not None
@@ -367,7 +375,7 @@ def test_160_recording_forward_matches_mlx_lm(model):
     from mlx_lm.models.cache import make_prompt_cache
 
     text_mtp._install_class_patches()
-    lm = model.language_model
+    lm = _lm(model)
     tokens = mx.array([PROMPT])
     extra = mx.array([[4, 44, 13]])
 
@@ -694,7 +702,7 @@ class SamplingDrafter:
     spec_sampling = True
 
     def __init__(self, model):
-        self.lm = model.language_model
+        self.lm = _lm(model)
         self.sampled = 0
 
     def reset(self, lm):
@@ -777,7 +785,7 @@ def test_105_join_drops_the_last_rounds_recorded_states(model):
     gen = BatchGenerator(model, max_tokens=30)
     mtp = text_mtp.TextMTP("oracle")
     mtp.block = 4
-    mtp.lm = model.language_model
+    mtp.lm = _lm(model)
     mtp.drafter = OracleDrafter(solo, gen._generation_batch, len(PROMPT), 0)
     text_mtp._install_class_patches()
     gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
@@ -808,7 +816,7 @@ def _join_and_leave(model, ref=None):
     if ref is not None:
         mtp = text_mtp.TextMTP("oracle")
         mtp.block = 4
-        mtp.lm = model.language_model
+        mtp.lm = _lm(model)
         mtp.drafter = OracleDrafter(ref, gen._generation_batch, len(PROMPT), 3)
         text_mtp._install_class_patches()
         gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
@@ -852,3 +860,113 @@ def test_105_dropped_recording_never_feeds_a_later_rollback(model):
     stats = mtp.stats()
     assert stats["bypass_counts"]["concurrent_batch"] > 0
     assert stats["accepted"] > 0 and stats["rejected"] > 0
+
+
+# ------------------------- #180 the qwen3_5 tree on both mlx-lm layouts ----
+def test_180_loading_binds_the_tree_and_decodes_exactly(model, monkeypatch):
+    """The production path end to end: ``ensure_loaded`` walks the installed
+    tree (no test-side ``mtp.lm``), hands the drafter's ``reset`` that text
+    model, and the stream and cache equal plain decoding. On 0.32.2 the
+    walked object is ``model.language_model`` itself."""
+    import mlx_vlm.speculative.drafters as drafters
+
+    from vllm_mlx import mlx_lm_compat
+
+    max_tokens = 24
+    plain_tokens, plain_caches, _, _ = _run(model, max_tokens)
+    ref = plain_tokens[0]
+    gen = BatchGenerator(model, max_tokens=max_tokens)
+    oracle = OracleDrafter(ref, gen._generation_batch, len(PROMPT))
+    seen = []
+    oracle.reset = seen.append
+    oracle.train = lambda mode: None
+    oracle.parameters = lambda: {}
+    monkeypatch.setattr(drafters, "load_drafter", lambda path, kind: (oracle, kind))
+    mtp = text_mtp.TextMTP("stub")
+    mtp.block = 3
+    text_mtp._install_class_patches()
+    gen._generation_batch._text_mtp = text_mtp._BatchState(mtp)
+    (uid,) = gen.insert([list(PROMPT)])
+    tokens, cache = [], None
+    while cache is None:
+        for r in gen.next_generated():
+            tokens.append(r.token)
+            if r.finish_reason is not None:
+                cache = r.prompt_cache
+    gen.close()
+
+    assert mtp.disabled_reason is None and mtp.drafter is oracle
+    lm, how = mlx_lm_compat.text_tree(model)
+    if how == mlx_lm_compat.LEGACY:
+        assert mtp.lm is model.language_model
+    else:
+        assert isinstance(mtp.lm, mlx_lm_compat.TextTreeView)
+    assert mtp.lm.model is lm.model and seen and all(s is mtp.lm for s in seen)
+    assert tokens == ref
+    assert _max_diff(cache, plain_caches[0]) < TOL
+    assert mtp.stats()["accepted"] > 0
+
+
+def test_180_packaged_tree_view_matches_the_model():
+    """A post-#2082-shaped tree (``Model.model.language_model`` +
+    ``args.text``), faked so it runs on either installed layout: the view
+    exposes the inner model, the text args and the outer ``lm_head``, and
+    nothing the mlx-vlm drafter would mistake for another level."""
+    from types import SimpleNamespace
+
+    from vllm_mlx import mlx_lm_compat
+
+    inner = _lm(_build_model()).model  # a real Qwen3_5TextModel
+    text_args = SimpleNamespace(tie_word_embeddings=False)
+    head = object()
+    outer = SimpleNamespace(
+        model=SimpleNamespace(language_model=inner),
+        args=SimpleNamespace(text=text_args),
+        lm_head=head,
+    )
+    view, how = mlx_lm_compat.text_tree(outer)
+    assert how == mlx_lm_compat.PACKAGED
+    assert view.model is inner and view.args is text_args and view.lm_head is head
+    assert view.outer is outer
+    assert not hasattr(view, "language_model") and not hasattr(view, "embed_tokens")
+    assert text_mtp._supports_recording(view)
+
+
+def test_180_unknown_tree_disables_loudly_and_never_raises(caplog, monkeypatch):
+    """#175 semantics for the tree: a target the walk cannot bind is one
+    ERROR naming what is missing, ``disabled_reason`` set, False returned -
+    nothing raises into decode, and the drafter is never loaded."""
+    from types import SimpleNamespace
+
+    import mlx_vlm.speculative.drafters as drafters
+
+    def boom(*a, **k):
+        raise AssertionError("must not load a drafter for an unbindable tree")
+
+    monkeypatch.setattr(drafters, "load_drafter", boom)
+    broken = SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace()), args=SimpleNamespace()
+    )
+    for target, needle in ((broken, "args.text"), (object(), "hidden-state")):
+        mtp = text_mtp.TextMTP("stub")
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_mtp"):
+            assert mtp.ensure_loaded(target) is False
+        assert needle in mtp.disabled_reason
+        assert mtp.stats()["disabled"] is True
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and needle in errors[0].getMessage()
+        assert mtp.ensure_loaded(target) is False  # once, not per round
+
+
+def test_180_round_state_pricing_walks_the_packaged_tree():
+    """#162 admission prices the recorded states on either tree."""
+    from types import SimpleNamespace
+
+    gdn = SimpleNamespace(num_v_heads=2, head_v_dim=3, head_k_dim=5)
+    layers = [SimpleNamespace(linear_attn=gdn), SimpleNamespace(self_attn=object())]
+    outer = SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace(layers=layers)),
+        args=SimpleNamespace(text=SimpleNamespace(tie_word_embeddings=True)),
+    )
+    assert text_mtp._round_state_bytes(outer, 2) == (2 * 3 * 5 * 4) * 3

@@ -113,7 +113,9 @@ def _drafter_weight_bytes(path: str) -> int:
 def _round_state_bytes(model: Any, block: int) -> int:
     """Recurrent states one round keeps until the next: one float32 state per
     verified position per recurrent layer, plus the copy a rollback makes."""
-    lm = getattr(model, "language_model", model)
+    from .mlx_lm_compat import text_tree
+
+    lm, _ = text_tree(model)  # (#180) either mlx-lm qwen3_5 tree
     layers = getattr(getattr(lm, "model", None), "layers", None) or []
     per_position = 0
     for layer in layers:
@@ -192,9 +194,15 @@ class TextMTP:
         if self.disabled_reason is not None:
             return False
         try:
-            lm = getattr(model, "language_model", model)
+            from .mlx_lm_compat import text_tree
+
+            # (#180) the legacy TextModel on 0.32.2, a view with the same
+            # surface (.model, .args, .lm_head) on the post-#2082 tree.
+            lm, how = text_tree(model)
             if not callable(getattr(lm, "model", None)):
-                raise TypeError(f"{type(model).__name__} exposes no hidden-state model")
+                raise TypeError(
+                    f"{type(model).__name__} exposes no hidden-state model ({how})"
+                )
             if not _supports_recording(lm):
                 raise TypeError("target recurrent layers are not mlx-lm GatedDeltaNet")
             from mlx_vlm.speculative.drafters import load_drafter

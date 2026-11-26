@@ -4661,7 +4661,7 @@ The first cut of this patch fixed only link 2 and was tested only at the schedul
 - **Drafter**, when armed and a symbol is missing: #159's semantics. One ERROR, `disabled: true` + `disabled_reason: "mlx-lm layout: ..."` in the `mtp` stats, no class patched, decoding continues. Routes without the env are untouched.
 - **Qwen3.5 VLM patch**: a missing mlx-vlm module is still a debug line; a missing mlx-lm helper with mlx-vlm present is an ERROR.
 
-**Not done (needs the mlx-lm release).** The drafter's model-tree adaptation (B2 in #118's verdict). On the new layout the qwen3_5 tree is `Model.model.language_model`, not `Model.language_model.model`, and `tie_word_embeddings` sits under `args.text`. Until it is adapted, the drafter on a new mlx-lm resolves its classes but disables at load with the existing "exposes no hidden-state model" ERROR. Also not routed through the resolver yet: the built-in MTP patches (`qwen3_5_mtp.py`, `qwen3_next_mtp.py`, no route uses them), `text_model_from_vlm.py` and the gdn bench script.
+**Not done here (TODO at release).** ~~The drafter's model-tree adaptation (B2 in #118's verdict).~~ **Done in #180**, built and tested against mlx-lm main (`6fe0ce48`) before the release: the drafter binds both qwen3_5 trees through `mlx_lm_compat.text_tree`, and `qwen3_next_mtp.py` goes through the resolver. Still open at the release: the built-in Qwen3.5 MTP patch (`qwen3_5_mtp.py`, no route uses it; it subclasses `TextModel`, so the new tree needs a real port, and it still fails loudly with an ImportError at injection), `text_model_from_vlm.py` (SimpleEngine only, needs a design change; see #180) and the gdn bench script.
 
 **Verification.**
 - `tests/test_mlx_lm_compat_175.py` (20). Installed layout: identity with the old imports and the signature table. Post-#2082 layout: a fake package tree in `tmp_path` mirroring upstream `2d4df8d`, the only faked paths in #175, with the stale `models/base.py`, `models/cache.py` and the `qwen3_5` package (exports only `Model`/`ModelArgs`) included so an old-first or cache-path resolver fails. Also covered: the trap, the "found nowhere" message, and a packaged module that raises a non-ImportError at import (a miss with the cause in the message, never a crash out of model load).
@@ -4799,3 +4799,42 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
 **Reconciled with #175 (`mlx_lm_compat`)** in the merge of `main` at `4bbb6540`: see the resolver and `/v1/status` bullets above. The draft's guesses were both wrong on the upstream tree: the block moves to `qwen3_next/layers.py` (the package `__init__` exports only `Model`/`ModelArgs`), and `SwiGLU` is defined in `layers/common.py`. `moe_fusion.py` merged without a conflict (#175 changed `fuse_moe_gate_up` and `FusedSwitchGLU`, this patch only `maybe_fuse`). The kernels read `FusedSwitchGLU` by its `gate_up_proj`/`down_proj`/`activation` attributes, which #175 did not change.
 
 **Retire** at the mlx-lm pin bump that merges #2053 and #2054. The needle check then refuses with the "redundant" hint, and the upstream path takes over (with its own new T=0 baseline).
+
+## 180. `patch: text-mtp-2082-tree` — the text drafter binds the qwen3_5 model tree of both mlx-lm layouts
+
+**Files:** `vllm_mlx/mlx_lm_compat.py` (`text_tree`, `TextTreeView`), `vllm_mlx/text_mtp.py`, `vllm_mlx/patches/qwen3_next_mtp.py`, `tests/test_text_mtp_160.py`, `tests/test_fork_invariants.py`, `tests/test_moe_kernels_179.py`.
+
+**Why (issue #118, step 3 of its order of work; B2 in the verdict).** #175 made the drafter's *symbols* resolve on mlx-lm's post-#2082 layout, but the qwen3_5 *tree* changed shape too, so on the next mlx-lm release the #160 drafter on the 27B-8bit route would disable itself at load ("exposes no hidden-state model") and the route would decode plain:
+
+| what the drafter walks | 0.32.2 | mlx-lm main (`6fe0ce48`, past #2082) |
+|---|---|---|
+| text model (`TextMTP.lm`, `drafter.reset(lm)`) | `Model.language_model` (`TextModel`) | gone; nearest is `Model` itself |
+| inner model, called for hidden states (`lm.model(x, cache)`) | `TextModel.model` (`Qwen3_5TextModel`) | `Model.model.language_model` (`Qwen3_5TextModel`, body unchanged); `Model.model` is `Qwen3_5Model`, not callable, no `embed_tokens` |
+| recurrent layers (`_supports_recording`, #162 pricing) | `lm.model.layers[i].linear_attn` | `Model.model.language_model.layers[i].linear_attn` (same class, same body) |
+| head (`_head`) | `lm.args.tie_word_embeddings`, `lm.model.embed_tokens`, `lm.lm_head` | `Model.args.text.tie_word_embeddings`, inner `embed_tokens`, `Model.lm_head` |
+| what mlx-vlm's `AutoregressiveMTPDraftModel.bind` finds | `lm.model.embed_tokens`, `lm.lm_head` | on the bare `Model`: nothing (`AttributeError`) |
+| `GenerationBatch` (`_step`, `extract_cache`, `filter`, `extend`) | | identical class body |
+
+**What.**
+- `mlx_lm_compat.text_tree(model)` returns `(text_model, how)`, the object with the legacy `TextModel` surface (`.model`, `.args`, `.lm_head`):
+  - **legacy**: `model.language_model`, the very object #160 used (`getattr(model, "language_model", model)`), so **0.32.2 behaviour is unchanged** (an invariant asserts `is`);
+  - **packaged**: a `TextTreeView` over `model.model.language_model` + `model.args.text` + `model.lm_head` (None when tied). It has no `language_model` or `embed_tokens` of its own, so mlx-vlm's `bind` lands on the inner `embed_tokens` and that `lm_head`, the same objects it binds on the old tree;
+  - **flat**: `model` itself (the old fallback).
+  It matches shape only and never raises. A packaged tree without `args.text` returns None with a message naming it.
+- `text_mtp`: `ensure_loaded` and `_round_state_bytes` (#162) walk through `text_tree`. Everything downstream (`lm.model(...)`, `_head`, `_supports_recording`, `drafter.reset(lm)`) is untouched and gets the same surface on both layouts.
+- **Failure semantics stay #175's:** a tree the walk cannot bind is one ERROR (`[text-mtp] DISABLED: load failed: TypeError: ... exposes no hidden-state model (<what is missing>)`), `disabled: true` + `disabled_reason` in the mtp stats, the drafter is never loaded, and nothing raises into model load or the batch-generator build.
+- **Built-in Qwen3-Next MTP** (`qwen3_next_mtp.py`, `--enable-mtp`, no route uses it): its masks and `Qwen3NextDecoderLayer` come from the resolver. The qwen3_next tree itself did not change, so that is the whole fix. A miss is still an ImportError (`MlxLmSymbolMissing`) at injection, as before.
+- **Tests that hard-coded the old tree:** `test_text_mtp_160.py` takes its `mtp.lm` from `text_tree`. `test_moe_kernels_179.py` builds its fixture as `Model` when `TextModel` is gone and takes the block class from the resolver. The two `test_179_*` invariants do the same. None of this changes anything on 0.32.2.
+
+**Not done (listed for the release; #118 rows E and C):**
+- **Built-in Qwen3.5 MTP** (`patches/qwen3_5_mtp.py`, no route uses it). It subclasses `TextModel` and patches `__call__`/`mtp_forward` against `self.model.embed_tokens` and `self.args`. On the new tree that is a port of the subclass onto `Model` (inner = `self.model.language_model`, args = `self.args.text`), plus its callers, and it needs real MTP weights to verify. Left as is, it still fails **loudly** at injection (`from mlx_lm.models.qwen3_5 import TextModelArgs` is an ImportError). Routing only its imports through the resolver would have moved that failure to the first forward, so they were left alone on purpose.
+- **`text_model_from_vlm.py`** (SimpleEngine only; every vision route is BatchedEngine). It needs a design change (#118 row C): no class on the new tree has the old `model.*` + `lm_head` layout, so it needs a fork-side wrapper or a weight-key remap. Until then it returns None and SimpleEngine falls back to the cacheless MLLM path, which is the existing silent fallback, unchanged by this patch.
+
+**Verification (laptop only, mocked/tiny random-weight models; no real weights, no Studio).**
+- New layout: a scratch venv with the shared venv's Python 3.12.12, mlx 0.32.4 and every other package at its shared-venv version, plus mlx-lm from GitHub `main` at `6fe0ce48c90cec11f2c305830ceba461051c33b2` (`0.32.3.dev22`). `uv pip check` is clean.
+- `tests/test_fork_invariants.py` + `tests/test_text_mtp_160.py` + `tests/test_moe_kernels_179.py` + `tests/test_mlx_lm_compat_175.py` are green on **both** layouts: old 364 passed; new 363 passed / 1 skipped (#175's legacy-only identity test).
+  - `test_180_text_mtp_binds_the_installed_qwen3_5_tree[tie]` is the invariant, with no importorskip. On the installed mlx-lm it requires the walk to match `mlx_lm_compat.layout()`, the recording check to pass, `_head(lm, lm.model(x))` to equal `model(x)` exactly, mlx-vlm's real `bind` to land on the inner `embed_tokens`/`lm_head`, and #162 pricing to be non-zero. On 0.32.2 it also asserts `lm is model.language_model`.
+  - `test_180_qwen3_next_builtin_mtp_injects_on_installed_mlx_lm` injects into a tiny qwen3_next model. Logits must equal stock, and the hidden state and `mtp_forward` must have the right shapes.
+  - `test_text_mtp_160.py` `test_180_*` cover four things: `ensure_loaded` end to end (the drafter's `reset` gets the walked object, and the stream and cache equal plain decoding), the packaged view on a faked post-#2082 tree, an unbindable tree (one ERROR, disabled, never loads, never raises) and #162 pricing on the packaged tree.
+- Full mocked suite on the old layout: 5625 passed / 32 skipped (30 deselected by `pytest.ini`). It was not run in full on the new layout, where #118's other rows (C, E, the `sys.modules` fakes) are still open.
+- **Not run:** the real 27B-8bit + Qwen3.8-27B-MTP drafter on either layout. The check is in the PR: on the Studio, prod venv, spare port, show drafter `disabled: false`, the acceptance rate, decode tok/s and T=0 byte identity against production; then the same in a scratch venv on the mlx-lm release.

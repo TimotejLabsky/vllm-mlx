@@ -25,10 +25,14 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx_lm.models import qwen3_5 as q35
-from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
 
 from vllm_mlx import moe_kernels
+from vllm_mlx.mlx_lm_compat import resolve
 from vllm_mlx.moe_fusion import FusedSwitchGLU, fuse_moe_gate_up, maybe_fuse
+
+# (#180) both mlx-lm layouts: post-#2082 the class lives in qwen3_next.layers
+# and qwen3_5 has no TextModel (Model.model.language_model instead).
+Qwen3NextSparseMoeBlock = resolve("qwen3_next.Qwen3NextSparseMoeBlock")
 
 pytestmark = pytest.mark.skipif(
     not moe_kernels.on_metal(), reason="the kernels are Metal-only"
@@ -49,7 +53,8 @@ ROUTER_SPREAD = 8.0
 
 def _build_model(seed=179):
     mx.random.seed(seed)
-    args = q35.TextModelArgs.from_dict(
+    legacy = hasattr(q35, "TextModel")
+    args = (q35.TextModelArgs if legacy else q35.ModelArgs).from_dict(
         {
             "model_type": "qwen3_5_moe",
             "hidden_size": DIM,
@@ -70,7 +75,7 @@ def _build_model(seed=179):
             "shared_expert_intermediate_size": 64,
         }
     )
-    m = q35.TextModel(args)
+    m = q35.TextModel(args) if legacy else q35.Model(args)
     # Default init gives a near-uniform router (16 experts at ~1/16 each),
     # where bf16 probability ties are everywhere. Spread the router logits
     # so expert selection is mostly unambiguous, as on a trained model.

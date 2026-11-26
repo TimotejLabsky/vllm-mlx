@@ -4436,13 +4436,14 @@ def test_175_text_mtp_hooks_bind_on_installed_mlx_lm():
 
 def test_175_hooks_resolve_through_the_compat_module_only():
     """A rebase must not bring back a hard-coded pre-#2082 path at the three
-    live sites (each one swallowed the ImportError)."""
+    live sites (each one swallowed the ImportError), nor at the built-in
+    Qwen3-Next MTP patch (#180)."""
     import inspect
 
     from vllm_mlx import moe_fusion, text_mtp
-    from vllm_mlx.patches import qwen3_5_mllm
+    from vllm_mlx.patches import qwen3_5_mllm, qwen3_next_mtp
 
-    for mod in (moe_fusion, text_mtp, qwen3_5_mllm):
+    for mod in (moe_fusion, text_mtp, qwen3_5_mllm, qwen3_next_mtp):
         src = inspect.getsource(mod)
         for old in (
             "mlx_lm.models.switch_layers",
@@ -4520,6 +4521,127 @@ def test_175_armed_drafter_on_a_layout_without_its_classes_disables_loudly(
     assert any(r.levelno == logging.ERROR for r in caplog.records)
     assert not hasattr(gen._generation_batch, "_text_mtp")
     assert GenerationBatch._step is step_before
+
+
+# ------- #180 the drafter binds the qwen3_5 model TREE on either mlx-lm layout
+
+
+def _tiny_qwen3_5(tie=False):
+    import mlx.core as mx
+    from mlx_lm.models import qwen3_5
+
+    mx.random.seed(180)
+    args = qwen3_5.ModelArgs.from_dict(
+        {
+            "model_type": "qwen3_5",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 32,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "full_attention_interval": 2,
+            "tie_word_embeddings": tie,
+        }
+    )
+    model = qwen3_5.Model(args)
+    model.train(False)
+    mx.eval(model.parameters())
+    return model
+
+
+@pytest.mark.parametrize("tie", [False, True])
+def test_180_text_mtp_binds_the_installed_qwen3_5_tree(tie):
+    """Patch #160 walks the target's tree: the inner text model (hidden
+    states), its recurrent layers (recording), the head, and what mlx-vlm's
+    drafter binds (embed + lm_head). mlx-lm #2082 reshaped that tree; #180
+    walks both. No importorskip: on a tree the walk does not know, the
+    drafter switches itself off in production, and this goes red. On the
+    0.32.2 tree the walk must hand back ``model.language_model`` itself -
+    the object #160 always used."""
+    import mlx.core as mx
+    from mlx_vlm.speculative.drafters.mtp_base import AutoregressiveMTPDraftModel
+
+    from vllm_mlx import mlx_lm_compat, text_mtp
+
+    model = _tiny_qwen3_5(tie)
+    lm, how = mlx_lm_compat.text_tree(model)
+    assert lm is not None and callable(lm.model), how
+    assert how == mlx_lm_compat.layout(), (how, mlx_lm_compat.layout())
+    if how == mlx_lm_compat.LEGACY:
+        assert lm is model.language_model
+    assert text_mtp._supports_recording(lm)
+    tokens = mx.array([[1, 5, 9, 2]])
+    assert mx.array_equal(text_mtp._head(lm, lm.model(tokens)), model(tokens))
+
+    drafter = AutoregressiveMTPDraftModel(config=None).bind(lm)
+    assert drafter._input_embed is lm.model.embed_tokens
+    if not tie:
+        assert drafter._lm_head_fn is lm.lm_head
+        owner = model.language_model if how == mlx_lm_compat.LEGACY else model
+        assert lm.lm_head is owner.lm_head
+    assert text_mtp._round_state_bytes(model, 2) > 0
+
+
+def test_180_qwen3_next_builtin_mtp_injects_on_installed_mlx_lm(tmp_path):
+    """The built-in Qwen3-Next MTP patch (``--enable-mtp``) hard-coded the
+    pre-#2082 mask and decoder-layer paths: an ImportError at injection on
+    the new layout. Through mlx_lm_compat it injects on either, and the
+    patched forward is the stock one (same logits, plus the hidden)."""
+    import mlx.core as mx
+    from mlx_lm.models import qwen3_next
+
+    from vllm_mlx.patches.qwen3_next_mtp import inject_mtp_support
+
+    mx.random.seed(180)
+    args = qwen3_next.ModelArgs.from_dict(
+        {
+            "model_type": "qwen3_next",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "shared_expert_intermediate_size": 64,
+            "mlp_only_layers": [],
+            "moe_intermediate_size": 32,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32,
+            "num_key_value_heads": 2,
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "max_position_embeddings": 256,
+            "head_dim": 16,
+            "full_attention_interval": 2,
+        }
+    )
+    model = qwen3_next.Model(args)
+    model.train(False)
+    mx.eval(model.parameters())
+    tokens = mx.array([[1, 5, 9, 2]])
+    stock = model(tokens)
+    mx.save_safetensors(
+        str(tmp_path / "model-mtp.safetensors"),
+        {"mtp.fc.weight": mx.zeros((64, 128))},
+    )
+    assert inject_mtp_support(model, tmp_path, {"num_nextn_predict_layers": 1})
+    logits, hidden = model(tokens, return_hidden=True)
+    assert mx.allclose(logits, stock, atol=1e-5)
+    assert hidden.shape == (1, 4, 64)
+    out = model.mtp_forward(hidden[:, -1:], mx.array([[3]]), mtp_cache=None)
+    assert out.shape == (1, 1, 32)
 
 
 # ------------- #177 a templated prompt's miss cuts its prefill at the shared prefix
@@ -4721,12 +4843,12 @@ def test_179_decode_kernels_cannot_arm_without_their_flag(monkeypatch):
     """The kernels change T=0 output, so nothing but
     VLLM_MLX_MOE_DECODE_KERNELS may arm them -- not #96's fusion flag, not
     the engines' load hook -- and arming never patches the mlx-lm class."""
-    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
-
     from tests.test_moe_kernels_179 import _blocks, _build_model
     from vllm_mlx import moe_kernels
+    from vllm_mlx.mlx_lm_compat import resolve
     from vllm_mlx.moe_fusion import maybe_fuse
 
+    Qwen3NextSparseMoeBlock = resolve("qwen3_next.Qwen3NextSparseMoeBlock")
     assert moe_kernels.ENV == "VLLM_MLX_MOE_DECODE_KERNELS"
     stock_call = Qwen3NextSparseMoeBlock.__call__
     monkeypatch.delenv(moe_kernels.ENV, raising=False)
@@ -4752,10 +4874,10 @@ def test_179_kernels_resolve_through_the_compat_module_and_bind():
     upgrade that only moved the classes."""
     import inspect
 
-    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
-
     from vllm_mlx import moe_kernels
+    from vllm_mlx.mlx_lm_compat import resolve
 
+    Qwen3NextSparseMoeBlock = resolve("qwen3_next.Qwen3NextSparseMoeBlock")
     src = inspect.getsource(moe_kernels)
     for old in ("mlx_lm.models.switch_layers", "mlx_lm.models.qwen3_next"):
         assert old not in src, f"moe_kernels hard-codes {old}"

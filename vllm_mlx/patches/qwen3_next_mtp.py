@@ -57,10 +57,17 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
 
     args = model.args
 
-    # Import model components
-    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    # Import model components. (#180) Through mlx_lm_compat: mlx-lm #2082
+    # moves the masks to mlx_lm.layers.* and the decoder layer to
+    # qwen3_next.layers (the qwen3_next tree itself is unchanged). A miss is
+    # still an ImportError (MlxLmSymbolMissing) at injection, as before.
     from mlx_lm.models.cache import KVCache
-    from mlx_lm.models.qwen3_next import Qwen3NextDecoderLayer
+
+    from ..mlx_lm_compat import resolve
+
+    create_attention_mask = resolve("create_attention_mask")
+    create_ssm_mask = resolve("create_ssm_mask")
+    Qwen3NextDecoderLayer = resolve("qwen3_next.Qwen3NextDecoderLayer")
 
     # --- Step 1: Create MTP module ---
     logger.info(f"[MTP inject] Creating MTP module ({num_mtp_layers} layers)")
