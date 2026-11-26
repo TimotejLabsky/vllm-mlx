@@ -37,6 +37,7 @@ from .mllm_batch_generator import (
 )
 from .grammar_guard import grammar_unterminated
 from .repetition_stop import RepetitionStopTracker
+from .gpu_gate import vision_turn
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
@@ -1207,9 +1208,13 @@ class MLLMScheduler:
 
                 # --- Step phase ---
                 if self.has_requests():
-                    _ensure_streams_bound()
-                    tic = time.perf_counter()
-                    self.step()
+                    # (#181) on a --vision-split route this is one turn of
+                    # the shared GPU gate (vllm_mlx/gpu_gate.py); None on
+                    # every other route, where the context is a no-op.
+                    async with vision_turn(getattr(self, "_gpu_gate", None)):
+                        _ensure_streams_bound()
+                        tic = time.perf_counter()
+                        self.step()
                     elapsed = time.perf_counter() - tic
                     if elapsed > 2.0:
                         logger.warning(

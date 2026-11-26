@@ -162,6 +162,19 @@ Mixed `--text-only` routes are *not* flipped: serving vision there today would
 trade away the text stack (system-KV etc.). That's phase 2 `--vision-split`
 (plan P15–P19), de-risked by this sweep.
 
+**Phase 2 built as #181 (`--vision-split`, default OFF, on no route).** One
+process, one mlx-vlm load. Text requests run the exact `--text-only` stack (a
+`BatchedEngine(force_text_only)` over `build_text_model`'s zero-copy text
+model), so they keep every cache row above that a text route has. Media
+requests run the MLLM branch exactly as described in this doc (pixel cache,
+#142 media prefix cache). On a split route the vision side's prefix cache
+has its own budget (`--vision-split-cache-mb`, default 1024 MB), no SSD tier
+and no disk persistence. The batched system-KV and the route's SSD
+directory belong to the text side alone: a media request never touches
+them, and a text request never reads the media prefix cache. The two
+schedulers take turns on the GPU, one step each (`vllm_mlx/gpu_gate.py`).
+Status, limits and the pending Studio check: PATCHES.md #181.
+
 ## Known residuals
 
 - MLLM preprocessing failures surface as HTTP 200 + `finish_reason:"error"` +

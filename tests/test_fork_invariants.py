@@ -4892,3 +4892,80 @@ def test_179_kernels_resolve_through_the_compat_module_and_bind():
     assert [stock for stock, _ in targets] == [Qwen3NextSparseMoeBlock]
     assert moe_kernels._swiglu_class() is not None
     assert set(moe_kernels.status()) == {"armed", "blocks", "skipped", "error"}
+
+
+# -------------- #181 --vision-split: one route, text + images, one load
+
+
+def test_181_vision_split_is_off_unless_asked():
+    """#181 is opt-in: with the flag off the CLI, load_model and the server's
+    message prep behave exactly as before (the fleet keeps --text-only), and
+    no engine but VisionSplitEngine claims the split."""
+    import inspect
+    from unittest.mock import MagicMock
+
+    from vllm_mlx import server
+    from vllm_mlx.cli import create_parser
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.vision_split import engine_serves_media, request_is_mllm
+
+    args = create_parser().parse_args(["serve", "m", "--continuous-batching"])
+    assert args.vision_split is False
+    params = inspect.signature(server.load_model).parameters
+    assert params["vision_split"].default is False
+    assert not hasattr(BatchedEngine, "vision_split")
+    media = [{"role": "user", "content": [{"type": "image_url"}]}]
+    for is_mllm in (True, False):
+        batched = BatchedEngine.__new__(BatchedEngine)
+        batched._is_mllm = is_mllm
+        for engine in (MagicMock(is_mllm=is_mllm), batched):
+            assert request_is_mllm(engine, media) is is_mllm
+            assert request_is_mllm(engine, []) is is_mllm
+            assert engine_serves_media(engine) is is_mllm
+
+
+def test_181_split_text_side_is_a_text_only_batched_engine(tmp_path):
+    """On a split route a text request reaches a BatchedEngine built with
+    force_text_only (AsyncEngineCore: batched system-KV, relief, admission,
+    MTP drafter), never the MLLM scheduler; media never reaches the text
+    core, so it can never touch the batched system-KV, and the vision side
+    has no SSD tier of its own (the route's SSD dir belongs to text)."""
+    import asyncio
+
+    from tests.test_vision_split_181 import IMAGE_MSG, TEXT_MSG, _drain, _wired
+
+    eng = _wired(tmp_path)
+    assert eng.text._is_mllm is False and eng.vision._is_mllm is True
+    assert eng.vision._scheduler_config.ssd_cache_dir is None
+    assert eng.text._scheduler_config.ssd_cache_dir is not None
+    _drain(eng.stream_chat(TEXT_MSG, max_tokens=4))
+    assert eng.text._engine.calls and not eng.vision._mllm_scheduler.calls
+    eng.text._engine.calls.clear()
+    asyncio.run(eng.chat(IMAGE_MSG, max_tokens=4))
+    assert eng.vision._mllm_scheduler.calls and not eng.text._engine.calls
+
+
+def test_181_mllm_steps_and_text_worker_calls_are_gpu_gate_turns():
+    """The two schedulers share one model's weights and one GPU: every
+    MLLMScheduler step is a vision turn and every call on the split text
+    worker a text turn. A rebase that moves the step out of the
+    ``vision_turn`` block (or rebuilds the worker un-gated) lets the two
+    evaluate at once from two threads."""
+    import inspect
+
+    from vllm_mlx.gpu_gate import GatedWorkerExecutor, GpuGate
+    from vllm_mlx.mllm_scheduler import MLLMScheduler
+    from vllm_mlx.vision_split import VisionSplitEngine
+
+    src = inspect.getsource(MLLMScheduler._process_loop)
+    turn = src.index('async with vision_turn(getattr(self, "_gpu_gate", None)):')
+    bind = src.index("_ensure_streams_bound()\n", turn)
+    assert turn < bind < src.index("self.step()", turn)
+    eng = VisionSplitEngine("org/M")
+    try:
+        worker = eng.text._generation_worker()
+        assert isinstance(worker, GatedWorkerExecutor)
+        assert isinstance(eng.gate, GpuGate) and worker.gate is eng.gate
+        assert worker.submit(lambda: eng.gate._holder).result() == "text"
+    finally:
+        eng.text._generation_executor.shutdown(wait=True)

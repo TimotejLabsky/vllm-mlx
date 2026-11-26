@@ -126,6 +126,26 @@ def serve_command(args):
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
+    if getattr(args, "vision_split", False):
+        # (#181) refuse every combination the split route cannot honour
+        # before any download; load_model re-checks the same rules.
+        from .vision_split import VisionSplitError, check_vision_split_config
+
+        try:
+            check_vision_split_config(
+                use_batching=args.continuous_batching,
+                force_text_only=getattr(args, "text_only", False),
+                force_mllm=getattr(args, "mllm", False),
+                auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+                lazy_load_model=args.lazy_load_model,
+                mllm_draft_model=mllm_draft_model,
+                enable_mtp=getattr(args, "enable_mtp", False),
+                compile=getattr(args, "compile", False),
+                models_config=models_config,
+            )
+        except VisionSplitError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
     # Configure server security settings
     server._api_key = args.api_key
@@ -283,6 +303,13 @@ def serve_command(args):
                 f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
                 f"(source={mllm_route.source})"
             )
+            if getattr(args, "vision_split", False) and not mllm_route.is_mllm:
+                print(
+                    "Error: --vision-split needs a checkpoint with a vision "
+                    f"tower; {model_arg} routes as LLM "
+                    f"(source={mllm_route.source})"
+                )
+                sys.exit(1)
         if args.lazy_load_model:
             print(f"Registering model for lazy load: {model_arg}")
             print("Model will load on the first request.")
@@ -475,10 +502,13 @@ def serve_command(args):
             force_mllm=(
                 False
                 if getattr(args, "text_only", False)
+                or getattr(args, "vision_split", False)  # (#181)
                 else (
                     mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
                 )
             ),
+            vision_split=getattr(args, "vision_split", False),
+            vision_split_cache_mb=getattr(args, "vision_split_cache_mb", 1024),
             force_text_only=getattr(args, "text_only", False),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
@@ -1607,6 +1637,28 @@ Examples:
             "processor metadata that breaks AutoProcessor while the language "
             "weights are sound; mlx_lm's strict=False fallback discards "
             "vision_tower.* tensors and serves it as text-only."
+        ),
+    )
+    serve_parser.add_argument(
+        "--vision-split",
+        action="store_true",
+        help=(
+            "(fork #181) One route for text AND images from one load of a "
+            "checkpoint with a vision tower: text requests run the exact "
+            "--text-only stack (batched system-KV, SSD tier, relief, MTP "
+            "drafter), media requests the MLLM scheduler; the two take turns "
+            "on the GPU. Requires --continuous-batching; excludes --text-only "
+            "and --mllm. Default off."
+        ),
+    )
+    serve_parser.add_argument(
+        "--vision-split-cache-mb",
+        type=int,
+        default=1024,
+        help=(
+            "(fork #181) Prefix-cache budget of the vision side of a "
+            "--vision-split route (MB, default 1024). --cache-memory-mb stays "
+            "the text side's."
         ),
     )
     serve_parser.add_argument(
