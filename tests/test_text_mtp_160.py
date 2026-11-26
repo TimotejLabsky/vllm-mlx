@@ -1024,9 +1024,7 @@ def _disabled_once(target, needle, caplog, monkeypatch):
     assert mtp.stats()["disabled"] is True
 
 
-def test_180_real_model_without_its_inner_text_model_disables_once(
-    caplog, monkeypatch
-):
+def test_180_real_model_without_its_inner_text_model_disables_once(caplog, monkeypatch):
     from vllm_mlx import mlx_lm_compat
 
     model = _tiny()
@@ -1037,9 +1035,7 @@ def test_180_real_model_without_its_inner_text_model_disables_once(
     _disabled_once(model, "hidden-state", caplog, monkeypatch)
 
 
-def test_180_real_packaged_model_without_args_text_disables_once(
-    caplog, monkeypatch
-):
+def test_180_real_packaged_model_without_args_text_disables_once(caplog, monkeypatch):
     from vllm_mlx import mlx_lm_compat
 
     if mlx_lm_compat.layout() == mlx_lm_compat.LEGACY:
