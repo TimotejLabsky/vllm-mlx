@@ -203,6 +203,17 @@ class TextMTP:
                 raise TypeError(
                     f"{type(model).__name__} exposes no hidden-state model ({how})"
                 )
+            # _head needs the text args and, untied, an lm_head: a miss is
+            # one load-time error, not a failed round per step.
+            lm_args = getattr(lm, "args", None)
+            if lm_args is None:
+                raise TypeError(f"{type(model).__name__} exposes no text args ({how})")
+            if not getattr(lm_args, "tie_word_embeddings", False) and not callable(
+                getattr(lm, "lm_head", None)
+            ):
+                raise TypeError(
+                    f"{type(model).__name__} is untied but exposes no lm_head ({how})"
+                )
             if not _supports_recording(lm):
                 raise TypeError("target recurrent layers are not mlx-lm GatedDeltaNet")
             from mlx_vlm.speculative.drafters import load_drafter

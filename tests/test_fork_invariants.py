@@ -4586,6 +4586,12 @@ def test_180_text_mtp_binds_the_installed_qwen3_5_tree(tie):
         owner = model.language_model if how == mlx_lm_compat.LEGACY else model
         assert lm.lm_head is owner.lm_head
     assert text_mtp._round_state_bytes(model, 2) > 0
+    # On 0.32.2 a rebase back to getattr(model, "language_model", model) is
+    # invisible; it only breaks on the next mlx-lm. Pin the walk itself.
+    import inspect
+
+    for fn in (text_mtp.TextMTP.ensure_loaded, text_mtp._round_state_bytes):
+        assert "text_tree(model)" in inspect.getsource(fn), fn.__name__
 
 
 def test_180_qwen3_next_builtin_mtp_injects_on_installed_mlx_lm(tmp_path):
