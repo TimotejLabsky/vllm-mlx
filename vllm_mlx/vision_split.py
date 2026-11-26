@@ -397,7 +397,8 @@ class VisionSplitEngine(BaseEngine):
                 raise VisionSplitError(
                     "--vision-split: the vision side did not start an MLLM scheduler"
                 )
-            scheduler._gpu_gate = self.gate
+            # read by MLLMScheduler._process_loop via getattr (#181)
+            setattr(scheduler, "_gpu_gate", self.gate)
             # 2. The text model from the same arrays, built on the text
             #    worker (its stepping thread), then a --text-only start.
             text_model, tokenizer = await self.text._run_on_generation_worker(
@@ -442,43 +443,109 @@ class VisionSplitEngine(BaseEngine):
         return self.text.is_healthy() and self.vision.is_healthy()
 
     # -- routing ---------------------------------------------------------------
-    def _side_for(self, messages: Any = None, images=None, videos=None, audio=None):
+    # Signatures and defaults are BatchedEngine's: every value is forwarded
+    # explicitly, so the chosen child sees exactly what the caller sent.
+    def _side_for(
+        self, messages: Any = None, images=None, videos=None, audio=None
+    ) -> Any:
         if images or videos or audio or messages_have_media(messages):
             return self.vision
         return self.text
 
-    async def generate(self, prompt: str, **kwargs: Any) -> GenerationOutput:
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> GenerationOutput:
         side = self._side_for(
             images=kwargs.get("images"),
             videos=kwargs.get("videos"),
             audio=kwargs.get("audio"),
         )
-        return await side.generate(prompt, **kwargs)
+        output: GenerationOutput = await side.generate(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            **kwargs,
+        )
+        return output
 
     async def stream_generate(
-        self, prompt: str, **kwargs: Any
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
         side = self._side_for(
             images=kwargs.get("images"),
             videos=kwargs.get("videos"),
             audio=kwargs.get("audio"),
         )
-        async for output in side.stream_generate(prompt, **kwargs):
+        async for output in side.stream_generate(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            **kwargs,
+        ):
             yield output
 
-    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any):
-        side = self._side_for(
-            messages, images=kwargs.get("images"), videos=kwargs.get("videos")
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs: Any,
+    ) -> GenerationOutput:
+        side = self._side_for(messages, images=images, videos=videos)
+        output: GenerationOutput = await side.chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            images=images,
+            videos=videos,
+            **kwargs,
         )
-        return await side.chat(messages, **kwargs)
+        return output
 
     async def stream_chat(
-        self, messages: list[dict[str, Any]], **kwargs: Any
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
-        side = self._side_for(
-            messages, images=kwargs.get("images"), videos=kwargs.get("videos")
-        )
-        async for output in side.stream_chat(messages, **kwargs):
+        side = self._side_for(messages, images=images, videos=videos)
+        async for output in side.stream_chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            images=images,
+            videos=videos,
+            **kwargs,
+        ):
             yield output
 
     async def abort_request(self, request_id: str) -> bool:
