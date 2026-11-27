@@ -4969,10 +4969,24 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
   - Plus invariant `test_181_image_cap_follows_the_encode_not_the_bytes`.
 - **Laptop e2e:** the unified session runs with a cap of 256 (`E2E_IMAGE_CAP`). A 1024² image (1024 tokens uncapped) is answered "green" at 257 tokens; its re-send restores 1635/1636 with the same answer; `media_images_downscaled` is 2. The 256 px probes (64 tokens) are untouched, and every earlier check is unchanged.
 
+**Parity on larger checkpoints: C3 on the 4B is a bf16 near-tie, not a bug (2026-11-27, Studio).**
+- **Finding.** `vision_unified_parity.py` C3 failed on `Qwen3.5-4B-4bit` (the trailing text prefilled through the batch answered `' red'`, mlx-vlm `'Red'`). It failed the same way on both package sets (mlx 0.32.4 / mlx-vlm 0.7.12 and 0.32.5 / 0.8.1). The 16/16 was measured on the 0.8B only.
+- **Margins (bf16, first token, "one image" prompt, L=219, delta -182, cut 201).** On mlx-vlm the top four are `'Red'` 23.75, `' red'` 23.5, `'red'` 23.375, `' Red'` 22.875. That is a 0.25 margin, two bf16 steps at that magnitude. In the batch, `' red'` leads `'Red'` by 0.25 (logprobs -1.0 vs -1.25). The text-stack floor at the last position is 0.41.
+- **The batch is not the cause.** A single stream with no `BatchGenerator` flips the same way when it uses the batch's chunk shape: media prefill to the image end, then the trailing text minus its last token, then the last token. Prefilling the trailing text in one forward keeps `'Red'`, with 3-axis MRoPE positions or with `nn.RoPE` at offset + delta alike. Positions after the image are 19..36 on all three axes, the expected `L - 1 + delta` = 36. Embeddings are bf16 on both paths, and the trailing embeddings are bit-equal to `embed_tokens`.
+- **float32 decides it.** With every activation in float32, the following all give `' red'` (margin 0.456 over `'Red'`) and agree to max |d| ≤ 0.002: mlx-vlm, the whole-prompt MRoPE path, every split variant, the media row alone in the batch, next to a text row in either order, and the C1 shape. So mlx-vlm's bf16 `'Red'` is the rounded side of the tie.
+- **Other sizes.** On the 0.8B, C3 passes (margin 1.9). On the 9B (`Qwen3.5-9B-4bit`) C3 passes: `' Red'` with a 2.1 margin, float32 margin 1.74, every path within 0.003 in float32.
+- **Script change** (`scripts/fork/vision_unified_parity.py`):
+  - New section **F** reruns B, C1 and C3 with float32 activations (`fp32_activations()`). It requires identical greedy tokens and logits / first-token logprobs within `--fp32-tol` (0.02). Measured: at most 0.0026 on the B paths, at most 0.00017 on the batched rows.
+  - A bf16 greedy mismatch in B, C1 or C3 is reported `NEAR-TIE` instead of `FAIL`, but only when the first differing pick lies within the text-stack last-position floor on both stacks (`classify_greedy`). F still gates it: a near-tie whose float32 rerun disagrees fails.
+  - `--inject-delta-error N` is a self-test. An off-by-one RoPE delta passed every bf16 greedy check on the 0.8B and the 4B, so the old script could not see it. F fails it on both, with first-token logprob max |d| of 0.09-0.20 against a float32 floor of 6e-5 to 2e-4.
+  - Results: 0.8B 26/26; 4B 25/26 + 1 near-tie (C3), RESULT PASS; 9B 26/26; 0.8B and 4B with `--inject-delta-error 1`: FAIL on F C1 and F C3.
+  - Tests: `tests/test_vision_unified_181_parity.py` (8, model-free) covers the classifier and the float32 switch.
+
 **Verification (current).**
-- Mocked: `tests/test_vision_unified_181*.py` 48 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6, `_imagecap` 9), plus `test_181_*` in `test_fork_invariants.py` (7).
-- Full mocked suite: 5686 passed / 33 skipped / 30 deselected.
-- Laptop, 0.8B: `vision_unified_parity.py` 16/16; `e2e_vision_unified.py` 34/34 (the 32 earlier checks plus the two over-cap checks).
+- Mocked: `tests/test_vision_unified_181*.py` 56 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6, `_imagecap` 9, `_parity` 8), plus `test_181_*` in `test_fork_invariants.py` (7).
+- Full mocked suite: 5694 passed / 33 skipped / 30 deselected.
+- Laptop, 0.8B: `vision_unified_parity.py` 16/16 (before section F); `e2e_vision_unified.py` 34/34 (the 32 earlier checks plus the two over-cap checks).
+- Studio, prod stack, mlx 0.32.5 / mlx-vlm 0.8.1: `vision_unified_parity.py` 26/26 on the 0.8B and the 9B; 25/26 + 1 near-tie on the 4B.
 - Longest inter-token gap while a 9.9K-token request is prefilled: 1114 ms for both the text and the image request.
 
 **Status:** the Studio check passed; merge is the owner's call. Enabling it on the 27B-8bit route is a deploy decision: accept the cap's encode stall and the +5 GB peak, or pick another cap.
