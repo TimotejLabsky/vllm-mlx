@@ -178,3 +178,78 @@ def test_181_unkeyable_media_stays_cold(
         _run(s, [req])
         assert req.cached_tokens == 0 and not m.keyed
     assert vlm.calls == 2
+
+
+
+def test_181_reconcile_never_splices_a_media_key(
+    monkeypatch, batch_patch, small_bag  # noqa: F811
+):
+    """(review) #139 reconcile rewrites ``prompt_token_ids`` and can change
+    its LENGTH. On a media request that is the content key, which must stay
+    aligned position-for-position with ``MediaInputs.input_ids``: the media
+    prefill continues the REAL ids from the key-space restore point, and the
+    finish store files the real-id KV under the key. A follow-up whose
+    earlier answer re-rendered with one extra token (the #75 whitespace
+    case) got the key spliced one shorter, restored the whole chain, then
+    re-fed one token of the real ids twice (wrong context, wrong answer)."""
+    model = _tiny_outer()
+    vu.install_mrope(model, [3, 3, 2])
+    s, _ = _fresh(monkeypatch, model)
+    first = _keyed(0.5, D1)
+    out1 = _run(s, [_req("a1", list(first.input_ids), first)])["a1"]
+    # the client re-renders the answer with one extra token inside it
+    follow_ids = list(first.input_ids) + out1[:2] + [99] + out1[2:] + [12, 13]
+    split = len(first.input_ids) + 2
+
+    def follow():
+        return vu.MediaInputs(
+            input_ids=follow_ids,
+            pixel_values=np.full((6, 4), 0.5, dtype=np.float32),
+            image_grid_thw=G,
+            image_digests=(D1,),
+            n_images=1,
+            image_tokens=6,
+            cache_key=vu.media_cache_key(follow_ids, IMAGE, (D1,), G),
+        )
+
+    calls = []
+
+    def splice(tokens):  # what #139 does: the model's own tokens back
+        calls.append(list(tokens))
+        return list(tokens[:split]) + list(tokens[split + 1 :])
+
+    s.hybrid_kv.reconcile_generated_on = True
+    monkeypatch.setattr(s.hybrid_kv, "reconcile_generated", splice)
+    req = _req("a2", list(follow_ids), follow())
+    hot = _run(s, [req])["a2"]
+    assert calls == []  # never asked for a media request
+    assert len(req.prompt_token_ids) == len(follow_ids)
+    assert hot == _cold(monkeypatch, model, follow())
+    # a text request on the same route still reconciles (unchanged path)
+    _run(s, [_req("t", [3, 9, 1, 22, 5, 7, 40, 2])])
+    assert len(calls) == 1
+
+
+def test_181_unkeyable_media_takes_no_admission_rematch(
+    monkeypatch, batch_patch, small_bag  # noqa: F811
+):
+    """(review) An unkeyed media request (an http(s) image) is marked a
+    ``miss``, and #131's admission re-match retries every miss: it found the
+    text entry sharing the prompt up to the image, built that restore copy
+    (multi-GB on a deep prefix), counted a hit and left ``cached_tokens``
+    set - while the media prefill ignores the cache and runs cold, so usage
+    reported cached tokens that were never used."""
+    model = _tiny_outer()
+    vu.install_mrope(model, [3, 3, 2])
+    s, _ = _fresh(monkeypatch, model)
+    ids = _media_ids()
+    first = ids.index(IMAGE)
+    _run(s, [_req("t", ids[:first])])  # its prompt end = the image start
+    hits = s.hybrid_kv.hits
+    m = _keyed(0.5, D1)
+    m.cache_key = None
+    req = _req("u", list(m.input_ids), m)
+    out = _run(s, [req])["u"]
+    assert not m.keyed and req.cached_tokens == 0
+    assert s.hybrid_kv.hits == hits
+    assert out == _cold(monkeypatch, model, _keyed(0.5, D1))

@@ -38,8 +38,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Sequence
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+
+# ``mlx.nn`` is imported lazily (``_mrope_class``): this module is imported
+# by the scheduler, the batched system-KV and the text drafter on EVERY
+# route, so with the flag off it must add no import the text path lacks
+# (the no-MLX unit tests stub ``mlx`` with ``mlx.core`` only).
 
 logger = logging.getLogger(__name__)
 
@@ -81,55 +85,74 @@ def interleaved_selector(mrope_section: Sequence[int], freq_dim: int) -> mx.arra
     return mx.array(selector, dtype=mx.int32)
 
 
-class MRoPEDispatch(nn.Module):
-    """Wraps one attention layer's ``nn.RoPE``. Outside
-    :func:`mrope_positions` it is a pass-through; inside, it rotates the
-    first ``dims`` features (half-split pairing, as ``nn.RoPE`` with
-    ``traditional=False``) by per-token, per-axis positions."""
+_MROPE_CLASS = None
 
-    def __init__(self, inner: nn.Module, mrope_section: Sequence[int]):
-        super().__init__()
-        self.inner = inner
-        dims = int(inner.dims)
-        if getattr(inner, "traditional", False):
-            raise ValueError("MRoPE dispatch supports half-split RoPE only")
-        if float(getattr(inner, "scale", 1.0)) != 1.0:
-            raise ValueError("MRoPE dispatch supports unscaled RoPE only")
-        self._dims = dims
-        base = float(inner.base)
-        self._inv_freq = 1.0 / (
-            base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        )
-        self._selector = interleaved_selector(list(mrope_section), dims // 2)
-        mx.eval(self._inv_freq, self._selector)
 
-    def __call__(self, x: mx.array, offset: Any = 0) -> mx.array:
-        positions = _active_positions()
-        if positions is None:
-            return self.inner(x, offset=offset)
-        return self._apply(x, positions)
+def _mrope_class():
+    """The :class:`MRoPEDispatch` class, built on first use."""
+    global _MROPE_CLASS
+    if _MROPE_CLASS is not None:
+        return _MROPE_CLASS
+    import mlx.nn as nn
 
-    def _apply(self, x: mx.array, positions: mx.array) -> mx.array:
-        # x: (B, H, L, D); positions: (3, B, L)
-        B, _, L, _ = x.shape
-        if positions.shape[1] != B or positions.shape[2] != L:
-            raise ValueError(
-                f"MRoPE positions {tuple(positions.shape)} do not match "
-                f"input batch/length ({B}, {L})"
+    class MRoPEDispatch(nn.Module):
+        """Wraps one attention layer's ``nn.RoPE``. Outside
+        :func:`mrope_positions` it is a pass-through; inside, it rotates the
+        first ``dims`` features (half-split pairing, as ``nn.RoPE`` with
+        ``traditional=False``) by per-token, per-axis positions."""
+
+        def __init__(self, inner: nn.Module, mrope_section: Sequence[int]):
+            super().__init__()
+            self.inner = inner
+            dims = int(inner.dims)
+            if getattr(inner, "traditional", False):
+                raise ValueError("MRoPE dispatch supports half-split RoPE only")
+            if float(getattr(inner, "scale", 1.0)) != 1.0:
+                raise ValueError("MRoPE dispatch supports unscaled RoPE only")
+            self._dims = dims
+            base = float(inner.base)
+            self._inv_freq = 1.0 / (
+                base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
             )
-        pos = mx.take(positions, self._selector, axis=0)  # (F, B, L)
-        freqs = pos.transpose(1, 2, 0).astype(mx.float32) * self._inv_freq
-        cos = mx.cos(freqs)[:, None, :, :]  # (B, 1, L, F)
-        sin = mx.sin(freqs)[:, None, :, :]
-        half = self._dims // 2
-        x1 = x[..., :half].astype(mx.float32)
-        x2 = x[..., half : self._dims].astype(mx.float32)
-        r1 = x1 * cos - x2 * sin
-        r2 = x2 * cos + x1 * sin
-        rotated = mx.concatenate([r1, r2], axis=-1).astype(x.dtype)
-        if self._dims == x.shape[-1]:
-            return rotated
-        return mx.concatenate([rotated, x[..., self._dims :]], axis=-1)
+            self._selector = interleaved_selector(list(mrope_section), dims // 2)
+            mx.eval(self._inv_freq, self._selector)
+
+        def __call__(self, x: mx.array, offset: Any = 0) -> mx.array:
+            positions = _active_positions()
+            if positions is None:
+                return self.inner(x, offset=offset)
+            return self._apply(x, positions)
+
+        def _apply(self, x: mx.array, positions: mx.array) -> mx.array:
+            # x: (B, H, L, D); positions: (3, B, L)
+            B, _, L, _ = x.shape
+            if positions.shape[1] != B or positions.shape[2] != L:
+                raise ValueError(
+                    f"MRoPE positions {tuple(positions.shape)} do not match "
+                    f"input batch/length ({B}, {L})"
+                )
+            pos = mx.take(positions, self._selector, axis=0)  # (F, B, L)
+            freqs = pos.transpose(1, 2, 0).astype(mx.float32) * self._inv_freq
+            cos = mx.cos(freqs)[:, None, :, :]  # (B, 1, L, F)
+            sin = mx.sin(freqs)[:, None, :, :]
+            half = self._dims // 2
+            x1 = x[..., :half].astype(mx.float32)
+            x2 = x[..., half : self._dims].astype(mx.float32)
+            r1 = x1 * cos - x2 * sin
+            r2 = x2 * cos + x1 * sin
+            rotated = mx.concatenate([r1, r2], axis=-1).astype(x.dtype)
+            if self._dims == x.shape[-1]:
+                return rotated
+            return mx.concatenate([rotated, x[..., self._dims :]], axis=-1)
+
+    _MROPE_CLASS = MRoPEDispatch
+    return MRoPEDispatch
+
+
+def __getattr__(name: str):
+    if name == "MRoPEDispatch":
+        return _mrope_class()
+    raise AttributeError(name)
 
 
 def _attention_modules(text_model: Any) -> list:
@@ -151,6 +174,9 @@ def install_mrope(text_model: Any, mrope_section: Sequence[int]) -> int:
     number of layers wrapped (0 if already installed)."""
     if len(mrope_section) != 3:
         raise ValueError(f"mrope_section must have 3 entries, got {mrope_section}")
+    import mlx.nn as nn
+
+    MRoPEDispatch = _mrope_class()
     count = 0
     for attn in _attention_modules(text_model):
         rope = attn.rope
