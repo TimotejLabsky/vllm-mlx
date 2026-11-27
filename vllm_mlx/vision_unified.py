@@ -306,6 +306,7 @@ class MediaInputs:
     cache_key: Optional[list] = None
     keyed: bool = False
     prompt_text: Optional[str] = None
+    n_downscaled: int = 0
     plan: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
 
@@ -411,6 +412,7 @@ class MediaRows:
             "media_prefill_s": 0.0,
             "media_encode_s": 0.0,
             "media_errors": 0,
+            "media_images_downscaled": 0,
             "media_cache_hits": 0,
             "media_cached_tokens": 0,
             "media_encode_skipped": 0,
@@ -490,6 +492,7 @@ class MediaRows:
             media_requests=1,
             media_images=media.n_images,
             media_image_tokens=media.image_tokens,
+            media_images_downscaled=media.n_downscaled,
             media_cache_hits=1 if n > 0 else 0,
             media_cached_tokens=n,
         )

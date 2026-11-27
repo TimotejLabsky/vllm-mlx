@@ -177,7 +177,19 @@ joins the same batch. Which caches apply to it:
 | RoPE delta | not stored; a key prefix fixes the positions, and a restore recomputes the delta from the request's own grids |
 
 Text requests on the route are byte-identical to `--text-only`, cache
-behaviour included (laptop e2e). Status, limits and the pending Studio check:
+behaviour included (laptop e2e and the 27B-8bit Studio check).
+
+**Image size cap: `VLLM_MLX_VISION_MAX_IMAGE_TOKENS` (default 4096, `0` =
+the processor's own 16,384).** The vision encode is the one step that cannot
+be chunked. On the 27B-8bit it took 4.2 s at 4096 tokens (2048² px) and 49 s
+at 16,384 (4096² px), with every other row waiting. Over-cap images are
+downscaled by the processor's own resize (aspect kept), not rejected. The
+cache key uses the post-resize grid, so one image under two caps never
+cross-hits; an image under the cap keeps its old key. With the default, a 4K
+screenshot is encoded at ~0.71 linear scale, a 5K one at ~0.53, and an A4 page
+at 300 dpi at ~207 dpi, so fine print loses detail. Peak memory with a
+cap-sized image behind a 23K prompt was +5.1 GB over the text equivalent.
+`/v1/status` reports the cap and counts downscaled images. Status, limits and the pending Studio check:
 PATCHES.md #181.
 
 ## Known residuals

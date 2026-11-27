@@ -5017,3 +5017,35 @@ def test_181_snapshots_carry_no_rope_delta():
     finally:
         BatchKVCache.merge = saved
         vu._BATCH_PATCHED = flag
+
+
+def test_181_image_cap_follows_the_encode_not_the_bytes():
+    """#181 image cap: the same image bytes encoded under two caps give two
+    grids, and the cache key carries the grid, so they can never cross-hit;
+    an image under the cap keeps the uncapped grid (and key)."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+    from PIL import Image
+
+    from vllm_mlx import vision_unified as vu
+    from vllm_mlx.vision_unified_engine import apply_image_token_cap
+
+    def grid(cap, size):
+        p = SimpleNamespace(
+            image_processor=Qwen3VLImageProcessor(
+                patch_size=16, merge_size=2, max_pixels=16777216, min_pixels=65536
+            )
+        )
+        apply_image_token_cap(p, cap)
+        out = p.image_processor(images=[Image.new("RGB", size)])
+        return np.asarray(out["image_grid_thw"]).reshape(-1, 3)
+
+    def key(g):
+        n = int(np.prod(g[0])) // 4
+        return vu.media_cache_key([1] + [9] * n, 9, (b"z" * 32,), g)
+
+    assert np.array_equal(grid(4096, (640, 480)), grid(0, (640, 480)))
+    a, b = grid(4096, (3000, 3000)), grid(1024, (3000, 3000))
+    assert key(a)[1] != key(b)[1]

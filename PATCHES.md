@@ -4841,7 +4841,7 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
 
 ## 181. `patch: vision-unified` — images through the TEXT scheduler (`--vision-unified`, default OFF)
 
-**Status: stages 1-3 built and laptop-verified (draft PR); not enabled on any route.** Not the two-scheduler design of draft PR #141 (`feat/vision-split`, rejected by the owner): one engine, one scheduler, one batch.
+**Status: stages 1-3 built, laptop-verified and Studio-checked on the 27B-8bit (PASS); not enabled on any route.** Not the two-scheduler design of draft PR #141 (`feat/vision-split`, rejected by the owner): one engine, one scheduler, one batch.
 
 **Stage 1 — numerical proof (passed, laptop, `mlx-community/Qwen3.5-0.8B-4bit`).**
 - **Files:** `vllm_mlx/vision_unified.py` (new), `scripts/fork/vision_unified_parity.py` (new), `tests/test_vision_unified_181.py` (new), `tests/test_fork_invariants.py` (`test_181_*`).
@@ -4923,4 +4923,56 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
   - The delta-0 drafter bypass works.
   - The go-cold reset works.
 
-**Pending (`hw:studio-bench`):** the 27B-8bit with the route's real env (template file, `VLLM_MLX_TEXT_MTP_DRAFTER`, SSD dir in a scratch HOME), spare port: T=0 byte parity and identical `cached_tokens` against `--text-only`; image answers; drafter `disabled: false` on text and `bypass_counts.media_row` on images; resident memory against `--text-only`; a text stream's longest inter-token gap while a ~20K-token system prompt + image request prefills, with peak memory, against the same request without the image (on the laptop the two are equal); the vision-encode time for the route's largest expected image; an SSD restart round trip of a media entry; no relief/OOM under an image plus deep-text mix. **Not enabled on any route.**
+**Studio check on the 27B-8bit (PASS, PR #144 verdict; head `47ee0d70`, the route's real env on a spare port).**
+- Text is byte-identical to `--text-only`, with the same `cached_tokens`, on every probe (short, 5.3K system prompt and its re-send, parallel tool calls and their follow-up, Anthropic, thinking on).
+- Decode at 5.3K: 21.77 vs 21.87 tok/s (-0.5%, n=3). The drafter counters are identical; image rows are bypassed (`media_row` 244 / 324).
+- Image answers are correct (colours, both orders of two images, an invoice, a 2048² page behind a 23K prompt).
+- The image chain hits past the image warm and after an SSD restart (6469/6476).
+- Active memory after load: +0.92 GB.
+- **Vision encode, the one atomic step:**
+
+  | Image | Image tokens | Encode |
+  |---|---|---|
+  | 256² | 64 | 0.05-0.10 s |
+  | 1024x512 | 512 | 0.24 s |
+  | 1024² | ~1024 | 0.53 s |
+  | 2048² | 4096 | 4.2 s |
+  | 4096² (processor maximum) | 16,384 | **49.1 s** (every other row waits) |
+
+- **Peak memory:** 43.6 GB with a 2048² image behind a 23K prompt co-batched next to a stream, vs 38.5 GB for the same-length text. That is +5.1 GB. There was no relief, OOM or swap growth.
+
+**Per-image token cap (`VLLM_MLX_VISION_MAX_IMAGE_TOKENS`, default 4096; `0` = the processor's own limit, 16,384 on Qwen3.5/3.8).**
+- **How it caps.** At load, `apply_image_token_cap` lowers the route's image processor `max_pixels` to `cap x (patch x merge)²` (32² px per token on Qwen3.5). An image above the cap is downscaled by the processor's own `smart_resize`: aspect kept, both sides floored to the 32 px grid, so it encodes to at most `cap` tokens. It is never rejected. Grid, MRoPE positions and pixel values all come from the same resize.
+- **Refused at startup:** a malformed or negative value (CLI check and load); a cap below the processor's minimum (64 tokens); a processor without `max_pixels`/`patch_size`/`merge_size` unless the cap is 0.
+- **Cache.** The fingerprint is seeded with the post-resize grid, so it follows what is encoded. The same bytes under two caps that both resize give two grids and two keys, which part at the first placeholder. An image under the cap gets the processor's unchanged grid, so its key is byte-identical to before.
+- **Counting.** The prompt ceiling and admission read the processor's output ids, so they count the post-resize tokens. `/v1/status` `vision_unified.image_cap` reports the cap, the processor maximum, `max_pixels` and the token size; `media_images_downscaled` counts images the cap shrank.
+- **Off the flag** nothing reads the knob: only `vision_unified_engine.py` references it (test). MLLM routes keep the processor limit.
+- **What the default costs:**
+  - Encode is bounded at about the measured 4.2 s on the 27B-8bit, not the 49 s at the processor maximum.
+  - Peak memory: the +5.1 GB measured above with a 2048² image is the cap-sized case.
+  - Detail:
+    - Up to 4096 tokens (~4.2 Mpx: 2048², 2560x1600) is untouched.
+    - A 3840x2160 screenshot (8100 tokens) is downscaled by ~0.71 linear to ~2730x1536.
+    - A 5120x2880 screenshot by ~0.53.
+    - An A4 page at 300 dpi (2480x3508, ~8500 tokens) by ~0.69, i.e. to ~207 dpi.
+  - Small UI text and fine print lose legibility in proportion. A route that reads dense documents or high-DPI screenshots may want 8192 (about 4x the encode time, unmeasured on the 27B; the encode grows faster than linearly) or 0.
+- **Tests** (`tests/test_vision_unified_181_imagecap.py`, 9, using mlx-vlm's real `Qwen3VLImageProcessor` without weights):
+  - default and env parsing;
+  - an over-cap 4096x2048 image (8192 tokens) encodes to ≤ 1024 tokens with its 2:1 aspect;
+  - an under-cap image keeps its grid and its byte-identical key;
+  - the same image under caps 4096 and 1024 never shares a key past the first placeholder;
+  - cap 0 leaves `max_pixels` alone;
+  - the refusals;
+  - the downscale count;
+  - only the unified engine module reads the knob;
+  - the CLI config check refuses a malformed value.
+  - Plus invariant `test_181_image_cap_follows_the_encode_not_the_bytes`.
+- **Laptop e2e:** the unified session runs with a cap of 256 (`E2E_IMAGE_CAP`). A 1024² image (1024 tokens uncapped) is answered "green" at 257 tokens; its re-send restores 1635/1636 with the same answer; `media_images_downscaled` is 2. The 256 px probes (64 tokens) are untouched, and every earlier check is unchanged.
+
+**Verification (current).**
+- Mocked: `tests/test_vision_unified_181*.py` 48 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6, `_imagecap` 9), plus `test_181_*` in `test_fork_invariants.py` (7).
+- Full mocked suite: 5686 passed / 33 skipped / 30 deselected.
+- Laptop, 0.8B: `vision_unified_parity.py` 16/16; `e2e_vision_unified.py` 34/34 (the 32 earlier checks plus the two over-cap checks).
+- Longest inter-token gap while a 9.9K-token request is prefilled: 1114 ms for both the text and the image request.
+
+**Status:** the Studio check passed; merge is the owner's call. Enabling it on the 27B-8bit route is a deploy decision: accept the cap's encode stall and the +5 GB peak, or pick another cap.

@@ -364,8 +364,17 @@ def _stop(proc, log, log_path):
     globals().setdefault("_LOGS", []).append(open(log_path).read())
 
 
+IMAGE_CAP = int(os.environ.get("E2E_IMAGE_CAP", "256"))
+BIG_GREEN = _png((20, 200, 40), size=1024)  # 1024 image tokens uncapped
+
+
 def _session(mode, workdir):
-    proc, log, log_path = _start(mode, workdir)
+    env = (
+        {"VLLM_MLX_VISION_MAX_IMAGE_TOKENS": str(IMAGE_CAP)}
+        if mode != "text-only"
+        else None
+    )
+    proc, log, log_path = _start(mode, workdir, env)
     r = {}
     try:
         r["mem_after_load_gb"] = (_status().get("metal") or {}).get("active_memory_gb")
@@ -437,6 +446,9 @@ def _session(mode, workdir):
             r["c_follow"] = _post(follow)
             r["c_other"] = _post(_img_msg([RED], COLOUR_Q, system=SYSTEM))
             r["c_other_resend"] = _post(_img_msg([RED], COLOUR_Q, system=SYSTEM))
+        big = _img_msg([BIG_GREEN], COLOUR_Q, system=SYSTEM)
+        r["big"] = _post(big)
+        r["big_resend"] = _post(big)
         if os.environ.get("E2E_GAPS", "1") == "1":
             nonce = str(time.time())
             r["gap_none"] = _gap_probe(None)
@@ -641,6 +653,23 @@ def main() -> int:
         and uni["health"].get("serves") == ["text", "image"],
         f"ref {ref.get('health', {}).get('model_type')} uni "
         f"{uni['health'].get('model_type')} {uni['health'].get('serves')}",
+    )
+    big, bigr = uni["big"], uni["big_resend"]
+    vstat = (uni["status"] or {}).get("vision_unified") or {}
+    check(
+        f"over-cap image (1024 tokens, cap {IMAGE_CAP}) downscaled and answered",
+        big["status"] == 200
+        and "green" in big["text"].lower()
+        and big["prompt"] - ref["system"]["prompt"] <= IMAGE_CAP + 30
+        and (vstat.get("media_images_downscaled") or 0) >= 1
+        and (vstat.get("image_cap") or {}).get("max_image_tokens") == IMAGE_CAP,
+        f"{big['text'][:30]!r} prompt {big['prompt']} downscaled "
+        f"{vstat.get('media_images_downscaled')} cap {vstat.get('image_cap')}",
+    )
+    check(
+        "over-cap image: re-send is a cache hit past the image, same answer",
+        bigr["cached"] > big["prompt"] - 30 and bigr["text"] == big["text"],
+        f"cached {bigr['cached']}/{bigr['prompt']}",
     )
     vu = (uni["status"] or {}).get("vision_unified") or {}
     check(

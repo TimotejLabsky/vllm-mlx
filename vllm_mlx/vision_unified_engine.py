@@ -32,6 +32,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -154,6 +156,10 @@ def check_vision_unified_config(
             "gate/up tensor would be a second copy of the expert weights next "
             "to the vision model's)"
         )
+    try:
+        max_image_tokens()
+    except VisionUnifiedError as e:
+        problems.append(f"cannot read its image cap: {e}")
     if problems:
         raise VisionUnifiedError("--vision-unified " + "; ".join(problems))
 
@@ -172,6 +178,88 @@ def _local_model_dir(model_path: str) -> Path:
                 f"--vision-unified: cannot resolve a local snapshot for {model_path!r}"
             ) from e
     return Path(local)
+
+
+# ---------------------------------------------------------------------------
+# Per-image token cap
+# ---------------------------------------------------------------------------
+
+ENV_MAX_IMAGE_TOKENS = "VLLM_MLX_VISION_MAX_IMAGE_TOKENS"
+DEFAULT_MAX_IMAGE_TOKENS = 4096
+
+
+def max_image_tokens() -> int:
+    """The route's per-image token cap (``0`` = the processor's own limit).
+    Read once at load; a malformed value refuses the start."""
+    raw = os.environ.get(ENV_MAX_IMAGE_TOKENS, "").strip()
+    if not raw:
+        return DEFAULT_MAX_IMAGE_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise VisionUnifiedError(
+            f"{ENV_MAX_IMAGE_TOKENS}={raw!r} is not an integer"
+        ) from None
+    if value < 0:
+        raise VisionUnifiedError(f"{ENV_MAX_IMAGE_TOKENS} must be >= 0, got {value}")
+    return value
+
+
+def smart_resize_tokens(height: int, width: int, factor: int, min_px: int, max_px: int):
+    """Image tokens the Qwen-VL processor's ``smart_resize`` gives an image
+    of ``height x width`` (each token is one ``factor x factor`` cell)."""
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+    if h_bar * w_bar > max_px:
+        beta = math.sqrt((height * width) / max_px)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_px:
+        beta = math.sqrt(min_px / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return (h_bar // factor) * (w_bar // factor)
+
+
+def apply_image_token_cap(processor: Any, cap: int) -> dict:
+    """Lower the image processor's own ``max_pixels`` so no image encodes to
+    more than ``cap`` tokens. Larger images are downscaled by the
+    processor's resize (aspect kept, grid and positions consistent), never
+    rejected. Returns what ``/v1/status`` reports."""
+    ip = getattr(processor, "image_processor", None)
+    patch = getattr(ip, "patch_size", None)
+    merge = getattr(ip, "merge_size", None)
+    native = getattr(ip, "max_pixels", None)
+    min_px = int(getattr(ip, "min_pixels", 0) or 0)
+    if not all(isinstance(v, int) and v > 0 for v in (patch, merge, native)):
+        if cap == 0:
+            return {"max_image_tokens": 0}
+        raise VisionUnifiedError(
+            f"--vision-unified: {ENV_MAX_IMAGE_TOKENS}={cap} needs an image "
+            f"processor with max_pixels/patch_size/merge_size "
+            f"(got {type(ip).__name__}); set it to 0 to serve uncapped"
+        )
+    factor = patch * merge
+    info = {
+        "max_image_tokens": cap,
+        "processor_max_image_tokens": native // (factor * factor),
+        "token_px": factor,
+        "native_max_pixels": native,
+        "min_pixels": min_px,
+    }
+    if cap == 0:
+        info["max_pixels"] = native
+        return info
+    min_tokens = -(-min_px // (factor * factor))
+    if cap < min_tokens:
+        raise VisionUnifiedError(
+            f"{ENV_MAX_IMAGE_TOKENS}={cap} is below the processor's minimum "
+            f"of {min_tokens} tokens per image"
+        )
+    capped = min(native, cap * factor * factor)
+    ip.max_pixels = capped
+    info["max_pixels"] = capped
+    return info
 
 
 def read_checkpoint_config(model_path: str) -> dict:
@@ -278,6 +366,7 @@ class VisionUnifiedEngine(BatchedEngine):
         self._text_model_type = ""
         self._media_rows: Optional[MediaRows] = None
         self._pending_media: dict[int, MediaInputs] = {}
+        self._image_cap: dict = {}
 
     # -- load ----------------------------------------------------------------
     def _prepare_llm_model(self) -> None:
@@ -314,6 +403,7 @@ class VisionUnifiedEngine(BatchedEngine):
         )
         self._model = model
         self._vlm_model = vlm_model
+        self._image_cap = apply_image_token_cap(processor, max_image_tokens())
         self._vlm_processor = processor
         self._mrope_section = section
         self._text_model_type = model_type
@@ -407,6 +497,7 @@ class VisionUnifiedEngine(BatchedEngine):
         n_tokens = sum(1 for t in ids if t == image_token)
         digests = tuple(image_digest(img) for img in images)
         grid_np = _np(grid)
+        downscaled = self._count_downscaled(paths, grid_np)
         return MediaInputs(
             input_ids=ids,
             pixel_values=_np(pixel_values),
@@ -416,8 +507,33 @@ class VisionUnifiedEngine(BatchedEngine):
             prompt_text=prompt,
             n_images=len(images),
             image_tokens=n_tokens,
+            n_downscaled=downscaled,
             preprocess_s=time.perf_counter() - tic,
         )
+
+    def _count_downscaled(self, paths: list, grid: np.ndarray) -> int:
+        """Images the cap made smaller than the processor would have."""
+        cap = self._image_cap or {}
+        if not cap.get("max_image_tokens") or "token_px" not in cap:
+            return 0
+        from PIL import Image
+
+        merge = 2  # grid rows are in patches; tokens are merged 2x2
+        ip = getattr(self._vlm_processor, "image_processor", None)
+        merge = int(getattr(ip, "merge_size", merge) or merge)
+        count = 0
+        for path, row in zip(paths, grid.reshape(-1, 3).tolist()):
+            try:
+                with Image.open(path) as im:
+                    w, h = im.size
+            except Exception:  # noqa: BLE001 - counting only
+                continue
+            native = smart_resize_tokens(
+                h, w, cap["token_px"], cap["min_pixels"], cap["native_max_pixels"]
+            )
+            if row[0] * row[1] * row[2] // (merge * merge) < native:
+                count += 1
+        return count
 
     async def _media_prompt(self, prompt: str, images, videos, audio) -> list:
         if videos or audio:
@@ -492,6 +608,7 @@ class VisionUnifiedEngine(BatchedEngine):
         stats["vision_unified"] = {
             "text_model_type": self._text_model_type,
             "mrope_section": self._mrope_section,
+            "image_cap": dict(self._image_cap),
             **(rows.stats() if rows is not None else {}),
         }
         return stats
