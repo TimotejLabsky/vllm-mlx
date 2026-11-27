@@ -278,7 +278,7 @@ def test_181_text_requests_never_read_media_state(monkeypatch):
     assert vu.media_of(SimpleNamespace(images=["http://x"])) is None
     assert vu.media_of(SimpleNamespace()) is None
     with pytest.raises(RuntimeError):
-        vu.prefill_media_row(SimpleNamespace(), _req("m", [1], _media()))
+        vu.plan_media_row(SimpleNamespace(), _req("m", [1], _media()))
 
 
 def test_181_media_cut_ends_after_the_last_image():

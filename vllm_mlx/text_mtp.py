@@ -716,7 +716,7 @@ def _bypass_reason(batch: Any, state: _BatchState) -> Optional[str]:
         return "disabled"
     if len(batch.uids) != 1:
         return "concurrent_batch"
-    if _vu.batch_has_media_row(batch.prompt_cache):
+    if _vu.batch_has_media_row(batch):
         return "media_row"  # (#181) never drafts for an image request
     processors = (batch.logits_processors or [None])[0] or ()
     for p in processors:

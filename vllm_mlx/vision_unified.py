@@ -33,6 +33,7 @@ import logging
 import struct
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Sequence
@@ -304,6 +305,8 @@ class MediaInputs:
     preprocess_s: float = 0.0
     cache_key: Optional[list] = None
     keyed: bool = False
+    prompt_text: Optional[str] = None
+    plan: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
 
 
@@ -396,13 +399,17 @@ class MediaRows:
         self.video_token_id = getattr(cfg, "video_token_id", None)
         self.vision_end_id = getattr(cfg, "vision_end_token_id", None)
         self.mrope_section = mrope_section
+        self.jobs: "OrderedDict[str, _MediaJob]" = OrderedDict()
+        self.prefix_rows: dict = {}
         self._lock = threading.Lock()
         self.counters = {
             "media_requests": 0,
             "media_images": 0,
             "media_image_tokens": 0,
             "media_prefill_tokens": 0,
-            "media_encode_prefill_s": 0.0,
+            "media_prefill_chunks": 0,
+            "media_prefill_s": 0.0,
+            "media_encode_s": 0.0,
             "media_errors": 0,
             "media_cache_hits": 0,
             "media_cached_tokens": 0,
@@ -412,7 +419,10 @@ class MediaRows:
     def stats(self) -> dict:
         with self._lock:
             out = dict(self.counters)
-        out["media_encode_prefill_s"] = round(out["media_encode_prefill_s"], 3)
+        for k in ("media_prefill_s", "media_encode_s"):
+            out[k] = round(out[k], 3)
+        out["media_jobs_active"] = len(self.jobs)
+        out["media_prefix_rows"] = len(self.prefix_rows)
         return out
 
     def count(self, **deltas) -> None:
@@ -421,7 +431,7 @@ class MediaRows:
                 self.counters[k] = self.counters.get(k, 0) + v
 
     def media_cut(self, ids: list) -> int:
-        """Tokens prefilled out of band: through the end of the LAST image
+        """End of the image span: through the end of the LAST image
         (its vision_end marker when present), never the final token."""
         last = -1
         for i in range(len(ids) - 1, -1, -1):
@@ -439,94 +449,331 @@ class MediaRows:
             cut += 1
         return min(cut, len(ids) - 1)
 
-    def prefill(self, scheduler: Any, request: Any) -> tuple:
-        """Encode + prefill one media request. Returns ``(tokens_to_process,
-        cache)`` for ``BatchGenerator.insert``.
+    # -- planning (schedule time, cheap) ------------------------------------
+    def first_image(self, ids: list) -> int:
+        for i, tok in enumerate(ids):
+            if tok == self.image_token_id or tok == self.video_token_id:
+                return i
+        raise ValueError("media request has no image tokens")
 
-        A restored prefix (stage 3) of ``n`` tokens is continued: if it
-        already covers the last image, no image is encoded and only the
-        delta is computed (from the grids); otherwise ``[n, cut)`` is
-        prefilled out of band into the restored cache."""
+    def plan(self, scheduler: Any, request: Any) -> tuple:
+        """Decide how one media request enters the batch. Returns
+        ``(tokens_to_process, cache)`` for the scheduler's insert; the plan
+        kind is kept in ``media.plan``:
+
+        * ``insert`` - a restore covers the last image: no encode; the rest
+          is an ordinary row (delta from the grids).
+        * ``prefix`` - text before the first image is still to prefill: it
+          is inserted as an ordinary row (same chunking, checkpoints, relief
+          as text) that stops at the first image; the image span then runs
+          as a chunked job (:meth:`step`).
+        * ``job`` - a restore ends inside [first image, last image): the
+          image span runs as a job right away, nothing is inserted now.
+        """
         import mlx.core as mx
-        from mlx_lm.models.cache import make_prompt_cache
 
         media = media_of(request)
-        tic = time.perf_counter()
-        ids_list = list(media.input_ids)
-        L = len(ids_list)
-        ids = mx.array([ids_list])
-        grid = mx.array(media.image_grid_thw)
-        cut = self.media_cut(ids_list)
+        ids = list(media.input_ids)
+        L = len(ids)
+        cut = self.media_cut(ids)
+        fis = self.first_image(ids)
         cache = request.prompt_cache if media.keyed else None
         n = int(request.cached_tokens or 0) if cache else 0
         if cache is not None and not (0 < n < L):
-            cache, n = None, 0  # full coverage cannot replay: go cold
-        encoded = False
-        if cache is not None and n >= cut:
-            _, deltas = self.vlm.language_model.get_rope_index(ids, grid)
-            delta = int(deltas.reshape(-1)[0].item())
-            start = n
-        else:
-            feats = self.vlm.get_input_embeddings(
-                ids, mx.array(media.pixel_values), image_grid_thw=grid
-            )
-            emb, pos = feats.inputs_embeds, feats.position_ids
-            if pos is None or pos.ndim != 3:
-                raise ValueError("vision model returned no 3-axis positions")
-            delta = int(feats.rope_deltas.reshape(-1)[0].item())
-            if cache is None:
-                cache = make_prompt_cache(scheduler.model)
-            step = int(getattr(scheduler.config, "prefill_step_size", 2048) or 2048)
-            media_prefill(
-                scheduler.model,
-                ids[:, n:cut],
-                emb[:, n:cut],
-                pos[:, :, n:cut],
-                cache,
-                step=step,
-            )
-            del feats, emb, pos
-            encoded = True
-            start = cut
-        set_rope_delta(cache, delta)
-        hybrid_kv = getattr(scheduler, "hybrid_kv", None)
-        if media.keyed and encoded and hybrid_kv is not None:
-            # checkpoint the recurrent state at the end of the last image:
-            # a later turn that diverges right after it restores here
-            try:
-                hybrid_kv.note_scheduled(request.request_id, cut)
-                hybrid_kv.capture_segment(request.request_id, 0, cache)
-            except Exception:
-                logger.debug(
-                    "[vision_unified] image-end checkpoint failed", exc_info=True
-                )
-        media.stats.update(start=start)
-        elapsed = time.perf_counter() - tic
+            # full coverage cannot replay: go cold
+            cache, n = None, 0
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.cache_hit_type = "miss"
+        media.plan = {"n": n, "fis": fis, "cut": cut}
         self.count(
             media_requests=1,
             media_images=media.n_images,
             media_image_tokens=media.image_tokens,
-            media_prefill_tokens=(cut - n) if encoded else 0,
-            media_encode_prefill_s=elapsed,
             media_cache_hits=1 if n > 0 else 0,
             media_cached_tokens=n,
-            media_encode_skipped=0 if encoded else 1,
         )
-        media.stats.update(delta=delta, cut=cut, encode_prefill_s=round(elapsed, 3))
+        if cache is not None and n >= cut:
+            grid = mx.array(media.image_grid_thw)
+            _, deltas = self.vlm.language_model.get_rope_index(mx.array([ids]), grid)
+            set_rope_delta(cache, int(deltas.reshape(-1)[0].item()))
+            self.count(media_encode_skipped=1)
+            media.plan.update(kind="insert", base=n, end=L)
+            return ids[n:], cache
+        if n < fis:
+            # stop the row at the first image; the extra token is never
+            # prefilled (the row leaves the batch at the segment end)
+            media.plan.update(kind="prefix", base=n, end=fis + 1)
+            return ids[n : fis + 1], cache
+        media.plan.update(kind="job", base=n, end=n)
+        return [], cache
+
+    def start_job(self, scheduler: Any, request: Any, cache, insert_kwargs) -> None:
+        from mlx_lm.models.cache import make_prompt_cache
+
+        media = media_of(request)
+        if cache is None:
+            cache = make_prompt_cache(scheduler.model)
+        self.jobs[request.request_id] = _MediaJob(
+            request=request,
+            cache=cache,
+            pos=media.plan["n"] if media.plan["kind"] == "job" else media.plan["fis"],
+            cut=media.plan["cut"],
+            insert_kwargs=insert_kwargs,
+        )
+
+    def insert(self, scheduler: Any, request: Any, tokens: list, insert_kwargs: dict):
+        """_schedule_waiting's insert for a media row (plans insert/prefix)."""
+        media = media_of(request)
+        plan = media.plan
+        if plan["kind"] == "prefix":
+            self.prefix_rows[request.request_id] = (
+                plan["fis"] - plan["base"],
+                insert_kwargs,
+            )
+            uids = _segmented_insert(
+                scheduler,
+                request,
+                tokens,
+                insert_kwargs,
+                base=plan["base"],
+                stop=len(tokens) - 1,
+            )
+        else:
+            uids = _segmented_insert(
+                scheduler, request, tokens, insert_kwargs, base=plan["base"]
+            )
+            _MEDIA_UIDS.update(uids)
+        return uids
+
+    # -- per step ------------------------------------------------------------
+    def after_prompt_responses(self, scheduler: Any, prompt_responses) -> None:
+        """A prefix row that reached its first image leaves the batch with
+        its cache; its image span becomes a job."""
+        if not self.prefix_rows or not prompt_responses:
+            return
+        for pr in prompt_responses:
+            rid = scheduler.uid_to_request_id.get(pr.uid)
+            entry = self.prefix_rows.get(rid) if rid is not None else None
+            if entry is None:
+                continue
+            progress = getattr(pr, "progress", None)
+            done = progress[0] if isinstance(progress, tuple) else int(progress or 0)
+            stop, insert_kwargs = entry
+            if done < stop:
+                continue
+            del self.prefix_rows[rid]
+            extracted = scheduler.batch_generator.extract_cache([pr.uid])
+            cache = list(extracted[pr.uid][0])
+            scheduler.batch_generator.remove([pr.uid])
+            scheduler.uid_to_request_id.pop(pr.uid, None)
+            scheduler.request_id_to_uid.pop(rid, None)
+            request = scheduler.requests.get(rid)
+            if request is None:
+                continue
+            request.batch_uid = None
+            self.start_job(scheduler, request, cache, insert_kwargs)
+
+    def step(self, scheduler: Any) -> None:
+        """One unit of media work per scheduler step: the vision encode of
+        the oldest job (atomic), or one ``prefill_step_size`` chunk of its
+        image span; a finished span joins the batch."""
+        if not self.jobs:
+            return
+        rid, job = next(iter(self.jobs.items()))
+        request = job.request
+        try:
+            if job.span is None:
+                self._encode(job)
+                return
+            self._chunk(scheduler, job)
+            if job.pos >= job.cut:
+                del self.jobs[rid]
+                self._finish(scheduler, job)
+        except Exception as e:
+            self.jobs.pop(rid, None)
+            if "Insufficient Memory" in str(e):
+                raise  # the step's OOM recovery, as for a text prefill
+            logger.error(
+                "[vision_unified] request=%s media prefill failed: %s",
+                rid[:12],
+                e,
+                exc_info=True,
+            )
+            self.count(media_errors=1)
+            scheduler.running.pop(rid, None)
+            scheduler._reject_at_schedule(request, "media_error")
+
+    def _encode(self, job: "_MediaJob") -> None:
+        import mlx.core as mx
+
+        media = media_of(job.request)
+        tic = time.perf_counter()
+        ids = mx.array([list(media.input_ids)])
+        feats = self.vlm.get_input_embeddings(
+            ids,
+            mx.array(media.pixel_values),
+            image_grid_thw=mx.array(media.image_grid_thw),
+        )
+        pos = feats.position_ids
+        if pos is None or pos.ndim != 3:
+            raise ValueError("vision model returned no 3-axis positions")
+        emb = feats.inputs_embeds[:, job.pos : job.cut]
+        pos = pos[:, :, job.pos : job.cut]
+        mx.eval(emb, pos)
+        job.delta = int(feats.rope_deltas.reshape(-1)[0].item())
+        job.span = (ids[:, job.pos : job.cut], emb, pos, job.pos)
+        del feats
+        dt = time.perf_counter() - tic
+        self.count(media_encode_s=dt)
+        media.stats["encode_s"] = round(dt, 4)
         logger.info(
-            "[vision_unified] request=%s images=%d image_tokens=%d restored=%d "
-            "prefilled=%d/%d delta=%d encoded=%s %.2fs",
-            request.request_id[:12],
+            "[vision_unified] request=%s encoded %d image(s), %d image tokens "
+            "in %.3fs; span [%d, %d) in chunks",
+            job.request.request_id[:12],
             media.n_images,
             media.image_tokens,
-            n,
-            (cut - n) if encoded else 0,
-            L,
-            delta,
-            encoded,
-            elapsed,
+            dt,
+            job.pos,
+            job.cut,
         )
-        return ids_list[start:], cache
+
+    def _chunk(self, scheduler: Any, job: "_MediaJob") -> None:
+        import mlx.core as mx
+
+        ids, emb, pos, origin = job.span
+        step = int(getattr(scheduler.config, "prefill_step_size", 2048) or 2048)
+        a = job.pos - origin
+        b = min(a + step, job.cut - origin)
+        tic = time.perf_counter()
+        with mrope_positions(pos[:, :, a:b]):
+            scheduler.model(ids[:, a:b], cache=job.cache, input_embeddings=emb[:, a:b])
+        mx.eval([c.state for c in job.cache])
+        job.pos = origin + b
+        self.count(
+            media_prefill_tokens=b - a,
+            media_prefill_chunks=1,
+            media_prefill_s=time.perf_counter() - tic,
+        )
+
+    def _finish(self, scheduler: Any, job: "_MediaJob") -> None:
+        request = job.request
+        media = media_of(request)
+        ids = list(media.input_ids)
+        set_rope_delta(job.cache, job.delta)
+        job.span = None
+        hybrid_kv = getattr(scheduler, "hybrid_kv", None)
+        if media.keyed and hybrid_kv is not None:
+            # checkpoint the recurrent state at the end of the last image
+            try:
+                hybrid_kv.note_scheduled(request.request_id, job.cut)
+                hybrid_kv.capture_segment(request.request_id, 0, job.cache)
+            except Exception:
+                logger.debug(
+                    "[vision_unified] image-end checkpoint failed", exc_info=True
+                )
+        kw = dict(job.insert_kwargs)
+        kw["caches"] = [job.cache]
+        kw["all_tokens"] = [ids[: job.cut]]
+        media.plan.update(kind="insert", base=job.cut, end=len(ids))
+        uids = _segmented_insert(scheduler, request, ids[job.cut :], kw, base=job.cut)
+        uid = uids[0]
+        _MEDIA_UIDS.add(uid)
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+        request.batch_uid = uid
+        job.cache = None
+        logger.info(
+            "[vision_unified] request=%s image span done (delta=%d); %d "
+            "trailing tokens join the batch as uid=%d",
+            request.request_id[:12],
+            job.delta,
+            len(ids) - job.cut,
+            uid,
+        )
+
+    # -- release -------------------------------------------------------------
+    def drop(self, scheduler: Any, request_id: str) -> bool:
+        job = self.jobs.pop(request_id, None)
+        prefix = self.prefix_rows.pop(request_id, None)
+        uid = scheduler.request_id_to_uid.get(request_id)
+        if uid is not None:
+            _MEDIA_UIDS.discard(uid)
+        if job is not None:
+            job.cache = None
+            job.span = None
+        return job is not None or prefix is not None
+
+    def drop_all(self) -> None:
+        self.jobs.clear()
+        self.prefix_rows.clear()
+        _MEDIA_UIDS.clear()
+
+
+@dataclass
+class _MediaJob:
+    request: Any
+    cache: Any
+    pos: int
+    cut: int
+    insert_kwargs: dict
+    span: Any = None
+    delta: int = 0
+
+
+# uids of media rows in the live batch (the text drafter bypasses them,
+# whatever their delta; read only by text_mtp)
+_MEDIA_UIDS: set = set()
+
+
+def _segmented_insert(
+    scheduler: Any,
+    request: Any,
+    tokens: list,
+    insert_kwargs: dict,
+    *,
+    base: int,
+    stop: Optional[int] = None,
+):
+    """Insert a media row's text part like a text row: with the batched
+    system-KV and a keyed request, the same message-boundary (#88/#126),
+    uniform-interval and divergence (#117) cuts ``insert_segmented`` makes,
+    at the row's absolute start ``base``; ``stop`` forces one more cut."""
+    media = media_of(request)
+    hybrid_kv = getattr(scheduler, "hybrid_kv", None)
+    bg = scheduler.batch_generator
+    extra = {stop} if stop else set()
+    if hybrid_kv is None or not media.keyed:
+        cuts = sorted(c for c in extra if 0 < c < len(tokens))
+        segs, start = [], 0
+        for c in cuts + [len(tokens)]:
+            segs.append(list(tokens[start:c]))
+            start = c
+        return bg.insert_segments([segs], **insert_kwargs)
+    from .batched_system_kv import find_message_boundaries
+
+    boundaries, anchor = (), None
+    try:
+        markers = hybrid_kv.boundary_marker_ids(media.prompt_text, scheduler.tokenizer)
+        boundaries, anchor = find_message_boundaries(
+            tokens,
+            markers,
+            hybrid_kv.boundary_min_step,
+            first_min=hybrid_kv.partial_min if base == 0 else None,
+            with_anchor=True,
+        )
+        boundaries = hybrid_kv.add_divergence_cut(
+            request.request_id, base, len(tokens), boundaries
+        )
+    except Exception:
+        logger.debug("[vision_unified] boundary detection failed", exc_info=True)
+    boundaries = tuple(sorted(set(boundaries) | extra))
+    hybrid_kv.note_scheduled(
+        request.request_id, base, boundaries=boundaries, anchor=anchor
+    )
+    return bg.insert_segments(
+        [hybrid_kv.split_segments(tokens, boundaries=boundaries)], **insert_kwargs
+    )
 
 
 def key_media_request(scheduler: Any, request: Any) -> bool:
@@ -545,14 +792,6 @@ def key_media_request(scheduler: Any, request: Any) -> bool:
     return True
 
 
-def insert_media_row(scheduler: Any, request: Any, tokens: list, insert_kwargs: dict):
-    """Insert a keyed media row as one segment whose absolute start is known
-    to the bag, so its prompt-end checkpoint lands at the right position."""
-    start = media_of(request).stats.get("start", 0)
-    scheduler.hybrid_kv.note_scheduled(request.request_id, start)
-    return scheduler.batch_generator.insert_segments([[list(tokens)]], **insert_kwargs)
-
-
 def mark_uncached(request: Any) -> None:
     """A media request that reads no cache: a cold miss."""
     request.cache_hit_type = "miss"
@@ -561,17 +800,69 @@ def mark_uncached(request: Any) -> None:
     request.remaining_tokens = request.prompt_token_ids
 
 
-def prefill_media_row(scheduler: Any, request: Any) -> tuple:
+def _rows(scheduler: Any) -> "MediaRows":
     rows = getattr(scheduler, "_vision_unified", None)
     if rows is None:
         raise RuntimeError("media request on a scheduler without --vision-unified")
-    return rows.prefill(scheduler, request)
+    return rows
+
+
+def plan_media_row(scheduler: Any, request: Any) -> tuple:
+    return _rows(scheduler).plan(scheduler, request)
+
+
+def planned_end(media: MediaInputs) -> int:
+    """Real-id index where the planned insert's tokens end."""
+    return media.plan["end"]
+
+
+def planned_job(media: MediaInputs) -> bool:
+    return media.plan.get("kind") == "job"
+
+
+def start_media_job(scheduler: Any, request: Any, cache, insert_kwargs) -> None:
+    _rows(scheduler).start_job(scheduler, request, cache, insert_kwargs)
+
+
+def insert_media(scheduler: Any, request: Any, tokens: list, insert_kwargs: dict):
+    return _rows(scheduler).insert(scheduler, request, tokens, insert_kwargs)
+
+
+def on_step(scheduler: Any, prompt_responses) -> None:
+    """step() hook: prefix rows that reached their image become jobs, then
+    one unit of media work runs. A no-op on every other route."""
+    rows = getattr(scheduler, "_vision_unified", None)
+    if rows is None:
+        return
+    rows.after_prompt_responses(scheduler, prompt_responses)
+    rows.step(scheduler)
+
+
+def drop_media(scheduler: Any, request_id: str) -> None:
+    """abort hook: release a media request's job / prefix bookkeeping."""
+    rows = getattr(scheduler, "_vision_unified", None)
+    if rows is not None:
+        rows.drop(scheduler, request_id)
+
+
+def drop_all_media(scheduler: Any) -> None:
+    """recovery / reschedule hook: every job and prefix row is gone (the
+    requests are aborted or re-planned from scratch)."""
+    rows = getattr(scheduler, "_vision_unified", None)
+    if rows is not None:
+        rows.drop_all()
 
 
 def count_media_error(scheduler: Any) -> None:
     rows = getattr(scheduler, "_vision_unified", None)
     if rows is not None:
         rows.count(media_errors=1)
+
+
+def forget_media_row(scheduler: Any, request_id: str) -> None:
+    uid = scheduler.request_id_to_uid.get(request_id)
+    if uid is not None:
+        _MEDIA_UIDS.discard(uid)
 
 
 def release_media_request(scheduler: Any, request_id: str, request: Any) -> None:
@@ -583,15 +874,9 @@ def release_media_request(scheduler: Any, request_id: str, request: Any) -> None
     request._extracted_cache = None
 
 
-def batch_has_media_row(cache: Any) -> bool:
-    """True when any row of a batch cache carries a RoPE delta (a media row
-    after its prefill). Answers False unless the #181 patch is installed."""
-    if not _BATCH_PATCHED or not cache:
+def batch_has_media_row(batch: Any) -> bool:
+    """True when a generation batch holds a media row (any delta, 0
+    included). False unless a --vision-unified route inserted one."""
+    if not _MEDIA_UIDS:
         return False
-    for layer in cache:
-        offset = getattr(layer, "offset", None)
-        left = getattr(layer, "left_padding", None)
-        idx = getattr(layer, "_idx", None)
-        if isinstance(offset, mx.array) and left is not None and idx is not None:
-            return bool(mx.any(offset != (idx - left)).item())
-    return False
+    return any(uid in _MEDIA_UIDS for uid in getattr(batch, "uids", ()) or ())

@@ -195,8 +195,6 @@ def test_181_merge_adds_a_rows_delta_and_rows_carry_it(batch_patch):
     assert merged.offset.tolist() == [4, 2]
     merged.trim(1)
     assert merged.offset.tolist() == [3, 1]
-    assert vu.batch_has_media_row([merged])
-    assert not vu.batch_has_media_row([batch_patch.merge([_kv(3), _kv(2)])])
 
 
 def test_181_rope_delta_helpers():

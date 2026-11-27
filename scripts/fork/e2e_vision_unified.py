@@ -225,6 +225,81 @@ VIDEO = [
 ]
 
 
+def _stream_times(messages, max_tokens, started):
+    """Stream ``messages``; return the arrival time of every content chunk.
+    ``started`` is set after the 10th chunk."""
+    req = urllib.request.Request(
+        f"{BASE}/v1/chat/completions",
+        json.dumps(
+            {
+                "model": MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        ).encode(),
+        {"Content-Type": "application/json"},
+    )
+    times = []
+    with urllib.request.urlopen(req, timeout=900) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            for ch in chunk.get("choices") or []:
+                if (ch.get("delta") or {}).get("content"):
+                    times.append(time.perf_counter())
+                    if len(times) == 10:
+                        started.set()
+    return times
+
+
+def _long_system(nonce):
+    return (
+        f"[{nonce}] You are a terse assistant. Answer in one word. Notes: "
+        + " ".join(f"crate {i} sits in bay {i % 11}." for i in range(900))
+    )
+
+
+def _gap_probe(extra_messages):
+    """Longest inter-token gap of a decoding text stream while
+    ``extra_messages`` (or nothing) is sent once it is decoding."""
+    started = threading.Event()
+    box = {}
+    stream = threading.Thread(
+        target=lambda: box.update(
+            times=_stream_times(
+                [
+                    {
+                        "role": "user",
+                        "content": "Count from one to two hundred in words.",
+                    }
+                ],
+                600,
+                started,
+            )
+        )
+    )
+    stream.start()
+    started.wait(timeout=300)
+    t_sent = time.perf_counter()
+    if extra_messages is not None:
+        box["extra"] = _post(extra_messages)
+    stream.join(timeout=900)
+    times = box.get("times") or []
+    gaps = [b - a for a, b in zip(times, times[1:]) if b > t_sent]
+    gaps.sort()
+    return {
+        "max_gap_ms": round(1000 * max(gaps), 1) if gaps else None,
+        "p50_gap_ms": round(1000 * gaps[len(gaps) // 2], 1) if gaps else None,
+        "tokens": len(times),
+        "extra": box.get("extra"),
+    }
+
+
 def _status():
     return json.load(urllib.request.urlopen(f"{BASE}/v1/status", timeout=30))
 
@@ -305,6 +380,9 @@ def _session(mode, workdir):
         )
         r["anthropic_image"] = _anthropic(ANTHROPIC_IMAGE)
         if mode == "text-only":
+            r["health"] = json.load(
+                urllib.request.urlopen(f"{BASE}/health", timeout=30)
+            )
             return r
         r["video"] = _post(VIDEO)
         r["two"] = _post(
@@ -359,6 +437,19 @@ def _session(mode, workdir):
             r["c_follow"] = _post(follow)
             r["c_other"] = _post(_img_msg([RED], COLOUR_Q, system=SYSTEM))
             r["c_other_resend"] = _post(_img_msg([RED], COLOUR_Q, system=SYSTEM))
+        if os.environ.get("E2E_GAPS", "1") == "1":
+            nonce = str(time.time())
+            r["gap_none"] = _gap_probe(None)
+            r["gap_text"] = _gap_probe(
+                [
+                    {"role": "system", "content": _long_system("t" + nonce)},
+                    {"role": "user", "content": "Which bay holds crate 40?"},
+                ]
+            )
+            r["gap_image"] = _gap_probe(
+                _img_msg([RED], COLOUR_Q, system=_long_system("i" + nonce))
+            )
+        r["health"] = json.load(urllib.request.urlopen(f"{BASE}/health", timeout=30))
         r["status"] = _status()
         return r
     finally:
@@ -513,19 +604,44 @@ def main() -> int:
             fo["status"] == 200 and fo["cached"] >= f["prompt"] - 30,
             f"cached {fo['cached']}/{fo['prompt']}",
         )
-        sys_tokens = ref["system"]["prompt"] - 20
+        # the 256 px test image is 64 placeholder tokens: a restore may end
+        # at the image's first token at most, never inside or after it
+        image_start_max = o["prompt"] - 64 - 2
         check(
             "stage 3: same text, different image never hits past the image",
             o["status"] == 200
-            and o["cached"] <= sys_tokens
+            and o["cached"] <= image_start_max
             and "red" in o["text"].lower(),
-            f"cached {o['cached']}/{o['prompt']} (system part ~{sys_tokens})",
+            f"cached {o['cached']}/{o['prompt']} (image starts at or below "
+            f"{image_start_max})",
         )
         check(
             "stage 3: the other image's own re-send hits",
             ors["cached"] > o["prompt"] - 30 and ors["text"] == o["text"],
             f"cached {ors['cached']}/{ors['prompt']}",
         )
+    if "gap_image" in uni:
+        for k in ("gap_none", "gap_text", "gap_image"):
+            g = uni[k]
+            print(
+                f"INFO  {k}: longest inter-token gap {g['max_gap_ms']} ms, "
+                f"median {g['p50_gap_ms']} ms over {g['tokens']} tokens "
+                f"(extra prompt {((g['extra'] or {}).get('prompt'))} tokens)"
+            )
+        gi = uni["gap_image"]["extra"] or {}
+        check(
+            "long system prompt + image while a stream decodes: answered red",
+            gi.get("status") == 200 and "red" in gi.get("text", "").lower(),
+            repr(gi.get("text", "")[:60]),
+        )
+    check(
+        "/health: --text-only says llm; unified says mllm and serves both",
+        ref.get("health", {}).get("model_type") == "llm"
+        and uni["health"].get("model_type") == "mllm"
+        and uni["health"].get("serves") == ["text", "image"],
+        f"ref {ref.get('health', {}).get('model_type')} uni "
+        f"{uni['health'].get('model_type')} {uni['health'].get('serves')}",
+    )
     vu = (uni["status"] or {}).get("vision_unified") or {}
     check(
         "/v1/status has the vision_unified counters",

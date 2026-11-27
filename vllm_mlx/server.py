@@ -191,7 +191,11 @@ from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 from .utils.logging_setup import configure_root_logging, timestamped_log_config
 from .utils.reasoning_effort import EFFORT_FALLBACK_KEY
-from .vision_unified_engine import engine_serves_media, request_is_mllm
+from .vision_unified_engine import (
+    engine_serves_media,
+    is_vision_unified,
+    request_is_mllm,
+)
 
 configure_root_logging(logging.INFO)  # PATCHES.md #90 — timestamped log lines
 logger = logging.getLogger(__name__)
@@ -4987,6 +4991,11 @@ async def health():
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
+    if is_vision_unified(_engine):
+        # (#181) one engine serves both: capability probes reading
+        # model_type must see vision; "serves" says text is there too
+        payload["model_type"] = "mllm"
+        payload["serves"] = ["text", "image"]
     if lifecycle is not None:
         lifecycle_fields = {
             "residency_state": lifecycle["state"],

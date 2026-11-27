@@ -388,8 +388,9 @@ class VisionUnifiedEngine(BatchedEngine):
         if placeholders != len(images):
             raise MediaNotSupported(
                 f"the chat template rendered {placeholders} image "
-                f"placeholder(s) for {len(images)} image(s); this route's "
-                f"template cannot place images"
+                f"placeholder(s) for {len(images)} image(s): either this "
+                f"route's template cannot place images, or the message text "
+                f"itself contains an image placeholder token"
             )
         paths = [process_image_input(img) for img in images]
         inputs = prepare_inputs(
@@ -412,6 +413,7 @@ class VisionUnifiedEngine(BatchedEngine):
             image_grid_thw=grid_np,
             image_digests=digests,
             cache_key=vu.media_cache_key(ids, image_token, digests, grid_np),
+            prompt_text=prompt,
             n_images=len(images),
             image_tokens=n_tokens,
             preprocess_s=time.perf_counter() - tic,

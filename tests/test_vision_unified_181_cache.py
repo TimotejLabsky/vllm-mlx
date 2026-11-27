@@ -180,7 +180,6 @@ def test_181_unkeyable_media_stays_cold(
     assert vlm.calls == 2
 
 
-
 def test_181_reconcile_never_splices_a_media_key(
     monkeypatch, batch_patch, small_bag  # noqa: F811
 ):
