@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling 2 message-block parsers (reasoning + tool calls), fork #181."""
+"""Inkling 2 message-block parsers (reasoning + tool calls), fork #182."""
 
 import json
 

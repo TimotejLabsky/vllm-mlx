@@ -4839,7 +4839,145 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
 - Full mocked suite on the old layout: 5625 passed / 32 skipped (30 deselected by `pytest.ini`). It was not run in full on the new layout, where #118's other rows (C, E, the `sys.modules` fakes) are still open.
 - **Not run:** the real 27B-8bit + Qwen3.8-27B-MTP drafter on either layout. The check is in the PR: on the Studio, prod venv, spare port, show drafter `disabled: false`, the acceptance rate, decode tok/s and T=0 byte identity against production; then the same in a scratch venv on the mlx-lm release.
 
-## 181. `patch: inkling-parsers` — reasoning and tool-call parsers for Inkling 2's message blocks
+## 181. `patch: vision-unified` — images through the TEXT scheduler (`--vision-unified`, default OFF)
+
+**Status: stages 1-3 built, laptop-verified and Studio-checked on the 27B-8bit (PASS); not enabled on any route.** Not the two-scheduler design of draft PR #141 (`feat/vision-split`, rejected by the owner): one engine, one scheduler, one batch.
+
+**Stage 1 — numerical proof (passed, laptop, `mlx-community/Qwen3.5-0.8B-4bit`).**
+- **Files:** `vllm_mlx/vision_unified.py` (new), `scripts/fork/vision_unified_parity.py` (new), `tests/test_vision_unified_181.py` (new), `tests/test_fork_invariants.py` (`test_181_*`).
+- **How positions reach mlx-lm's class, with no site-packages edit and no upstream-file seam.** Qwen3.5 attention uses interleaved 3-axis MRoPE (`mrope_section`, e.g. `[11, 11, 10]`); mlx-lm's text class applies plain 1-D RoPE at `cache.offset`. When all three axes are equal (text) the two are the same function, so only two things differ for a media request: the per-token 3-axis positions of the prompt (image tokens get their T/H/W grid), and a constant shift `delta = max_position + 1 - prompt_len` (negative: an image of `h*w` tokens advances positions by `max(h, w)`) for every token after the last image, decode included.
+  - `install_mrope(text_model, mrope_section)` wraps each full-attention layer's `nn.RoPE` in `MRoPEDispatch`. Outside `mrope_positions(...)` it calls the wrapped `nn.RoPE` with the same arguments. Inside, it rotates the first `dims` features (half-split pairing) by explicit `(3, B, L)` positions, matching mlx-vlm's `Qwen3_5RotaryEmbedding` to 6e-6 (fp32).
+  - The delta needs no dispatch at all. mlx-lm's `BatchKVCache` uses `offset` only as the RoPE position (mask and buffer index use `_idx` and `left_padding`), and `filter`/`extend`/`trim`/decode carry it per row. `install_batch_cache_delta()` patches `BatchKVCache.merge` (adds a row's `rope_delta`, stamped on its single-row `KVCache` layers, to that row's offset). Rows without a delta get no extra op.
+  - Both are installed only by `--vision-unified`; nothing in the module runs at import.
+- **Results** (`vision_unified_parity.py`, 16/16):
+  - text-only, patches installed vs not: logits **bit-identical** (max |d| = 0.0), greedy tokens identical single-stream and through `BatchGenerator` (2 rows).
+  - image prompts, mlx-lm text model + mlx-vlm's merged embeddings + MRoPE positions vs mlx-vlm's own forward (one image L=219 delta=-182; two images L=415 delta=-364; image then a later text turn L=242): **greedy tokens equal** on all three (full answers, up to 17 tokens). Logits are not bit-equal, and cannot be: the two stacks are not bit-equal on plain text either. Tolerance asserted: mean |d| over all positions <= 2x the text-stack floor (mlx-vlm vs mlx-lm on a text prompt of the same length). Measured mean |d| 0.057 / 0.062 / 0.066 vs floor 0.034 / 0.035 / 0.035 (1.7-1.9x); last-position max |d| 0.66 / 0.97 / 0.81 vs a text floor max of 0.33. Negative control: the same embeddings with 1-D positions give mean |d| 0.42-0.51 (7-8x worse), so positions are doing the work.
+  - through a real `BatchGenerator` next to a text row: the media row (prefilled out of band to the last token, or to the end of the image with the trailing text prefilled in the batch) produces mlx-vlm's tokens, and the text row's tokens equal the text row alone. (The stage-1 `extract` patch was later removed; see stage 3.)
+
+**Stage 2 — media requests through the text scheduler, uncached (passed, laptop).**
+- **Files:** `vllm_mlx/vision_unified_engine.py` (new: engine, config check, server seams), `vllm_mlx/vision_unified.py` (`MediaInputs`, `MediaRows`, scheduler hooks), thin seams in `scheduler.py` (add_request: a media request skips the cache fetch; `_schedule_waiting`: encode + out-of-band prefill, plain insert, no cacheless retry; `_process_batch_responses` and `_cleanup_finished`: no extraction, no store), `batched_system_kv.py` (`capture_checkpoints` skips media rows), `text_mtp.py` (drafter bypass `media_row`; `count_bypass` takes a new key without pre-registering it, so text routes' stats keys are unchanged), `server.py` (per-request MLLM message prep and the #65 guard through `request_is_mllm`/`engine_serves_media`, the `load_model` branch, `/v1/status` `vision_unified` only when present), `cli.py` (`--vision-unified`), `scripts/fork/e2e_vision_unified.py` (new), `tests/test_vision_unified_181_engine.py`, `tests/test_vision_unified_181_scheduler.py` (new).
+- **One load, one scheduler.** `VisionUnifiedEngine` is a `BatchedEngine(force_text_only=True)` whose `_prepare_llm_model` loads the checkpoint once through mlx-vlm, builds the text model with `build_text_model(enable_mtp=False)` and puts it in the outer `mlx_lm.models.qwen3_5.Model` class a `--text-only` load builds (no new arrays; every fork hook that walks the tree sees the `--text-only` shape). The tokenizer is the one `--text-only` gets (mlx-lm `load_tokenizer`, config eos ids, the Qwen3 `<|im_end|>` override, custom template, `VLLM_MLX_CHAT_TEMPLATE_FILE`), a separate object from the processor's.
+- **A media request.** `chat()` renders the template with `{"type": "image"}` parts (the tokenizer's template emits the vision placeholders; the engine refuses with 400 `media_not_supported` if the rendered prompt has a different number of image placeholders than images). The processor (`prepare_inputs`, off the event loop, numpy out) expands the placeholders and produces pixel values and grids. The expanded ids go to `AsyncEngineCore` as the prompt, so the prompt ceiling (#50) and every admission gate count image tokens; the `MediaInputs` rides on `Request.images` (attached by prompt-list identity in a wrapper around `EngineCore.add_request`; no `engine_core.py`/`request.py` change). (Superseded by "Chunked media prefill" below.) At schedule time, on the generation worker, `MediaRows.prefill` runs mlx-vlm's `get_input_embeddings` (vision tower + merge + `get_rope_index`), prefills through the end of the last image (its `vision_end` included) into a fresh single-row cache with MRoPE positions, stamps the delta and returns the trailing tokens; the scheduler inserts them like a prefix-cache hit. A failed encode/prefill finishes only that request (`error_kind=media_error`, 503 shape); there is no "retry without cache" for a media row (it would prefill placeholder ids without the image).
+- **Bypassed in this stage (correct but cold):** every cache read (fetch) and write (prompt-only store, finish extraction/store, checkpoint captures) for media requests. Abort, disconnect and the error-recovery ladder treat a media row as any other row; the processed pixels stay on the request until it finishes (so a cache-error reschedule re-encodes), the embeddings and the out-of-band cache are dropped once inserted.
+- **Text MTP drafter / speculative sampling:** bypassed for a media row (counted `bypass_counts.media_row`); the row decodes plainly. Detection is the cache itself: a row whose `offset != _idx - left_padding`. The drafter only speculates for single-row batches anyway, and greedy verification makes T=0 output the same either way; acceptance on image context is unmeasured, so bypass is the safe choice.
+- **Refused at startup, never degraded** (`check_vision_unified_config`, in the CLI before any download and again in `load_model`; `checkpoint_support` on the config): no `--continuous-batching`; `--text-only`; `--mllm`; residency (`--auto-unload-idle-seconds`, `--lazy-load-model`); an MLLM draft model; `--enable-mtp`; `--compile`; `--models-config`; `--max-kv-size` (rotating caches do not carry the delta); `--chunked-prefill-tokens`; `VLLM_MLX_MOE_GATEUP_FUSION`; a checkpoint without `vision_config`, a text `model_type` outside `qwen3_5`/`qwen3_5_moe`, no 3-axis `mrope_section`, or non-interleaved MRoPE; `build_text_model` returning None.
+- **Results.** Mocked: a media request through the REAL `Scheduler` (tiny random Qwen3.5, batched system-KV on, a fake vision model with mlx-vlm's `get_input_embeddings` shape) decodes the single-stream MRoPE reference tokens while a text request in the same batch decodes exactly what it decodes alone; the media row is never fetched, stored or checkpointed; a failed encode rejects only that request. Real server (`e2e_vision_unified.py`, laptop, 0.8B, `E2E_STAGE=2`): 30/31 on the first run, the miss being the script's own counter threshold (7 media requests counted, threshold 8: the disconnect probe can abort before it is scheduled; threshold now 7). Text byte-identical to `--text-only` and with identical `cached_tokens` on all five text cases (incl. 1378/1379 re-send hit) and Anthropic; red/blue/two images in order/image in an earlier turn/Anthropic image all answered; video 400; concurrent image + text both finish and the text equals the reference; disconnect mid image stream leaves 0 running/0 waiting and the next image request answers; a ceiling of 80 tokens 400s the 88-token image prompt and serves the 25-token text one; no traceback. Metal active after load: 0.42 GB `--text-only` vs 0.63 GB unified (the 0.2 GB vision tower).
+
+**Stage 3 — caching for media requests (passed, laptop).**
+- **Files:** `vllm_mlx/vision_unified.py` (`media_cache_key`, `key_media_request`, `insert_media_row`, restore-aware `MediaRows.prefill`), `vllm_mlx/vision_unified_engine.py` (the key is computed with the processed inputs), `scheduler.py` (the stage-2 seams now test `media_uncached`; a keyed media row is inserted through `insert_media_row`; `all_tokens` gets the real ids, never the key), `batched_system_kv.py` (the capture skip tests `media_uncached`), `tests/test_vision_unified_181_cache.py` (new), `docs/fork/vision-caching.md`.
+- **The key.** `media_cache_key` replaces the k-th image-placeholder run of the prompt with negative values derived from SHA-256(image content digest + its `(t, h, w)` grid) (the #142 digest: full bytes of a data URL/file; an `http(s)` URL has none, and such a request stays uncached). The scheduler adopts it as the request's `prompt_token_ids`, so the unchanged batched system-KV matches, stores, checkpoints and spills on it (the SSD index stores int32 tokens; the fingerprints fit). The real ids still go to the model and to `all_tokens` (logits processors). Same image + same text -> same key; another image, or the same bytes at another grid, parts at its first placeholder, so only the text before it (1-D positions, delta 0) can be shared. Text keys hold no negative values, so text never matches into an image span, and a media request can restore a text entry's prefix (the system prompt).
+- **The delta is not a separate field; the key fixes it.** The grid is in the fingerprint, so a key prefix determines every MRoPE position up to its end. An entry is a delta-free snapshot (stock `BatchKVCache.extract`; the stage-1 extract patch was removed so text extraction gets no extra sync), and a media restore recomputes the delta from the request's own positions (`get_rope_index` on ids + grids). An entry therefore cannot be restored with a delta other than the one it was made with: a request with other positions has another key. Pinned by `test_181_different_images_never_share_a_key_past_the_image` and `test_181_snapshots_carry_no_rope_delta`.
+- **A restore of `n` tokens.** If it covers the last image (`n >= cut`), the vision tower does not run at all; the delta is computed from the grids and the rest is ordinary batched prefill. Otherwise `[n, cut)` is prefilled out of band into the restored cache (the vision tower runs for the whole prompt; per-image partial encoding is not done). After an out-of-band prefill the recurrent state at the end of the last image is checkpointed (`note_scheduled` + `capture_segment`), and the row is inserted as one segment at its absolute start, so the prompt-end checkpoint and the finish store land where a text row's would.
+- **Results.** Mocked (tiny model, real scheduler + bag): a re-send restores past the image, skips the encode and decodes the cold tokens; a follow-up turn (prompt + output + new text) restores at least the previous prompt and decodes what a cold run decodes; a different image with the same text restores nothing past the image and decodes its own cold tokens; a text request with the same ids never matches into the media entry; an unkeyable request stays cold. Real server (`e2e_vision_unified.py`, laptop, 0.8B, 1.4K system prompt + image): first image turn restores 1356 (the system prompt a text request stored); its re-send 1443/1444 with the same answer; the follow-up text turn 1425/1464 (the image-end checkpoint: the re-rendered assistant turn diverges before the prompt-end one, as on text); the same text with another image 1356/1444 (system only) and the right colour; that image's re-send 1443/1444; 3 re-encodes skipped. All e2e checks passed (the count was misreported as 35; the script had 30 checks then), no traceback.
+
+**Answers (laptop; no Studio in this pass).**
+- **Drafter / speculative sampling:** bypassed for media rows (stage 2). Not run with a real drafter.
+- **`qwen3_5_moe`:** same route in code (same mlx-lm `TextModel`, same attention module, `build_text_model` supports it; `checkpoint_support` accepts it). **Not verified**: no small MoE vision checkpoint is cached and none was downloaded. The live 35B route's DWQ checkpoint has no vision tower (PR #141's config reading), so it cannot be a unified route at all.
+- **Multi-image and image-in-later-turn:** verified (stage 1 numerics; e2e two images in order, image in turn 1 answered in turn 2).
+- **Video/audio:** 400 `media_not_supported` (verified for video; audio takes the same branch).
+- **Extra resident memory:** the vision tower (0.21 GB on the 0.8B: 0.42 -> 0.63 GB active after load; 0.92 GB bf16 on the 27B-8bit per its checkpoint), plus per media request the transient vision activations and merged embeddings during its prefill and the host-side pixel array until it finishes. No second copy of the text weights; no separate vision cache budget (media KV lives in the batched system-KV under the route's budget).
+- **What of mlx-vlm is still needed:** the load (vision tower + processor), `prepare_inputs` (image loading/resizing/patching, placeholder expansion) and `get_input_embeddings` (vision tower, merge, `get_rope_index`). The processor's chat template is not used: the text tokenizer renders.
+- **Custom templates (`VLLM_MLX_CHAT_TEMPLATE_FILE`):** the prompt is rendered with the route's text template, so the file applies to image requests too. The 27B-8bit file in the deploy repo renders `{"type": "image"}` as `<|vision_start|><|image_pad|><|vision_end|>` (read, not run), like the stock template. A template that renders no placeholder, or a different count, gets a 400 rather than an image the model never sees.
+
+**Not done / known limits.**
+- The vision encode is atomic: it holds one scheduler step (measured on the 0.8B below; unmeasured on the 27B). The rest of a media prefill is chunked (see "Chunked media prefill").
+- Admission and relief price image tokens (they are in the prompt) but not the vision tower's activations.
+- mlx-lm post-#2082: `build_text_model` returns None (#180 / #118 row C), so the route refuses to start at that pin bump.
+- SSD tier with media keys: not exercised (no SSD dir in the e2e).
+- `--max-kv-size`, `--enable-mtp`, `--compile`, residency, chunked legacy prefill: refused.
+
+**Verification (after the chunked-prefill change).** Mocked: `tests/test_vision_unified_181*.py` 39 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6), plus `test_181_*` in `test_fork_invariants.py` (6). Full mocked suite 5676 passed / 33 skipped / 30 deselected. Real (laptop, `mlx-community/Qwen3.5-0.8B-4bit`): `vision_unified_parity.py` 16/16; `e2e_vision_unified.py` 32/32 at the default `--prefill-step-size` and 32/32 at 512. The 32 checks are 30 + the long-prompt image answer + `/health`.
+
+**Review fixes (independent review of PR #144).** (1) #139 reconcile is skipped for media requests (`fetch_for_request`): it rewrites `prompt_token_ids`, which on a media request is the content key, and a length-changing splice misaligned the key with the real ids the media prefill continues (wrong context on a follow-up whose earlier answer re-rendered with other whitespace; the 27B-8bit route arms reconcile). (2) An unkeyed media request takes no #131 admission re-match and its solo verdict prices no restore: the re-match built a restore copy the media prefill then ignored and left `cached_tokens` reporting it. (3) `vision_unified` imports `mlx.nn` lazily: the module is imported on every route, and the no-MLX CI job's stub has `mlx.core` only (CI was red). Tests: `test_181_reconcile_never_splices_a_media_key`, `test_181_unkeyable_media_takes_no_admission_rematch` (both red without their fix). The e2e prints 30 checks at stage 3 (30/30 pass), not 35.
+
+**Chunked media prefill (review item 4, fixed before any Studio run).** The out-of-band prefill used to run as one synchronous block inside one scheduler step and covered everything up to the end of the last image, the text before the first image included. Every other row's decode waited, aborts could not interrupt it, #48 relief did not run during it, and no #88/#126 checkpoints were taken in that prefix. Now a media request has three parts:
+- **Text before the first image** is an ordinary `BatchGenerator` row, inserted through the same cuts `insert_segmented` makes (#88 message boundaries from the rendered prompt, #126 end-of-system, #117 divergence, the uniform interval), plus one forced cut at the first image. It prefills in `prefill_step_size` chunks next to decode, with relief once per step and checkpoints at its segment ends, like a text row. When its last prefix segment ends, the row is extracted (cache at exactly the first image) and removed from the batch. One extra placeholder token sits in the row so that it never moves to generation; it is never prefilled.
+- **The image span** `[first image, end of the last image)` is a job on `MediaRows`. Each scheduler step does one unit of media work, after the batch's own step: the vision encode (`get_input_embeddings`, atomic) or one `prefill_step_size` chunk with embeddings + MRoPE positions. So other rows decode between chunks, an abort lands at the next step (`_do_abort_request` drops the job), and relief runs before every chunk. One job advances per step (oldest first). A failed chunk rejects only that request (`media_error`), except "Insufficient Memory", which goes to the step's ordinary OOM recovery like a text prefill. Generation-error recovery and cache-error reschedule drop all jobs: aborted requests are gone, and rescheduled ones are re-planned and re-encoded.
+- **Text after the last image** joins the batch as a row again (cache with the delta; checkpoint at the image end), through the same segmented insert at its absolute start. Message boundaries in it are checkpointed.
+- **Which boundaries are checkpointable:**
+  - Before the first image and after the last image: all of them. Positions there are 1-D, or 1-D + delta, both fixed by the key prefix.
+  - Inside an image span: none on purpose. A restore that ends inside an image still has to run the vision tower for that image, so a checkpoint there would save prefill but never the encode, and it would cost a recurrent-state copy per chunk.
+  - The image end is checkpointed. A restore exactly at the first image (another image after the same text) starts the job directly, with no prefix row.
+- **Measured** (laptop, 0.8B; `e2e_vision_unified.py`: a 600-token text stream decoding while a ~9.9K-token request is sent):
+
+  | Extra request | Longest inter-token gap, step 2048 (median ~4.9 ms) | step 512 |
+  |---|---|---|
+  | none | 13.5 ms | 13.5 ms |
+  | long system prompt, text only | 1106 ms | 302 ms |
+  | long system prompt + image, new code | 1106 ms | 304 ms |
+  | long system prompt + image, before this change (`f7cc373d`) | 5326 ms | not run |
+
+  An image request now stalls a decoding stream exactly as much as a text request of the same length: one prefill chunk.
+- **Vision encode** (the one atomic piece), 0.8B, n=3: 27-45 ms at 256 px (64 tokens), 68-70 ms at 448 px (196), 436-441 ms at 1024 px (1024), 1470-1491 ms at 1536 px (2304). It grows faster than linearly with image tokens. It is unmeasured on the 27B; its tower is ~4.6x the 0.8B's by weight (0.92 vs 0.2 GB), so expect a large image to hold one step for several seconds there.
+- **Minors from the review, fixed:**
+  - The go-cold branch resets `cached_tokens` and `cache_hit_type`.
+  - The drafter bypass keys on a registry of media-row uids, so a delta-0 media row is bypassed too, and the per-step GPU read of the offsets is gone.
+  - `/health` on a unified route reports `model_type: "mllm"` and `serves: ["text", "image"]`; it is unchanged elsewhere.
+  - The placeholder-count 400 names both causes (the template, or a literal placeholder token in the text).
+  - The e2e count is corrected (see Verification).
+- **Tests** (`tests/test_vision_unified_181_chunked.py`, 6):
+  - With `prefill_step_size=4`, a media request with a 40-token prefix and a 17-token image span never runs a forward longer than one chunk. A decoding text row gets a token in every step, and the media row still decodes the single-stream reference tokens.
+  - The text before the image gets a checkpoint at the first image, and another image after the same text restores exactly there.
+  - An abort mid-span drops the job at the next step, with no further media forward.
+  - Relief runs before every image chunk and during the prefix.
+  - The delta-0 drafter bypass works.
+  - The go-cold reset works.
+
+**Studio check on the 27B-8bit (PASS, PR #144 verdict; head `47ee0d70`, the route's real env on a spare port).**
+- Text is byte-identical to `--text-only`, with the same `cached_tokens`, on every probe (short, 5.3K system prompt and its re-send, parallel tool calls and their follow-up, Anthropic, thinking on).
+- Decode at 5.3K: 21.77 vs 21.87 tok/s (-0.5%, n=3). The drafter counters are identical; image rows are bypassed (`media_row` 244 / 324).
+- Image answers are correct (colours, both orders of two images, an invoice, a 2048² page behind a 23K prompt).
+- The image chain hits past the image warm and after an SSD restart (6469/6476).
+- Active memory after load: +0.92 GB.
+- **Vision encode, the one atomic step:**
+
+  | Image | Image tokens | Encode |
+  |---|---|---|
+  | 256² | 64 | 0.05-0.10 s |
+  | 1024x512 | 512 | 0.24 s |
+  | 1024² | ~1024 | 0.53 s |
+  | 2048² | 4096 | 4.2 s |
+  | 4096² (processor maximum) | 16,384 | **49.1 s** (every other row waits) |
+
+- **Peak memory:** 43.6 GB with a 2048² image behind a 23K prompt co-batched next to a stream, vs 38.5 GB for the same-length text. That is +5.1 GB. There was no relief, OOM or swap growth.
+
+**Per-image token cap (`VLLM_MLX_VISION_MAX_IMAGE_TOKENS`, default 4096; `0` = the processor's own limit, 16,384 on Qwen3.5/3.8).**
+- **How it caps.** At load, `apply_image_token_cap` lowers the route's image processor `max_pixels` to `cap x (patch x merge)²` (32² px per token on Qwen3.5). An image above the cap is downscaled by the processor's own `smart_resize`: aspect kept, both sides floored to the 32 px grid, so it encodes to at most `cap` tokens. It is never rejected. Grid, MRoPE positions and pixel values all come from the same resize.
+- **Refused at startup:** a malformed or negative value (CLI check and load); a cap below the processor's minimum (64 tokens); a processor without `max_pixels`/`patch_size`/`merge_size` unless the cap is 0.
+- **Cache.** The fingerprint is seeded with the post-resize grid, so it follows what is encoded. The same bytes under two caps that both resize give two grids and two keys, which part at the first placeholder. An image under the cap gets the processor's unchanged grid, so its key is byte-identical to before.
+- **Counting.** The prompt ceiling and admission read the processor's output ids, so they count the post-resize tokens. `/v1/status` `vision_unified.image_cap` reports the cap, the processor maximum, `max_pixels` and the token size; `media_images_downscaled` counts images the cap shrank.
+- **Off the flag** nothing reads the knob: only `vision_unified_engine.py` references it (test). MLLM routes keep the processor limit.
+- **What the default costs:**
+  - Encode is bounded at about the measured 4.2 s on the 27B-8bit, not the 49 s at the processor maximum.
+  - Peak memory: the +5.1 GB measured above with a 2048² image is the cap-sized case.
+  - Detail:
+    - Up to 4096 tokens (~4.2 Mpx: 2048², 2560x1600) is untouched.
+    - A 3840x2160 screenshot (8100 tokens) is downscaled by ~0.71 linear to ~2730x1536.
+    - A 5120x2880 screenshot by ~0.53.
+    - An A4 page at 300 dpi (2480x3508, ~8500 tokens) by ~0.69, i.e. to ~207 dpi.
+  - Small UI text and fine print lose legibility in proportion. A route that reads dense documents or high-DPI screenshots may want 8192 (about 4x the encode time, unmeasured on the 27B; the encode grows faster than linearly) or 0.
+- **Tests** (`tests/test_vision_unified_181_imagecap.py`, 9, using mlx-vlm's real `Qwen3VLImageProcessor` without weights):
+  - default and env parsing;
+  - an over-cap 4096x2048 image (8192 tokens) encodes to ≤ 1024 tokens with its 2:1 aspect;
+  - an under-cap image keeps its grid and its byte-identical key;
+  - the same image under caps 4096 and 1024 never shares a key past the first placeholder;
+  - cap 0 leaves `max_pixels` alone;
+  - the refusals;
+  - the downscale count;
+  - only the unified engine module reads the knob;
+  - the CLI config check refuses a malformed value.
+  - Plus invariant `test_181_image_cap_follows_the_encode_not_the_bytes`.
+- **Laptop e2e:** the unified session runs with a cap of 256 (`E2E_IMAGE_CAP`). A 1024² image (1024 tokens uncapped) is answered "green" at 257 tokens; its re-send restores 1635/1636 with the same answer; `media_images_downscaled` is 2. The 256 px probes (64 tokens) are untouched, and every earlier check is unchanged.
+
+**Verification (current).**
+- Mocked: `tests/test_vision_unified_181*.py` 48 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6, `_imagecap` 9), plus `test_181_*` in `test_fork_invariants.py` (7).
+- Full mocked suite: 5686 passed / 33 skipped / 30 deselected.
+- Laptop, 0.8B: `vision_unified_parity.py` 16/16; `e2e_vision_unified.py` 34/34 (the 32 earlier checks plus the two over-cap checks).
+- Longest inter-token gap while a 9.9K-token request is prefilled: 1114 ms for both the text and the image request.
+
+**Status:** the Studio check passed; merge is the owner's call. Enabling it on the 27B-8bit route is a deploy decision: accept the cap's encode stall and the +5 GB peak, or pick another cap.
+
+## 182. `patch: inkling-parsers` — reasoning and tool-call parsers for Inkling 2's message blocks
 
 **Files:** `vllm_mlx/inkling_blocks.py` (new, the shared scanner), `vllm_mlx/reasoning/inkling_parser.py` (new), `vllm_mlx/tool_parsers/inkling_tool_parser.py` (new), both `__init__.py` registries, `tests/test_inkling_parsers.py`.
 
