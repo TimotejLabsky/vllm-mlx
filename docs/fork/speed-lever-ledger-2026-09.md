@@ -526,3 +526,25 @@ Numbers are from the verdict comments on fork issues #111, #113, #114, #115 and 
   - **Flint 40B-A2.5B: NOT RUN.** The GGUF declares `general.architecture = flint` and the llama.cpp build on the box (commit `d812350`, 2026-10-05) has no such architecture. Unchecked alternative: mlx-vlm 0.7.12 ships a `flint` module (mlx-lm 0.32.2 does not), so an MLX build may load through the fork's MLLM path with no llama.cpp.
 
 - **Not added:** the all-true GDN mask (#116, +1.2 % NULL) already has its line in the 2026-11-24 survey section above.
+
+### 2026-11-27 — #96 fusion re-check with the #179 kernels armed, Flint through MLX, `--vision-unified`, mlx 0.32.5 bump
+
+- **#96 MoE gate/up fusion no longer earns its keep where the #179 kernels are armed (fork issue #148): NULL, drop the env line from the 35B-A3B route at the next config touch.** Qwen3.6-35B-A3B-4bit, live route argv and env (incl. the #41 buffer env) on a spare port with the resident Home Assistant LLM held out, fork `300c5831`, mlx 0.32.5, fresh process per variant, T=0, unique-nonce prompts, 300 tokens, rounds interleaved; both flags confirmed bound per process (`moe_kernels` 40 blocks; `[moe-fusion] fused 40`).
+
+  | Variant | Decode ~4K, tok/s median (min-max) | Decode ~32K | n per size |
+  |---|---|---|---|
+  | A kernels + fusion (deployed) | 99.70 (99.53-100.01) | 76.16 (72.19-76.22) | 6 |
+  | B kernels, no fusion | 99.23 (99.12-99.36) | 75.94 (75.88-76.07) | 6 |
+  | C fusion, no kernels | 87.70 | 68.72 | 4 |
+  | D neither | 85.74 | 68.19 | 4 |
+
+  - Fusion on top of kernels: +0.47 % at 4K, +0.29 % at 32K, at the noise floor (within-variant spread 0.1-0.4 %). Fusion alone: +2.3 % / +0.8 % — **the shipped +12.8 % does not reproduce on today's stack** (that the #41 buffer env absorbed it is an inference; buffer env off was not run). Kernels alone: +15.7 % / +11.4 %.
+  - T=0: A = B and C = D on 3 fixed prompts in every round. Memory: identical active after load (20.66 GB) and identical peaks at 4K / 32K; +0.28 GB transient at load. Prefill unaffected (≤1.5 %).
+  - Not run: 4/8-way concurrent decode (fusion's old +9 % there), other MoE routes. Keep the patch for routes without the kernels. Two more reasons to drop the env on kernel routes: it silently un-fuses on the next mlx-lm layout (#118 row A), and `--vision-unified` refuses to start with it.
+
+- **Flint 40B-A2.5B through MLX (fork issue #139): runs only through the MLLM path; not a route yet.** `mlx-community/flint-mixed-3-4bit` (17.8 GB), `--continuous-batching --mllm`, mlx-vlm 0.7.12 (mlx-lm 0.32.2 has no `flint` module, so `--text-only` fails to load). T=0, 300 tokens, n=5: decode 57.2 tok/s at ~4K and 45.6 at ~32K, prefill 1,371 / 1,023 tok/s, peak 19.8 / 24.4 GB; exact re-send reuses 4,029 / 4,029 tokens (MLLM prefix cache only — no batched system-KV). Coding 8/8 at the vendor sampling; agent prompts 2/4 at T=0 with one runaway tool-argument loop to the token limit. Vendor benchmarks put it below Qwen3.8 27B on every shared row. Revisit when mlx-lm ships Flint support.
+
+- **`--vision-unified` (#181) is not a speed lever, recorded for its costs:** text decode on the 27B-8bit unchanged vs `--text-only` (21.87 vs 21.77 tok/s, drafter counters identical), +0.92 GB resident. The vision encode is one atomic scheduler step: 0.05-0.10 s at 64 image tokens, 0.53 s at ~1024, 4.2 s at 4096, 49.1 s at 16,384 — hence the default cap of 4096 tokens per image (`VLLM_MLX_VISION_MAX_IMAGE_TOKENS`). Image prefill is chunked like text (a decoding stream's longest gap is the same for an image request as for a text request of equal length).
+
+- **mlx 0.32.4 → 0.32.5 + mlx-vlm 0.7.12 → 0.8.1 (fork issue #145): speed-neutral.** Same-session prod vs candidate: GLM-4.6V 79.3 → 79.4, Qwen3-VL-30B 57.8 → 57.7 (#168 still binds), 14B 37.8 → 37.7, 35B-A3B 100.5 → 100.3, 27B-8bit 21.8 → 22.8 tok/s (different text, so drafter acceptance differs). T=0 unchanged on the vision routes and the 14B classifier set; long free text / reasoning shifted on the 35B and 27B. The #119 re-measurements (batching ceiling, decode-only command-buffer limits, fp16 vs bf16) are now unblocked and NOT yet run.
+- **Capacity note:** two 35B-A3B processes no longer fit together on this box (a spare beside the resident one grew swap by 2.6 GB); 35B spare-port work needs the resident one held out.
