@@ -29,6 +29,7 @@ from .batch_compat import (
     _sanitize_batch_generator_logits_processors,
 )
 from . import batched_system_kv as _batched_kv
+from . import vision_unified as _vu
 from . import recurrent_state_eval as _recurrent_eval
 from .cache_state_compat import (
     from_legacy_state,
@@ -2256,7 +2257,11 @@ class Scheduler:
                 )
 
         # Check prefix cache for cached KV state
-        if self.hybrid_kv is not None:
+        if _vu.media_of(request) is not None and not _vu.key_media_request(
+            self, request
+        ):
+            _vu.mark_uncached(request)  # (#181) unkeyable media: cold
+        elif self.hybrid_kv is not None:
             _batched_kv.fetch_for_request(self.hybrid_kv, request)
         elif self.block_aware_cache is not None:
             # Use paged cache
@@ -2397,6 +2402,7 @@ class Scheduler:
         was_waiting = False
         was_running = False
         removed_from_batch = False
+        _vu.drop_media(self, request_id)  # (#181) a media job stops here
 
         # Remove from waiting queue
         if request is not None and request.status == RequestStatus.WAITING:
@@ -2671,6 +2677,23 @@ class Scheduler:
                 )
             lp = combined_lp
 
+            # (#181) a media request on a --vision-unified route: its text
+            # before the first image is an ordinary row, the image span a
+            # chunked job (vision_unified.MediaRows), the rest a row again.
+            media = _vu.media_of(request)
+            if media is not None:
+                try:
+                    tokens_to_process, cache_to_use = _vu.plan_media_row(self, request)
+                except Exception as e:
+                    logger.error(
+                        f"[vision_unified] request={request.request_id[:12]} "
+                        f"media prefill failed: {e}",
+                        exc_info=True,
+                    )
+                    _vu.count_media_error(self)
+                    self._reject_at_schedule(request, "media_error")
+                    continue
+
             # Per-request sampler (fork patch #33): the generator-level
             # fallback sampler carries only the FIRST request's
             # (temperature, top_p, min_p) — top_k was dropped entirely and
@@ -2703,6 +2726,8 @@ class Scheduler:
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
             prompt_tokens = request.prompt_token_ids or []
+            if media is not None:  # (#181) real ids, never the cache key
+                prompt_tokens = media.input_ids[: _vu.planned_end(media)]
             # all_tokens seeds only the cached prefix. BatchGenerator appends
             # tokens_to_process itself before running logits processors.
             cached_history = (
@@ -2721,7 +2746,18 @@ class Scheduler:
                 "samplers": [sampler],
             }
 
+            if media is not None and _vu.planned_job(media):  # (#181)
+                _vu.start_media_job(self, request, cache_to_use, insert_kwargs)
+                request.status = RequestStatus.RUNNING
+                request.prompt_cache = None
+                self.running[request.request_id] = request
+                scheduled.append(request)
+                self.total_prompt_tokens += request.num_prompt_tokens
+                continue
+
             def _do_insert(toks):
+                if media is not None:  # (#181)
+                    return _vu.insert_media(self, request, toks, insert_kwargs)
                 if self.hybrid_kv is not None:
                     return _batched_kv.insert_segmented(
                         self.hybrid_kv, self.batch_generator, request,
@@ -2733,7 +2769,7 @@ class Scheduler:
             try:
                 uids = _do_insert(tokens_to_process)
             except Exception as e:
-                if cache_to_use is not None:
+                if cache_to_use is not None and media is None:
                     logger.warning(
                         f"[cache_insert_error] request={request.request_id[:12]} "
                         f"cache insert failed ({e}), retrying without cache"
@@ -3126,7 +3162,7 @@ class Scheduler:
             # window wraps (RotatingKVCache.is_trimmable() is offset<max_size),
             # while its PoolingCache cannot split a pooled window. That data is
             # gone, so no trim can recover it.
-            if request.num_output_tokens == 0:
+            if request.num_output_tokens == 0 and _vu.media_of(request) is None:
                 self._store_prompt_only_cache(request, response)
 
             # Append token to request
@@ -3262,7 +3298,10 @@ class Scheduler:
                 self._cleanup_detokenizer(request_id)
 
                 # Extract cache for future reuse (critical for agentic multi-turn)
-                if hasattr(response, "prompt_cache"):
+                # (#181) unkeyed media rows are not cached
+                if hasattr(response, "prompt_cache") and not _vu.media_uncached(
+                    request
+                ):
                     try:
                         # prompt_cache may be callable or direct attribute
                         if callable(response.prompt_cache):
@@ -3313,7 +3352,11 @@ class Scheduler:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
-            if request is not None and request.prompt_token_ids:
+            if request is not None and _vu.media_of(request) is not None:
+                _vu.forget_media_row(self, request_id)  # (#181)
+            if request is not None and _vu.media_uncached(request):
+                _vu.release_media_request(self, request_id, request)  # (#181)
+            elif request is not None and request.prompt_token_ids:
                 if self.hybrid_kv is not None:
                     _batched_kv.store_finished(self.hybrid_kv, request_id, request)
 
@@ -3528,6 +3571,7 @@ class Scheduler:
         # Close batch generator (clears _partial state, active_batch)
         self._close_batch_generator()
         self._current_sampler_params = None
+        _vu.drop_all_media(self)  # (#181)
 
         # Abort all running requests
         aborted_ids: Set[str] = set()
@@ -3567,6 +3611,7 @@ class Scheduler:
     def _reschedule_running_requests(self) -> None:
         """Move running requests back to waiting queue for retry."""
         count = len(self.running)
+        _vu.drop_all_media(self)  # (#181) re-planned from scratch
         for request_id, request in list(self.running.items()):
             # Reset request state
             request.status = RequestStatus.WAITING
@@ -3624,6 +3669,7 @@ class Scheduler:
                     r.num_prompt_tokens for r in scheduled
                 )
 
+                prompt_responses = []
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
                     _sanitize_batch_generator_logits_processors(self.batch_generator)
@@ -3652,6 +3698,9 @@ class Scheduler:
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
+
+                # (#181) one unit of media work per step (no-op off-route)
+                _vu.on_step(self, prompt_responses)
 
                 # Success - break out of retry loop
                 break

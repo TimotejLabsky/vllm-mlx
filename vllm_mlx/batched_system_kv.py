@@ -40,6 +40,7 @@ import threading
 from collections import OrderedDict
 from typing import Any, Optional
 
+from . import vision_unified as _vu
 from .cache_state_compat import legacy_state
 from .memory_pressure import PressureManager
 
@@ -2595,7 +2596,12 @@ def fetch_for_request(hybrid_kv: "BatchedSystemKV", request) -> None:
     probe from here to the end of admission reuses the first one's answer
     (closed by ``materialize_pending_restore`` / ``discard_pending``)."""
     _open_memo(hybrid_kv, request)
-    if getattr(hybrid_kv, "reconcile_generated_on", False) is True:
+    # (#181) never on a media request: its key must stay position-aligned
+    # with the real ids the media prefill runs (MediaInputs.input_ids).
+    if (
+        getattr(hybrid_kv, "reconcile_generated_on", False) is True
+        and _vu.media_of(request) is None
+    ):
         try:
             spliced = hybrid_kv.reconcile_generated(request.prompt_token_ids)
             if spliced is not None:
@@ -2717,7 +2723,11 @@ def solo_prefill_verdict(scheduler, request) -> Optional[str]:
         hit_type = getattr(request, "cache_hit_type", None)
         if hit_type == "system_kv_pending":
             restore = hybrid_kv.restore_bytes(getattr(request, "cached_tokens", 0) or 0)
-        elif hit_type == "miss" and hasattr(hybrid_kv, "peek"):
+        elif (
+            hit_type == "miss"
+            and hasattr(hybrid_kv, "peek")
+            and not _vu.media_uncached(request)  # (#181) never re-matched
+        ):
             restore = hybrid_kv.restore_bytes(
                 hybrid_kv.peek(request.prompt_token_ids, touch=False)
             )
@@ -2762,6 +2772,8 @@ def materialize_pending_restore(scheduler, request) -> None:
 
 
 def _materialize_pending_restore(scheduler, request) -> None:
+    if _vu.media_uncached(request):
+        return  # (#181) reads no cache: no #131 re-match, no restore copy
     if getattr(request, "cache_hit_type", None) == "miss":
         _rematch_at_admission(scheduler.hybrid_kv, request)
         return
@@ -2986,6 +2998,8 @@ def capture_checkpoints(scheduler, prompt_responses) -> None:
         request_id = scheduler.uid_to_request_id.get(pr.uid)
         if request_id is None:
             continue
+        if _vu.media_uncached(scheduler.requests.get(request_id)):
+            continue  # (#181) unkeyed media rows are not checkpointed
         try:
             extracted = scheduler.batch_generator.extract_cache([pr.uid])
             entry = extracted.get(pr.uid)

@@ -4892,3 +4892,160 @@ def test_179_kernels_resolve_through_the_compat_module_and_bind():
     assert [stock for stock, _ in targets] == [Qwen3NextSparseMoeBlock]
     assert moe_kernels._swiglu_class() is not None
     assert set(moe_kernels.status()) == {"armed", "blocks", "skipped", "error"}
+
+
+def test_181_vision_unified_is_inert_until_installed():
+    """#181 patches mlx-lm's BatchKVCache class and wraps RoPE modules, so
+    nothing may do it at import: a route without ``--vision-unified`` must
+    run stock mlx-lm. (The #181 tests restore the class after installing.)"""
+    import importlib
+
+    from mlx_lm.models.cache import BatchKVCache
+
+    import vllm_mlx.vision_unified as vu
+
+    importlib.reload(vu)
+    assert not getattr(BatchKVCache.merge, "__vllm_mlx_181__", False)
+    assert not getattr(BatchKVCache.extract, "__vllm_mlx_181__", False)
+    model = _tiny_qwen3_5()
+    for layer in model.language_model.layers:
+        if not layer.is_linear:
+            assert type(layer.self_attn.rope).__name__ == "RoPE"
+
+
+def test_181_rope_dispatch_without_positions_is_bit_identical():
+    """With the #181 dispatch installed and no media positions set, every
+    text forward is the stock nn.RoPE call: logits bit-equal."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_mlx import vision_unified as vu
+
+    model = _tiny_qwen3_5().language_model
+    tokens = mx.array([[1, 5, 9, 2, 7, 3]])
+    before = model(tokens, cache=make_prompt_cache(model))
+    assert vu.install_mrope(model, [2, 1, 1]) > 0
+    after = model(tokens, cache=make_prompt_cache(model))
+    assert mx.array_equal(before, after)
+
+
+def test_181_text_requests_take_no_media_branch():
+    """Every #181 seam in the scheduler keys on ``media_of(request)``; it
+    must be None for anything but the unified engine's MediaInputs, so a
+    text request (and every request on a flag-off route) takes the
+    unchanged path."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_mlx import vision_unified as vu
+    from vllm_mlx.request import Request, SamplingParams
+
+    for images in (None, [], ["data:image/png;base64,AAAA"], [{"url": "x"}]):
+        r = Request(
+            request_id="r",
+            prompt=[1, 2],
+            sampling_params=SamplingParams(max_tokens=1),
+            images=images,
+        )
+        assert vu.media_of(r) is None
+    m = vu.MediaInputs(
+        input_ids=[1], pixel_values=np.zeros(1), image_grid_thw=np.zeros(3)
+    )
+    assert vu.media_of(SimpleNamespace(images=[m])) is m
+
+
+def test_181_off_route_server_seams_equal_engine_is_mllm():
+    """Flag off, the two server seams are the old ``engine.is_mllm`` reads."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.vision_unified_engine import engine_serves_media, request_is_mllm
+
+    img = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}
+    ]
+    for flag in (False, True):
+        eng = SimpleNamespace(is_mllm=flag)
+        assert request_is_mllm(eng, img) is flag
+        assert engine_serves_media(eng) is flag
+
+
+def test_181_different_images_never_share_a_key_past_the_image():
+    """#181 stage 3: media cache keys carry each image's content digest AND
+    grid. Different content, or the same content at another grid (other
+    MRoPE positions, other delta), must part at the first placeholder; the
+    same image and text must give the same key (re-sends hit)."""
+    import numpy as np
+
+    from vllm_mlx import vision_unified as vu
+
+    ids = [5, 6, 9, 9, 9, 9, 7, 8]
+    g = np.array([[1, 2, 2]])
+    k = vu.media_cache_key(ids, 9, (b"a" * 32,), g)
+    assert k == vu.media_cache_key(ids, 9, (b"a" * 32,), g)
+    for other in (
+        vu.media_cache_key(ids, 9, (b"b" * 32,), g),
+        vu.media_cache_key(ids, 9, (b"a" * 32,), np.array([[1, 1, 4]])),
+    ):
+        assert other[:2] == k[:2] == [5, 6] and other[2] != k[2]
+    assert vu.media_cache_key(ids, 9, (None,), g) is None
+
+
+def test_181_snapshots_carry_no_rope_delta():
+    """A cached entry never carries a delta of its own (stock
+    ``BatchKVCache.extract``): a media restore recomputes the delta from the
+    request's own positions, which its key prefix fixes, so an entry can
+    never be restored with another delta; a text restore gets none."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import BatchKVCache, KVCache
+
+    from vllm_mlx import vision_unified as vu
+
+    saved = BatchKVCache.__dict__["merge"]
+    flag = vu._BATCH_PATCHED
+    vu._BATCH_PATCHED = False
+    try:
+        vu.install_batch_cache_delta()
+        c = KVCache()
+        k = mx.zeros((1, 1, 4, 2))
+        c.update_and_fetch(k, k)
+        c.rope_delta = -3
+        merged = BatchKVCache.merge([c])
+        assert merged.offset.tolist() == [1]
+        assert not hasattr(merged.extract(0), "rope_delta")
+        assert not getattr(BatchKVCache.extract, "__vllm_mlx_181__", False)
+    finally:
+        BatchKVCache.merge = saved
+        vu._BATCH_PATCHED = flag
+
+
+def test_181_image_cap_follows_the_encode_not_the_bytes():
+    """#181 image cap: the same image bytes encoded under two caps give two
+    grids, and the cache key carries the grid, so they can never cross-hit;
+    an image under the cap keeps the uncapped grid (and key)."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+    from PIL import Image
+
+    from vllm_mlx import vision_unified as vu
+    from vllm_mlx.vision_unified_engine import apply_image_token_cap
+
+    def grid(cap, size):
+        p = SimpleNamespace(
+            image_processor=Qwen3VLImageProcessor(
+                patch_size=16, merge_size=2, max_pixels=16777216, min_pixels=65536
+            )
+        )
+        apply_image_token_cap(p, cap)
+        out = p.image_processor(images=[Image.new("RGB", size)])
+        return np.asarray(out["image_grid_thw"]).reshape(-1, 3)
+
+    def key(g):
+        n = int(np.prod(g[0])) // 4
+        return vu.media_cache_key([1] + [9] * n, 9, (b"z" * 32,), g)
+
+    assert np.array_equal(grid(4096, (640, 480)), grid(0, (640, 480)))
+    a, b = grid(4096, (3000, 3000)), grid(1024, (3000, 3000))
+    assert key(a)[1] != key(b)[1]

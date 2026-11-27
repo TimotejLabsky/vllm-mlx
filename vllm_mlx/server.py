@@ -191,6 +191,11 @@ from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 from .utils.logging_setup import configure_root_logging, timestamped_log_config
 from .utils.reasoning_effort import EFFORT_FALLBACK_KEY
+from .vision_unified_engine import (
+    engine_serves_media,
+    is_vision_unified,
+    request_is_mllm,
+)
 
 configure_root_logging(logging.INFO)  # PATCHES.md #90 — timestamped log lines
 logger = logging.getLogger(__name__)
@@ -342,7 +347,8 @@ def _prepare_chat_messages(
     _validate_remote_media_urls(request_messages)
     validate_media_shape(request_messages)
 
-    is_mllm = bool(getattr(engine, "is_mllm", False))
+    # (#181) per request on a --vision-unified route; engine.is_mllm elsewhere
+    is_mllm = request_is_mllm(engine, request_messages)
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
     # Harmony rendering needs the structural ``tool_calls`` / ``role=tool``
     # shape to survive ``extract_multimodal_content`` — otherwise prior
@@ -1020,7 +1026,7 @@ def _prepare_chat_completion_invocation(
         # silently STRIPPED (a 200 about an image the model never saw).
         # Reject before any engine work — this runs pre-StreamingResponse,
         # so streams get a real 400 too.
-        if not getattr(engine, "is_mllm", False):
+        if not engine_serves_media(engine):  # (#181) unified routes serve it
             raise MediaNotSupported(
                 "this route serves a text-only engine; image/video/audio "
                 "content is not supported here"
@@ -1143,7 +1149,7 @@ def _prepare_anthropic_invocation(
     messages, _, _, _, has_media = _prepare_chat_messages(
         engine, openai_request.messages
     )
-    if has_media and not getattr(engine, "is_mllm", False):
+    if has_media and not engine_serves_media(engine):  # (#181)
         # Same guard as _prepare_chat_completion_invocation: never answer
         # about media the text-only engine silently dropped.
         raise MediaNotSupported(
@@ -4494,6 +4500,7 @@ def load_model(
     default_mllm_draft: bool = False,
     model_path: str | None = None,
     compile: bool = False,
+    vision_unified: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -4559,6 +4566,23 @@ def load_model(
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
         raise ValueError(
             "MLLM draft models are not supported with lifecycle residency yet"
+        )
+    if vision_unified:  # (#181) refuse, never degrade
+        from .vision_unified_engine import check_vision_unified_config
+
+        check_vision_unified_config(
+            use_batching=use_batching,
+            force_text_only=force_text_only,
+            force_mllm=force_mllm,
+            auto_unload_idle_seconds=auto_unload_idle_seconds,
+            lazy_load_model=lazy_load_model,
+            mllm_draft_model=mllm_draft_model,
+            enable_mtp=bool(getattr(scheduler_config, "enable_mtp", False)),
+            compile=compile,
+            max_kv_size=int(getattr(scheduler_config, "max_kv_size", 0) or 0),
+            chunked_prefill_tokens=int(
+                getattr(scheduler_config, "chunked_prefill_tokens", 0) or 0
+            ),
         )
 
     if _lifespan_active:
@@ -4647,7 +4671,19 @@ def load_model(
     _auto_unload_idle_seconds = 0.0
     _lazy_load_model = False
 
-    if use_batching:
+    if use_batching and vision_unified:
+        from .vision_unified_engine import VisionUnifiedEngine
+
+        logger.info(f"Loading model with VisionUnifiedEngine (#181): {model_name}")
+        _engine = VisionUnifiedEngine(
+            model_name=model_name,
+            trust_remote_code=trust_remote_code,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval,
+            gpu_memory_utilization=gpu_memory_utilization,
+            model_path=model_path,
+        )
+    elif use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
@@ -4955,6 +4991,11 @@ async def health():
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
+    if is_vision_unified(_engine):
+        # (#181) one engine serves both: capability probes reading
+        # model_type must see vision; "serves" says text is there too
+        payload["model_type"] = "mllm"
+        payload["serves"] = ["text", "image"]
     if lifecycle is not None:
         lifecycle_fields = {
             "residency_state": lifecycle["state"],
@@ -5035,7 +5076,7 @@ async def status():
     # Extract batch_generator throughput when available (MLLM scheduler).
     bg = stats.get("batch_generator", {})
 
-    return {
+    payload = {
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
         # bench-serve provenance: auto_detect_runtime reads this top-level
@@ -5107,6 +5148,9 @@ async def status():
         "text_route_degraded": stats.get("mllm_text_route_degraded", False),
         "requests": stats.get("requests", []),
     }
+    if stats.get("vision_unified") is not None:  # (#181) unified routes only
+        payload["vision_unified"] = stats["vision_unified"]
+    return payload
 
 
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
