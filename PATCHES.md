@@ -4984,7 +4984,7 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
 
 **Verification (current).**
 - Mocked: `tests/test_vision_unified_181*.py` 56 tests (`_181` 10, `_engine` 10, `_scheduler` 4, `_cache` 9, `_chunked` 6, `_imagecap` 9, `_parity` 8), plus `test_181_*` in `test_fork_invariants.py` (7).
-- Full mocked suite: 5686 passed / 33 skipped / 30 deselected.
+- Full mocked suite: 5694 passed / 33 skipped / 30 deselected.
 - Laptop, 0.8B: `vision_unified_parity.py` 16/16 (before section F); `e2e_vision_unified.py` 34/34 (the 32 earlier checks plus the two over-cap checks).
 - Studio, prod stack, mlx 0.32.5 / mlx-vlm 0.8.1: `vision_unified_parity.py` 26/26 on the 0.8B and the 9B; 25/26 + 1 near-tie on the 4B.
 - Longest inter-token gap while a 9.9K-token request is prefilled: 1114 ms for both the text and the image request.
