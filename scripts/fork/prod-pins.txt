@@ -3,11 +3,11 @@
 # the MLX-dependent tests run against what the fleet runs (latest PyPI mlx-lm
 # has a different cache API than our git pin: 10-04..10-05 CI was red on that).
 # Update this file in the same PR as every dependency bump.
-mlx==0.32.4
-mlx-metal==0.32.4
+mlx==0.32.5
+mlx-metal==0.32.5
 mlx-lm==0.32.2
-mlx-vlm==0.7.8
-transformers==5.20.0
+mlx-vlm==0.8.1
+transformers==5.23.0
 huggingface-hub==1.33.0
 tokenizers==0.23.3
 llguidance==1.9.1
