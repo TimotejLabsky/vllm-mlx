@@ -22,14 +22,15 @@ Two mechanisms carry the positions, both installed only when the flag is on:
    only as the RoPE position (the mask and the buffer index use ``_idx`` and
    ``left_padding``), and ``filter``/``extend``/``trim`` carry it per row.
    A media row's single-row ``KVCache`` layers carry ``rope_delta``; the
-   patched ``BatchKVCache.merge`` adds it to that row's offset, and the
-   patched ``extract`` writes it back onto the extracted row. A row without
-   a delta is untouched (no op is added).
+   patched ``BatchKVCache.merge`` adds it to that row's offset. A row
+   without a delta is untouched (no op is added).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import threading
 import time
 from contextlib import contextmanager
@@ -175,16 +176,17 @@ _BATCH_PATCHED = False
 
 
 def install_batch_cache_delta() -> None:
-    """Patch ``BatchKVCache.merge``/``extract`` so a row's ``rope_delta``
-    survives into the batch offset and back out. Idempotent; a no-op on
-    rows that carry no delta."""
+    """Patch ``BatchKVCache.merge`` so a row's ``rope_delta`` (stamped on its
+    single-row ``KVCache`` layers) is added to that row's batch offset.
+    Idempotent; adds no op when no row carries a delta. ``extract`` is left
+    stock: an extracted row (a cache snapshot) carries no delta, because a
+    restore recomputes it from the request's own positions (stage 3)."""
     global _BATCH_PATCHED
     if _BATCH_PATCHED:
         return
     from mlx_lm.models.cache import BatchKVCache
 
     orig_merge = BatchKVCache.merge.__func__
-    orig_extract = BatchKVCache.extract
 
     def merge(cls, caches):
         batch = orig_merge(cls, caches)
@@ -193,17 +195,8 @@ def install_batch_cache_delta() -> None:
             batch.offset = batch.offset + mx.array(deltas, dtype=batch.offset.dtype)
         return batch
 
-    def extract(self, idx):
-        cache = orig_extract(self, idx)
-        delta = int(self.offset[idx].item()) - int(cache.offset)
-        if delta:
-            cache.rope_delta = delta
-        return cache
-
     merge.__vllm_mlx_181__ = True
-    extract.__vllm_mlx_181__ = True
     BatchKVCache.merge = classmethod(merge)
-    BatchKVCache.extract = extract
     _BATCH_PATCHED = True
 
 
@@ -268,7 +261,13 @@ def media_prefill(
 @dataclass
 class MediaInputs:
     """One request's processed images, host-side (numpy) so nothing lazy
-    crosses threads. Carried on ``Request.images`` as a one-item list."""
+    crosses threads. Carried on ``Request.images`` as a one-item list.
+
+    ``cache_key`` (stage 3) is the prompt with every image's placeholder run
+    replaced by a content fingerprint (see :func:`media_cache_key`); None
+    when an image has no trustworthy digest (a remote URL), and then the
+    request runs uncached. ``keyed`` is set once the scheduler adopted the
+    key as the request's ``prompt_token_ids``."""
 
     input_ids: list
     pixel_values: np.ndarray
@@ -277,6 +276,8 @@ class MediaInputs:
     n_images: int = 0
     image_tokens: int = 0
     preprocess_s: float = 0.0
+    cache_key: Optional[list] = None
+    keyed: bool = False
     stats: dict = field(default_factory=dict)
 
 
@@ -287,6 +288,59 @@ def media_of(request: Any) -> Optional[MediaInputs]:
     if images and isinstance(images[0], MediaInputs):
         return images[0]
     return None
+
+
+def media_uncached(request: Any) -> bool:
+    """A media request that must not read or write any cache."""
+    media = media_of(request)
+    return media is not None and not media.keyed
+
+
+def _fingerprint(seed: bytes, length: int) -> list:
+    words = struct.unpack(">8I", hashlib.sha256(seed).digest())
+    return [
+        -(1 + ((words[j % 8] ^ (j * 0x9E3779B1)) & 0x7FFFFFFE)) for j in range(length)
+    ]
+
+
+def media_cache_key(
+    ids: Sequence[int],
+    image_token_id: int,
+    digests: Sequence[Optional[bytes]],
+    grids: Any,
+) -> Optional[list]:
+    """The cache key of a media prompt: ``ids`` with the k-th contiguous
+    image-placeholder run replaced by negative values derived from the k-th
+    image's content digest AND its ``(t, h, w)`` grid.
+
+    * same images + same text -> the same key (re-sends and follow-ups hit);
+    * a different image -> the keys part at its first placeholder, so only
+      the text before it can be shared (where every position is 1-D);
+    * the grid is in the fingerprint, so a key prefix fixes every MRoPE
+      position (and so the delta) up to its end: an entry made with one
+      delta can never be matched by a request whose positions differ.
+      Negative values never collide with token ids (vocab ids are >= 0).
+    """
+    if not digests or any(d is None for d in digests):
+        return None
+    grid_rows = [list(map(int, g)) for g in np.asarray(grids).reshape(-1, 3)]
+    runs, start = [], None
+    for i, tok in enumerate(ids):
+        if tok == image_token_id:
+            if start is None:
+                start = i
+        elif start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, len(ids)))
+    if len(runs) != len(digests) or len(grid_rows) != len(digests):
+        return None
+    key = list(ids)
+    for (a, b), digest, grid in zip(runs, digests, grid_rows):
+        seed = bytes(digest) + struct.pack(">3q", *grid)
+        key[a:b] = _fingerprint(seed, b - a)
+    return key
 
 
 def _np(value: Any) -> np.ndarray:
@@ -324,6 +378,9 @@ class MediaRows:
             "media_prefill_tokens": 0,
             "media_encode_prefill_s": 0.0,
             "media_errors": 0,
+            "media_cache_hits": 0,
+            "media_cached_tokens": 0,
+            "media_encode_skipped": 0,
         }
 
     def stats(self) -> dict:
@@ -358,61 +415,120 @@ class MediaRows:
 
     def prefill(self, scheduler: Any, request: Any) -> tuple:
         """Encode + prefill one media request. Returns ``(tokens_to_process,
-        cache)`` for ``BatchGenerator.insert``."""
+        cache)`` for ``BatchGenerator.insert``.
+
+        A restored prefix (stage 3) of ``n`` tokens is continued: if it
+        already covers the last image, no image is encoded and only the
+        delta is computed (from the grids); otherwise ``[n, cut)`` is
+        prefilled out of band into the restored cache."""
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
         media = media_of(request)
         tic = time.perf_counter()
         ids_list = list(media.input_ids)
+        L = len(ids_list)
         ids = mx.array([ids_list])
-        feats = self.vlm.get_input_embeddings(
-            ids,
-            mx.array(media.pixel_values),
-            image_grid_thw=mx.array(media.image_grid_thw),
-        )
-        emb, pos, deltas = feats.inputs_embeds, feats.position_ids, feats.rope_deltas
-        if pos is None or pos.ndim != 3:
-            raise ValueError("vision model returned no 3-axis positions")
-        delta = int(deltas.reshape(-1)[0].item())
+        grid = mx.array(media.image_grid_thw)
         cut = self.media_cut(ids_list)
-        cache = make_prompt_cache(scheduler.model)
-        step = int(getattr(scheduler.config, "prefill_step_size", 2048) or 2048)
-        media_prefill(
-            scheduler.model,
-            ids[:, :cut],
-            emb[:, :cut],
-            pos[:, :, :cut],
-            cache,
-            step=step,
-        )
+        cache = request.prompt_cache if media.keyed else None
+        n = int(request.cached_tokens or 0) if cache else 0
+        if cache is not None and not (0 < n < L):
+            cache, n = None, 0  # full coverage cannot replay: go cold
+        encoded = False
+        if cache is not None and n >= cut:
+            _, deltas = self.vlm.language_model.get_rope_index(ids, grid)
+            delta = int(deltas.reshape(-1)[0].item())
+            start = n
+        else:
+            feats = self.vlm.get_input_embeddings(
+                ids, mx.array(media.pixel_values), image_grid_thw=grid
+            )
+            emb, pos = feats.inputs_embeds, feats.position_ids
+            if pos is None or pos.ndim != 3:
+                raise ValueError("vision model returned no 3-axis positions")
+            delta = int(feats.rope_deltas.reshape(-1)[0].item())
+            if cache is None:
+                cache = make_prompt_cache(scheduler.model)
+            step = int(getattr(scheduler.config, "prefill_step_size", 2048) or 2048)
+            media_prefill(
+                scheduler.model,
+                ids[:, n:cut],
+                emb[:, n:cut],
+                pos[:, :, n:cut],
+                cache,
+                step=step,
+            )
+            del feats, emb, pos
+            encoded = True
+            start = cut
         set_rope_delta(cache, delta)
-        del feats, emb, pos
+        hybrid_kv = getattr(scheduler, "hybrid_kv", None)
+        if media.keyed and encoded and hybrid_kv is not None:
+            # checkpoint the recurrent state at the end of the last image:
+            # a later turn that diverges right after it restores here
+            try:
+                hybrid_kv.note_scheduled(request.request_id, cut)
+                hybrid_kv.capture_segment(request.request_id, 0, cache)
+            except Exception:
+                logger.debug(
+                    "[vision_unified] image-end checkpoint failed", exc_info=True
+                )
+        media.stats.update(start=start)
         elapsed = time.perf_counter() - tic
         self.count(
             media_requests=1,
             media_images=media.n_images,
             media_image_tokens=media.image_tokens,
-            media_prefill_tokens=cut,
+            media_prefill_tokens=(cut - n) if encoded else 0,
             media_encode_prefill_s=elapsed,
+            media_cache_hits=1 if n > 0 else 0,
+            media_cached_tokens=n,
+            media_encode_skipped=0 if encoded else 1,
         )
         media.stats.update(delta=delta, cut=cut, encode_prefill_s=round(elapsed, 3))
         logger.info(
-            "[vision_unified] request=%s images=%d image_tokens=%d "
-            "prefilled=%d/%d delta=%d encode+prefill=%.2fs",
+            "[vision_unified] request=%s images=%d image_tokens=%d restored=%d "
+            "prefilled=%d/%d delta=%d encoded=%s %.2fs",
             request.request_id[:12],
             media.n_images,
             media.image_tokens,
-            cut,
-            len(ids_list),
+            n,
+            (cut - n) if encoded else 0,
+            L,
             delta,
+            encoded,
             elapsed,
         )
-        return ids_list[cut:], cache
+        return ids_list[start:], cache
+
+
+def key_media_request(scheduler: Any, request: Any) -> bool:
+    """add_request: adopt the content key as the request's token ids so the
+    batched system-KV matches and stores on it (stage 3). False (the request
+    stays uncached) without a key or without the batched system-KV."""
+    media = media_of(request)
+    if media is None or media.cache_key is None:
+        return False
+    if getattr(scheduler, "hybrid_kv", None) is None:
+        return False
+    if len(media.cache_key) != len(request.prompt_token_ids or ()):
+        return False
+    request.prompt_token_ids = list(media.cache_key)
+    media.keyed = True
+    return True
+
+
+def insert_media_row(scheduler: Any, request: Any, tokens: list, insert_kwargs: dict):
+    """Insert a keyed media row as one segment whose absolute start is known
+    to the bag, so its prompt-end checkpoint lands at the right position."""
+    start = media_of(request).stats.get("start", 0)
+    scheduler.hybrid_kv.note_scheduled(request.request_id, start)
+    return scheduler.batch_generator.insert_segments([[list(tokens)]], **insert_kwargs)
 
 
 def mark_uncached(request: Any) -> None:
-    """(stage 2) A media request reads no cache: a cold miss."""
+    """A media request that reads no cache: a cold miss."""
     request.cache_hit_type = "miss"
     request.prompt_cache = None
     request.cached_tokens = 0
@@ -433,7 +549,7 @@ def count_media_error(scheduler: Any) -> None:
 
 
 def release_media_request(scheduler: Any, request_id: str, request: Any) -> None:
-    """_cleanup_finished for a media request: nothing is stored (stage 2);
+    """_cleanup_finished for an uncached media request: nothing is stored;
     drop any pending checkpoint ladder and the extraction reference."""
     hybrid_kv = getattr(scheduler, "hybrid_kv", None)
     if hybrid_kv is not None:

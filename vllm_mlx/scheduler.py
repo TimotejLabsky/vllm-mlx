@@ -2257,8 +2257,10 @@ class Scheduler:
                 )
 
         # Check prefix cache for cached KV state
-        if _vu.media_of(request) is not None:
-            _vu.mark_uncached(request)  # (#181) media on --vision-unified
+        if _vu.media_of(request) is not None and not _vu.key_media_request(
+            self, request
+        ):
+            _vu.mark_uncached(request)  # (#181) unkeyable media: cold
         elif self.hybrid_kv is not None:
             _batched_kv.fetch_for_request(self.hybrid_kv, request)
         elif self.block_aware_cache is not None:
@@ -2725,6 +2727,8 @@ class Scheduler:
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
             prompt_tokens = request.prompt_token_ids or []
+            if media is not None:  # (#181) real ids, never the cache key
+                prompt_tokens = media.input_ids
             # all_tokens seeds only the cached prefix. BatchGenerator appends
             # tokens_to_process itself before running logits processors.
             cached_history = (
@@ -2744,6 +2748,8 @@ class Scheduler:
             }
 
             def _do_insert(toks):
+                if media is not None and media.keyed:  # (#181)
+                    return _vu.insert_media_row(self, request, toks, insert_kwargs)
                 if self.hybrid_kv is not None and media is None:
                     return _batched_kv.insert_segmented(
                         self.hybrid_kv, self.batch_generator, request,
@@ -3284,8 +3290,10 @@ class Scheduler:
                 self._cleanup_detokenizer(request_id)
 
                 # Extract cache for future reuse (critical for agentic multi-turn)
-                # (#181) media rows are not cached
-                if hasattr(response, "prompt_cache") and _vu.media_of(request) is None:
+                # (#181) unkeyed media rows are not cached
+                if hasattr(response, "prompt_cache") and not _vu.media_uncached(
+                    request
+                ):
                     try:
                         # prompt_cache may be callable or direct attribute
                         if callable(response.prompt_cache):
@@ -3336,7 +3344,7 @@ class Scheduler:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
-            if request is not None and _vu.media_of(request) is not None:
+            if request is not None and _vu.media_uncached(request):
                 _vu.release_media_request(self, request_id, request)  # (#181)
             elif request is not None and request.prompt_token_ids:
                 if self.hybrid_kv is not None:

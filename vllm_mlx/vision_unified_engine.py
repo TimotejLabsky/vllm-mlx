@@ -404,11 +404,14 @@ class VisionUnifiedEngine(BatchedEngine):
         if grid is None or pixel_values is None:
             raise MediaNotSupported("the processor returned no image grid")
         n_tokens = sum(1 for t in ids if t == image_token)
+        digests = tuple(image_digest(img) for img in images)
+        grid_np = _np(grid)
         return MediaInputs(
             input_ids=ids,
             pixel_values=_np(pixel_values),
-            image_grid_thw=_np(grid),
-            image_digests=tuple(image_digest(img) for img in images),
+            image_grid_thw=grid_np,
+            image_digests=digests,
+            cache_key=vu.media_cache_key(ids, image_token, digests, grid_np),
             n_images=len(images),
             image_tokens=n_tokens,
             preprocess_s=time.perf_counter() - tic,

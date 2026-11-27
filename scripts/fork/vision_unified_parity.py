@@ -342,18 +342,6 @@ def main() -> int:
             rows2[0] == ref_toks[: len(rows2[0])] and len(rows2[0]) > 0,
         )
         check("C4 text row unchanged (trailing-text media row)", rows2[1] == text_alone)
-        # extract round trip keeps the delta
-        from mlx_lm.models.cache import BatchKVCache, KVCache
-
-        kv = [c for c in mcache2 if isinstance(c, KVCache)][0]
-        b = BatchKVCache.merge([kv, KVCache()])
-        back = b.extract(0)
-        check(
-            "C5 merge/extract round trip keeps rope_delta",
-            getattr(back, "rope_delta", 0) == delta,
-            f"(delta={delta})",
-        )
-
     print("\nRESULT:", "PASS" if not failures else f"FAIL {failures}")
     return 0 if not failures else 1
 

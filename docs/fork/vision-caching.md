@@ -162,6 +162,24 @@ Mixed `--text-only` routes are *not* flipped: serving vision there today would
 trade away the text stack (system-KV etc.). That's phase 2 `--vision-split`
 (plan P15–P19), de-risked by this sweep.
 
+**Phase 2 as one engine: #181 `--vision-unified` (default OFF, on no route).**
+The two-scheduler `--vision-split` design (draft PR #141) was rejected; images
+now go through the TEXT scheduler itself (Qwen3.5 family only). One mlx-vlm
+load; the batched scheduler runs the zero-copy text model; a media request is
+vision-encoded and prefilled through its last image with MRoPE positions, then
+joins the same batch. Which caches apply to it:
+
+| Layer | Media request on `--vision-unified` |
+|---|---|
+| Pixel / vision-embedding cache | not used (the MLLM branch's; the encode is skipped instead when a restore already covers the images) |
+| #142 MLLM media prefix cache | not used (no MLLM scheduler) |
+| Batched system-KV (RAM + SSD) | **ON**, keyed on the prompt with each image's placeholder run replaced by a fingerprint of its content digest **and grid** (`media_cache_key`). Same image + text hits; another image parts at its first placeholder; `http(s)` images (no content digest) run uncached |
+| RoPE delta | not stored; a key prefix fixes the positions, and a restore recomputes the delta from the request's own grids |
+
+Text requests on the route are byte-identical to `--text-only`, cache
+behaviour included (laptop e2e). Status, limits and the pending Studio check:
+PATCHES.md #181.
+
 ## Known residuals
 
 - MLLM preprocessing failures surface as HTTP 200 + `finish_reason:"error"` +

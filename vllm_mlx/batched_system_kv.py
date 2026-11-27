@@ -2987,8 +2987,8 @@ def capture_checkpoints(scheduler, prompt_responses) -> None:
         request_id = scheduler.uid_to_request_id.get(pr.uid)
         if request_id is None:
             continue
-        if _vu.media_of(scheduler.requests.get(request_id)) is not None:
-            continue  # (#181) media rows are not checkpointed
+        if _vu.media_uncached(scheduler.requests.get(request_id)):
+            continue  # (#181) unkeyed media rows are not checkpointed
         try:
             extracted = scheduler.batch_generator.extract_cache([pr.uid])
             entry = extracted.get(pr.uid)

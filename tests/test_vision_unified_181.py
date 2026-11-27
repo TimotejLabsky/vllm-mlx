@@ -175,16 +175,16 @@ def test_181_merge_without_deltas_is_unchanged(batch_patch):
     assert merged.left_padding.tolist() == [0, 2]
 
 
-def test_181_merge_adds_a_rows_delta_and_extract_returns_it(batch_patch):
+def test_181_merge_adds_a_rows_delta_and_rows_carry_it(batch_patch):
     a, b = _kv(5), _kv(7, delta=-4)
     merged = batch_patch.merge([a, b])
     # mask/index state untouched; only the RoPE offset moves
     assert merged.offset.tolist() == [5, 3]
     assert merged._idx == 7 and merged.left_padding.tolist() == [2, 0]
+    # an extracted row is a delta-free snapshot (restores recompute it)
     back = merged.extract(1)
-    assert back.offset == 7 and back.rope_delta == -4
-    assert not hasattr(merged.extract(0), "rope_delta")
-    # decode step, filter and extend carry the delta per row
+    assert back.offset == 7 and not hasattr(back, "rope_delta")
+    # decode step, filter, extend and trim carry the delta per row
     k = mx.random.normal((2, 2, 1, 8))
     merged.update_and_fetch(k, k)
     assert merged.offset.tolist() == [6, 4]
@@ -193,9 +193,10 @@ def test_181_merge_adds_a_rows_delta_and_extract_returns_it(batch_patch):
     other = batch_patch.merge([_kv(2)])
     merged.extend(other)
     assert merged.offset.tolist() == [4, 2]
-    assert merged.extract(0).rope_delta == -4
     merged.trim(1)
-    assert merged.extract(0).rope_delta == -4
+    assert merged.offset.tolist() == [3, 1]
+    assert vu.batch_has_media_row([merged])
+    assert not vu.batch_has_media_row([batch_patch.merge([_kv(3), _kv(2)])])
 
 
 def test_181_rope_delta_helpers():

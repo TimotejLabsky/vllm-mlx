@@ -78,6 +78,7 @@ class FakeVLM:
             image_token_id=IMAGE, video_token_id=None, vision_end_token_id=VEND
         )
         self.calls = 0
+        self.language_model = SimpleNamespace(get_rope_index=self.get_rope_index)
 
     def get_input_embeddings(self, ids, pixel_values, image_grid_thw=None):
         self.calls += 1
@@ -86,6 +87,13 @@ class FakeVLM:
         mask = mx.array([t == IMAGE for t in toks])[None, :, None]
         feat = mx.broadcast_to(pixel_values.reshape(1, 1, -1)[..., :1], emb.shape)
         emb = mx.where(mask, emb + feat.astype(emb.dtype), emb)
+        positions, deltas = self.get_rope_index(ids, image_grid_thw)
+        return SimpleNamespace(
+            inputs_embeds=emb, position_ids=positions, rope_deltas=deltas
+        )
+
+    def get_rope_index(self, ids, image_grid_thw):
+        toks = ids[0].tolist()
         grids = image_grid_thw.tolist()
         t, h, w = [], [], []
         pos, i, k = 0, 0, 0
@@ -107,12 +115,7 @@ class FakeVLM:
                 pos += 1
                 i += 1
         positions = mx.array([t, h, w], dtype=mx.int32)[:, None, :]
-        delta = pos - len(toks)
-        return SimpleNamespace(
-            inputs_embeds=emb,
-            position_ids=positions,
-            rope_deltas=mx.array([[delta]]),
-        )
+        return positions, mx.array([[pos - len(toks)]])
 
 
 class Tok:

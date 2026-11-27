@@ -4968,3 +4968,52 @@ def test_181_off_route_server_seams_equal_engine_is_mllm():
         eng = SimpleNamespace(is_mllm=flag)
         assert request_is_mllm(eng, img) is flag
         assert engine_serves_media(eng) is flag
+
+
+def test_181_different_images_never_share_a_key_past_the_image():
+    """#181 stage 3: media cache keys carry each image's content digest AND
+    grid. Different content, or the same content at another grid (other
+    MRoPE positions, other delta), must part at the first placeholder; the
+    same image and text must give the same key (re-sends hit)."""
+    import numpy as np
+
+    from vllm_mlx import vision_unified as vu
+
+    ids = [5, 6, 9, 9, 9, 9, 7, 8]
+    g = np.array([[1, 2, 2]])
+    k = vu.media_cache_key(ids, 9, (b"a" * 32,), g)
+    assert k == vu.media_cache_key(ids, 9, (b"a" * 32,), g)
+    for other in (
+        vu.media_cache_key(ids, 9, (b"b" * 32,), g),
+        vu.media_cache_key(ids, 9, (b"a" * 32,), np.array([[1, 1, 4]])),
+    ):
+        assert other[:2] == k[:2] == [5, 6] and other[2] != k[2]
+    assert vu.media_cache_key(ids, 9, (None,), g) is None
+
+
+def test_181_snapshots_carry_no_rope_delta():
+    """A cached entry never carries a delta of its own (stock
+    ``BatchKVCache.extract``): a media restore recomputes the delta from the
+    request's own positions, which its key prefix fixes, so an entry can
+    never be restored with another delta; a text restore gets none."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import BatchKVCache, KVCache
+
+    from vllm_mlx import vision_unified as vu
+
+    saved = BatchKVCache.__dict__["merge"]
+    flag = vu._BATCH_PATCHED
+    vu._BATCH_PATCHED = False
+    try:
+        vu.install_batch_cache_delta()
+        c = KVCache()
+        k = mx.zeros((1, 1, 4, 2))
+        c.update_and_fetch(k, k)
+        c.rope_delta = -3
+        merged = BatchKVCache.merge([c])
+        assert merged.offset.tolist() == [1]
+        assert not hasattr(merged.extract(0), "rope_delta")
+        assert not getattr(BatchKVCache.extract, "__vllm_mlx_181__", False)
+    finally:
+        BatchKVCache.merge = saved
+        vu._BATCH_PATCHED = flag
