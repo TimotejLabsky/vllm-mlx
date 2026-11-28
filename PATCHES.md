@@ -4990,3 +4990,22 @@ Measured on the Studio in a standalone `generate_step` loop (not the server): Qw
 - Longest inter-token gap while a 9.9K-token request is prefilled: 1114 ms for both the text and the image request.
 
 **Status:** the Studio check passed; merge is the owner's call. Enabling it on the 27B-8bit route is a deploy decision: accept the cap's encode stall and the +5 GB peak, or pick another cap.
+
+## 182. `patch: inkling-parsers` — reasoning and tool-call parsers for Inkling 2's message blocks
+
+**Files:** `vllm_mlx/inkling_blocks.py` (new, the shared scanner), `vllm_mlx/reasoning/inkling_parser.py` (new), `vllm_mlx/tool_parsers/inkling_tool_parser.py` (new), both `__init__.py` registries, `tests/test_inkling_parsers.py`.
+
+**Why:** Thinking Machines' Inkling 2 Mini (`inkling2_loop`, 26.4B looped MoE, text + image, Apache-2.0) frames every part of a turn as a typed message block: `<|content_thinking|>` is reasoning, `<|content_text|>` the reply, `<|content_invoke_tool_json|>` a tool call (`{"name":..,"args":{..}}`, tool name in the `<|message_model|>` header), each closed by `<|end_message|>`. Without parsers the control tokens leak into `content` and calls are never recognised. Neither upstream nor mlx-lm 0.32.2 knows the model; it loads only through mlx-vlm >= 0.8.1, so it runs on the MLLM BatchedEngine path.
+
+**What:** `--tool-call-parser inkling` (alias `inkling2`) and `--reasoning-parser inkling`. Both read the raw stream (`CONSUMES_RAW_STREAM`, like harmony #112) through one incremental scanner, so streaming and non-streaming, and the two parsers, cannot disagree about block boundaries. The scanner costs O(delta) and holds back a marker split across deltas. The grammar is the checkpoint's own `response_template` (tokenizer_config.json): `text` / `tool_error` / `invoke_tool_text` blocks are content, every kind may repeat, the `<|message_model|>` header is optional. A call cut off by `max_tokens` is a call only if its JSON is already complete; a closed block with unparseable JSON keeps its raw text as the arguments under the header's name. No engine or server change was needed.
+
+**Upstream:** not offered yet (upstream has no Inkling support at all).
+
+**Verification:**
+- `tests/test_inkling_parsers.py`: 45 tests (non-stream, streaming at chunk sizes 1/3/7/16/1000, truncation, split markers, resync). With the neighbouring parser suites: 542 passed. ruff and black clean.
+- **Studio, real model, 2026-11-27.** `thinkingmachines/Inkling-2-Mini` (the vendor checkpoint, 20.2 GB with its drafter; mlx-vlm loads it natively) in a **separate venv** (`~/vllm-mlx-inkling-env` = prod freeze + `mlx-vlm==0.8.1 --no-deps`; prod stays on 0.7.12), spare port, `--continuous-batching --max-num-seqs 2 --tool-call-parser inkling --reasoning-parser inkling --default-chat-template-kwargs '{"reasoning_effort":"medium"}'`, `HF_HUB_OFFLINE=1`:
+  - Smoke 9/9: plain answer + reasoning split (non-stream and stream), tool call (non-stream and stream), tool-result round trip, Slovak, `reasoning_effort=none` (reasoning empty), image input, no control token in any `content` or `reasoning`. Four parallel calls in one turn came back as four calls, and the turn after their results answered in text.
+  - Speed: decode 21.5 tok/s after the first token (700 tokens). Cold prefill 3.3K in ~3 s, 13.7K in ~19 s, 45K in ~100 s end to end.
+  - Memory (Metal active / peak): 22.5 / 22.7 GB after load and short turns; 26.5 / 28.4 GB after a 45K-token prompt with 4.9 GB of prefix cache held. Recall correct at 45K (needle and highest note number).
+  - Prefix cache (the MLLM path's `MemoryAwarePrefixCache`): an identical prompt and a follow-up turn reuse the whole previous prompt (TTFT 5.4 s -> 0.2-0.4 s at 3.3K, 25 s -> 0.2 s at 13.7K). **Known gap:** a shared system prompt under a different first question is not reused (cold again). `media_prefix_enabled` is false for this architecture (#142 has not been swept on it).
+- **Not run:** contexts past 45K, concurrent requests, the bundled DSpark drafter (`mtp.safetensors`), and the fork's full mocked suite on mlx-vlm 0.8.1.

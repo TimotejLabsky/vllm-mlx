@@ -81,6 +81,7 @@ def _register_builtin_parsers():
     from .glm4_parser import Glm4ReasoningParser
     from .gpt_oss_parser import GptOssReasoningParser
     from .harmony_parser import HarmonyReasoningParser
+    from .inkling_parser import InklingReasoningParser
     from .mistral_parser import MistralReasoningParser
     from .muse_glimmer_parser import MuseGlimmerReasoningParser
     from .poolside_v1_parser import PoolsideV1ReasoningParser
@@ -98,6 +99,7 @@ def _register_builtin_parsers():
     register_parser("poolside_v1", PoolsideV1ReasoningParser)
     register_parser("step3p5", Step3p5ReasoningParser)
     register_parser("muse_glimmer", MuseGlimmerReasoningParser)
+    register_parser("inkling", InklingReasoningParser)
 
 
 # Register built-in parsers on module load
